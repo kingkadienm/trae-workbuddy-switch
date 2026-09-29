@@ -167,6 +167,7 @@ pub fn run() {
             commands::export_accounts_to_path,
             commands::preview_import_accounts,
             commands::import_accounts,
+            commands::import_auths_dir,
             commands::switch_account,
             commands::switch_progress,
             commands::list_sessions,

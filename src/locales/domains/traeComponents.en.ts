@@ -120,6 +120,7 @@ export const en = {
   "trae.comp.oauth.start": "Start {variant} web sign-in",
   "trae.comp.oauth.startBusy": "Starting sign-in for {variant}…",
   "trae.comp.oauth.waiting": "Waiting for authorization; please finish signing in in your browser…",
+  "trae.comp.oauth.webMode": "No local client detected — signed in via web mode (synthetic device identity). Token refreshes also use web mode; no client install needed.",
   "trae.comp.oauth.remaining": "{time} left",
   "trae.comp.oauth.callback": "Local callback listener: ",
   "trae.comp.oauth.result": "Account added: {name}",

@@ -127,6 +127,7 @@ export const zh = {
   "trae.comp.oauth.start": "开始 {variant} 网页登录",
   "trae.comp.oauth.startBusy": "正在为 {variant} 发起登录…",
   "trae.comp.oauth.waiting": "正在等待授权，请在浏览器完成登录…",
+  "trae.comp.oauth.webMode": "本机未检测到客户端，已用网页模式登录（合成设备身份）；后续 Token 刷新同样走网页模式，无需安装客户端。",
   "trae.comp.oauth.remaining": "剩余 {time}",
   "trae.comp.oauth.callback": "本机回调监听：",
   "trae.comp.oauth.result": "已添加账号：{name}",

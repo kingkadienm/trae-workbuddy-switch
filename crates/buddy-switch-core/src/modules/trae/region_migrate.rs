@@ -319,6 +319,7 @@ mod tests {
         let file = AccountsFile {
             accounts,
             device_bindings: HashMap::from([("u-legacy".to_string(), "dev-legacy".to_string())]),
+            web_devices: std::collections::HashSet::new(),
         };
         store_write(&legacy_path_for(&paths::accounts_file_for_region(TraeRegion::Cn)), &file);
         store_write(&legacy_path_for(&paths::groups_file_for_region(TraeRegion::Cn)), &groups);
@@ -341,6 +342,7 @@ mod tests {
         let cn_seed = AccountsFile {
             accounts: vec![legacy_account("u-cn", "主号")],
             device_bindings: HashMap::new(),
+            web_devices: std::collections::HashSet::new(),
         };
         store_write(&paths::accounts_file_for_region(TraeRegion::Cn), &cn_seed);
         write_legacy(
@@ -400,6 +402,7 @@ mod tests {
                 updated_at: None,
             }],
             device_bindings: HashMap::new(),
+            web_devices: std::collections::HashSet::new(),
         };
         store_write(&paths::accounts_file_for_region(TraeRegion::Cn), &target_seed);
         write_legacy(vec![legacy_account("u-1", "旧主号")], GroupsFile::default());
@@ -433,6 +436,7 @@ mod tests {
             &AccountsFile {
                 accounts: vec![legacy_account("u-cn", "主号")],
                 device_bindings: HashMap::new(),
+                web_devices: std::collections::HashSet::new(),
             },
         );
         write_legacy(vec![legacy_account("u-x", "X")], GroupsFile::default());

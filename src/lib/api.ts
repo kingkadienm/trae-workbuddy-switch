@@ -26,6 +26,7 @@ import type {
   GatewayLogEntry,
   GatewayStatus,
   GithubConfig,
+  AuthsDirImportResult,
   ImportPreviewAccount,
   ImportResult,
   OAuthPollResult,
@@ -151,6 +152,7 @@ const ROUTES: Record<string, Route> = {
   export_accounts_to_path: { method: "POST", path: "/api/export-accounts-to-path" },
   preview_import_accounts: { method: "POST", path: "/api/import/preview" },
   import_accounts: { method: "POST", path: "/api/import" },
+  import_auths_dir: { method: "POST", path: "/api/import/auths-dir" },
   switch_account: { method: "POST", path: "/api/switch" },
   list_sessions: { method: "GET", path: "/api/sessions" },
   copy_sessions: { method: "POST", path: "/api/sessions/copy" },
@@ -466,6 +468,11 @@ export function previewImportAccounts(
 
 export function importAccounts(fileText: string, indexes: number[], region?: Region): Promise<ImportResult> {
   return call("import_accounts", { fileText, indexes, ...regionArg(region) });
+}
+
+/** 导入 panel 的 `auths/` 目录（每文件一个账号，嵌套形）到该 region 账号库。 */
+export function importAuthsDir(dir: string, region?: Region): Promise<AuthsDirImportResult> {
+  return call("import_auths_dir", { dir, ...regionArg(region) });
 }
 
 export function switchAccount(args: {

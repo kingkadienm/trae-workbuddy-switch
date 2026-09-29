@@ -6,6 +6,7 @@ import {
   Download,
   FileDown,
   FileUp,
+  FolderOpen,
   Loader2,
   QrCode,
   RefreshCw,
@@ -38,6 +39,7 @@ import { OAuthLoginDialog } from "@/components/oauth-login-dialog";
 import { SwitchAccountDialog } from "@/components/switch-account-dialog";
 import * as api from "@/lib/api";
 import { copyText } from "@/lib/clipboard";
+import { Input } from "@/components/ui/input";
 import { displayText } from "@/lib/display-text";
 import { REGIONS, regionDescriptor } from "@/lib/region";
 import type {
@@ -250,6 +252,11 @@ function RegionPanel({ region }: { region: Region }) {
   const [oauthOpen, setOauthOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
+  /** panel `auths/` 目录导入弹框（桌面选目录；WebUI 手动输入路径）。 */
+  const [panelAuthsOpen, setPanelAuthsOpen] = useState(false);
+  const [panelAuthsDir, setPanelAuthsDir] = useState("");
+  const [panelAuthsBusy, setPanelAuthsBusy] = useState(false);
+  const [panelAuthsError, setPanelAuthsError] = useState("");
   const [switchAccount, setSwitchAccount] = useState<AccountMeta | null>(null);
   const [importing, setImporting] = useState(false);
   const [autoCheckinConfig, setAutoCheckinConfig] = useState<CheckinConfig | null>(null);
@@ -498,6 +505,42 @@ function RegionPanel({ region }: { region: Region }) {
       toast.error(t("wbAccounts.toast.importFail"), { description: api.asError(e) });
     } finally {
       setImporting(false);
+    }
+  }
+
+  /** 桌面端选 panel 的 `auths/` 目录（仅填路径，不触发导入）。 */
+  async function onPickPanelAuthsDir() {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const selected = await open({ directory: true });
+    if (typeof selected !== "string") return; // 用户取消
+    setPanelAuthsDir(selected);
+    setPanelAuthsError("");
+  }
+
+  /** 按已填路径导入 panel `auths/` 目录，成功后刷新账号库。 */
+  async function onImportPanelAuths() {
+    if (panelAuthsBusy) return;
+    const dir = panelAuthsDir.trim();
+    if (!dir) {
+      setPanelAuthsError(t("wbAccounts.page.importPanelAuthsPrompt"));
+      return;
+    }
+    setPanelAuthsBusy(true);
+    setPanelAuthsError("");
+    try {
+      const res = await api.importAuthsDir(dir, region);
+      const overwriteText = res.overwritten > 0 ? t("wbAccounts.toast.importOverwrite", { n: res.overwritten }) : "";
+      toast.success(
+        t("wbAccounts.toast.importSuccess"),
+        { description: t("wbAccounts.page.importPanelAuthsResult", { imported: res.imported, overwrite: overwriteText, skipped: res.skipped, mismatch: res.mismatch }) },
+      );
+      setPanelAuthsDir("");
+      setPanelAuthsOpen(false);
+      void reconcileAccounts(region);
+    } catch (e) {
+      setPanelAuthsError(api.asError(e));
+    } finally {
+      setPanelAuthsBusy(false);
     }
   }
 
@@ -936,6 +979,17 @@ function RegionPanel({ region }: { region: Region }) {
                   </Button>
                 </DemoAction>
                 <DemoAction>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-9 px-2.5"
+                    onClick={() => setPanelAuthsOpen(true)}
+                    title={t("wbAccounts.page.importPanelAuthsDesc")}
+                  >
+                    <FolderOpen />{t("wbAccounts.page.importPanelAuths")}
+                  </Button>
+                </DemoAction>
+                <DemoAction>
                   <Button variant="ghost" size="sm" className="h-9 px-2.5" onClick={() => setExportOpen(true)} disabled={accounts.length === 0} title={t("wbAccounts.page.exportTitle")}>
                     <FileDown />{t("wbAccounts.page.export")}
                   </Button>
@@ -1151,6 +1205,50 @@ function RegionPanel({ region }: { region: Region }) {
         onImported={onImported}
         region={region}
       />
+      {/* panel `auths/` 目录导入：桌面选目录、WebUI 手动输入路径，均走 `import_auths_dir` 命令 */}
+      <Dialog
+        open={panelAuthsOpen}
+        onOpenChange={(o) => {
+          setPanelAuthsOpen(o);
+          if (!o) {
+            setPanelAuthsDir("");
+            setPanelAuthsError("");
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t("wbAccounts.page.importPanelAuthsTitle")}</DialogTitle>
+            <DialogDescription>{t("wbAccounts.page.importPanelAuthsDesc")}</DialogDescription>
+          </DialogHeader>
+          <div className="flex items-center gap-2">
+            <Input
+              value={panelAuthsDir}
+              onChange={(e) => setPanelAuthsDir(e.target.value)}
+              placeholder={t("wbAccounts.page.importPanelAuthsPrompt")}
+            />
+            {!api.isWebui() && (
+              <Button variant="outline" onClick={onPickPanelAuthsDir} disabled={panelAuthsBusy}>
+                <FolderOpen />
+                {t("wbAccounts.page.importPanelAuthsPick")}
+              </Button>
+            )}
+          </div>
+          {panelAuthsError && (
+            <Alert variant="destructive">
+              <AlertDescription>{panelAuthsError}</AlertDescription>
+            </Alert>
+          )}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setPanelAuthsOpen(false)} disabled={panelAuthsBusy}>
+              {t("wbAccounts.dialog.cancel")}
+            </Button>
+            <Button onClick={onImportPanelAuths} disabled={panelAuthsBusy || !panelAuthsDir.trim()}>
+              {panelAuthsBusy ? t("wbAccounts.page.importPanelAuthsImporting") : t("wbAccounts.page.importPanelAuths")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <SwitchAccountDialog
         open={switchAccount !== null}
         onOpenChange={(o) => {

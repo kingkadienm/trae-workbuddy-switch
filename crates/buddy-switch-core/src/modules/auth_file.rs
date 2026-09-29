@@ -442,6 +442,16 @@ fn plain_text_or_envelope(v: &Value, key: &str) -> Option<Value> {
     None
 }
 
+/// 归一化客户端认证文件内容，返回账号记录。
+///
+/// 该实现也用于 workbuddy2api-panel 的 `auths/*.json` 导入兜底
+/// （`export_import` 导入路径）：两者同根 —— 顶层 `{"auth":{...},"account":{...}}`
+/// 的双对象形态，客户端文件多出的信封（`$wbEncrypted`）按既有纪律原样保留。
+/// `imported_account_from_root` 本身不动。
+pub fn normalize_imported_account(root: Value) -> Option<Value> {
+    imported_account_from_root(root)
+}
+
 fn imported_account_from_root(root: Value) -> Option<Value> {
     let account_obj = root
         .get("account")

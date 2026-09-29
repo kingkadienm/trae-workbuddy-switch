@@ -85,6 +85,8 @@ export function TraeOAuthLoginDialog({ open, onOpenChange, onSuccess }: Props) {
   const [launchNote, setLaunchNote] = useState("");
   /** 剩余等待秒数（`null` 表示尚未进入等待态）。 */
   const [remaining, setRemaining] = useState<number | null>(null);
+  /** 本次登录是否走了合成设备身份（本机无客户端 → 纯网页模式，见 `webMode`）。 */
+  const [webMode, setWebMode] = useState(false);
   /**
    * 是否已到前端超时。
    *
@@ -137,6 +139,7 @@ export function TraeOAuthLoginDialog({ open, onOpenChange, onSuccess }: Props) {
       setError("");
       setResult(null);
       setRemaining(null);
+      setWebMode(false);
       timedOutRef.current = false;
     }
   }, [open]);
@@ -285,6 +288,7 @@ export function TraeOAuthLoginDialog({ open, onOpenChange, onSuccess }: Props) {
       setLoginId(res.loginId);
       setUri(res.verificationUri);
       setPort(res.port);
+      setWebMode(res.webMode === true);
       // 按当前宿主能力打开验证页
       await openInBrowser(res.verificationUri);
     } catch (e) {
@@ -386,6 +390,9 @@ export function TraeOAuthLoginDialog({ open, onOpenChange, onSuccess }: Props) {
                 {t("trae.comp.oauth.callback")}
                 <code>http://127.0.0.1:{port}/authorize</code>
               </p>
+            )}
+            {webMode && (
+              <p className="text-xs text-muted-foreground">{t("trae.comp.oauth.webMode")}</p>
             )}
           </div>
         )}

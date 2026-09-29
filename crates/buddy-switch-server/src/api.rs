@@ -98,6 +98,7 @@ fn api_routes() -> Router {
         )
         .route("/api/import/preview", post(api_preview_import))
         .route("/api/import", post(api_import))
+        .route("/api/import/auths-dir", post(api_import_auths_dir))
         .route("/api/switch", post(api_switch))
         .route("/api/switch/progress", get(api_switch_progress))
         .route("/api/sessions", get(api_sessions))
@@ -578,6 +579,41 @@ async fn api_import(Json(body): Json<Value>) -> Response {
         })),
         Err(e) => json_err(e, StatusCode::BAD_REQUEST),
     }
+}
+
+/// POST /api/import/auths-dir —— 导入 panel 的 `auths/` 目录到该 region 账号库。
+///
+/// 入参 `{dir, region}`：`dir` 由前端 `@tauri-apps/plugin-dialog` 的
+/// `open({directory: true})` 选取。后端枚举 `*.json` 逐项归一 + realm 分流 +
+/// 秒→毫秒 + 合并；域不符计入 `mismatch` 跳过。与 Tauri 侧 `import_auths_dir`
+/// 命令同构（webui 通道）。
+async fn api_import_auths_dir(Json(body): Json<Value>) -> Response {
+    let region = parse_region(body.get("region").and_then(Value::as_str));
+    let dir = body
+        .get("dir")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if dir.is_empty() {
+        return json_err("缺少 dir 参数".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let dir = std::path::PathBuf::from(dir);
+    let result = match tokio::task::spawn_blocking(move || {
+        export_import::import_auths_dir(&dir, region)
+    })
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => return json_err(e, StatusCode::BAD_REQUEST),
+        Err(e) => return json_err(format!("导入任务失败: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    json_ok(json!({
+        "ok": true,
+        "imported": result.imported,
+        "skipped": result.skipped,
+        "overwritten": result.overwritten,
+        "mismatch": result.mismatch,
+    }))
 }
 
 // ---------------------------------------------------------------------------

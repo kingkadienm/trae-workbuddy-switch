@@ -321,6 +321,26 @@ pub fn import_accounts(
     }))
 }
 
+/// POST /api/import/auths-dir —— 导入 panel 的 `auths/` 目录（每文件一个账号，
+/// 嵌套形 `{"auth":{...},"account":{...}}`）到该 region 账号库。
+///
+/// 与 [`import_accounts`] 的差别：入参是**目录路径**而非文件文本，后端枚举
+/// `*.json` 逐项归一 + realm 分流 + 秒→毫秒 + 合并；域不符的账号计入 `mismatch`
+/// 跳过（不塞错库）。目录路径由前端用 `@tauri-apps/plugin-dialog` 的
+/// `open({directory: true})` 选取（capability `dialog:default` 已含 open）。
+#[tauri::command(rename_all = "camelCase")]
+pub fn import_auths_dir(dir: String, region: Option<String>) -> Result<Value, String> {
+    let region = parse_region(region.as_deref());
+    let result = export_import::import_auths_dir(std::path::Path::new(&dir), region)?;
+    Ok(json!({
+        "ok": true,
+        "imported": result.imported,
+        "skipped": result.skipped,
+        "overwritten": result.overwritten,
+        "mismatch": result.mismatch,
+    }))
+}
+
 /// 打开系统设置授权面板。默认「完全磁盘访问」（该 anchor 各版本均有效）；
 /// 传 `target="app_management"` 尝试「App 管理」（macOS 15+，部分版本不支持深链）。
 ///

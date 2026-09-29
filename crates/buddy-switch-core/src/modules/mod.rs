@@ -34,4 +34,5 @@ pub mod trae;
 pub mod travel;
 pub mod update;
 pub mod upstream;
+pub mod wb_register;
 pub mod vscode_cn_inject;

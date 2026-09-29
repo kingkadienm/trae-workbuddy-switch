@@ -526,6 +526,11 @@ export interface TraeOAuthStartResult {
   expiresIn: number;
   /** 本机回调监听端口（`127.0.0.1:<port>/authorize`）。 */
   port: number;
+  /**
+   * 本次登录是否走了合成设备身份（本机取不到客户端设备身份时后端自动降级为
+   * 纯 web 网页模式，随机 deviceId）。前端据此提示「已用网页模式登录」。
+   */
+  webMode?: boolean;
 }
 
 /** 轮询结果：`done` 之后二选一（`account` 或 `error`）。 */

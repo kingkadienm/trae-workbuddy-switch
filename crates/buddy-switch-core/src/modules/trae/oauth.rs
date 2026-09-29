@@ -550,6 +550,11 @@ struct ClientFacts {
     meta: ClientInstallMeta,
     /// 系统信息。测试里可注入固定值。
     system: SystemProfile,
+    /// **网页模式**：本机取不到客户端设备身份时，用随机合成身份替代
+    /// （见 [`ClientFacts::synthetic_for`]）。合成身份的 `publicKeyPEM` 为空，
+    /// `build_exchange_payload` 据此省略 `DevicePublicKey`；账号落库时标记
+    /// `web_devices`，续期只走无签名变体。
+    web_device: bool,
 }
 
 impl ClientFacts {
@@ -563,7 +568,43 @@ impl ClientFacts {
             identity,
             meta: platform::client_install_meta_for(variant).unwrap_or_default(),
             system: platform::system_profile(),
+            web_device: false,
         })
+    }
+
+    /// 网页模式身份：**不读本机**，随机生成 device 身份，对齐参考项目
+    /// trae2api-web 的 `randomHex` 设备口径（登录态自洽，无需客户端）。
+    ///
+    /// 合成值的纪律：
+    /// - `device_id` = `random_hex(32)`，本次登录内只生成一次（会话随 facts 走，
+    ///   URL / 交换请求体 / 落库标记全程同源，红线不变）；
+    /// - `machine_id` 走 [`crate::modules::trae::device::oauth_login_machine_for`]
+    ///   的稳定值（按变体落盘一次后固定），不为合成身份新造一条取值路径；
+    /// - `publicKeyPEM` 留空：交换请求体没有签名密钥可报，**省略**该键而不是
+    ///   报空串（`build_exchange_payload` 按空值判定）。
+    /// - 版本/系统字段复用既有回落链（内置常量），不读安装目录。
+    fn synthetic_for(variant: TraeVariant) -> ClientFacts {
+        let identity = DeviceIdentity {
+            variant,
+            device_id: icube::random_hex(32),
+            machine_id: String::new(),
+            app_version: String::new(),
+            public_key_pem: String::new(),
+            source_app: "网页模式（合成身份）".to_string(),
+        };
+        // `machine_id` 为空 ⇒ [`authorize_machine_id`] 回落 `oauth_login_machine_for`
+        // 的稳定值，与客户端模式走的是同一条取值函数。
+        ClientFacts {
+            identity,
+            meta: ClientInstallMeta::default(),
+            system: platform::system_profile(),
+            web_device: true,
+        }
+    }
+
+    /// 合成身份（网页模式）没有公钥：`DeviceInfo` 是否要带 `DevicePublicKey`。
+    fn has_public_key(&self) -> bool {
+        !self.identity.public_key_pem.trim().is_empty()
     }
 
     /// `machine_id` / `x_machine_id` / `DeviceInfo.MachineID` 的**共同**取值。
@@ -787,35 +828,40 @@ fn build_exchange_payload(
     let system = &facts.system;
     // ★ 与授权 URL 的 `x_app_version` 同源（客户端三处同值）。
     let app_version = facts.app_version();
+    let mut device_info = json!({
+        "DeviceID": identity.device_id,
+        // ★ 与授权 URL 的 `machine_id` / `x_machine_id` **同源**（唯一派生点）。
+        // 改造前这里取 `storage.json` 的 `telemetry.machineId`、URL 取自造值 ⇒
+        // 上游回 `20403/040036 Token device not match`。
+        "MachineID": facts.machine_id(),
+        // ★ 按**产品线**派生：SOLO 线 `SOLO_PC` / IDE 线 `IDE_PC`
+        // （客户端 `k(){ return gr(product) ? "SOLO_PC" : "IDE_PC" }`）。
+        // 改造前写死 `IDE_PC`（照抄参考实现的 IDE 线），SOLO 线上必然对不上。
+        "PlatformCode": identity.variant.oauth_line().platform_code(),
+        "DeviceType": "PC",
+        // 真值是「Windows 账户全名 + 本地化后缀」（本机 `Jackey的电脑`）——
+        // 本实现留空，理由见 `platform::system_profile`（无稳定来源，且该字段
+        // **不在授权 URL 里**，不参与同源比对）。
+        "DeviceName": system.device_name,
+        // ★ 与授权 URL 的 `x_device_brand` 同源（客户端装的是 `deviceModel`）。
+        "DeviceModel": system.device_model,
+        "ClientVersion": app_version,
+        "DeviceBrand": system.device_manufacturer,
+        "DeviceCPU": system.cpu_brand,
+        // ★ 与授权 URL 的 `x_device_type` / `x_os_version` 同源。
+        "OSInfo": system.os_name,
+        "OSVersion": system.os_version,
+    });
+    // 网页模式合成身份没有公钥（无客户端私钥可签名）：**省略** `DevicePublicKey`
+    // 而不是报空串（空串会被上游当成「声明了但为空」的设备声明，语义相反）。
+    if facts.has_public_key() {
+        device_info["DevicePublicKey"] = json!(identity.public_key_pem);
+    }
     json!({
         "ClientID": client_id,
         "AuthCode": auth_code,
         "CodeVerifier": code_verifier,
-        "DeviceInfo": {
-            "DeviceID": identity.device_id,
-            // ★ 与授权 URL 的 `machine_id` / `x_machine_id` **同源**（唯一派生点）。
-            // 改造前这里取 `storage.json` 的 `telemetry.machineId`、URL 取自造值 ⇒
-            // 上游回 `20403/040036 Token device not match`。
-            "MachineID": facts.machine_id(),
-            // ★ 按**产品线**派生：SOLO 线 `SOLO_PC` / IDE 线 `IDE_PC`
-            // （客户端 `k(){ return gr(product) ? "SOLO_PC" : "IDE_PC" }`）。
-            // 改造前写死 `IDE_PC`（照抄参考实现的 IDE 线），SOLO 线上必然对不上。
-            "PlatformCode": identity.variant.oauth_line().platform_code(),
-            "DeviceType": "PC",
-            // 真值是「Windows 账户全名 + 本地化后缀」（本机 `Jackey的电脑`）——
-            // 本实现留空，理由见 `platform::system_profile`（无稳定来源，且该字段
-            // **不在授权 URL 里**，不参与同源比对）。
-            "DeviceName": system.device_name,
-            // ★ 与授权 URL 的 `x_device_brand` 同源（客户端装的是 `deviceModel`）。
-            "DeviceModel": system.device_model,
-            "ClientVersion": app_version,
-            "DevicePublicKey": identity.public_key_pem,
-            "DeviceBrand": system.device_manufacturer,
-            "DeviceCPU": system.cpu_brand,
-            // ★ 与授权 URL 的 `x_device_type` / `x_os_version` 同源。
-            "OSInfo": system.os_name,
-            "OSVersion": system.os_version,
-        },
+        "DeviceInfo": device_info,
         "IDEVersion": app_version,
     })
 }
@@ -1147,23 +1193,34 @@ pub async fn login_start() -> Result<Value, String> {
 /// 返回值形状（camelCase，与线上约定一致）：
 /// ```json
 /// { "loginId", "verificationUri", "expiresIn", "port",
-///   "variant", "variantLabel",
+///   "variant", "variantLabel", "webMode",
 ///   "deviceCredential": { "available", "sourceApp", "deviceId", "machineId",
 ///                         "appVersion", "errorKind", "errorMessage" } }
 /// ```
 /// `deviceCredential` 是**脱敏**诊断（`icube::credential_status_for`），
-/// **私钥永不出现**。
+/// **私钥永不出现**。`webMode` = 本次登录是否走合成身份（本机取不到客户端
+/// 设备身份时为 `true`，前端据此展示「网页模式」提示）。
 pub async fn login_start_for(variant: TraeVariant) -> Result<Value, String> {
-    // ★ 身份先于端口取：授权 URL 的 `device_id` **必须**与 icube 设备凭证同源，
-    // 取不到就**直接失败**，不做任何降级（见 [`build_authorize_url`] 的红线说明）。
-    //
-    // 为什么放在绑端口之前：身份缺失是本机环境问题（客户端没启动过 / 没登录过），
-    // 与端口无关。先判它，用户拿到的第一句话就是「去启动一次客户端」，
-    // 而不是先被一个端口错误引到错误的方向。
-    //
     // ★ 一次读齐「客户端侧事实」（身份 + 安装元数据 + 系统信息）：授权 URL 与
     // 兑换请求体都**只**从这里取值，两处不可能各说一套（见 [`ClientFacts`]）。
-    let facts = ClientFacts::load_for(variant)?;
+    //
+    // 本机**取不到客户端设备身份**（没装客户端 / 从没登录过）时，降级为**网页模式**：
+    // 用随机合成身份替代（对齐参考项目 trae2api-web 的 randomHex 设备口径），不再
+    // 要求先装客户端。合成身份的账号落库时带 `web_devices` 标记，续期只走无签名变体。
+    let facts = match ClientFacts::load_for(variant) {
+        Ok(facts) => facts,
+        Err(error) => {
+            // 留痕：只有「降级到网页模式」才写这条日志，成功读客户端的事实不落日志。
+            store::append_log(
+                &crate::modules::trae::paths::checkin_log_file_for(variant),
+                &format!(
+                    "网页模式登录：本机客户端设备身份不可用（{}），改用随机合成设备身份",
+                    error
+                ),
+            );
+            ClientFacts::synthetic_for(variant)
+        }
+    };
 
     // 绑**固定端口**（见 [`CALLBACK_PORT`] 的说明）：授权页会来探这个端口判断
     // 客户端在线，随机端口会让它永远探不到、流程永久卡在「认证中」。
@@ -1210,6 +1267,7 @@ pub async fn login_start_for(variant: TraeVariant) -> Result<Value, String> {
         );
     }
 
+    let web_mode = facts.web_device;
     let authorize_url = build_authorize_url(variant, &facts, port, &trace_id, &code_challenge);
     let session_id = login_id.clone();
     // 客户端事实随监听任务一起搬进去：回调到达时要拿**同一份**去填 `DeviceInfo`
@@ -1415,6 +1473,8 @@ pub async fn login_start_for(variant: TraeVariant) -> Result<Value, String> {
         "port": port,
         "variant": variant.as_str(),
         "variantLabel": variant.display_name(),
+        // 网页模式（合成身份）：本机取不到客户端设备身份时为 true。
+        "webMode": web_mode,
         // 脱敏诊断：只含白名单字段，私钥不可能出现（见 icube::credential_status_value）。
         "deviceCredential": icube::credential_status_for(variant),
     }))
@@ -1600,16 +1660,22 @@ async fn perform_login(
     } else if let Some(refresh_token) = callback.refresh_token.as_deref() {
         // 兼容路径（回调直接给 refreshToken）：此刻**还没有**账号绑定 ——
         // 绑定由下面 `login_with_exchanged_tokens_for` 在落库时写入。
-        // 故这里传 `None`：`exchange_token_for` 会回落「当前目录的那一条」并留痕。
+        // 故这里传 `None`：客户端模式下 `exchange_token_for` 会回落「当前目录的那一条」并留痕；
+        // 网页模式（facts.web_device）下 `web_device=true` 跳过凭证解析，只走无签名变体。
         //
         // ⚠️ 这个 `None` 是**必须**的，**不是漏改**（R6 裁定）：若改成
         // `Some(&identity.device_id)`，当本机没有该 id 的 `icube-dc` 条目时，行为会从
         // 「用当前目录的那一条」变成「**无设备凭证**」—— 即从「可能签错名」变成
         // 「连签名都没有」，凭空新增一种失败模式。且那一刻绑定尚未落库，
         // `Some` 拿不到任何比 `None` 更可信的东西。
-        let exchanged = account::exchange_token_for(variant, refresh_token, None)
-            .await
-            .map_err(|error| account::refresh_error_message(&error))?;
+        let exchanged = account::exchange_token_for(
+            variant,
+            refresh_token,
+            None,
+            facts.web_device,
+        )
+        .await
+        .map_err(|error| account::refresh_error_message(&error))?;
         // 上游没轮换就沿用回调给的那个（绝不写成 None：那会让刚登录的账号
         // 立刻失去自动续期能力）。
         (
@@ -1630,6 +1696,7 @@ async fn perform_login(
         // 登录时实际使用的那台设备（授权 URL 的 `device_id` / `DeviceInfo.DeviceID` /
         // `x-device-id` 三方同源的那个值）⇒ 落成账号绑定，续期复用它签名。
         Some(facts.identity.device_id.as_str()),
+        facts.web_device,
     )?;
     let uid = account::resolve_user_id(&raw);
     // jwt 已经写进 `raw.jwt`（落盘源就是它），这里的解析只用于日志里的到期时间。
@@ -1774,7 +1841,7 @@ mod tests {
     /// ★ 刻意用固定值、不读本机：本组用例要断言的是「授权 URL 与兑换请求体**同源**」，
     /// 而不是「本机现在是什么」。读本机会让用例随机器漂，也无法钉住取值来源。
     /// 固定值逐字取自 2026-09-24 真机抓到的客户端原文（`TRAE SOLO CN`）。
-    fn synthetic_facts(identity: DeviceIdentity) -> ClientFacts {
+    fn synthetic_facts(identity: DeviceIdentity, web_device: bool) -> ClientFacts {
         ClientFacts {
             identity,
             meta: ClientInstallMeta {
@@ -1791,6 +1858,7 @@ mod tests {
                 os_name: "windows".into(),
                 os_version: "Windows 11 Pro".into(),
             },
+            web_device,
         }
     }
 
@@ -1909,7 +1977,7 @@ mod tests {
     #[test]
     fn authorize_url_carries_all_native_ide_params() {
         let identity = identity_with_device_id("dev");
-        let facts = synthetic_facts(identity.clone());
+        let facts = synthetic_facts(identity.clone(), false);
 
         // (变体, auth_from, client_id, 是否带 hide_saas_login)
         let cases: [(TraeVariant, &str, &str, bool); 3] = [
@@ -2012,7 +2080,7 @@ mod tests {
         for variant in [TraeVariant::TraeWork, TraeVariant::Trae, TraeVariant::Global] {
             let url = build_authorize_url(
                 variant,
-                &synthetic_facts(synthetic_identity()),
+                &synthetic_facts(synthetic_identity(), false),
                 1,
                 "t",
                 "c",
@@ -2037,7 +2105,7 @@ mod tests {
     #[test]
     fn authorize_url_splits_by_the_right_axis() {
         let url_of = |variant| {
-            build_authorize_url(variant, &synthetic_facts(synthetic_identity()), 1, "t", "c")
+            build_authorize_url(variant, &synthetic_facts(synthetic_identity(), false), 1, "t", "c")
         };
         let key_of = |variant| {
             let url = url_of(variant);
@@ -2070,7 +2138,7 @@ mod tests {
         // 构造与解析必须共用同一个路径常量，否则浏览器跳回来接不住。
         let url = build_authorize_url(
             TraeVariant::TraeWork,
-            &synthetic_facts(synthetic_identity()),
+            &synthetic_facts(synthetic_identity(), false),
             1,
             "t",
             "c",
@@ -2102,14 +2170,14 @@ mod tests {
     fn 授权页域随区域分家() {
         let work = build_authorize_url(
             TraeVariant::TraeWork,
-            &synthetic_facts(synthetic_identity()),
+            &synthetic_facts(synthetic_identity(), false),
             1,
             "t",
             "c",
         );
         let global = build_authorize_url(
             TraeVariant::Global,
-            &synthetic_facts(synthetic_identity()),
+            &synthetic_facts(synthetic_identity(), false),
             1,
             "t",
             "c",
@@ -2159,7 +2227,7 @@ mod tests {
         let identity = identity_with_device_id("2292929806738024");
         let url = build_authorize_url(
             TraeVariant::TraeWork,
-            &synthetic_facts(identity.clone()),
+            &synthetic_facts(identity.clone(), false),
             17388,
             "trace-1",
             "chal-1",
@@ -2212,7 +2280,7 @@ mod tests {
     #[test]
     fn authorize_url_and_exchange_body_share_the_same_device_facts() {
         for variant in [TraeVariant::TraeWork, TraeVariant::Trae, TraeVariant::Global] {
-            let facts = synthetic_facts(identity_with_device_id("dev-same-source"));
+            let facts = synthetic_facts(identity_with_device_id("dev-same-source"), false);
             let url = build_authorize_url(variant, &facts, 17388, "trace-1", "chal-1");
             let params = parse_query(url.split_once('?').expect("授权 URL 必须带查询串").1);
             let body = build_exchange_payload("en1oxy7wnw8j9n", "ac-1", "verifier-1", &facts);
@@ -2400,7 +2468,7 @@ mod tests {
     #[test]
     fn build_exchange_payload_has_deviceinfo_and_no_deviceproof() {
         let identity = synthetic_identity();
-        let facts = synthetic_facts(identity.clone());
+        let facts = synthetic_facts(identity.clone(), false);
         let payload = build_exchange_payload("ono9krqynydwx5", "ac-1", "verifier-1", &facts);
 
         let device_info = payload.get("DeviceInfo").expect("必须有 DeviceInfo");
@@ -2448,6 +2516,36 @@ mod tests {
             "AuthCode 请求体里出现了 DeviceProof"
         );
         assert_eq!(payload.as_object().unwrap().len(), 5);
+    }
+
+    /// 网页模式（合成身份，空公钥）：`DeviceInfo` **省略** `DevicePublicKey` 键，
+    /// 但 `DeviceID`（随机合成）与 `MachineID` 仍在。公钥非空时该键必须存在。
+    #[test]
+    fn build_exchange_payload_omits_device_public_key_when_empty() {
+        let web_identity = DeviceIdentity {
+            public_key_pem: String::new(),
+            ..synthetic_identity()
+        };
+        let web_facts = synthetic_facts(web_identity, true);
+        let payload = build_exchange_payload("ono9krqynydwx5", "ac-1", "verifier-1", &web_facts);
+        let device_info = payload.get("DeviceInfo").expect("必须有 DeviceInfo");
+        assert!(
+            device_info.get("DevicePublicKey").is_none(),
+            "空公钥时必须省略 DevicePublicKey（报空串会让上游当声明为空）"
+        );
+        assert!(device_info.get("DeviceID").is_some(), "合成 DeviceID 仍在");
+        assert!(device_info.get("MachineID").is_some());
+        // 非空公钥 ⇒ 该键出现（既有断言的阳性对照，防止无脑全省略）。
+        let client_facts = synthetic_facts(synthetic_identity(), false);
+        let client_payload =
+            build_exchange_payload("ono9krqynydwx5", "ac-1", "verifier-1", &client_facts);
+        assert!(
+            client_payload
+                .get("DeviceInfo")
+                .and_then(|d| d.get("DevicePublicKey"))
+                .is_some(),
+            "非空公钥必须带 DevicePublicKey"
+        );
     }
 
     /// 旧端点兜底体：只有 5 个字段，**既无 Proof 也无公钥** ⇒ 同样不需要私钥。
@@ -2671,6 +2769,7 @@ mod tests {
             None,
             Some("Work".to_string()),
             None,
+            false,
         )
         .expect("Trae Work 账号应能落库");
         account::login_with_exchanged_tokens_for(
@@ -2679,6 +2778,7 @@ mod tests {
             None,
             Some("CN".to_string()),
             None,
+            false,
         )
         .expect("Trae CN 账号应能落库");
 
@@ -2718,26 +2818,47 @@ mod tests {
         assert_eq!(started["variantLabel"].as_str(), Some("国际版"));
         // 授权 URL 的 `device_id` 必须与**该变体**的 icube 设备身份同源
         // （fixture 里两条产品线的候选目录给了不同 deviceId ⇒ 读错变体会露馅）。
+        //
+        // fixture 写进 `APPDATA`（Windows 口径）；mac/linux 的数据目录不读该变量，
+        // 取不到身份时本次登录降级为网页模式 —— 两种情形都如实断言。
         let uri = started["verificationUri"].as_str().unwrap();
         let params = parse_query(uri.split_once('?').unwrap().1);
-        let cn_identity = icube::device_identity_for(TraeVariant::Global).expect("fixture 身份应可读");
-        assert_eq!(
-            params.get("device_id").map(String::as_str),
-            Some(cn_identity.device_id.as_str())
-        );
+        let device_id = params
+            .get("device_id")
+            .cloned()
+            .expect("授权 URL 必须带 device_id");
+        match icube::device_identity_for(TraeVariant::Global) {
+            Ok(identity) => {
+                // 身份可读（Windows fixture 命中）：device_id 必须与 fixture 同源。
+                assert_eq!(
+                    device_id, identity.device_id,
+                    "device_id 与该变体 icube 身份不同源"
+                );
+                assert_eq!(
+                    started.get("webMode").and_then(|v| v.as_bool()),
+                    Some(false),
+                    "身份可读时不得走网页模式"
+                );
+            }
+            Err(_) => {
+                // 身份不可读：必须降级网页模式且合成 device_id 为 32 位 hex。
+                assert_eq!(
+                    started.get("webMode").and_then(|v| v.as_bool()),
+                    Some(true),
+                    "身份缺失时必须如实标记 webMode"
+                );
+                assert_eq!(device_id.len(), 32, "合成 device_id 应为 32 位 hex");
+            }
+        }
 
         let login_id = started["loginId"].as_str().unwrap().to_string();
         assert!(login_cancel(&login_id));
     }
 
-    /// ★ 设备身份取不到时 `login_start_for` **必须明确失败**，绝不降级。
-    ///
-    /// 参考在凭证缺失时会回落「`device_map` 最小键条目 → 15 位随机数字」，
-    /// 但参考自己的注释已说明这类值与私钥不匹配 ⇒ **必然 20403/20405**。
-    /// 本设计**不移植**该回落：宁可给一句「去启动一次客户端」，也不要产出一个
-    /// 注定失败、且用户完全看不懂原因的登录。
+    /// 设备身份缺失时 `login_start_for` **不再失败**，降级为网页模式（合成身份），
+    /// 返回体新增 `webMode: true` 让前端如实展示「网页模式（本机无客户端）」。
     #[tokio::test]
-    async fn login_start_fails_loudly_when_device_identity_missing() {
+    async fn login_start_falls_back_to_web_mode_when_device_identity_missing() {
         let _gate = lock_the_callback_port();
         let _env = temp_env();
         // 把该变体的候选目录全部删掉 ⇒ 模拟「客户端没启动过 / 没登录过」。
@@ -2746,22 +2867,33 @@ mod tests {
             let _ = std::fs::remove_dir_all(std::path::PathBuf::from(&appdata).join(name));
         }
 
-        let error = login_start_for(TraeVariant::TraeWork)
+        let started = login_start_for(TraeVariant::TraeWork)
             .await
-            .expect_err("设备身份缺失时必须失败，不得回落自造 device_id");
-        assert!(
-            error.contains("Trae Work"),
-            "错误文案必须点明是哪条产品线（否则用户不知道该启动哪个客户端）: {error}"
+            .expect("设备身份缺失时降级为网页模式，不再失败");
+        assert_eq!(
+            started.get("webMode").and_then(|v| v.as_bool()),
+            Some(true),
+            "合成身份登录必须在返回体上如实标记 webMode"
         );
-        assert!(
-            error.contains("设备凭证"),
-            "错误文案应指出缺的是设备凭证: {error}"
+        assert_eq!(
+            started
+                .get("deviceCredential")
+                .and_then(|v| v.get("available"))
+                .and_then(|v| v.as_bool()),
+            Some(false),
+            "诊断仍要如实反映本机无客户端凭证"
         );
-        // 端口必须已释放：失败路径不该白占 300 秒。
-        assert!(
-            std::net::TcpListener::bind(("127.0.0.1", CALLBACK_PORT)).is_ok(),
-            "失败路径没有释放回调端口"
+
+        let login_id = started.get("loginId").and_then(|v| v.as_str()).unwrap().to_string();
+        // 授权 URL 仍带一个 32 位 hex（本次登录同源的合成 device_id）。
+        let uri = started.get("verificationUri").and_then(|v| v.as_str()).unwrap();
+        let params = parse_query(uri.split_once('?').unwrap().1);
+        assert_eq!(
+            params.get("device_id").map(String::as_str).map(|id| id.len()),
+            Some(32),
+            "合成 device_id 应为 32 位 hex"
         );
+        let _ = login_cancel(&login_id);
     }
 
     #[test]
@@ -3165,7 +3297,7 @@ mod tests {
         let (port, captured) = mock_upstream(1, body).await;
 
         let identity = synthetic_identity();
-        let facts = synthetic_facts(identity.clone());
+        let facts = synthetic_facts(identity.clone(), false);
         let exchanged = exchange_auth_code(
             TraeVariant::TraeWork,
             &format!("http://127.0.0.1:{port}"),

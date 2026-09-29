@@ -69,7 +69,19 @@ export interface OAuthStartResult {
 
 export interface OAuthPollResult {
   done: boolean;
-  result?: AccountMeta;
+  result?: AccountMeta & {
+    /** 添加账号后的自动任务摘要（全可选，按 region 出现不同字段；文案为后端生成的中文描述）。 */
+    postTasks?: {
+      /** CN：签到状态（"签到成功" / "今日已签到" / "签到失败: …"）。 */
+      checkin?: string;
+      /** Global：注册激活结果。 */
+      register?: string;
+      /** Global：trial 加油包领取结果。 */
+      trial?: string;
+      /** 积分余额摘要（两 region 都有）。 */
+      credits?: string;
+    };
+  };
   error?: string;
 }
 
@@ -106,6 +118,15 @@ export interface ImportResult {
   imported: number;
   skipped: number;
   overwritten: number;
+}
+
+/** 导入 panel `auths/` 目录的结果（比文件导入多一个「域不符被跳过」计数）。 */
+export interface AuthsDirImportResult {
+  ok: boolean;
+  imported: number;
+  skipped: number;
+  overwritten: number;
+  mismatch: number;
 }
 
 export interface Session {

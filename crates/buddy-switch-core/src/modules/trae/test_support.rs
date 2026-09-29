@@ -52,9 +52,9 @@ impl TempEnv {
     /// 调用方拿 [`TempEnv::appdata`] 当「客户端 userData 的父目录」用：
     /// 在里面建 `<产品线目录>/User/globalStorage/storage.json` 即可。
     ///
-    /// 只在 Windows 上提供：`platform::data_dir_base()` 只在 Windows 分支读环境变量，
-    /// 本仓库所有依赖「客户端数据目录」的用例也都是 `#[cfg(windows)]`（既有约定）。
-    #[cfg(windows)]
+    /// `new(false)` 本体跨平台；只有依赖「客户端数据目录」的用例是
+    /// `#[cfg(windows)]`（`appdata()` 语义与 `APPDATA` 约定绑定 Windows），
+    /// 因此 `empty()` 保持全平台可用，供非 Windows 环境下的 home 隔离用例。
     pub(crate) fn empty() -> Self {
         Self::new(false)
     }

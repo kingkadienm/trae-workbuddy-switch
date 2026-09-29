@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 use crate::modules::account;
-use crate::modules::region::Region;
+use crate::modules::auth_file;
+use crate::modules::config::norm_ts;
+use crate::modules::region::{region_of, Region};
 
 /// 导入结果计数。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -25,9 +27,28 @@ pub struct ImportResult {
     pub overwritten: usize,
 }
 
+/// 目录导入（panel `auths/`）结果计数：在 [`ImportResult`] 基础上多一个
+/// 「域不符被跳过」的计数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AuthsDirImportResult {
+    /// 成功合入账号库的数量（含覆盖与新增）。
+    pub imported: usize,
+    /// 缺 access_token 的数量。
+    pub skipped: usize,
+    /// 其中覆盖了同 uid 本地账号的数量。
+    pub overwritten: usize,
+    /// 域（realm）与目标 region 不符而被跳过的数量。
+    pub mismatch: usize,
+}
+
 /// 解析导出/导入文件文本：必须是 JSON 数组，且每项为 JSON 对象。
 ///
 /// 失败时返回带位置的明确错误文案（非法 JSON / 非数组 / 元素不是对象）。
+///
+/// 每项解析后做**嵌套形态归一**：workbuddy2api-panel 的 `auths/*.json`
+/// （`{"auth":{...},"account":{...}}`）在数组里被内联成单项时，归一成
+/// 账号库记录形态（对照 `auth_file::normalize_imported_account`）；
+/// 扁平记录（本仓自己的导出格式）原样保留。
 pub fn parse_accounts_json(text: &str) -> Result<Vec<Value>, String> {
     if text.trim().is_empty() {
         return Err("文件内容为空".to_string());
@@ -37,12 +58,26 @@ pub fn parse_accounts_json(text: &str) -> Result<Vec<Value>, String> {
     let array = parsed
         .as_array()
         .ok_or_else(|| "文件内容应为 JSON 数组（账号列表）".to_string())?;
+    let mut items = Vec::with_capacity(array.len());
     for (index, item) in array.iter().enumerate() {
         if !item.is_object() {
             return Err(format!("文件第 {} 项不是合法的账号对象", index + 1));
         }
+        items.push(normalize_import_item(item));
     }
-    Ok(array.clone())
+    Ok(items)
+}
+
+/// 导入单项的形态归一：嵌套（顶层含 `auth`/`account` 对象且无顶层 `access_token`）
+/// → 账号库记录形态；归一失败（缺 token 等）原样返回，由 [`merge_import_record`]
+/// 按缺 token 跳过，错误文案口径不变。
+pub fn normalize_import_item(item: &Value) -> Value {
+    let nested = item.get("auth").map(|v| v.is_object()) == Some(true)
+        || item.get("account").map(|v| v.is_object()) == Some(true);
+    if !nested {
+        return item.clone();
+    }
+    auth_file::normalize_imported_account(item.clone()).unwrap_or_else(|| item.clone())
 }
 
 /// 生成导入文件的脱敏预览（含文件内索引，不含 token）。
@@ -146,6 +181,118 @@ pub fn import_accounts_for(
     let mut accounts = account::load_accounts_for(region);
     let result = merge_import_records(&mut accounts, text, indexes)?;
     account::save_accounts_for(region, &accounts).map_err(|e| format!("保存账号库失败：{e}"))?;
+    Ok(result)
+}
+
+/// 一个 panel `auths/*.json` 文件（顶层嵌套对象）归一后与目标 region 的判定。
+enum AuthsDirItem {
+    /// 归一后的账号记录（与目标 region 同域、含 access_token）。
+    Record(Value),
+    /// 域（realm/domain）与目标 region 不符，跳过。
+    Mismatch,
+    /// 缺 access_token，跳过。
+    Skipped,
+}
+
+/// 判定一条（嵌套形）panel auths 记录归属哪个 region：优先 `auth.realm`，
+/// 回落 `auth.domain`（`region_of` 对空域归 CN，与账号库既有口径一致）。
+///
+/// 抽成纯函数便于单测钉住「realm 优先于 domain」的取数顺序。
+fn auths_item_region(item: &Value) -> Region {
+    let auth = item.get("auth");
+    if let Some(realm) = auth
+        .and_then(|a| a.get("realm"))
+        .and_then(|v| v.as_str())
+        .and_then(|r| Region::parse(r))
+    {
+        return realm;
+    }
+    let domain = auth
+        .and_then(|a| a.get("domain"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    region_of(domain)
+}
+
+/// 把一个 panel `auths/*.json` 单项判定为该 region 的导入动作（纯函数，可测）：
+/// 归一（嵌套形 → 账号库记录）→ 有 token？→ 域与目标 region 一致？→ 时间戳归一为毫秒。
+///
+/// 域不符的账号**宁可跳过**也不塞进错库（CN 号进 Global 库会让切换写回被
+/// `RegionMismatch` 拦下，见 `region::RegionMismatch`）；缺 token 与既有导入同口径跳过。
+///
+/// 时间戳：panel 落盘用 Unix **秒**（`expiresAt` 为 10 位），本仓账号库存**毫秒**
+/// （`now_ms()`）。归一时过一遍 `norm_ts`：秒 → 毫秒，毫秒（≥ `10^10`）原样保留，
+/// 所以对「panel 文件」与「本仓自己导出的备份（已是毫秒）」都安全。
+fn classify_auths_item(item: &Value, region: Region) -> AuthsDirItem {
+    let mut record = normalize_import_item(item);
+    if account::get_str(&record, "access_token").is_none() {
+        return AuthsDirItem::Skipped;
+    }
+    if auths_item_region(item) != region {
+        return AuthsDirItem::Mismatch;
+    }
+    // expiresAt / refreshExpiresAt 秒 → 毫秒（毫秒值不受影响）。
+    for key in ["expiresAt", "refreshExpiresAt"] {
+        if let Some(obj) = record.as_object_mut() {
+            if let Some(value) = obj.get_mut(key) {
+                if let Some(ms) = norm_ts(Some(value)) {
+                    *value = json!(ms);
+                }
+            }
+        }
+    }
+    AuthsDirItem::Record(record)
+}
+
+/// 导入 panel 的 `auths/` 目录：枚举目录下每个 `.json`（一个文件一个账号，
+/// 嵌套形 `{"auth":{...},"account":{...}}`）→ 归一 → realm 分流 → 合并进该 region 账号库。
+///
+/// 目录枚举是薄壳；逐项判定（归一 + realm + token + 时间戳）走纯函数 [`classify_auths_item`]，
+/// 计数走 [`AuthsDirImportResult`]（多一个 `mismatch` 反映域不符被跳过）。
+pub fn import_auths_dir(dir: &Path, region: Region) -> Result<AuthsDirImportResult, String> {
+    let mut result = AuthsDirImportResult::default();
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| format!("读取目录失败（{}）：{e}", dir.display()))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // 只认顶层 `.json`（panel 的 `auths/workbuddy-<uid>.json` 都是单层）。
+        if !path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        {
+            continue;
+        }
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| format!("读取失败（{}）：{e}", path.display()))?;
+        let item: Value =
+            serde_json::from_str(&text).map_err(|e| format!("{} 不是合法 JSON：{e}", path.display()))?;
+        if !item.is_object() {
+            return Err(format!("{} 顶层应为 JSON 对象（账号）", path.display()));
+        }
+        match classify_auths_item(&item, region) {
+            AuthsDirItem::Record(record) => {
+                let mut accounts = account::load_accounts_for(region);
+                // 归一后走与文件导入完全相同的合并口径（uid 去重、缺 id 保留本地 id）。
+                let merged = merge_import_record(&mut accounts, &record);
+                // classify 已保证有 token，`merged` 不会为 `Skipped`；仍按实际结果计数。
+                match merged {
+                    MergeOutcome::Appended => {
+                        result.imported += 1;
+                    }
+                    MergeOutcome::Overwritten => {
+                        result.imported += 1;
+                        result.overwritten += 1;
+                    }
+                    MergeOutcome::Skipped => result.skipped += 1,
+                }
+                account::save_accounts_for(region, &accounts)
+                    .map_err(|e| format!("保存账号库失败：{e}"))?;
+            }
+            AuthsDirItem::Mismatch => result.mismatch += 1,
+            AuthsDirItem::Skipped => result.skipped += 1,
+        }
+    }
     Ok(result)
 }
 

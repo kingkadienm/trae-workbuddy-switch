@@ -9,10 +9,13 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use crate::modules::account;
+use crate::modules::checkin;
 use crate::modules::config::{
     http_request, norm_ts, now_ms, now_secs, OAUTH_TIMEOUT_SECONDS, WORKBUDDY_API_PREFIX,
 };
+use crate::modules::credits;
 use crate::modules::region::{region_spec, Region};
+use crate::modules::wb_register;
 
 #[derive(Default)]
 struct OAuthInfo {
@@ -210,7 +213,20 @@ pub async fn oauth_poll_for(region: Region, login_id: &str) -> Value {
         }
     };
 
-    let result = account::account_meta_for(region, &account);
+    let account_meta = account::account_meta_for(region, &account);
+    // 添加账号后置任务（移植 workbuddy2api-panel 的 login 闭环）：CN 自动签到；
+    // Global 注册激活（需补地区取白名单首个 HK）+ trial 加油包；两者都补查一次积分。
+    // 全部**不阻断登录结果**——账号已落库，任务失败只进 postTasks.message。
+    let post_tasks = run_post_tasks(region, &account).await;
+
+    let result = {
+        let mut out = account_meta.clone();
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert("postTasks".to_string(), post_tasks.clone());
+        }
+        out
+    };
+
     let mut map = oauth_states().lock().unwrap();
     if let Some(info) = map.get_mut(login_id) {
         info.done = true;
@@ -219,6 +235,105 @@ pub async fn oauth_poll_for(region: Region, login_id: &str) -> Value {
     drop(map);
 
     json!({"done": true, "result": result})
+}
+
+/// 签到结果 → 展示文案（纯映射，便于测试）。
+fn checkin_task_message(checkin: &Value) -> Value {
+    let status = checkin
+        .get("result")
+        .and_then(|v| v.as_str())
+        .unwrap_or("error")
+        .to_string();
+    match status.as_str() {
+        "success" => json!("签到成功"),
+        "already" => json!("今日已签到"),
+        other => json!(format!(
+            "签到失败: {}",
+            checkin
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or(other)
+        )),
+    }
+}
+
+/// 积分查询结果 → 展示文案（纯映射，便于测试）。
+fn credits_task_message(credits: &Value) -> Value {
+    if credits.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+        let mut msg = format!(
+            "积分余额 {}/{}",
+            credits
+                .get("totalRemaining")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0),
+            credits
+                .get("totalCapacity")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0)
+        );
+        if let Some(date) = format_soonest_expire_ms(
+            credits.get("soonestExpireAt").and_then(|v| v.as_i64()),
+        ) {
+            msg.push_str(&format!("，最早到期 {date}"));
+        }
+        json!(msg)
+    } else {
+        json!(format!(
+            "积分查询失败: {}",
+            credits
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("未知原因")
+        ))
+    }
+}
+
+fn format_soonest_expire_ms(ms: Option<i64>) -> Option<String> {
+    let secs = ms? / 1000;
+    Some(
+        chrono::DateTime::from_timestamp(secs, 0)?
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d")
+            .to_string(),
+    )
+}
+
+/// 添加账号成功后的自动任务，返回前端可直接展示状态的扁平结构。
+///
+/// 字段口径：
+/// - `checkin`（CN）：签到状态文案，取自 [`checkin::checkin_account_for`]（内置并发守卫与惰性刷新）。
+/// - `register` / `trial`（Global）：注册激活与 trial 领取结果，失败带原因。
+/// - `credits`：积分摘要（两 region 都有），失败带原因。
+async fn run_post_tasks(region: Region, account: &Value) -> Value {
+    let mut tasks = serde_json::Map::new();
+    if region == Region::Cn {
+        let checkin = checkin::checkin_account_for(region, account).await;
+        tasks.insert("checkin".to_string(), checkin_task_message(&checkin));
+    } else {
+        let register = wb_register::global_complete_registration(account).await;
+        let register_msg = if register["activated"] == json!(true) {
+            "注册激活成功".to_string()
+        } else {
+            register["message"]
+                .as_str()
+                .map(|s| format!("注册激活: {s}"))
+                .unwrap_or_default()
+        };
+        tasks.insert("register".to_string(), json!(register_msg));
+        let trial = wb_register::claim_trial(account).await;
+        let trial_msg = if trial["claimed"] == json!(true) {
+            "trial 加油包领取成功".to_string()
+        } else {
+            trial["message"]
+                .as_str()
+                .map(|s| format!("trial: {s}"))
+                .unwrap_or_default()
+        };
+        tasks.insert("trial".to_string(), json!(trial_msg));
+    }
+    let credits = credits::get_credit_expiry_for(region, account).await;
+    tasks.insert("credits".to_string(), credits_task_message(&credits));
+    Value::Object(tasks)
 }
 
 fn oauth_profile_email(profile: &Value) -> Option<String> {
@@ -301,5 +416,46 @@ mod tests {
         let mut map = oauth_states().lock().unwrap();
         map.remove(&cn_login);
         map.remove(&global_login);
+    }
+
+    /// 后置任务纯映射：登录结果与任务结果在文案层合并（任务失败不改变登录成功）。
+    #[test]
+    fn post_task_messages_map_checkin_and_credits() {
+        assert_eq!(
+            checkin_task_message(&json!({"result": "success"})),
+            json!("签到成功")
+        );
+        assert_eq!(
+            checkin_task_message(&json!({"result": "already"})),
+            json!("今日已签到")
+        );
+        assert!(checkin_task_message(&json!({
+            "result": "error",
+            "error": "网络超时"
+        }))
+        .to_string()
+        .contains("签到失败: 网络超时"));
+
+        let ok = credits_task_message(&json!({
+            "ok": true,
+            "totalRemaining": 120.0,
+            "totalCapacity": 300.0,
+            "soonestExpireAt": 1_750_000_000_000_i64
+        }));
+        let text = ok.to_string();
+        assert!(text.contains("120"), "应含剩余量: {text}");
+        assert!(text.contains("300"), "应含总量: {text}");
+        // 1_750_000_000_000 ms = 2025-06-15 23:46 UTC（按本机时区渲染，
+        // 东半球为 06-16）——断言覆盖两个候选日期。
+        assert!(
+            text.contains("2025-06-15") || text.contains("2025-06-16"),
+            "应含到期日: {text}"
+        );
+
+        let fail = credits_task_message(&json!({
+            "ok": false,
+            "error": "上游 500"
+        }));
+        assert!(fail.to_string().contains("积分查询失败: 上游 500"));
     }
 }

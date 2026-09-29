@@ -13,7 +13,7 @@ import {
 } from "@/components/ui/dialog";
 import * as api from "@/lib/api";
 import { useT } from "@/lib/i18n";
-import type { AccountMeta, Region } from "@/lib/types";
+import type { AccountMeta, OAuthPollResult, Region } from "@/lib/types";
 import { useAccountsStore } from "@/stores/accounts";
 
 interface Props {
@@ -33,6 +33,7 @@ export function OAuthLoginDialog({ open, onOpenChange, region }: Props) {
   const [uri, setUri] = useState("");
   const [error, setError] = useState("");
   const [result, setResult] = useState<AccountMeta | null>(null);
+  const [postTasks, setPostTasks] = useState<NonNullable<OAuthPollResult["result"]>["postTasks"]>(undefined);
 
   // 打开时重置
   useEffect(() => {
@@ -42,6 +43,7 @@ export function OAuthLoginDialog({ open, onOpenChange, region }: Props) {
       setUri("");
       setError("");
       setResult(null);
+      setPostTasks(undefined);
     }
   }, [open]);
 
@@ -57,7 +59,10 @@ export function OAuthLoginDialog({ open, onOpenChange, region }: Props) {
         if (res.done) {
           if (res.result) {
             await reconcileAccounts(region);
-            if (!cancelled) setResult(res.result);
+            if (!cancelled) {
+              setResult(res.result);
+              setPostTasks(res.result.postTasks);
+            }
           } else if (!cancelled) {
             setError(res.error || t("wbAccounts.dialog.oauthLoginFail"));
           }
@@ -141,11 +146,29 @@ export function OAuthLoginDialog({ open, onOpenChange, region }: Props) {
         )}
 
         {result && (
-          <Alert>
-            <AlertDescription>
-              {t("wbAccounts.dialog.oauthCollected", { name: result.nickname || result.email || result.id })}
-            </AlertDescription>
-          </Alert>
+          <div className="space-y-2">
+            <Alert>
+              <AlertDescription>
+                {t("wbAccounts.dialog.oauthCollected", { name: result.nickname || result.email || result.id })}
+              </AlertDescription>
+            </Alert>
+            {postTasks && (
+              <div className="space-y-1 text-xs text-muted-foreground">
+                {postTasks.checkin && (
+                  <p>{`${t("wbAccounts.dialog.postTasksCheckin")}: ${postTasks.checkin}`}</p>
+                )}
+                {postTasks.register && (
+                  <p>{`${t("wbAccounts.dialog.postTasksRegister")}: ${postTasks.register}`}</p>
+                )}
+                {postTasks.trial && (
+                  <p>{`${t("wbAccounts.dialog.postTasksTrial")}: ${postTasks.trial}`}</p>
+                )}
+                {postTasks.credits && (
+                  <p>{`${t("wbAccounts.dialog.postTasksCredits")}: ${postTasks.credits}`}</p>
+                )}
+              </div>
+            )}
+          </div>
         )}
 
         {error && (

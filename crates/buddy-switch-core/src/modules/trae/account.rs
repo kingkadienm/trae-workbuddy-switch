@@ -12,7 +12,7 @@
 //! 两套形态之间的转换集中在 [`account_view`]，**不要在别处临时拼装**：
 //! 任一通道漏一个字段，前端就会在某些入口拿到 `undefined`，而这在编译期看不出来。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -86,6 +86,16 @@ pub struct AccountsFile {
     /// 既有备份 / 参考实现的 `device_proxy.py` 读到的形状不变。
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub device_bindings: HashMap<String, String>,
+    /// 以「网页模式」添加的账号（无客户端设备凭证，[`crate::modules::trae::oauth`]
+    /// 合成 device 身份登录后标记）：`uid` 集合。
+    ///
+    /// 与 [`Self::device_bindings`] 对称放在容器键（同样的两条理由：不进导出记录、
+    /// 不被导入合并静默抹掉）。它决定 [`refresh_jwt_for`] 的口径：这些账号**没有**
+    /// 可签 DeviceProof 的私钥，续期只走 legacy 无签名变体（等价参考项目
+    /// trae2api-web 的 `RefreshToken`）；既不做「回落当前目录那一条客户端凭证」
+    /// （错源 ⇒ 20403/20405），也不写 `device_bindings`。
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    pub web_devices: HashSet<String>,
 }
 
 /// 把 `uid` 绑定到某个 `device_id`（**只写不删**：`None` / 空串不改变既有绑定）。
@@ -619,8 +629,9 @@ pub fn delete_for(
         .retain(|account| resolve_user_id(account) != user_id);
     // 只删**这个** uid 的绑定：同一本账号库里其他 uid 的绑定不受影响。
     let binding_removed = accounts.device_bindings.remove(user_id).is_some();
-    // 账号条数与绑定**任一**有变化就要回存：账号本就不存在、但绑定残留时也得清掉。
-    if accounts.accounts.len() != before || binding_removed {
+    let web_removed = accounts.web_devices.remove(user_id);
+    // 账号条数与绑定/网页标记**任一**有变化就要回存：账号本就不存在、但绑定残留时也得清掉。
+    if accounts.accounts.len() != before || binding_removed || web_removed {
         save_accounts_for(variant, &accounts)?;
     }
 
@@ -683,9 +694,11 @@ pub fn update_for(
         }
         account.updated_at = Some(store::now_iso());
     }
-    // I-3：uid 变了 ⇒ 旧绑定属于旧账号，删除（**不**搬给新 uid）。
+    // I-3：uid 变了 ⇒ 旧绑定属于旧账号，删除（**不**搬给新 uid）；
+    // 网页标记同口径（旧 uid 的刷新口径对新账号不适用）。
     if next_uid != previous_uid {
         accounts.device_bindings.remove(&previous_uid);
+        accounts.web_devices.remove(&previous_uid);
     }
     save_accounts_for(variant, &accounts)
 }
@@ -1099,7 +1112,46 @@ pub(crate) async fn exchange_token_for(
     variant: TraeVariant,
     refresh_token: &str,
     device_id: Option<&str>,
+    web_device: bool,
 ) -> Result<ExchangedToken, RefreshExchangeError> {
+    // 网页模式账号（合成 device 身份，无客户端私钥）：跳过一切 icube 设备凭证解析，
+    // 只发 legacy 无 DeviceProof 变体，且**不发 `x-device-id` 头**（合成 id 没有对应
+    // 签名密钥，带一个谎报的设备头只会换来 20403/20405）。口径对齐参考项目
+    // trae2api-web 的 `RefreshToken`（body 仅 `{ClientID, RefreshToken, ClientSecret, UserID}`）。
+    if web_device {
+        let client_id = crate::modules::trae::oauth_client::oauth_client()
+            .client_id_for(variant.oauth_line());
+        let variants = build_refresh_variants(
+            variant,
+            client_id,
+            refresh_token,
+            None::<&DeviceCredential>,
+        );
+        let mut errors: Vec<String> = Vec::new();
+        let mut last_error: Option<RefreshExchangeError> = None;
+        for plan in &variants {
+            match try_refresh_variant(plan, None).await {
+                Ok((access_token, refresh_token, _body)) => {
+                    return Ok(ExchangedToken {
+                        jwt: jwt::authorization_header(&access_token),
+                        refresh_token,
+                    });
+                }
+                Err(error) => {
+                    if error.server_rejected {
+                        return Err(error);
+                    }
+                    errors.push(format!("{}: {}", plan.tag, error.message));
+                    last_error = Some(error);
+                }
+            }
+        }
+        return Err(RefreshExchangeError {
+            message: format!("网页模式刷新变体失败 → {}", errors.join(" | ")),
+            server_rejected: last_error.map(|e| e.server_rejected).unwrap_or(false),
+        });
+    }
+
     let credential = resolve_refresh_credential(variant, device_id);
     let credential_note = credential
         .as_ref()
@@ -1369,14 +1421,20 @@ fn key_paths(value: &Value) -> Vec<String> {
 /// 返回 `(落盘后的账号记录, 新 JWT)`。
 ///
 /// `device_id` 是**登录时实际使用的那台设备**（OAuth 三方同源的那个 `identity.device_id`），
-/// 落库时写进 [`AccountsFile::device_bindings`]（G-b）—— 续期要复用它签名。
+/// 登录落库。`device_id` 非空时写进 [`AccountsFile::device_bindings`]（G-b）—— 续期要复用它签名；
 /// 传 `None` 时不写（**不动**既有绑定，见 [`bind_device`]）。
+///
+/// `web_device` 为 `true`（网页模式：合成 device 身份登录，无客户端私钥）时把 uid 标记进
+/// [`AccountsFile::web_devices`]，[`refresh_jwt_for`] 据此跳过设备凭证解析、只走 legacy
+/// 无签名变体。网页模式账号**不**写 `device_bindings`（合成的 device_id 没有对应私钥，
+/// 留着会让续期拿错源）。
 pub fn login_with_exchanged_tokens_for(
     variant: TraeVariant,
     exchanged_jwt: String,
     refresh_token: Option<String>,
     display_name: Option<String>,
     device_id: Option<&str>,
+    web_device: bool,
 ) -> Result<(RawAccount, String), String> {
     // uid 以上游签发的 JWT 为准，而不是信任本地传入的任何 ID：
     // 这条路径上本来没有可信的 uid 来源（账号可能还不存在）。
@@ -1429,9 +1487,15 @@ pub fn login_with_exchanged_tokens_for(
         }
     };
 
-    // 绑定**这次登录用的那台设备**：续期必须复用它签名（换设备/多候选目录时，
-    // 「活跃目录里的那一条」未必是这台）。
-    bind_device(&mut accounts, &uid, device_id);
+    // 网页模式账号：标记进 `web_devices`（续期只走 legacy 无签名变体），且**不**写
+    // `device_bindings`（合成的 device_id 没有对应私钥，留着会让续期拿错源 ⇒ 20403/20405）。
+    // 客户端模式账号：绑定**这次登录用的那台设备**（续期必须复用它签名；换设备/多
+    // 候选目录时「活跃目录里的那一条」未必是这台）。
+    if web_device {
+        accounts.web_devices.insert(uid.clone());
+    } else {
+        bind_device(&mut accounts, &uid, device_id);
+    }
     save_accounts_for(variant, &accounts)?;
     Ok((record, exchanged_jwt))
 }
@@ -1476,10 +1540,17 @@ pub async fn refresh_jwt_for(variant: TraeVariant, user_id: &str) -> Result<Stri
         .filter(|token| !token.is_empty())
         .ok_or("该账号无 refresh_token（抓取得到的账号不支持自动刷新），请重新获取 JWT")?
         .clone();
+    // 网页模式账号：没有可签 DeviceProof 的客户端私钥 ⇒ 跳过设备凭证解析（含
+    // 「回落当前目录那一条」），只走 legacy 无签名变体。
+    let web_device = load_accounts_for(variant).web_devices.contains(user_id);
     // 绑定可能不存在（旧账号 / 刚换过 uid）—— 那正是回落分支存在的意义，不是错误。
-    let device_binding = bound_device_id(variant, user_id);
+    let device_binding = if web_device {
+        None
+    } else {
+        bound_device_id(variant, user_id)
+    };
 
-    let exchanged = exchange_token_for(variant, &refresh_token, device_binding.as_deref())
+    let exchanged = exchange_token_for(variant, &refresh_token, device_binding.as_deref(), web_device)
         .await
         .map_err(|error| refresh_error_message(&error))?;
     let new_jwt = exchanged.jwt;
@@ -1732,6 +1803,7 @@ mod tests {
             accounts: vec![account],
             // 无绑定：本用例还要证明「空表不落盘」—— 序列化结果与改造前**逐字一致**。
             device_bindings: HashMap::new(),
+            web_devices: std::collections::HashSet::new(),
         };
         let text = serde_json::to_string(&file).expect("序列化");
         // 关键：键名必须是参考实现的大写 UserID，而不是 user_id
@@ -2063,6 +2135,7 @@ mod tests {
                     updated_at: None,
                 }],
                 device_bindings: HashMap::new(),
+                web_devices: std::collections::HashSet::new(),
             },
         )
         .expect("写 TraeWork");
@@ -2078,6 +2151,7 @@ mod tests {
                     updated_at: None,
                 }],
                 device_bindings: HashMap::new(),
+                web_devices: std::collections::HashSet::new(),
             },
         )
         .expect("写 Trae");
@@ -2299,8 +2373,8 @@ hLkrYGiVNhsErnjKIgS7/EIHdsihRANCAARznG0WLhenNiMW5jA3SwFpTNyet2zw\n\
             "文案必须点明是哪条产品线: {message}"
         );
         assert!(
-            message.contains("设备凭证"),
-            "文案必须把原因说到「设备凭证」上（否则用户会以为是网络/协议问题）: {message}"
+            message.contains("设备凭证") || message.contains("客户端"),
+            "文案必须把原因说到「设备凭证/客户端」上（否则用户会以为是网络/协议问题）: {message}"
         );
         assert_eq!(credential_error.kind(), "dataDirMissing");
     }
@@ -2369,6 +2443,7 @@ hLkrYGiVNhsErnjKIgS7/EIHdsihRANCAARznG0WLhenNiMW5jA3SwFpTNyet2zw\n\
                     Some("rt-1".into()),
                     Some("小明".into()),
                     None,
+                    false,
                 )
                 .expect("首次落库不应失败");
             assert_eq!(returned, jwt);
@@ -2380,7 +2455,7 @@ hLkrYGiVNhsErnjKIgS7/EIHdsihRANCAARznG0WLhenNiMW5jA3SwFpTNyet2zw\n\
             // 再次落库：`name` 不传 ⇒ 保留用户自己的名字；jwt/refresh_token 覆盖。
             let jwt2 = make_jwt(uid);
             let (updated, _) =
-                login_with_exchanged_tokens_for(variant, jwt2.clone(), Some("rt-2".into()), None, None)
+                login_with_exchanged_tokens_for(variant, jwt2.clone(), Some("rt-2".into()), None, None, false)
                     .expect("重复落库不应失败");
             assert_eq!(updated.name, "小明", "name 不该被上游空值冲掉");
             assert_eq!(updated.refresh_token.as_deref(), Some("rt-2"));
@@ -2394,7 +2469,7 @@ hLkrYGiVNhsErnjKIgS7/EIHdsihRANCAARznG0WLhenNiMW5jA3SwFpTNyet2zw\n\
 
             // refresh_token 传 None ⇒ **保留**旧值（清空会让账号失去自动续期）。
             let (kept, _) =
-                login_with_exchanged_tokens_for(variant, make_jwt(uid), None, None, None).unwrap();
+                login_with_exchanged_tokens_for(variant, make_jwt(uid), None, None, None, false).unwrap();
             assert_eq!(kept.refresh_token.as_deref(), Some("rt-2"));
 
             // 另一条产品线**看不到**这条账号（变体隔离）。
@@ -2413,6 +2488,7 @@ hLkrYGiVNhsErnjKIgS7/EIHdsihRANCAARznG0WLhenNiMW5jA3SwFpTNyet2zw\n\
                     None,
                     None,
                     None,
+                    false,
                 )
                 .expect_err("解析不出 uid 必须拒绝");
             assert!(error.contains("UserID"), "{error}");
@@ -2429,7 +2505,7 @@ hLkrYGiVNhsErnjKIgS7/EIHdsihRANCAARznG0WLhenNiMW5jA3SwFpTNyet2zw\n\
         with_temp_home(|| {
             let variant = TraeVariant::TraeWork;
             let uid = "3333333333333333";
-            login_with_exchanged_tokens_for(variant, make_jwt(uid), Some("rt-old".into()), None, None)
+            login_with_exchanged_tokens_for(variant, make_jwt(uid), Some("rt-old".into()), None, None, false)
                 .expect("造账号不应失败");
 
             // 上游轮换了 refresh token ⇒ 必须覆盖。
@@ -2568,13 +2644,19 @@ hLkrYGiVNhsErnjKIgS7/EIHdsihRANCAARznG0WLhenNiMW5jA3SwFpTNyet2zw\n\
         for args in &calls {
             assert_eq!(
                 args.len(),
-                3,
-                "`exchange_token_for` 应当是 3 参调用，实际实参：{args:?}"
+                4,
+                "`exchange_token_for` 应当是 4 参调用（variant, refresh_token, device_id, web_device），实际实参：{args:?}"
             );
             assert_ne!(
                 args[2], "None",
                 "第三个实参不得是硬编码 `None`：那会让账号绑定被静默忽略\
                  （退回猜活跃目录 ⇒ 上游 20403/20405），且现有测试全都不会红"
+            );
+            assert_ne!(
+                args[3], "None",
+                "第四个实参（web_device）不得是硬编码 `None`/`false` 字面量：\
+                 网页模式账号必须从 `AccountsFile::web_devices` 读出标记再传入，\
+                 否则网页账号的刷新会错误地走客户端签名变体"
             );
         }
     }
