@@ -125,13 +125,15 @@ const CALLBACK_PORT: u16 = 17388;
 /// 只要请求带上其中任一参数，就说明它是**真正的回调**（而不是授权页的在线探测）。
 /// 改造前只认 `refreshToken`，而新协议的主路径是 `authCodeInfo` —— 若沿用旧判别，
 /// 一个合法的 AuthCode 回调会被当成探测而 `continue`，会话空等到 300 秒超时。
-const CREDENTIAL_MARKERS: [&str; 6] = [
+const CREDENTIAL_MARKERS: [&str; 7] = [
     "authCodeInfo",
     "code",
     "accessToken",
     "access_token",
     "refreshToken",
     "refresh_token",
+    // 网页模式回调（不承诺 PKCE）可能只带 userJwt。
+    "userJwt",
 ];
 
 /// 单次登录会话的可变状态。
@@ -160,6 +162,10 @@ struct LoginSession {
     /// 注意必须用 `notify_one()` 而非 `notify_waiters()`——后者只唤醒**当前**正在
     /// 等待的任务，若取消发生在任务开始 await 之前，信号会被丢掉。
     cancel: Arc<Notify>,
+    /// 发起登录时是否用了合成（网页模式）设备身份。网页模式**不承诺** PKCE
+    /// （`BuildLoginURL` 口径，无 `code_challenge`），回调可能只有
+    /// refreshToken / userJwt，须走 [`CallbackInfo::user_jwt_fallback`]。
+    web_device: bool,
 }
 
 static LOGIN_SESSIONS: OnceLock<Mutex<HashMap<String, LoginSession>>> = OnceLock::new();
@@ -175,6 +181,7 @@ struct SessionView {
     variant: TraeVariant,
     trace_id: String,
     pkce_verifier: String,
+    web_device: bool,
 }
 
 impl Default for SessionView {
@@ -184,6 +191,7 @@ impl Default for SessionView {
             variant: TraeVariant::default(),
             trace_id: String::new(),
             pkce_verifier: String::new(),
+            web_device: false,
         }
     }
 }
@@ -199,6 +207,7 @@ fn session_view(login_id: &str) -> SessionView {
             variant: session.variant,
             trace_id: session.trace_id.clone(),
             pkce_verifier: session.pkce_verifier.clone(),
+            web_device: session.web_device,
         })
         .unwrap_or_default()
 }
@@ -310,6 +319,38 @@ fn extract_user_info(params: &HashMap<String, String>) -> Value {
     json!({})
 }
 
+/// 从回调参数里抽取 `userJwt`（URL 编码的 JSON，与 `userInfo` 同口径）。
+///
+/// 网页模式（合成设备身份、授权 URL 不承诺 PKCE）的回调里**没有** `authCodeInfo` /
+/// `refreshToken`，凭据全在 `userJwt` 里（参考项目 trae2api-web `ParseCallback` 的
+/// 兜底路径）：`Token` 直接可用为 access token、`RefreshToken` 可续期。
+/// 与 `extract_user_info` 同款纪律：解析失败返回空对象而不是报错。
+fn extract_user_jwt(params: &HashMap<String, String>) -> Value {
+    for key in ["userJwt", "user_jwt", "UserJwt"] {
+        if let Some(raw) = params.get(key) {
+            let trimmed = raw.trim();
+            if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+                return parsed;
+            }
+        }
+    }
+    json!({})
+}
+
+/// `userJwt.TokenExpireAt`（上游回毫秒）→ Unix **秒**（账号库口径）。
+///
+/// 归一化阈值与参考项目一致：毫秒时间戳 ~1.7e12，秒 ~1.7e9，用 1e12 分界。
+fn normalize_user_jwt_expires(user_jwt: &Value) -> Option<i64> {
+    let raw = user_jwt
+        .get("TokenExpireAt")
+        .and_then(|value| value.as_i64())
+        .or_else(|| user_jwt.get("TokenExpireAt").and_then(|value| value.as_str()).and_then(|text| text.trim().parse::<i64>().ok()))?;
+    if raw <= 0 {
+        return None;
+    }
+    Some(if raw > 1_000_000_000_000 { raw / 1000 } else { raw })
+}
+
 /// 展示名候选键，按「越像人名的越优先」排列。
 ///
 /// 真实回调里是 `userInfo.ScreenName`（抓包固化），旧形态是 `nickname` / `name` /
@@ -356,6 +397,11 @@ struct CallbackInfo {
     display_name: Option<String>,
     /// 头像 URL。
     avatar: Option<String>,
+    /// `userJwt` 兜底（网页模式）：无 refreshToken 时直接作为 access token，
+    /// 并附其 `TokenExpireAt`（毫秒）。
+    user_jwt_fallback: Option<String>,
+    /// `userJwt.TokenExpireAt`（毫秒）→ 归一化后的 Unix **秒**。
+    user_jwt_expires_at: Option<i64>,
 }
 
 /// 取非空字符串参数。
@@ -429,6 +475,27 @@ fn parse_callback(params: &HashMap<String, String>) -> Result<CallbackInfo, Stri
         .and_then(|value| value.as_str())
         .map(str::to_string)
         .or_else(|| param(params, &["avatar"]));
+
+    // ---- userJwt（网页模式兜底，容错）----
+    let user_jwt = extract_user_jwt(params);
+    info.refresh_token = info
+        .refresh_token
+        .clone()
+        .or_else(|| {
+            user_jwt
+                .get("RefreshToken")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        });
+    info.user_jwt_fallback = user_jwt
+        .get("Token")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string);
+    info.user_jwt_expires_at = normalize_user_jwt_expires(&user_jwt);
 
     Ok(info)
 }
@@ -724,7 +791,7 @@ fn build_authorize_url(
     facts: &ClientFacts,
     port: u16,
     trace_id: &str,
-    code_challenge: &str,
+    code_challenge: Option<&str>,
 ) -> String {
     let identity = &facts.identity;
     let device_id = identity.device_id.as_str();
@@ -758,10 +825,7 @@ fn build_authorize_url(
         &x_os_version={os_version}\
         &x_env=\
         &x_app_version={app_version}\
-        &x_app_type={app_type}\
-        &code_challenge={code_challenge}\
-        &code_challenge_method=S256\
-        &channel_name=common",
+        &x_app_type={app_type}",
         console_base = endpoints_for(variant).console_base,
         auth_from = line.auth_from(),
         plugin_version = facts.build_version(),
@@ -776,6 +840,15 @@ fn build_authorize_url(
         app_version = facts.app_version(),
         app_type = facts.app_type(),
     );
+    // PKCE 是**客户端模式**的承诺：网页模式（合成设备身份）对齐参考项目
+    // trae2api-web 的 `BuildLoginURL` —— 不发 `code_challenge`（没有客户端侧
+    // verifier 可信地走完 S256），授权页回调只带 refreshToken / userJwt。
+    if let Some(challenge) = code_challenge {
+        url.push_str(&format!(
+            "&code_challenge={challenge}&code_challenge_method=S256"
+        ));
+    }
+    url.push_str("&channel_name=common");
     // `hide_saas_login` 是 `auth_from=solo` 的**从属**参数（客户端：`A==="solo" && (D+=…)`），
     // 追加在**最末**，与客户端拼串顺序一致。
     if line.hide_saas_login() {
@@ -1240,7 +1313,15 @@ pub async fn login_start_for(variant: TraeVariant) -> Result<Value, String> {
     // 与请求体的 `DeviceInfo.MachineID` 共用同一个派生点（改造前两处各取一份，
     // URL 用自造值、请求体用 `telemetry.machineId`，上游回 20403）。
     let trace_id = icube::random_hex(32);
-    let (pkce_verifier, code_challenge) = pkce_pair();
+    // 网页模式（合成设备身份）不承诺 PKCE：不发 `code_challenge`，回调走
+    // refreshToken / userJwt（见 `build_authorize_url` 的说明与 `perform_login` 兜底）。
+    let web_mode = facts.web_device;
+    let (pkce_verifier, code_challenge): (String, Option<String>) = if web_mode {
+        (String::new(), None)
+    } else {
+        let (verifier, challenge) = pkce_pair();
+        (verifier, Some(challenge))
+    };
     let login_id = format!("trae_{}", uuid::Uuid::new_v4().simple());
     let cancel = Arc::new(Notify::new());
 
@@ -1261,6 +1342,7 @@ pub async fn login_start_for(variant: TraeVariant) -> Result<Value, String> {
                 variant,
                 trace_id: trace_id.clone(),
                 pkce_verifier,
+                web_device: web_mode,
                 cancel: cancel.clone(),
                 ..Default::default()
             },
@@ -1268,7 +1350,13 @@ pub async fn login_start_for(variant: TraeVariant) -> Result<Value, String> {
     }
 
     let web_mode = facts.web_device;
-    let authorize_url = build_authorize_url(variant, &facts, port, &trace_id, &code_challenge);
+    let authorize_url = build_authorize_url(
+        variant,
+        &facts,
+        port,
+        &trace_id,
+        code_challenge.as_deref(),
+    );
     let session_id = login_id.clone();
     // 客户端事实随监听任务一起搬进去：回调到达时要拿**同一份**去填 `DeviceInfo`
     // （`DeviceID` / `MachineID` / `PlatformCode` / 系统信息）。
@@ -1414,7 +1502,10 @@ pub async fn login_start_for(variant: TraeVariant) -> Result<Value, String> {
                 }
             };
 
-            if callback.auth_code.is_none() && callback.refresh_token.is_none() {
+            if callback.auth_code.is_none()
+                && callback.refresh_token.is_none()
+                && callback.user_jwt_fallback.is_none()
+            {
                 // 有凭据标记却两种凭据都没有：明确失败，不要空等到 300 秒。
                 let page = result_page(
                     PageKind::Failure,
@@ -1427,7 +1518,7 @@ pub async fn login_start_for(variant: TraeVariant) -> Result<Value, String> {
                     None,
                     Some(classify_error(
                         "callback",
-                        "回调带了凭据参数，但既无 AuthCode 也无 refreshToken",
+                        "回调带了凭据参数，但既无 AuthCode 也无 refreshToken / userJwt",
                     )),
                 );
                 return;
@@ -1684,8 +1775,21 @@ async fn perform_login(
                 .refresh_token
                 .or_else(|| Some(refresh_token.to_string())),
         )
+    } else if let Some(user_jwt) = callback.user_jwt_fallback.as_deref() {
+        // 网页模式兜底（对齐参考项目 trae2api-web `ParseCallback`）：授权 URL 不承诺
+        // PKCE，回调无 authCodeInfo / refreshToken 时凭据全在 `userJwt` 里——
+        // `Token` 直接可用为 access token（同口径进 `jwt::authorization_header`），
+        // 无需再打 ExchangeToken。uid 解析不出来时由 `login_with_exchanged_tokens_for`
+        // 的报错兜住（不会写库）。
+        (
+            crate::modules::trae::jwt::authorization_header(user_jwt),
+            callback.refresh_token.clone(),
+        )
     } else {
-        return Err(classify_error("callback", "回调既无 AuthCode 也无 refreshToken"));
+        return Err(classify_error(
+            "callback",
+            "回调既无 AuthCode 也无 refreshToken / userJwt",
+        ));
     };
 
     let (raw, _jwt) = account::login_with_exchanged_tokens_for(
@@ -1700,9 +1804,19 @@ async fn perform_login(
     )?;
     let uid = account::resolve_user_id(&raw);
     // jwt 已经写进 `raw.jwt`（落盘源就是它），这里的解析只用于日志里的到期时间。
+    // userJwt 兜底路径的过期时间可从 `callback.user_jwt_expires_at` 交叉核对（日志用）。
     let exp_hours = crate::modules::trae::jwt::parse(&raw.jwt)
         .exp_hours
         .map(|hours| format!("{hours:.1}h"))
+        .or_else(|| {
+            callback.user_jwt_expires_at.map(|seconds| {
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_secs() as i64)
+                    .unwrap_or(0);
+                format!("{}h", (seconds.saturating_sub(now_secs) as f64 / 3600.0))
+            })
+        })
         .unwrap_or_else(|| "?".into());
 
     store::append_log(
@@ -1937,6 +2051,55 @@ mod tests {
         );
     }
 
+    /// `userJwt` 兜底解析（网页模式回调）：Token / RefreshToken / 毫秒归一化。
+    #[test]
+    fn user_jwt_fallback_fields_are_parsed_and_normalized() {
+        let mut params = HashMap::new();
+        params.insert(
+            "userJwt".into(),
+            r#"{"Token":"cloud-ide-jwt-x","RefreshToken":"rt-web","TokenExpireAt":1786847930141}"#.into(),
+        );
+        let info = parse_callback(&params).expect("userJwt 回调应可解析");
+        assert_eq!(
+            info.user_jwt_fallback.as_deref(),
+            Some("cloud-ide-jwt-x"),
+            "Token 必须作为 access token 兜底来源"
+        );
+        assert_eq!(info.refresh_token.as_deref(), Some("rt-web"));
+        // 毫秒（~1.7e12）→ 秒（~1.7e9），与参考项目 normalizeExpire 同口径。
+        assert_eq!(info.user_jwt_expires_at, Some(1_786_847_930));
+    }
+
+    /// 网页模式典型回调（只有 userJwt、无 authCodeInfo / refreshToken）：
+    /// 既不会被「无凭据」判失败，也能给出全部三类凭据的判定。
+    #[test]
+    fn parse_callback_tolerates_user_jwt_only_callback() {
+        let mut params = HashMap::new();
+        params.insert(
+            "userJwt".into(),
+            r#"{"Token":"jwt-only","TokenExpireAt":1786847930}"#.into(),
+        );
+        let info = parse_callback(&params).expect("解析必须成功");
+        assert!(info.auth_code.is_none());
+        assert!(info.refresh_token.is_none());
+        assert_eq!(info.user_jwt_fallback.as_deref(), Some("jwt-only"));
+        // 秒值（< 1e12）不得被当毫秒再除一次。
+        assert_eq!(info.user_jwt_expires_at, Some(1_786_847_930));
+    }
+
+    /// `TokenExpireAt` 缺失 / 非法时回落 `None`（不影响登录本身，只影响日志）。
+    #[test]
+    fn user_jwt_expires_at_missing_is_none() {
+        let mut params = HashMap::new();
+        params.insert("userJwt".into(), r#"{"Token":"t"}"#.into());
+        let info = parse_callback(&params).unwrap();
+        assert_eq!(info.user_jwt_expires_at, None);
+
+        let mut params = HashMap::new();
+        params.insert("userJwt".into(), r#"{"Token":"t","TokenExpireAt":"not-a-number"}"#.into());
+        assert_eq!(parse_callback(&params).unwrap().user_jwt_expires_at, None);
+    }
+
     #[test]
     fn pick_display_name_prefers_nickname_over_email() {
         let info = json!({"email": "a@b.c", "nickname": "小明"});
@@ -1989,7 +2152,7 @@ mod tests {
         ];
 
         for (variant, auth_from, client_id, hide_saas) in cases {
-            let url = build_authorize_url(variant, &facts, 12345, "trace-1", "challenge-1");
+            let url = build_authorize_url(variant, &facts, 12345, "trace-1", Some("challenge-1"));
             assert!(
                 url.starts_with(&format!(
                     "{}{AUTHORIZE_PATH}",
@@ -2083,7 +2246,7 @@ mod tests {
                 &synthetic_facts(synthetic_identity(), false),
                 1,
                 "t",
-                "c",
+                Some("c"),
             );
             let params = parse_query(url.split_once('?').unwrap().1);
             let url_key = params.get("client_id").expect("授权 URL 必须带 client_id");
@@ -2105,7 +2268,7 @@ mod tests {
     #[test]
     fn authorize_url_splits_by_the_right_axis() {
         let url_of = |variant| {
-            build_authorize_url(variant, &synthetic_facts(synthetic_identity(), false), 1, "t", "c")
+            build_authorize_url(variant, &synthetic_facts(synthetic_identity(), false), 1, "t", Some("c"))
         };
         let key_of = |variant| {
             let url = url_of(variant);
@@ -2141,7 +2304,7 @@ mod tests {
             &synthetic_facts(synthetic_identity(), false),
             1,
             "t",
-            "c",
+            Some("c"),
         );
         assert!(url.contains(&format!("%2F{}", CALLBACK_PATH.trim_start_matches('/'))));
     }
@@ -2173,14 +2336,14 @@ mod tests {
             &synthetic_facts(synthetic_identity(), false),
             1,
             "t",
-            "c",
+            Some("c"),
         );
         let global = build_authorize_url(
             TraeVariant::Global,
             &synthetic_facts(synthetic_identity(), false),
             1,
             "t",
-            "c",
+            Some("c"),
         );
 
         assert!(
@@ -2230,7 +2393,7 @@ mod tests {
             &synthetic_facts(identity.clone(), false),
             17388,
             "trace-1",
-            "chal-1",
+            Some("chal-1"),
         );
         let params = parse_query(url.split_once('?').unwrap().1);
 
@@ -2281,7 +2444,7 @@ mod tests {
     fn authorize_url_and_exchange_body_share_the_same_device_facts() {
         for variant in [TraeVariant::TraeWork, TraeVariant::Trae, TraeVariant::Global] {
             let facts = synthetic_facts(identity_with_device_id("dev-same-source"), false);
-            let url = build_authorize_url(variant, &facts, 17388, "trace-1", "chal-1");
+            let url = build_authorize_url(variant, &facts, 17388, "trace-1", Some("chal-1"));
             let params = parse_query(url.split_once('?').expect("授权 URL 必须带查询串").1);
             let body = build_exchange_payload("en1oxy7wnw8j9n", "ac-1", "verifier-1", &facts);
             let device = body.get("DeviceInfo").expect("必须有 DeviceInfo").clone();
@@ -2893,6 +3056,12 @@ mod tests {
             Some(32),
             "合成 device_id 应为 32 位 hex"
         );
+        // 网页模式不承诺 PKCE：授权 URL **不得**带 `code_challenge`
+        // （对齐参考项目 `BuildLoginURL`，其回调只带 refreshToken / userJwt）。
+        assert!(
+            params.get("code_challenge").is_none(),
+            "网页模式授权 URL 不应带 code_challenge，否则回调 AuthCode 交换必失败：{params:?}"
+        );
         let _ = login_cancel(&login_id);
     }
 
@@ -3028,13 +3197,25 @@ mod tests {
             Some("Trae Work")
         );
         let params = parse_query(uri.split_once('?').unwrap().1);
-        assert_eq!(
-            params.get("code_challenge_method").map(String::as_str),
-            Some("S256"),
-            "PKCE 方法必须是 S256"
-        );
-        let challenge = params.get("code_challenge").cloned().unwrap_or_default();
-        assert_eq!(challenge.len(), 43, "S256 challenge 是 32B 的 base64url");
+        let web_mode = started
+            .get("webMode")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if web_mode {
+            // 网页模式（合成身份）不承诺 PKCE（对齐参考项目 `BuildLoginURL`）。
+            assert!(
+                params.get("code_challenge_method").is_none(),
+                "网页模式授权 URL 不应带 PKCE 参数，否则回调 AuthCode 交换必失败: {params:?}"
+            );
+        } else {
+            assert_eq!(
+                params.get("code_challenge_method").map(String::as_str),
+                Some("S256"),
+                "客户端模式 PKCE 方法必须是 S256"
+            );
+            let challenge = params.get("code_challenge").cloned().unwrap_or_default();
+            assert_eq!(challenge.len(), 43, "S256 challenge 是 32B 的 base64url");
+        }
         let trace = params.get("login_trace_id").cloned().unwrap_or_default();
         assert_eq!(trace.len(), 32, "login_trace_id 必须是 32 位 hex");
         assert!(trace.chars().all(|c| c.is_ascii_hexdigit()));
