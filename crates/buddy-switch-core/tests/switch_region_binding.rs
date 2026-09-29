@@ -30,8 +30,9 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use buddy_switch_core::modules::config::BUDDY_SWITCH_HOME_ENV;
+use buddy_switch_core::modules::export_import;
 use buddy_switch_core::modules::region::{self, Region, RegionFilter};
-use buddy_switch_core::modules::{auth_file, config, credit_usage, switch};
+use buddy_switch_core::modules::{account, auth_file, config, credit_usage, switch};
 
 /// 串行化所有会修改 `BUDDY_SWITCH_HOME` 的测试（该变量是进程级全局状态）。
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -702,4 +703,72 @@ fn existing_file_override_is_ignored() {
     );
 
     let _ = fs::remove_file(&file);
+}
+
+// ---------------------------------------------------------------------------
+// panel `auths/` 目录导入（`import_auths_dir`）：隔离 home 下的**写库全链路**
+// ---------------------------------------------------------------------------
+
+/// panel `auths/*.json` 的落盘形态：嵌套双对象、`expiresAt` 为 Unix **秒**。
+fn write_auths_fixture(home: &Path, cn: usize, global: usize) -> PathBuf {
+    let dir = home.join("auths");
+    fs::create_dir_all(&dir).expect("create auths fixture dir");
+    for i in 0..cn {
+        let text = format!(
+            r#"{{"account":{{"enterpriseId":"","nickname":"cn-{i}","uid":"cn-uid-{i}"}},"auth":{{"accessToken":"tok-cn-{i}","refreshToken":"ref-cn-{i}","expiresAt":1793155025,"domain":"www.codebuddy.cn","realm":"cn"}}}}"#
+        );
+        fs::write(dir.join(format!("workbuddy-cn-{i}.json")), text).expect("write cn fixture");
+    }
+    for i in 0..global {
+        let text = format!(
+            r#"{{"account":{{"enterpriseId":"","nickname":"global-{i}","uid":"g-uid-{i}"}},"auth":{{"accessToken":"tok-g-{i}","refreshToken":"ref-g-{i}","expiresAt":1793155026,"domain":"www.workbuddy.ai","realm":"global"}}}}"#
+        );
+        fs::write(dir.join(format!("workbuddy-global-{i}.json")), text).expect("write global fixture");
+    }
+    dir
+}
+
+/// 可证伪：把 3 个 CN + 1 个 Global 的 panel 文件按真实形态落进隔离 home 下的
+/// `auths/`，分别对 CN / Global 库执行目录导入，钉住两条红线：
+/// - **域分流**：CN 库里只能出现 cn 账号、Global 库只能出现 global 账号，
+///   跨域文件计入 `mismatch` 且**不落任何库**；
+/// - **秒 → 毫秒**：panel 落盘是 Unix 秒（10 位），导入后账号库必须存 13 位毫秒
+///   （`norm_ts` 口径），否则 UI 的过期判定会按「已过期 5 万年后」处理。
+#[test]
+fn import_auths_dir_splits_by_realm_and_normalizes_seconds_to_ms() {
+    let home = IsolatedHome::new("auths-dir-import");
+    let dir = write_auths_fixture(home.path(), 3, 1);
+
+    // CN 库：收 3 个、mismatch 1（那个 global 文件不得进 CN 库）。
+    let cn = export_import::import_auths_dir(&dir, Region::Cn).expect("导入 CN 库");
+    assert_eq!(cn.imported, 3, "3 个 CN 文件应全部入库");
+    assert_eq!(cn.mismatch, 1, "Global 域文件应计 mismatch 跳过");
+    assert_eq!(cn.skipped, 0);
+    let accounts = account::load_accounts_for(Region::Cn);
+    assert_eq!(accounts.len(), 3);
+    assert!(accounts.iter().all(|a| a["uid"].as_str().is_some_and(|u| u.starts_with("cn-uid-"))));
+    assert!(accounts
+        .iter()
+        .all(|a| a["expiresAt"].as_i64() == Some(1_793_155_025_000)),
+        "秒 1793155025 必须归一成毫秒 1793155025000: {accounts:?}");
+
+    // Global 库：收 1 个、mismatch 3；Global 库文件此时才首次出现。
+    let g = export_import::import_auths_dir(&dir, Region::Global).expect("导入 Global 库");
+    assert_eq!(g.imported, 1);
+    assert_eq!(g.mismatch, 3);
+    let global_accounts = account::load_accounts_for(Region::Global);
+    assert_eq!(global_accounts.len(), 1);
+    assert_eq!(global_accounts[0]["uid"], "g-uid-0");
+    assert_eq!(global_accounts[0]["expiresAt"], 1_793_155_026_000_i64);
+
+    // 幂等：同目录再导一次，全部按 uid 覆盖，不产生重复账号。
+    let again = export_import::import_auths_dir(&dir, Region::Cn).expect("重复导入");
+    assert_eq!(again.imported, 3);
+    assert_eq!(again.overwritten, 3, "同 uid 再导入必须走覆盖而不是追加");
+    assert_eq!(account::load_accounts_for(Region::Cn).len(), 3);
+
+    // 隔离护栏：真实账号库未被触碰。
+    let real = real_home_snapshot();
+    drop(home);
+    assert_eq!(real, real_home_snapshot(), "隔离导入不得写真实 ~/.buddy-switch");
 }
