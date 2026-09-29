@@ -21,6 +21,8 @@ export const en = {
   "wbAccounts.page.importPanelAuthsPick": "Choose auths directory",
   "wbAccounts.page.importPanelAuthsImporting": "Importing…",
   "wbAccounts.page.importPanelAuthsResult": "Imported {imported} account(s){overwrite}, skipped {skipped}, domain mismatch {mismatch}",
+  "wbAccounts.page.importPanelAuthsNoMatchTitle": "No accounts imported",
+  "wbAccounts.page.importPanelAuthsNoMatch": "Every account in that directory belongs to the other domain. Switch to the matching tab (CN / Global) and import again.",
   "wbAccounts.page.export": "Export",
   "wbAccounts.page.exportTitle": "Export account backup",
   "wbAccounts.page.loadFailed": "Failed to load",

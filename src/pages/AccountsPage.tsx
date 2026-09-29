@@ -529,6 +529,17 @@ function RegionPanel({ region }: { region: Region }) {
     setPanelAuthsError("");
     try {
       const res = await api.importAuthsDir(dir, region);
+      if (res.imported === 0 && res.mismatch > 0) {
+        // 全部域不符（如在 Global 页签导入 CN 的 auths）：别用成功 toast 掩盖，明确指路。
+        toast.warning(
+          t("wbAccounts.page.importPanelAuthsNoMatchTitle"),
+          { description: t("wbAccounts.page.importPanelAuthsNoMatch") },
+        );
+        setPanelAuthsError("");
+        setPanelAuthsDir("");
+        setPanelAuthsOpen(false);
+        return;
+      }
       const overwriteText = res.overwritten > 0 ? t("wbAccounts.toast.importOverwrite", { n: res.overwritten }) : "";
       toast.success(
         t("wbAccounts.toast.importSuccess"),

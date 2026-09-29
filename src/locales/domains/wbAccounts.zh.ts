@@ -25,6 +25,8 @@ export const zh = {
   "wbAccounts.page.importPanelAuthsPick": "选择 auths 目录",
   "wbAccounts.page.importPanelAuthsImporting": "正在导入…",
   "wbAccounts.page.importPanelAuthsResult": "已导入 {imported} 个{overwrite}，跳过 {skipped} 个，域不符 {mismatch} 个",
+  "wbAccounts.page.importPanelAuthsNoMatchTitle": "没有账号导入",
+  "wbAccounts.page.importPanelAuthsNoMatch": "该目录下所有账号的域都与当前页签不符，请切到对应域（CN / Global）的账号页重试。",
   "wbAccounts.page.export": "导出",
   "wbAccounts.page.exportTitle": "导出账号备份",
   "wbAccounts.page.loadFailed": "加载失败",
