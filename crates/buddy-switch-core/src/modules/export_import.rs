@@ -185,6 +185,7 @@ pub fn import_accounts_for(
 }
 
 /// 一个 panel `auths/*.json` 文件（顶层嵌套对象）归一后与目标 region 的判定。
+#[derive(Debug)]
 enum AuthsDirItem {
     /// 归一后的账号记录（与目标 region 同域、含 access_token）。
     Record(Value),
@@ -525,6 +526,53 @@ mod tests {
             merge_import_records(&mut accounts, r#"[{ "access_token": "t" }]"#, &[5]).unwrap();
         assert_eq!(result.imported, 0);
         assert_eq!(result.skipped, 1);
+    }
+
+    /// 按 panel `auths/*.json` 的**真实落盘形态**钉住目录导入的判定口径
+    /// （`realm: "cn"` 优先于 `domain`；`expiresAt` 为 Unix **秒**要转毫秒）。
+    #[test]
+    fn classify_auths_item_handles_real_panel_shape_cn_seconds() {
+        let item = json!({
+            "account": { "enterpriseId": "", "nickname": "17538802558", "uid": "u-1" },
+            "auth": {
+                "accessToken": "tok",
+                "refreshToken": "ref",
+                "expiresAt": 1793155025,
+                "domain": "www.codebuddy.cn",
+                "realm": "cn",
+            }
+        });
+        match classify_auths_item(&item, Region::Cn) {
+            AuthsDirItem::Record(record) => {
+                assert_eq!(record["uid"], json!("u-1"));
+                assert_eq!(record["access_token"], json!("tok"));
+                assert_eq!(record["domain"], json!("www.codebuddy.cn"));
+                // 秒 → 毫秒（`norm_ts`）
+                assert_eq!(record["expiresAt"], json!(1_793_155_025_000_i64));
+                assert!(record["refreshExpiresAt"].is_null(), "panel 文件无 refreshExpiresAt 时应为 null");
+            }
+            other => panic!("CN panel 记录应可导入 CN 库，实际 {other:?}"),
+        }
+        // 同一文件导 Global 库：域不符计入 mismatch，不进错库。
+        match classify_auths_item(&item, Region::Global) {
+            AuthsDirItem::Mismatch => {}
+            other => panic!("CN realm 记录导入 Global 库应计 mismatch，实际 {other:?}"),
+        }
+    }
+
+    /// `realm` 缺失时回落 `domain` 判定（panel 早期文件 / 自定义 realm 值）。
+    #[test]
+    fn auths_item_region_falls_back_to_domain_when_realm_missing() {
+        let global_item = json!({
+            "account": { "uid": "u-2" },
+            "auth": { "accessToken": "t", "domain": "www.workbuddy.ai", "realm": "global" }
+        });
+        let no_realm = json!({
+            "account": { "uid": "u-3" },
+            "auth": { "accessToken": "t", "domain": "www.codebuddy.cn" }
+        });
+        assert_eq!(auths_item_region(&global_item), Region::Global);
+        assert_eq!(auths_item_region(&no_realm), Region::Cn);
     }
 
     #[test]
