@@ -612,7 +612,11 @@ export interface TraeGatewayPoolSummary {
 export interface TraeGatewayAccountStatus {
   uid: string;
   name: string;
-  status: "available" | "cooling" | "disabled" | "expired" | "no_credits";
+  /**
+   * `free_plan`：国际版免费档——没有积分体系，`credits=0` 是正常态，
+   * 该账号**可用**（`no_credits` 仅用于国内版的真正零积分）。
+   */
+  status: "available" | "cooling" | "disabled" | "expired" | "no_credits" | "free_plan";
   credits: number | null;
   creditsExpireAt: number | null;
   cooling: boolean;

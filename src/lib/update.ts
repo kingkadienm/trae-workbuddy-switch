@@ -1,4 +1,4 @@
-export const GITHUB_OWNER = "NextAgentX";
+export const GITHUB_OWNER = "kingkadienm";
 export const GITHUB_REPO = "trae-workbuddy-switch";
 export const GITHUB_REPOSITORY_URL = `https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}`;
 export const GITHUB_RELEASE_URL = `${GITHUB_REPOSITORY_URL}/releases/latest`;

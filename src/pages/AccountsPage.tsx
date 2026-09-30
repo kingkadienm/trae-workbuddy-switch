@@ -35,6 +35,8 @@ import {
 } from "@/components/ui/dialog";
 import { ExportAccountsDialog } from "@/components/export-accounts-dialog";
 import { ImportAccountsDialog } from "@/components/import-accounts-dialog";
+import { GrowthTaskCenter } from "@/components/growth-task-center";
+import { GrowthTasksDialog } from "@/components/growth-tasks-dialog";
 import { OAuthLoginDialog } from "@/components/oauth-login-dialog";
 import { SwitchAccountDialog } from "@/components/switch-account-dialog";
 import * as api from "@/lib/api";
@@ -258,6 +260,8 @@ function RegionPanel({ region }: { region: Region }) {
   const [panelAuthsBusy, setPanelAuthsBusy] = useState(false);
   const [panelAuthsError, setPanelAuthsError] = useState("");
   const [switchAccount, setSwitchAccount] = useState<AccountMeta | null>(null);
+  /** 成长任务弹窗目标账号（CN 专有；Global 区域不渲染入口，此状态恒为 null）。 */
+  const [growthAccount, setGrowthAccount] = useState<AccountMeta | null>(null);
   const [importing, setImporting] = useState(false);
   const [autoCheckinConfig, setAutoCheckinConfig] = useState<CheckinConfig | null>(null);
   const [autoCheckinSaving, setAutoCheckinSaving] = useState(false);
@@ -962,6 +966,7 @@ function RegionPanel({ region }: { region: Region }) {
           expectedAuthFile={expectedAuthFile}
           onRecheck={() => void onRecheck()}
           onImport={() => void onImport()}
+          onOauth={() => setOauthOpen(true)}
           importing={importing}
         />
       ) : (
@@ -1100,6 +1105,16 @@ function RegionPanel({ region }: { region: Region }) {
             </div>
           )}
 
+          {/* 成长任务中心（CN 专有；Global 区域整个不渲染，对照 panel D4 门控；演示模式无后端，同样不渲染） */}
+          {region === "cn" && !api.isDemoMode() && (
+            <div className="mt-7">
+              <GrowthTaskCenter
+                region={region}
+                onCreditRefresh={() => void refreshCredits(accounts.map((account) => account.id), { region, silent: true }).catch(() => undefined)}
+              />
+            </div>
+          )}
+
           <section className="mt-7 min-w-0" aria-labelledby={`accounts-list-title-${region}`}>
             <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
               <div className="flex items-center gap-2">
@@ -1212,6 +1227,7 @@ function RegionPanel({ region }: { region: Region }) {
                     codebuddyCnIdeLoading={codebuddyCnIdeSwitchingId === a.id}
                     onSwitchCodebuddyCnIde={onSwitchCodebuddyCnIde}
                     onAddPlaintextAccount={() => setOauthOpen(true)}
+                    onGrowthTasks={region === "cn" && !api.isDemoMode() ? setGrowthAccount : undefined}
                     featuresDisabled={false}
                   />
                 ))}
@@ -1294,6 +1310,16 @@ function RegionPanel({ region }: { region: Region }) {
           void refreshCodebuddyCliStatus();
           void refreshCodebuddyCnIdeStatus();
         }}
+      />
+
+      {/* 成长任务弹窗（panel 移植；卡片「更多操作」里的入口，CN 专有） */}
+      <GrowthTasksDialog
+        open={growthAccount !== null}
+        onOpenChange={(o) => {
+          if (!o) setGrowthAccount(null);
+        }}
+        account={growthAccount}
+        region={region}
       />
 
       {/* 接入/升级 CLI 认证确认（桌面 App 不支持 window.confirm） */}
@@ -1395,6 +1421,7 @@ function EmptyRegionCard({
   expectedAuthFile,
   onRecheck,
   onImport,
+  onOauth,
   importing,
 }: {
   region: Region;
@@ -1402,6 +1429,7 @@ function EmptyRegionCard({
   expectedAuthFile: string;
   onRecheck: () => void;
   onImport: () => void;
+  onOauth: () => void;
   importing: boolean;
 }) {
   const descriptor = regionDescriptor(region);
@@ -1446,11 +1474,15 @@ function EmptyRegionCard({
           </div>
 
           <div className="mt-4 flex flex-wrap gap-2">
+            <Button size="sm" onClick={onOauth}>
+              <QrCode />
+              {t("wbAccounts.page.oauthAdd")}
+            </Button>
             <Button size="sm" variant="outline" onClick={onRecheck}>
               <RefreshCw />
               {t("wbAccounts.empty.recheck")}
             </Button>
-            <Button size="sm" onClick={onImport} disabled={importing}>
+            <Button size="sm" variant="outline" onClick={onImport} disabled={importing}>
               {importing ? <Loader2 className="animate-spin" /> : <Download />}
               {t("wbAccounts.empty.importLocal")}
             </Button>

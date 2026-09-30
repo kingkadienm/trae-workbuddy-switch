@@ -33,6 +33,7 @@ export const zh = {
   "shared.trae.poolStatus.disabled": "会话失效",
   "shared.trae.poolStatus.expired": "积分过期",
   "shared.trae.poolStatus.noCredits": "零积分",
+  "shared.trae.poolStatus.freePlan": "免费额度",
 
   // ---- 剪贴板（clipboard.ts） ----
   "shared.clipboard.copied": "已复制",

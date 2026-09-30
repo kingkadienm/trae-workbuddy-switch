@@ -21,6 +21,7 @@ export const en = {
   "shared.trae.poolStatus.disabled": "Session expired",
   "shared.trae.poolStatus.expired": "Credits expired",
   "shared.trae.poolStatus.noCredits": "No credits",
+  "shared.trae.poolStatus.freePlan": "Free plan",
 
   // ---- Clipboard (clipboard.ts) ----
   "shared.clipboard.copied": "Copied",

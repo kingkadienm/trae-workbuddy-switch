@@ -33,19 +33,51 @@ fn oauth_states() -> &'static Mutex<HashMap<String, OAuthInfo>> {
     OAUTH_STATES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Global（workbuddy.ai）web 设备登录专用请求头，与 panel `loginHTTP` 同口径：
+/// CLI UA + XHR 头 + 按域切 Origin/Referer。`http_request` 的 headers 参数可逐请求
+/// 覆盖默认桌面 UA，因此无需另建 client。
+fn web_login_headers(base: &str) -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    headers.insert("User-Agent".to_string(), "CLI/2.63.2 CodeBuddy/2.63.2".to_string());
+    headers.insert("X-Requested-With".to_string(), "XMLHttpRequest".to_string());
+    headers.insert("Origin".to_string(), base.to_string());
+    headers.insert("Referer".to_string(), format!("{base}/"));
+    headers.insert("Accept".to_string(), "application/json, text/plain, */*".to_string());
+    headers
+}
+
+/// uid 安全校验（panel 同口径）：只放行 `[A-Za-z0-9_-]`，长度 ≤ 64。
+/// 上游返回的 uid 会参与拼本地文件名，路径字符（`.` / `/` 等）一律拒绝。
+fn valid_uid(uid: &str) -> bool {
+    let uid = uid.trim();
+    if uid.is_empty() || uid.len() > 64 {
+        return false;
+    }
+    uid.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 /// 发起 CN 登录。
 pub async fn oauth_start() -> Result<Value, String> {
     oauth_start_for(Region::Cn).await
 }
 
 /// 发起指定 region 的登录：向官方申请 state，返回 loginId / verificationUri / expiresIn。
+///
+/// Global 与 panel 的 web 设备登录同口径：`platform=CLI` + CLI UA / XHR / Origin 头
+/// （[`web_login_headers`]）；CN 保持既有 workbuddy 平台参数与默认桌面 UA。
 pub async fn oauth_start_for(region: Region) -> Result<Value, String> {
     let spec = region_spec(region);
     let base = spec.billing_base;
-    let platform = spec.platform;
+    let platform = if region == Region::Global {
+        "CLI"
+    } else {
+        spec.platform
+    };
+    let web_headers = (region == Region::Global).then(|| web_login_headers(base));
     let login_id = format!("wb_{}", uuid::Uuid::new_v4().simple());
     let url = format!("{base}{WORKBUDDY_API_PREFIX}/auth/state?platform={platform}");
-    let resp = http_request(&url, "POST", Some(json!({})), None).await;
+    let resp = http_request(&url, "POST", Some(json!({})), web_headers.as_ref()).await;
     let data = resp.get("data").cloned().unwrap_or_else(|| json!({}));
     let state = data
         .get("state")
@@ -116,8 +148,9 @@ pub async fn oauth_poll_for(region: Region, login_id: &str) -> Value {
         info.state.clone()
     };
 
+    let web_headers = (region == Region::Global).then(|| web_login_headers(base));
     let url = format!("{base}{WORKBUDDY_API_PREFIX}/auth/token?state={state}");
-    let resp = http_request(&url, "GET", None, None).await;
+    let resp = http_request(&url, "GET", None, web_headers.as_ref()).await;
     let code = resp.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
     if code != 0 && code != 200 {
         return json!({"done": false});
@@ -135,7 +168,7 @@ pub async fn oauth_poll_for(region: Region, login_id: &str) -> Value {
 
     // 拉取账号信息
     let account_url = format!("{base}{WORKBUDDY_API_PREFIX}/login/account?state={state}");
-    let mut headers = HashMap::new();
+    let mut headers = web_headers.unwrap_or_default();
     headers.insert(
         "Authorization".to_string(),
         format!("Bearer {access_token}"),
@@ -151,6 +184,21 @@ pub async fn oauth_poll_for(region: Region, login_id: &str) -> Value {
         .get("uid")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    // Global 口径（panel 同）：uid 会参与拼本地文件名，路径字符一律拒绝；
+    // 空 uid 也拒绝（panel：token 已发但账号信息缺失，要求重试而非落空号）。
+    if region == Region::Global {
+        match uid.as_deref() {
+            Some(uid_str) if valid_uid(uid_str) => {}
+            _ => {
+                let mut map = oauth_states().lock().unwrap();
+                if let Some(info) = map.get_mut(login_id) {
+                    info.done = true;
+                    info.error = Some("未获取到合法 uid，已拒绝保存（请重试）".to_string());
+                }
+                return json!({"done": true, "error": "未获取到合法 uid，已拒绝保存（请重试）"});
+            }
+        }
+    }
     let nickname = acc_data
         .get("nickname")
         .and_then(|v| v.as_str())
@@ -362,6 +410,26 @@ mod tests {
             oauth_profile_email(&profile).as_deref(),
             Some("user@example.com")
         );
+    }
+
+    #[test]
+    fn valid_uid_rejects_path_traversal_and_allows_uuid_shape() {
+        assert!(valid_uid("0d1a2b3c-4d5e-6f70-8192-a3b4c5d6e7f8"));
+        assert!(valid_uid("u_12345"));
+        assert!(!valid_uid(""), "空 uid 必须拒绝");
+        assert!(!valid_uid("../../evil"), "路径穿越必须拒绝");
+        assert!(!valid_uid("a/b"), "斜杠必须拒绝");
+        assert!(!valid_uid("a.b"), "点号必须拒绝");
+        assert!(!valid_uid(&"x".repeat(65)), "超长必须拒绝");
+    }
+
+    #[test]
+    fn web_login_headers_match_panel_cli_profile() {
+        let headers = web_login_headers("https://www.workbuddy.ai");
+        assert_eq!(headers.get("User-Agent").unwrap(), "CLI/2.63.2 CodeBuddy/2.63.2");
+        assert_eq!(headers.get("X-Requested-With").unwrap(), "XMLHttpRequest");
+        assert_eq!(headers.get("Origin").unwrap(), "https://www.workbuddy.ai");
+        assert_eq!(headers.get("Referer").unwrap(), "https://www.workbuddy.ai/");
     }
 
     /// 轮询必须校验 loginId 绑定的 region（PRD G1）：用另一版轮询同一 loginId
