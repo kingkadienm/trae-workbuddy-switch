@@ -26,8 +26,8 @@ npm run build:app:release  # 构建 release .app + 签名更新包
 
 ### npm 版（webui）发布
 
-主包与平台分包统一在 **`@nextagentx` scope** 下：主包 `@nextagentx/buddy-switch`，
-平台包 `@nextagentx/buddy-switch-<platform>-<arch>`（**目录名不带 scope**，
+主包与平台分包统一在 **`@kingkadienm` scope** 下：主包 `@kingkadienm/buddy-switch`，
+平台包 `@kingkadienm/buddy-switch-<platform>-<arch>`（**目录名不带 scope**，
 仍是 `npm/platform/buddy-switch-<tag>`，`build.yml` 的 `PKG_DIR` 与生成脚本都按目录名拼路径）。
 安装后的**命令名仍是 `buddy-switch`**（`bin` 字段决定，与包名无关）。
 
@@ -35,9 +35,9 @@ npm run build:app:release  # 构建 release .app + 签名更新包
 2. 先 `sh scripts/gen-platform-packages.sh <版本>` 生成 5 个平台包，把对应二进制放进各包 `bin/` 后逐个 `npm publish --access public`
 3. `cd npm && npm publish --access public`（主包，`postinstall` 从已安装的平台包复制二进制）
 
-> ⚠️ **发布前提**：npm 账号必须拥有 **`nextagentx` 这个 scope**（用户名即为 `nextagentx`，
+> ⚠️ **发布前提**：npm 账号必须拥有 **`kingkadienm` 这个 scope**（用户名即为 `kingkadienm`，
 > 或在该账号下创建同名 organization）。scope 不属于自己时 `npm publish` 会 403，
-> 且 `@nextagentx/*` 是别人无法代持的命名空间。
+> 且 `@kingkadienm/*` 是别人无法代持的命名空间。
 >
 > 另外：`buddy-switch`（不带 scope）这个包名**在 npm 上已被他人占用**，所以不能再退回无 scope 命名；
 > 本项目此前的发布用的是 `workbuddy-switch`。

@@ -21,11 +21,11 @@ One interface, three forms:
 
 | Form | How to get it | Notes |
 | --- | --- | --- |
-| **Desktop app** | Download the installer from [GitHub Releases](https://github.com/NextAgentX/trae-workbuddy-switch/releases/latest) | Packaged with Tauri; recommended for daily use |
+| **Desktop app** | Download the installer from [GitHub Releases](https://github.com/kingkadienm/trae-workbuddy-switch/releases/latest) | Packaged with Tauri; recommended for daily use |
 | **webui (browser)** | Build from source, see [webui form](#webui-form-build-from-source) | The same frontend bundle as the desktop app, served over a local HTTP channel |
-| **Online demo** | [GitHub Pages](https://nextagentx.github.io/trae-workbuddy-switch/) | Read-only demo; accounts, credits and request records are fictional data and all business actions are disabled |
+| **Online demo** | [GitHub Pages](https://kingkadienm.github.io/trae-workbuddy-switch/) | Read-only demo; accounts, credits and request records are fictional data and all business actions are disabled |
 
-> **No npm distribution yet**: the npm package `@nextagentx/buddy-switch` has not been published, so `npm i -g …` will not install it yet.
+> **No npm distribution yet**: the npm package `@kingkadienm/buddy-switch` has not been published, so `npm i -g …` will not install it yet.
 > For the webui form, follow [Build from source](#webui-form-build-from-source) below; the install command will be added here once it is published.
 
 ## Two product sections
@@ -45,7 +45,7 @@ The pages under both sections are **structurally identical, item for item**: Acc
 
 ### Desktop app
 
-Download the installer for your platform from [GitHub Releases](https://github.com/NextAgentX/trae-workbuddy-switch/releases/latest):
+Download the installer for your platform from [GitHub Releases](https://github.com/kingkadienm/trae-workbuddy-switch/releases/latest):
 
 | Platform | Installer | Installation |
 | --- | --- | --- |
@@ -299,7 +299,7 @@ crates/
   buddy-switch-server/   # HTTP server + CLI (axum API + rust-embed embedded frontend)
 src-tauri/               # desktop host (thin Tauri command wrappers + tray)
 src/                     # frontend: components / pages / lib (api.ts dual channel: Tauri invoke or HTTP fetch)
-npm/                     # npm packages (**not published yet**): main package @nextagentx/buddy-switch + 5 platform packages
+npm/                     # npm packages (**not published yet**): main package @kingkadienm/buddy-switch + 5 platform packages
 ```
 
 ## Contributing
@@ -351,10 +351,10 @@ This project is licensed under the **[PolyForm Noncommercial License 1.0.0](./LI
 
 ## Star History
 
-<a href="https://www.star-history.com/?repos=NextAgentX%2Ftrae-workbuddy-switch&type=date&legend=top-left">
+<a href="https://www.star-history.com/?repos=kingkadienm%2Ftrae-workbuddy-switch&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=NextAgentX/trae-workbuddy-switch&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=NextAgentX/trae-workbuddy-switch&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=NextAgentX/trae-workbuddy-switch&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=kingkadienm/trae-workbuddy-switch&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=kingkadienm/trae-workbuddy-switch&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=kingkadienm/trae-workbuddy-switch&type=date&legend=top-left" />
  </picture>
 </a>

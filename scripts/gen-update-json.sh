@@ -7,7 +7,7 @@
 set -e
 cd "$(dirname "$0")/.." || exit 1
 
-OWNER="${1:-NextAgentX}"
+OWNER="${1:-kingkadienm}"
 REPO="${2:-trae-workbuddy-switch}"
 VERSION="${UPDATE_VERSION:-$(grep '^version' src-tauri/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')}"
 UPDATE_OS="${UPDATE_OS:-macos}"

@@ -26,7 +26,7 @@ Noncommercial use is permitted; **commercial use requires prior written authoriz
 - Bundling it into a commercial product
 - Use in for-profit business activities (**including internal commercial projects**)
 
-For commercial licensing, contact the author via the [main repository's Issues](https://github.com/NextAgentX/trae-workbuddy-switch/issues).
+For commercial licensing, contact the author via the [main repository's Issues](https://github.com/kingkadienm/trae-workbuddy-switch/issues).
 
 ## FAQ
 

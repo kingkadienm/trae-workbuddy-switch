@@ -19,7 +19,7 @@ use crate::modules::config::{
 
 /// 应用当前版本（来自 Cargo.toml package.version）。
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const GITHUB_OWNER: &str = "NextAgentX";
+pub const GITHUB_OWNER: &str = "kingkadienm";
 pub const GITHUB_REPO: &str = "trae-workbuddy-switch";
 
 /// 成功结果缓存有效期（6 小时）。自动轮询（30 分钟）命中缓存，不发网络请求；
@@ -399,8 +399,8 @@ mod tests {
         assert_eq!(
             urls,
             vec![
-                "https://github.com/NextAgentX/trae-workbuddy-switch/releases/latest/download/latest.json",
-                "https://github.com/NextAgentX/trae-workbuddy-switch/releases/latest/download/latest-macos-aarch64.json",
+                "https://github.com/kingkadienm/trae-workbuddy-switch/releases/latest/download/latest.json",
+                "https://github.com/kingkadienm/trae-workbuddy-switch/releases/latest/download/latest-macos-aarch64.json",
             ]
         );
     }
@@ -411,9 +411,9 @@ mod tests {
         assert_eq!(
             urls,
             vec![
-                "https://github.com/NextAgentX/trae-workbuddy-switch/releases/latest/download/latest.json",
-                "https://github.com/NextAgentX/trae-workbuddy-switch/releases/latest/download/latest-windows-x86_64.json",
-                "https://github.com/NextAgentX/trae-workbuddy-switch/releases/latest/download/latest-macos-x86_64.json",
+                "https://github.com/kingkadienm/trae-workbuddy-switch/releases/latest/download/latest.json",
+                "https://github.com/kingkadienm/trae-workbuddy-switch/releases/latest/download/latest-windows-x86_64.json",
+                "https://github.com/kingkadienm/trae-workbuddy-switch/releases/latest/download/latest-macos-x86_64.json",
             ]
         );
     }

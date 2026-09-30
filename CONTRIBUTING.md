@@ -10,7 +10,7 @@
 
 | 类型 | 说明 |
 | --- | --- |
-| 报告问题 | 到 [Issues](https://github.com/NextAgentX/trae-workbuddy-switch/issues) 反馈 Bug 或提建议。请附**复现步骤**、**客户端版本**和日志；粘贴前先抹掉 token、账号等敏感信息 |
+| 报告问题 | 到 [Issues](https://github.com/kingkadienm/trae-workbuddy-switch/issues) 反馈 Bug 或提建议。请附**复现步骤**、**客户端版本**和日志；粘贴前先抹掉 token、账号等敏感信息 |
 | 修 Bug | 客户端升级后数据结构或接口变了、某个功能失效 —— 这类修复价值最高 |
 | 适配新客户端版本 | 跟进新版客户端的数据结构与端点变化 |
 | 文档与翻译 | 修正 README / `docs/` 里过时的描述，改进中英文表述 |
@@ -101,7 +101,7 @@ cargo test        # Rust 单元测试
 
 ## 有问题在哪问
 
-- 用法问题、Bug、功能建议 → [Issues](https://github.com/NextAgentX/trae-workbuddy-switch/issues)
+- 用法问题、Bug、功能建议 → [Issues](https://github.com/kingkadienm/trae-workbuddy-switch/issues)
 - 安全相关（凭据泄露、越权访问等）→ 请**不要**公开开 Issue，先私下联系作者说明情况
 
 ---

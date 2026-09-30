@@ -15,7 +15,7 @@
  * usage:
  *   node scripts/gen-release-notes.mjs --tag v2026.9.221126
  *   node scripts/gen-release-notes.mjs --tag v2026.9.221126 --from v2026.9.211636
- *   node scripts/gen-release-notes.mjs --tag v2026.9.221126 --repo NextAgentX/trae-workbuddy-switch
+ *   node scripts/gen-release-notes.mjs --tag v2026.9.221126 --repo kingkadienm/trae-workbuddy-switch
  *   node scripts/gen-release-notes.mjs --help
  *
  * ## 几处刻意选择（改动前先读）

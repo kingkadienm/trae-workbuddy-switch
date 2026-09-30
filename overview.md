@@ -54,7 +54,7 @@
 - **`/api/checkin/status` 是只读 GET 却会触发上游网络调用**（P3，设计层面，非本轮引入）。注意 `buddy-switch serve` 启动时 `spawn_background_loops()` 会执行一次 `checkin::run_checkin_cycle(StartupVerify)`，并会改动 `~/.buddy-switch/` 下的账号与缓存文件——本地做实验时务必先用 `BUDDY_SWITCH_HOME` 指向**已存在**的目录隔离。
 - **前端无单测框架**，故未跑前端单测，仅以 `tsc` + 生产构建作为门禁。
 - **未运行 Tauri 运行时验证**（仅保证其 crate 可编译）；未做并发压测（受 `CARGO_INCREMENTAL=0` + cargo 串行约束）。
-- **Git 仓库已建立并发布**（2026-09-24 起）：远端 `NextAgentX/trae-workbuddy-switch`，已打 tag `v2026.9.221126` / `v2026.9.241700` / `v2026.9.242126` 并发布 Release（四平台安装包 + 签名 + updater 清单）。
+- **Git 仓库已建立并发布**（2026-09-24 起）：远端 `kingkadienm/trae-workbuddy-switch`，已打 tag `v2026.9.221126` / `v2026.9.241700` / `v2026.9.242126` 并发布 Release（四平台安装包 + 签名 + updater 清单）。
   ⚠️ 遗留：release 工作流的 4 个 `npm platform *` job 因缺 `NPM_TOKEN` secret 持续失败 ⇒ **run 整体标 `failure`，但 Release 与安装包本身 success**（npm 是独立 job，不阻塞 Release）。判读 CI 结论必须看**具体 job**，不能只看 run 状态。
 
 ## 重要环境说明

@@ -22,7 +22,7 @@ const path = require("node:path");
 
 const ROOT = path.resolve(__dirname, "..");
 const PLATFORM_DIR = path.join(ROOT, "npm", "platform");
-const SCOPE = "@nextagentx";
+const SCOPE = "@kingkadienm";
 
 const problems = [];
 const fail = (msg) => problems.push(msg);

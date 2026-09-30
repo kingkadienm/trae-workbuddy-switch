@@ -36,7 +36,7 @@
     "active": true,
     "targets": "all",
     "createUpdaterArtifacts": true,
-    "publisher": "NextAgentX",
+    "publisher": "kingkadienm",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -49,9 +49,9 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDgzNTE1NDY4Q0RBNDE2QTQKUldTa0ZxVE5hRlJSZzUvTVlOWlF5UklxTVE3MXkvL1E3OVZTRHNQVzdkZ0k2MHcwWkVXdjdzVFAK",
       "endpoints": [
-        "https://github.com/NextAgentX/trae-workbuddy-switch/releases/latest/download/latest.json",
-        "https://github.com/NextAgentX/trae-workbuddy-switch/releases/latest/download/latest-{{target}}-{{arch}}.json",
-        "https://github.com/NextAgentX/trae-workbuddy-switch/releases/latest/download/latest-macos-{{arch}}.json"
+        "https://github.com/kingkadienm/trae-workbuddy-switch/releases/latest/download/latest.json",
+        "https://github.com/kingkadienm/trae-workbuddy-switch/releases/latest/download/latest-{{target}}-{{arch}}.json",
+        "https://github.com/kingkadienm/trae-workbuddy-switch/releases/latest/download/latest-macos-{{arch}}.json"
       ]
     }
   }

@@ -21,11 +21,11 @@
 
 | 形态 | 获取方式 | 说明 |
 | --- | --- | --- |
-| **桌面 App** | 从 [GitHub Releases](https://github.com/NextAgentX/trae-workbuddy-switch/releases/latest) 下载安装包 | Tauri 打包，推荐日常使用 |
+| **桌面 App** | 从 [GitHub Releases](https://github.com/kingkadienm/trae-workbuddy-switch/releases/latest) 下载安装包 | Tauri 打包，推荐日常使用 |
 | **webui（浏览器）** | 从源码构建，见 [webui 形态](#webui-形态源码构建) | 与桌面 App 同一份前端产物，走本地 HTTP 通道 |
-| **在线演示** | [GitHub Pages](https://nextagentx.github.io/trae-workbuddy-switch/) | 只读演示；账号、积分与请求记录均为虚构数据，所有业务操作已禁用 |
+| **在线演示** | [GitHub Pages](https://kingkadienm.github.io/trae-workbuddy-switch/) | 只读演示；账号、积分与请求记录均为虚构数据，所有业务操作已禁用 |
 
-> **暂未提供 npm 安装**：npm 包 `@nextagentx/buddy-switch` 尚未发布，`npm i -g …` 还装不到它。
+> **暂未提供 npm 安装**：npm 包 `@kingkadienm/buddy-switch` 尚未发布，`npm i -g …` 还装不到它。
 > 需要 webui 形态请按下方[从源码构建](#webui-形态源码构建)；发布后会在这里补上安装命令。
 
 
@@ -46,7 +46,7 @@
 
 ### 桌面 App
 
-前往 [GitHub Releases](https://github.com/NextAgentX/trae-workbuddy-switch/releases/latest) 下载对应平台的安装包：
+前往 [GitHub Releases](https://github.com/kingkadienm/trae-workbuddy-switch/releases/latest) 下载对应平台的安装包：
 
 | 平台 | 安装包 | 安装方式 |
 | --- | --- | --- |
@@ -300,7 +300,7 @@ crates/
   buddy-switch-server/   # HTTP server + CLI（axum API + rust-embed 内嵌前端）
 src-tauri/               # 桌面宿主（Tauri command 薄包装 + 托盘）
 src/                     # 前端：components / pages / lib（api.ts 双通道：Tauri invoke 或 HTTP fetch）
-npm/                     # npm 包（**尚未发布**）：主包 @nextagentx/buddy-switch + 5 个平台分包
+npm/                     # npm 包（**尚未发布**）：主包 @kingkadienm/buddy-switch + 5 个平台分包
 ```
 
 ## 参与贡献
@@ -352,10 +352,10 @@ npm/                     # npm 包（**尚未发布**）：主包 @nextagentx/bu
 
 ## Star 趋势
 
-<a href="https://www.star-history.com/?repos=NextAgentX%2Ftrae-workbuddy-switch&type=date&legend=top-left">
+<a href="https://www.star-history.com/?repos=kingkadienm%2Ftrae-workbuddy-switch&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=NextAgentX/trae-workbuddy-switch&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=NextAgentX/trae-workbuddy-switch&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=NextAgentX/trae-workbuddy-switch&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=kingkadienm/trae-workbuddy-switch&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=kingkadienm/trae-workbuddy-switch&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=kingkadienm/trae-workbuddy-switch&type=date&legend=top-left" />
  </picture>
 </a>

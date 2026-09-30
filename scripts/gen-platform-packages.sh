@@ -3,8 +3,8 @@
 # 用法：sh scripts/gen-platform-packages.sh <版本号，如 2026.9.211636>
 #
 # **目录名不带 scope、包名带 scope**：目录是 `buddy-switch-<tag>`（`.github/workflows/build.yml`
-# 里的 `PKG_DIR` 直接拼这个路径），而 npm 包名是 `@nextagentx/buddy-switch-<tag>`
-# ——主包 `@nextagentx/buddy-switch` 的 `optionalDependencies` 与 `npm/scripts/install.js`
+# 里的 `PKG_DIR` 直接拼这个路径），而 npm 包名是 `@kingkadienm/buddy-switch-<tag>`
+# ——主包 `@kingkadienm/buddy-switch` 的 `optionalDependencies` 与 `npm/scripts/install.js`
 # 都按**包名**查找，两者不要混。
 set -e
 V=$1
@@ -18,7 +18,7 @@ gen() {
   mkdir -p "$dir/bin"
   cat > "$dir/package.json" << JSON
 {
-  "name": "@nextagentx/buddy-switch-$tag",
+  "name": "@kingkadienm/buddy-switch-$tag",
   "version": "$V",
   "description": "Buddy Switch platform binary ($tag)",
   "os": ["$os"],
@@ -27,7 +27,7 @@ gen() {
   "license": "PolyForm-Noncommercial-1.0.0"
 }
 JSON
-  echo "生成 $dir (包名 @nextagentx/buddy-switch-$tag, bin=$binfile)"
+  echo "生成 $dir (包名 @kingkadienm/buddy-switch-$tag, bin=$binfile)"
 }
 
 gen darwin-arm64 darwin arm64 buddy-switch-darwin-arm64

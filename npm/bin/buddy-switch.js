@@ -23,7 +23,7 @@ if (!FILE) {
 const binPath = path.join(binDir, FILE);
 if (!fs.existsSync(binPath)) {
   console.error(
-    "buddy-switch: 未找到平台二进制，请重新安装（npm install -g @nextagentx/buddy-switch 触发下载）",
+    "buddy-switch: 未找到平台二进制，请重新安装（npm install -g @kingkadienm/buddy-switch 触发下载）",
   );
   process.exit(1);
 }

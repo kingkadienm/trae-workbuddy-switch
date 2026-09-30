@@ -19,7 +19,7 @@ for profile in debug release; do
     echo "fix-app: dist 已复制到 $APP/Contents/Resources/dist"
     # 签名让 TCC（App 管理/完全磁盘访问）能识别本 app：
     # 优先自签名证书（~/.buddy-switch，已加入钥匙串并设为 codeSign 信任），失败回退 adhoc。
-    SIGN_IDENTITY="NextAgentX Development Signing"
+    SIGN_IDENTITY="kingkadienm Development Signing"
     if codesign --force --deep --sign "$SIGN_IDENTITY" "$APP" 2>/dev/null; then
       echo "fix-app: 已用证书签名 $APP"
     elif codesign --force --deep --sign - "$APP" 2>/dev/null; then

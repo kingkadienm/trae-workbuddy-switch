@@ -10,7 +10,7 @@
 
 | Type | Notes |
 | --- | --- |
-| Report a problem | File a bug or a suggestion in [Issues](https://github.com/NextAgentX/trae-workbuddy-switch/issues). Include **steps to reproduce**, the **client version** and logs; strip tokens, account details and anything else sensitive before pasting |
+| Report a problem | File a bug or a suggestion in [Issues](https://github.com/kingkadienm/trae-workbuddy-switch/issues). Include **steps to reproduce**, the **client version** and logs; strip tokens, account details and anything else sensitive before pasting |
 | Fix a bug | A client update changed a data structure or an endpoint and something stopped working — these fixes are the most valuable kind |
 | Support a new client version | Follow up on data-structure and endpoint changes in new client releases |
 | Docs and translation | Correct outdated descriptions in the README / `docs/`, improve the Chinese or English wording |
@@ -101,7 +101,7 @@ When cleaning up, mind the "smallest committable unit": if A uses a **newly adde
 
 ## Where to ask
 
-- Usage questions, bugs, feature requests → [Issues](https://github.com/NextAgentX/trae-workbuddy-switch/issues)
+- Usage questions, bugs, feature requests → [Issues](https://github.com/kingkadienm/trae-workbuddy-switch/issues)
 - Security issues (credential leaks, unauthorized access, …) → please do **not** open a public Issue; contact the author privately first and describe the situation
 
 ---

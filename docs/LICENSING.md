@@ -26,7 +26,7 @@
 - 作为商业产品的捆绑组件分发
 - 在以营利为目的的经营活动中使用（**含企业内部商业项目**）
 
-商业授权请通过[主仓库 Issues](https://github.com/NextAgentX/trae-workbuddy-switch/issues)联系作者。
+商业授权请通过[主仓库 Issues](https://github.com/kingkadienm/trae-workbuddy-switch/issues)联系作者。
 
 ## 常见问题
 

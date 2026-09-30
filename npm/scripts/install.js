@@ -1,6 +1,6 @@
 // buddy-switch postinstall：从「平台包」复制本平台二进制。
 //
-// 平台分包（esbuild 模式）：二进制发布在独立 npm 包（@nextagentx/buddy-switch-<platform>-<arch>），
+// 平台分包（esbuild 模式）：二进制发布在独立 npm 包（@kingkadienm/buddy-switch-<platform>-<arch>），
 // 主包声明为 optionalDependencies，安装时 npm 自动装好平台包，postinstall 只需复制——
 // 不依赖 GitHub，国内镜像（npmmirror）也能稳定安装。
 //
@@ -17,8 +17,8 @@ const FILE = {
   "linux-arm64": "buddy-switch-linux-arm64",
 }[`${process.platform}-${process.arch}`];
 
-// 主包与平台包同在 `@nextagentx` scope 下（包名带 scope，目录名不带）。
-const PLATFORM_PKG = `@nextagentx/buddy-switch-${process.platform}-${process.arch}`;
+// 主包与平台包同在 `@kingkadienm` scope 下（包名带 scope，目录名不带）。
+const PLATFORM_PKG = `@kingkadienm/buddy-switch-${process.platform}-${process.arch}`;
 
 if (!FILE) {
   console.warn(
@@ -61,7 +61,7 @@ async function main() {
     return fail(`BUDDY_SWITCH_BINARY 指向的文件不存在: ${local}`);
   }
 
-  // 2) 从平台包复制（node_modules/@nextagentx/buddy-switch-<platform>-<arch>/bin/<file>）
+  // 2) 从平台包复制（node_modules/@kingkadienm/buddy-switch-<platform>-<arch>/bin/<file>）
   try {
     const pkgRoot = path.dirname(require.resolve(`${PLATFORM_PKG}/package.json`));
     const src = path.join(pkgRoot, "bin", FILE);
