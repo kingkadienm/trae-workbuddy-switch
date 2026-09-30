@@ -21,6 +21,7 @@ use buddy_switch_core::modules::{
     migrate, oauth, process, refresh, region::Region, region::RegionFilter, rotate, schedule, scheduler,
     session, switch, token_stats, trae, travel, update,
 };
+use buddy_switch_core::modules::growth::{autotasks, queue, tasks};
 use buddy_switch_gateway::{GatewayConfig, GatewayStatusView};
 
 /// WorkBuddy 运行状态缓存：Windows 上检测要跑 tasklist（慢），缓存几秒避免
@@ -129,6 +130,16 @@ fn api_routes() -> Router {
             get(api_schedule_config).post(api_save_schedule_config),
         )
         .route("/api/schedule/run", post(api_run_schedule_task))
+        // —— 成长任务中心（与 Tauri 的 9 个 growth 命令同契约；CN 专有，Global 返回结构化提示）——
+        .route("/api/growth/tasks", get(api_growth_tasks_list))
+        .route("/api/growth/tasks/accept", post(api_growth_tasks_accept))
+        .route("/api/growth/tasks/accept-all", post(api_growth_accept_all))
+        .route("/api/growth/tasks/claim", post(api_growth_task_claim))
+        .route("/api/growth/auto-task", post(api_growth_auto_task))
+        .route("/api/growth/auto-all", post(api_growth_auto_all))
+        .route("/api/growth/scan-all", get(api_growth_tasks_scan_all))
+        .route("/api/growth/run-queue", post(api_growth_run_queue))
+        .route("/api/growth/queue/status", get(api_growth_queue_status))
         .route("/api/rotate/status", get(api_rotate_status))
         .route("/api/rotate/run", post(api_rotate_run))
         .route("/api/rotate/logs", get(api_rotate_logs))
@@ -1092,6 +1103,114 @@ async fn api_run_schedule_task(Json(body): Json<Value>) -> Response {
         Some(task) => json_ok(scheduler::run_scheduled_task(task).await),
         None => json_err(format!("未知定时任务: {task}"), StatusCode::BAD_REQUEST),
     }
+}
+
+// ---------------------------------------------------------------------------
+// 成长任务中心（panel 移植；CN 专有，Global 返回结构化提示）
+// ---------------------------------------------------------------------------
+
+/// 取 region 内 uid 对应的账号；缺失返回 404。
+fn growth_account(region: Region, uid: &str) -> Option<Value> {
+    account::load_accounts_for(region)
+        .into_iter()
+        .find(|acc| acc.get("uid").and_then(Value::as_str) == Some(uid))
+}
+
+async fn api_growth_tasks_list(RawQuery(query): RawQuery) -> Response {
+    let region = parse_region(query_value(query.as_deref(), "region").as_deref());
+    let uid = query_value(query.as_deref(), "uid").unwrap_or_default();
+    let Some(acc) = growth_account(region, &uid) else {
+        return json_err("账号不存在".to_string(), StatusCode::NOT_FOUND);
+    };
+    let io = tasks::RealGrowthIo;
+    let default_tasks = match tasks::list_tasks(&io, region, &acc, false).await {
+        Ok(t) => t,
+        Err(e) => return json_err(e, StatusCode::BAD_GATEWAY),
+    };
+    // mp 口径是默认列表的超集（开学季 / Sequential 族只在 mp 出现）；失败静默。
+    let mut merged = default_tasks.clone();
+    if let Ok(mp) = tasks::list_tasks(&io, region, &acc, true).await {
+        let seen: std::collections::HashSet<&str> =
+            merged.iter().map(|t| t.task_code.as_str()).collect();
+        let fresh: Vec<_> = mp.into_iter().filter(|t| !seen.contains(t.task_code.as_str())).collect();
+        merged.extend(fresh);
+    }
+    json_ok(json!({ "ok": true, "tasks": merged }))
+}
+
+async fn api_growth_tasks_accept(Json(body): Json<Value>) -> Response {
+    let region = parse_region(body.get("region").and_then(Value::as_str));
+    let uid = body.get("uid").and_then(Value::as_str).unwrap_or("");
+    let code = body.get("taskCode").and_then(Value::as_str).unwrap_or("");
+    let Some(acc) = growth_account(region, uid) else {
+        return json_err("账号不存在".to_string(), StatusCode::NOT_FOUND);
+    };
+    match tasks::accept_tasks(&tasks::RealGrowthIo, region, &acc, &[code.to_string()]).await {
+        Ok(()) => json_ok(json!({ "ok": true })),
+        Err(e) => json_err(e, StatusCode::BAD_GATEWAY),
+    }
+}
+
+async fn api_growth_accept_all(Json(body): Json<Value>) -> Response {
+    let region = parse_region(body.get("region").and_then(Value::as_str));
+    let uid = body.get("uid").and_then(Value::as_str).unwrap_or("");
+    let Some(acc) = growth_account(region, uid) else {
+        return json_err("账号不存在".to_string(), StatusCode::NOT_FOUND);
+    };
+    json_ok(tasks::accept_all(&tasks::RealGrowthIo, region, &acc).await)
+}
+
+async fn api_growth_task_claim(Json(body): Json<Value>) -> Response {
+    let region = parse_region(body.get("region").and_then(Value::as_str));
+    let uid = body.get("uid").and_then(Value::as_str).unwrap_or("");
+    let code = body.get("taskCode").and_then(Value::as_str).unwrap_or("");
+    let Some(acc) = growth_account(region, uid) else {
+        return json_err("账号不存在".to_string(), StatusCode::NOT_FOUND);
+    };
+    match tasks::claim_task(&tasks::RealGrowthIo, region, &acc, code).await {
+        Ok(out) => json_ok(out),
+        Err(e) => json_err(e, StatusCode::BAD_GATEWAY),
+    }
+}
+
+async fn api_growth_auto_task(Json(body): Json<Value>) -> Response {
+    let region = parse_region(body.get("region").and_then(Value::as_str));
+    let uid = body.get("uid").and_then(Value::as_str).unwrap_or("");
+    let code = body.get("taskCode").and_then(Value::as_str).unwrap_or("");
+    let Some(acc) = growth_account(region, uid) else {
+        return json_err("账号不存在".to_string(), StatusCode::NOT_FOUND);
+    };
+    match autotasks::run_auto_action(&tasks::RealGrowthIo, region, &acc, code).await {
+        Ok(out) => json_ok(out),
+        Err(e) => json_err(e, StatusCode::BAD_GATEWAY),
+    }
+}
+
+async fn api_growth_auto_all(Json(body): Json<Value>) -> Response {
+    let region = parse_region(body.get("region").and_then(Value::as_str));
+    let uid = body.get("uid").and_then(Value::as_str).unwrap_or("");
+    let Some(acc) = growth_account(region, uid) else {
+        return json_err("账号不存在".to_string(), StatusCode::NOT_FOUND);
+    };
+    match autotasks::run_auto_all(&tasks::RealGrowthIo, region, &acc).await {
+        Ok(out) => json_ok(out),
+        Err(e) => json_err(e, StatusCode::BAD_GATEWAY),
+    }
+}
+
+async fn api_growth_tasks_scan_all(RawQuery(query): RawQuery) -> Response {
+    let region = parse_region(query_value(query.as_deref(), "region").as_deref());
+    json_ok(queue::scan_all(region).await)
+}
+
+async fn api_growth_run_queue(Json(body): Json<Value>) -> Response {
+    let region = parse_region(body.get("region").and_then(Value::as_str));
+    let conc = body.get("concurrency").and_then(Value::as_u64).unwrap_or(1) as u32;
+    json_ok(queue::start_growth_queue(region, conc).await)
+}
+
+async fn api_growth_queue_status() -> Response {
+    json_ok(queue::queue_status().await)
 }
 
 // ---------------------------------------------------------------------------

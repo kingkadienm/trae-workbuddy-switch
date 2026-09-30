@@ -787,6 +787,148 @@ pub async fn run_schedule_task(task: String) -> Result<Value, String> {
 }
 
 // ---------------------------------------------------------------------------
+// 成长任务中心（panel 移植：任务列表 / 接受 / 领奖 / 一键完成 / 全账号队列）
+// ---------------------------------------------------------------------------
+
+/// 取 region 内 uid 对应的账号（按 uid 精确匹配）；缺失返回可读 Err。
+fn account_by_uid(region: Region, uid: &str) -> Result<Value, String> {
+    crate::modules::account::load_accounts_for(region)
+        .into_iter()
+        .find(|acc| acc.get("uid").and_then(Value::as_str) == Some(uid))
+        .ok_or_else(|| format!("找不到账号 uid={uid}"))
+}
+
+/// GET /api/growth/tasks —— 单账号成长任务列表（默认 + 小程序口径合并去重，mp 失败静默）。
+#[tauri::command]
+pub async fn growth_tasks_list(uid: String, region: Option<String>) -> Result<Value, String> {
+    use buddy_switch_core::modules::growth::tasks::{self, RealGrowthIo};
+    let region = parse_region(region.as_deref());
+    let account = account_by_uid(region, &uid)?;
+    let io = RealGrowthIo;
+    let default_tasks = tasks::list_tasks(&io, region, &account, false)
+        .await
+        .map_err(|e| format!("任务列表获取失败: {e}"))?;
+    // mp 口径是默认列表的超集（开学季 / Sequential 族只在 mp 出现）；失败静默。
+    let mut merged = default_tasks.clone();
+    if let Ok(mp_tasks) = tasks::list_tasks(&io, region, &account, true).await {
+        let seen: std::collections::HashSet<&str> =
+            merged.iter().map(|t| t.task_code.as_str()).collect();
+        let fresh: Vec<_> = mp_tasks
+            .into_iter()
+            .filter(|t| !seen.contains(t.task_code.as_str()))
+            .collect();
+        merged.extend(fresh);
+    }
+    Ok(json!({"ok": true, "tasks": merged}))
+}
+
+/// POST /api/growth/tasks/accept —— 接受单个任务。
+#[tauri::command]
+pub async fn growth_tasks_accept(
+    uid: String,
+    task_code: String,
+    region: Option<String>,
+) -> Result<Value, String> {
+    let region = parse_region(region.as_deref());
+    let account = account_by_uid(region, &uid)?;
+    buddy_switch_core::modules::growth::tasks::accept_tasks(
+        &buddy_switch_core::modules::growth::tasks::RealGrowthIo,
+        region,
+        &account,
+        &[task_code],
+    )
+    .await
+    .map(|()| json!({"ok": true}))
+    .map_err(|e| e.to_string())
+}
+
+/// POST /api/growth/tasks/accept-all —— 一键接受全部（默认 + mp 两轮）。
+#[tauri::command]
+pub async fn growth_accept_all(uid: String, region: Option<String>) -> Result<Value, String> {
+    let region = parse_region(region.as_deref());
+    let account = account_by_uid(region, &uid)?;
+    Ok(buddy_switch_core::modules::growth::tasks::accept_all(
+        &buddy_switch_core::modules::growth::tasks::RealGrowthIo,
+        region,
+        &account,
+    )
+    .await)
+}
+
+/// POST /api/growth/tasks/claim —— 领取达标任务奖励。
+#[tauri::command]
+pub async fn growth_task_claim(
+    uid: String,
+    task_code: String,
+    region: Option<String>,
+) -> Result<Value, String> {
+    let region = parse_region(region.as_deref());
+    let account = account_by_uid(region, &uid)?;
+    buddy_switch_core::modules::growth::tasks::claim_task(
+        &buddy_switch_core::modules::growth::tasks::RealGrowthIo,
+        region,
+        &account,
+        &task_code,
+    )
+    .await
+}
+
+/// POST /api/growth/auto-task —— 执行单个自动动作（前置读 → 执行 → 回读 → 达标领奖）。
+#[tauri::command]
+pub async fn growth_auto_task(
+    uid: String,
+    task_code: String,
+    region: Option<String>,
+) -> Result<Value, String> {
+    let region = parse_region(region.as_deref());
+    let account = account_by_uid(region, &uid)?;
+    buddy_switch_core::modules::growth::autotasks::run_auto_action(
+        &buddy_switch_core::modules::growth::tasks::RealGrowthIo,
+        region,
+        &account,
+        &task_code,
+    )
+    .await
+}
+
+/// POST /api/growth/auto-all —— 一键完成全部可自动任务。
+#[tauri::command]
+pub async fn growth_auto_all(uid: String, region: Option<String>) -> Result<Value, String> {
+    let region = parse_region(region.as_deref());
+    let account = account_by_uid(region, &uid)?;
+    buddy_switch_core::modules::growth::autotasks::run_auto_all(
+        &buddy_switch_core::modules::growth::tasks::RealGrowthIo,
+        region,
+        &account,
+    )
+    .await
+}
+
+/// POST /api/growth/scan-all —— 全账号扫描成长任务待办（只读）。
+#[tauri::command]
+pub async fn growth_tasks_scan_all(region: Option<String>) -> Value {
+    let region = parse_region(region.as_deref());
+    buddy_switch_core::modules::growth::queue::scan_all(region).await
+}
+
+/// POST /api/growth/run-queue —— 启动全账号执行队列（先扫描，再并发跑全部待办）。
+#[tauri::command]
+pub async fn growth_run_queue(
+    region: Option<String>,
+    concurrency: Option<u32>,
+) -> Value {
+    let region = parse_region(region.as_deref());
+    buddy_switch_core::modules::growth::queue::start_growth_queue(region, concurrency.unwrap_or(1))
+        .await
+}
+
+/// GET /api/growth/queue/status —— 队列状态快照（前端 3s 轮询）。
+#[tauri::command]
+pub async fn growth_queue_status() -> Value {
+    buddy_switch_core::modules::growth::queue::queue_status().await
+}
+
+// ---------------------------------------------------------------------------
 // 自动轮换（CodeBuddy CLI）
 // ---------------------------------------------------------------------------
 

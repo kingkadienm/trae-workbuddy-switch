@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 use super::{
-    activity, cat, checkin, config, refresh,
+    activity, cat, checkin, config, growth, refresh,
     region::Region,
     schedule::{self, ScheduleConfig, ScheduleTask},
     school, travel,
@@ -109,6 +109,11 @@ pub async fn run_scheduled_task(task: ScheduleTask) -> Value {
         }
         ScheduleTask::Cat => {
             json!({ "task": task.as_str(), "result": cat::run_cat_cycle_for(Region::Cn).await })
+        }
+        // 成长任务队列（CN 专有）：与「执行全部待办」按钮同管线（串行并发 1）。
+        // 默认 01:00 触发，让 Sequential 族每日零点解锁一环后自动推进。
+        ScheduleTask::Growth => {
+            json!({ "task": task.as_str(), "result": growth::queue::run_growth_queue_once(Region::Cn).await })
         }
         // Trae 的账号体系与 WorkBuddy **没有 region 交集**（`Region` 只有 CN/Global，
         // 而 Trae 的区域是它自己那本账号库的轴），因此这里不套 `Region::all()` 循环：

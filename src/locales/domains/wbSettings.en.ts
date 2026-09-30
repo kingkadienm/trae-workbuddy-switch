@@ -135,6 +135,8 @@ export const en = {
   "wbSettings.schedule.task.school.desc": "Back-to-school event tasks",
   "wbSettings.schedule.task.cat.label": "Night owl",
   "wbSettings.schedule.task.cat.desc": "Night owl (cat claim) task",
+  "wbSettings.schedule.task.growth.label": "Growth tasks",
+  "wbSettings.schedule.task.growth.desc": "All-account growth task queue (CN only; default daily at 01:00)",
   "wbSettings.schedule.enableAria": "Enable {label}",
   "wbSettings.schedule.runNowBtn": "Run now",
   "wbSettings.schedule.activityCountLabel": "Activity report count",

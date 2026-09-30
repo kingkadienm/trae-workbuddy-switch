@@ -1,4 +1,4 @@
-import { ArrowRight, Check, CircleCheck, Clock3, Coins, Ellipsis, Loader2, Pencil, PlaneTakeoff, QrCode, RefreshCw, Sparkles, Star, StickyNote, Trash2 } from "lucide-react";
+import { ArrowRight, Check, CircleCheck, Clock3, Coins, Ellipsis, Gift, Loader2, Pencil, PlaneTakeoff, QrCode, RefreshCw, Sparkles, Star, StickyNote, Trash2 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
@@ -217,6 +217,12 @@ interface Props {
    *（弹窗由页面持有），所以走回调。
    */
   onAddPlaintextAccount?: () => void;
+  /**
+   * 打开该账号的「成长任务」弹窗（CN 专有；不传 = 该区域没有入口）。
+   *
+   * 弹窗由页面持有（`GrowthTasksDialog` 需要刷新账号列表），卡片只回调。
+   */
+  onGrowthTasks?: (a: AccountMeta) => void;
   featuresDisabled?: boolean;
   /** 紧凑模式：头部缩成一条、按钮图标化、无 footer */
   compact?: boolean;
@@ -252,7 +258,7 @@ function ProductCurrentState({ product, compact = false }: { product: "workbuddy
   );
 }
 
-export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch, onSaveRemark, todayCheckedIn, travelStatus, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, onAddPlaintextAccount, featuresDisabled = true, compact = false }: Props) {
+export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch, onSaveRemark, todayCheckedIn, travelStatus, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, onAddPlaintextAccount, onGrowthTasks, featuresDisabled = true, compact = false }: Props) {
   const t = useT();
   const [resourcesOpen, setResourcesOpen] = useState(false);
   const [remarkEditing, setRemarkEditing] = useState(false);
@@ -439,6 +445,11 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
                 >
                   <StickyNote />{t("wbAccounts.card.editRemark")}
                 </DropdownMenuItem>
+                {onGrowthTasks && (
+                  <DropdownMenuItem disabled={featuresDisabled} onSelect={() => onGrowthTasks(account)}>
+                    <Gift />{t("wbAccounts.card.growthTasks")}
+                  </DropdownMenuItem>
+                )}
                 <DropdownMenuSeparator />
                 <DropdownMenuItem className="text-destructive focus:bg-destructive/5 focus:text-destructive" onSelect={() => onDelete(account)}>
                   <Trash2 />{t("wbAccounts.card.deleteAccount")}

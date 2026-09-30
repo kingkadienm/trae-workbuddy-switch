@@ -142,6 +142,8 @@ export const zh = {
   "wbSettings.schedule.task.school.desc": "开学季任务",
   "wbSettings.schedule.task.cat.label": "夜猫子",
   "wbSettings.schedule.task.cat.desc": "夜猫子（猫猫领取）任务",
+  "wbSettings.schedule.task.growth.label": "成长任务",
+  "wbSettings.schedule.task.growth.desc": "全账号成长任务队列（仅 CN；默认每天 01:00）",
   "wbSettings.schedule.enableAria": "启用{label}",
   "wbSettings.schedule.runNowBtn": "立即执行",
   "wbSettings.schedule.activityCountLabel": "活跃上报次数",

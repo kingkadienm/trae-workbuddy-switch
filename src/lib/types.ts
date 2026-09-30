@@ -272,6 +272,8 @@ export interface ScheduleConfig {
   school_hours: number[];
   /** 夜猫子（猫猫领取）的小时点。 */
   cat_hours: number[];
+  /** 成长任务队列的小时点（CN 专有；默认 01:00，对齐 panel GrowthHours [1]）。 */
+  growth_hours: number[];
   /** Trae 分区自动签到的小时点（第二条产品线，签的是 Trae 自己的区域账号库）。 */
   trae_checkin_hours: number[];
   /** 自动签到开关（签 WorkBuddy 的账号）。 */
@@ -286,6 +288,8 @@ export interface ScheduleConfig {
   school_enabled: boolean;
   /** 夜猫子任务开关。 */
   cat_enabled: boolean;
+  /** 成长任务队列开关（默认启用，CN 专有；Global 账号在队列内被门控跳过）。 */
+  growth_enabled: boolean;
   /**
    * Trae 自动签到开关（签 Trae 的区域账号库）。
    *
@@ -315,6 +319,79 @@ export interface ScheduleRunResult {
   claimed?: Record<string, unknown>;
   /** 单段结果（开学季 / 夜猫子）。 */
   result?: Record<string, unknown>;
+}
+
+/**
+ * 成长任务（panel 移植）：上游 `/v2/activity/growth/tasks` 的任务行。
+ * 字段名对齐上游 JSON（camelCase），`current` / `target` 为进度计数。
+ */
+export interface GrowthTask {
+  taskCode: string;
+  title?: string;
+  description?: string;
+  taskDesc?: string;
+  credit?: number;
+  energy?: number;
+  hasReward?: boolean;
+  rewardBuddy?: boolean;
+  taskType?: string;
+  current?: number;
+  target?: number;
+  claimed?: boolean;
+  locked?: boolean;
+  /** 进度达标且未领取（后端本地推算）。 */
+  claimable?: boolean;
+  acceptStatus?: string;
+  status?: string;
+  [key: string]: unknown;
+}
+
+/** 一键完成全部可自动任务的逐项结果（`run_auto_all` 的 `results[]` 元素）。 */
+export interface GrowthAutoAllItem {
+  taskCode: string;
+  desc?: string;
+  /** done | skipped | error */
+  status: string;
+  message?: string;
+  /** 达标后已自动领奖。 */
+  claimed?: boolean;
+  credit?: number;
+  energy?: number;
+  progressAfter?: string;
+  claimError?: string;
+  [key: string]: unknown;
+}
+
+/** 全账号扫描结果（`/api/growth/scan-all`）。 */
+export interface GrowthScanResult {
+  ok?: boolean;
+  accounts: Array<{
+    uid: string;
+    nickname?: string;
+    growth?: GrowthTask[];
+    growthError?: string;
+  }>;
+  pendingCount?: number;
+  message?: string;
+}
+
+/** 全账号执行队列状态（`/api/growth/queue/status`，3s 轮询）。 */
+export interface GrowthQueueStatus {
+  running: boolean;
+  total: number;
+  conc: number;
+  started: boolean;
+  startedAt: number;
+  seq: number;
+  items: Array<{
+    uid: string;
+    nickname: string;
+    kind: string;
+    code: string;
+    /** pending | running | done | skipped | error */
+    status: string;
+    message: string;
+  }>;
 }
 
 export interface AutoRotateConfig {
@@ -522,7 +599,7 @@ export interface CreditStatistics {
 
 export interface TokenStatsTotals { total: number; input: number; output: number; cacheRead: number; cacheWrite: number; uncachedInput: number; records: number; cacheHitRate: number | null; }
 export interface TokenStatsGroup extends TokenStatsTotals { key: string; title?: string | null; project?: string; sessionId?: string; }
-export interface TokenStatsSource { source: "workbuddy" | "codebuddy-cli" | "codebuddy-ide" | "workbuddy-ai"; summary: TokenStatsTotals; models: TokenStatsGroup[]; projects: TokenStatsGroup[]; sessions: TokenStatsGroup[]; daily: TokenStatsGroup[]; /** Optional model-specific daily series for trend filtering. */ dailyByModel?: Record<string, TokenStatsGroup[]>; hours: TokenStatsGroup[]; filesScanned: number; parseErrors: number; coverageStartAt?: number | null; coverageEndAt?: number | null; }
+export interface TokenStatsSource { source: "workbuddy" | "codebuddy-cli" | "codebuddy-ide" | "workbuddy-ai" | "workbuddy-gateway"; summary: TokenStatsTotals; models: TokenStatsGroup[]; projects: TokenStatsGroup[]; sessions: TokenStatsGroup[]; daily: TokenStatsGroup[]; /** Optional model-specific daily series for trend filtering. */ dailyByModel?: Record<string, TokenStatsGroup[]>; hours: TokenStatsGroup[]; filesScanned: number; parseErrors: number; coverageStartAt?: number | null; coverageEndAt?: number | null; }
 export interface TokenStatistics { /** 查询范围（后端返回：cn / global / all）；缺省兼容旧后端。 */ region?: RegionFilter; generatedAt: number; rangeDays?: number | null; sources: TokenStatsSource[]; }
 
 export interface CodeBuddyCliStatus {

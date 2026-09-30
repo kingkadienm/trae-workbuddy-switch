@@ -940,7 +940,7 @@ function GatewaySettingsCard() {
 }
 
 // ---------------------------------------------------------------------------
-// 定时任务排程（六类任务：各自独立开关 + 独立小时表）
+// 定时任务排程（七类任务：各自独立开关 + 独立小时表）
 // ---------------------------------------------------------------------------
 
 type ScheduleHoursField =
@@ -949,7 +949,8 @@ type ScheduleHoursField =
   | "activity_hours"
   | "keepalive_hours"
   | "school_hours"
-  | "cat_hours";
+  | "cat_hours"
+  | "growth_hours";
 
 type ScheduleEnabledField =
   | "checkin_enabled"
@@ -957,7 +958,8 @@ type ScheduleEnabledField =
   | "activity_enabled"
   | "keepalive_enabled"
   | "school_enabled"
-  | "cat_enabled";
+  | "cat_enabled"
+  | "growth_enabled";
 
 interface ScheduleTaskDef {
   key: string;
@@ -969,9 +971,9 @@ interface ScheduleTaskDef {
 }
 
 /**
- * WorkBuddy 分区**六类**定时任务的展示定义（顺序与后端 `ScheduleTask::all()` 的前六类一致）。
+ * WorkBuddy 分区**七类**定时任务的展示定义（顺序与后端 `ScheduleTask::all()` 的前七类一致）。
  *
- * ⚠️ 后端 `all()` 还有**第七类** `trae_checkin`（Trae 分区的自动签到），它**刻意不在此表**：
+ * ⚠️ 后端 `all()` 还有**第八类** `trae_checkin`（Trae 分区的自动签到），它**刻意不在此表**：
  * 本页是 WorkBuddy 分区的设置页，把另一条产品线的开关摆进来会让人误以为它属于本产品。
  * Trae 的那份入口在 Trae 设置页，两者读写**同一份** `schedule_config.json`
  * （排程是全局单份，与 region / 产品无关）。
@@ -983,6 +985,7 @@ const SCHEDULE_TASKS: ScheduleTaskDef[] = [
   { key: "keepalive", labelKey: "wbSettings.schedule.task.keepalive.label", descKey: "wbSettings.schedule.task.keepalive.desc", hoursField: "keepalive_hours", enabledField: "keepalive_enabled" },
   { key: "school", labelKey: "wbSettings.schedule.task.school.label", descKey: "wbSettings.schedule.task.school.desc", hoursField: "school_hours", enabledField: "school_enabled" },
   { key: "cat", labelKey: "wbSettings.schedule.task.cat.label", descKey: "wbSettings.schedule.task.cat.desc", hoursField: "cat_hours", enabledField: "cat_enabled" },
+  { key: "growth", labelKey: "wbSettings.schedule.task.growth.label", descKey: "wbSettings.schedule.task.growth.desc", hoursField: "growth_hours", enabledField: "growth_enabled" },
 ];
 
 /**
@@ -1015,7 +1018,7 @@ function summarizeScheduleRun(
     : { key: "wbSettings.schedule.summaryStreak", params: { reported, streak } };
 }
 
-/** 定时任务排程配置：六类任务各自独立开关与小时表 + 活跃上报次数。 */
+/** 定时任务排程配置：七类任务各自独立开关与小时表 + 活跃上报次数。 */
 function ScheduleCard() {
   const t = useT();
   const [cfg, setCfg] = useState<ScheduleConfig | null>(null);

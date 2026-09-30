@@ -21,6 +21,10 @@ import type {
   CreditStatistics,
   TokenStatistics,
   CopyResult,
+  GrowthAutoAllItem,
+  GrowthQueueStatus,
+  GrowthScanResult,
+  GrowthTask,
   MigrateResult,
   GatewayConfig,
   GatewayLogEntry,
@@ -178,6 +182,16 @@ const ROUTES: Record<string, Route> = {
   get_schedule_config: { method: "GET", path: "/api/schedule/config" },
   save_schedule_config: { method: "POST", path: "/api/schedule/config" },
   run_schedule_task: { method: "POST", path: "/api/schedule/run" },
+  // ---- 成长任务中心（对照 /api/growth/* 路由与 9 个 Tauri 命令）----
+  growth_tasks_list: { method: "GET", path: "/api/growth/tasks" },
+  growth_tasks_accept: { method: "POST", path: "/api/growth/tasks/accept" },
+  growth_accept_all: { method: "POST", path: "/api/growth/tasks/accept-all" },
+  growth_task_claim: { method: "POST", path: "/api/growth/tasks/claim" },
+  growth_auto_task: { method: "POST", path: "/api/growth/auto-task" },
+  growth_auto_all: { method: "POST", path: "/api/growth/auto-all" },
+  growth_tasks_scan_all: { method: "GET", path: "/api/growth/scan-all" },
+  growth_run_queue: { method: "POST", path: "/api/growth/run-queue" },
+  growth_queue_status: { method: "GET", path: "/api/growth/queue/status" },
   rotate_status: { method: "GET", path: "/api/rotate/status" },
   run_rotate: { method: "POST", path: "/api/rotate/run" },
   get_rotate_logs: { method: "GET", path: "/api/rotate/logs" },
@@ -868,7 +882,7 @@ export function saveAutoRotateConfig(config: AutoRotateConfig): Promise<AutoRota
 }
 
 // ---------------------------------------------------------------------------
-// 定时任务排程（六类任务，全局单份，无需 region）
+// 定时任务排程（七类任务，全局单份，无需 region）
 // ---------------------------------------------------------------------------
 
 export function getScheduleConfig(): Promise<ScheduleConfig> {
@@ -884,6 +898,79 @@ export function saveScheduleConfig(config: ScheduleConfig): Promise<ScheduleConf
 /** 立即执行某一类定时任务（不等排程到点），用于保存排程后当场自证是否生效。 */
 export function runScheduleTask(task: string): Promise<ScheduleRunResult> {
   return call("run_schedule_task", { task });
+}
+
+// ---------------------------------------------------------------------------
+// 成长任务中心（panel 移植；CN 专有，Global 区域返回结构化提示）
+// ---------------------------------------------------------------------------
+
+/** 单账号成长任务列表（默认 + 小程序口径合并去重，mp 失败静默）。 */
+export function growthTasksList(
+  uid: string,
+  region?: Region,
+): Promise<{ ok: boolean; tasks: GrowthTask[] }> {
+  return call("growth_tasks_list", { uid, region });
+}
+
+/** 接受单个成长任务。 */
+export function growthTasksAccept(
+  uid: string,
+  taskCode: string,
+  region?: Region,
+): Promise<{ ok: boolean }> {
+  return call("growth_tasks_accept", { uid, taskCode, region });
+}
+
+/** 一键接受该账号全部未接受任务（默认 + mp 两轮）。 */
+export function growthAcceptAll(
+  uid: string,
+  region?: Region,
+): Promise<{ accepted: number; failed: string[]; message?: string }> {
+  return call("growth_accept_all", { uid, region });
+}
+
+/** 领取达标任务奖励。 */
+export function growthTaskClaim(
+  uid: string,
+  taskCode: string,
+  region?: Region,
+): Promise<{ credit?: number; energy?: number; alreadyClaimed?: boolean; [key: string]: unknown }> {
+  return call("growth_task_claim", { uid, taskCode, region });
+}
+
+/** 执行单个自动动作（前置读 → 执行 → 回读 → 达标自动领奖）。 */
+export function growthAutoTask(
+  uid: string,
+  taskCode: string,
+  region?: Region,
+): Promise<Record<string, unknown>> {
+  return call("growth_auto_task", { uid, taskCode, region });
+}
+
+/** 一键完成该账号全部可自动任务。 */
+export function growthAutoAll(
+  uid: string,
+  region?: Region,
+): Promise<{ ok: boolean; results: GrowthAutoAllItem[] }> {
+  return call("growth_auto_all", { uid, region });
+}
+
+/** 全账号扫描成长任务待办（只读，并发拉取）。 */
+export function growthTasksScanAll(region?: Region): Promise<GrowthScanResult> {
+  return call("growth_tasks_scan_all", { region });
+}
+
+/** 启动全账号执行队列（先扫描，再账号间并发、账号内串行跑全部待办）。 */
+export function growthRunQueue(
+  region?: Region,
+  concurrency?: number,
+): Promise<{ ok: boolean; started: boolean; total?: number; seq?: number; message?: string }> {
+  return call("growth_run_queue", { region, concurrency });
+}
+
+/** 队列状态快照（前端 3s 轮询；`seq` 变化 = 新一轮启动）。 */
+export function growthQueueStatus(): Promise<GrowthQueueStatus> {
+  return call("growth_queue_status");
 }
 
 export function getRotateStatus(): Promise<RotateStatus> {

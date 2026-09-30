@@ -14,6 +14,7 @@ pub mod credits;
 pub mod cst;
 pub mod error_code;
 pub mod export_import;
+pub mod growth;
 pub mod identity;
 pub mod memory;
 pub mod migrate;
