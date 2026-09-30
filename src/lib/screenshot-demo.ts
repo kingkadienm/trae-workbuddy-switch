@@ -1286,6 +1286,7 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
       keepalive_hours: [22],
       school_hours: [12],
       cat_hours: [1],
+      growth_hours: [1],
       trae_checkin_hours: [9, 21],
       checkin_enabled: true,
       travel_enabled: true,
@@ -1293,6 +1294,7 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
       keepalive_enabled: true,
       school_enabled: true,
       cat_enabled: true,
+      growth_enabled: true,
       // 与后端默认值一致（Trae 自动签到默认关闭）——演示数据也必须如实，
       // 否则截图会误导成「装上就是开着的」。
       trae_checkin_enabled: false,
@@ -1302,7 +1304,7 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "rotate_status": return rotateStatus;
     case "get_rotate_logs": return { logs: rotateLogs() };
     case "get_github_config": return githubConfig;
-    case "check_update": return { ok: true, current: "2026.9.16", latest: "2026.9.17", latestTag: "v2026.9.17", hasUpdate: true, releaseName: t("shared.demo.updateTitle"), releaseUrl: "https://github.com/NextAgentX/trae-workbuddy-switch/releases/tag/v2026.9.17" };
+    case "check_update": return { ok: true, current: "2026.9.16", latest: "2026.9.17", latestTag: "v2026.9.17", hasUpdate: true, releaseName: t("shared.demo.updateTitle"), releaseUrl: "https://github.com/kingkadienm/trae-workbuddy-switch/releases/tag/v2026.9.17" };
     case "get_launch_at_login_enabled": return true;
     case "switch_progress": return { running: false, progress: null };
     case "get_gateway_config": return demoGatewayConfig();

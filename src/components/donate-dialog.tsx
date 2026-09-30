@@ -15,8 +15,8 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import { GITHUB_REPOSITORY_URL, openReleaseUrl } from "@/lib/update";
-import donateAlipay from "@/assets/donate-alipay.jpg";
-import donateWechat from "@/assets/donate-wechat.png";
+import donateAlipay from "@/assets/donate-alipay.jpeg";
+import donateWechat from "@/assets/donate-wechat.jpeg";
 
 /**
  * 打赏渠道。收款码随前端产物一起打包（`src/assets/`，由 Vite 处理 base 路径），

@@ -475,6 +475,19 @@ export default function TraeAccountsPage() {
    * 跳过策略由 `settings.checkinSkipChecked` 决定（后端读，不在这里传）。
    */
   async function checkinAll() {
+    // 国际版没有签到体系（checkin_credits 是 CN 端点；免费档是请求次数/用量制，
+    // 无签到积分）。整颗按钮退化为「只刷新剩余权益」，避免点一次刷一次 CN 空端点。
+    if (variant === "global") {
+      await run(
+        "refresh-credits",
+        "trae.page.accounts.actionRefreshCredits",
+        async () => {
+          await api.traeRefreshCredits(undefined, variant);
+          return { total: 0 };
+        },
+      );
+      return;
+    }
     await run(
       "checkin",
       "trae.page.accounts.actionCheckinAll",
@@ -942,6 +955,14 @@ export default function TraeAccountsPage() {
               </div>
               <TooltipProvider delayDuration={400}>
                 <div className="ml-auto flex items-center gap-1">
+                  {variant === "global" ? (
+                    /* 国际版没有签到体系：两枚签到开关没有可作用的对象（定时签到对
+                       Global 区域也一律短路），换成一句说明文案占住同一槽位。 */
+                    <span className="mr-1 text-xs text-muted-foreground">
+                      {t("trae.page.accounts.noCheckinInGlobal")}
+                    </span>
+                  ) : (
+                  <>
                   {/* 自动签到：与 WorkBuddy 工具栏的**同名开关同位同义** —— 都写排程任务
                       （何时签）。Trae 是**独立任务**（`trae_checkin`），关掉另一方不受影响。
                       小时点在 Trae 设置页配（这里只放开/关）。 */}
@@ -995,6 +1016,8 @@ export default function TraeAccountsPage() {
                       />
                     )}
                   </div>
+                  </>
+                  )}
                   <Separator orientation="vertical" className="mx-2 h-5" />
                   <Tooltip>
                     <TooltipTrigger asChild>
@@ -1024,7 +1047,11 @@ export default function TraeAccountsPage() {
                             className="size-9 rounded-lg"
                             disabled={busy === "checkin" || busy === "refresh-credits" || accounts.length === 0}
                             onClick={() => void checkinAll()}
-                            aria-label={t("trae.page.accounts.checkinRefreshAll")}
+                            aria-label={
+                              variant === "global"
+                                ? t("trae.page.accounts.refreshCreditsOnly")
+                                : t("trae.page.accounts.checkinRefreshAll")
+                            }
                           >
                             <RefreshCw className={busy === "checkin" || busy === "refresh-credits" ? "animate-spin" : undefined} />
                           </Button>
@@ -1032,7 +1059,7 @@ export default function TraeAccountsPage() {
                       </span>
                     </TooltipTrigger>
                     <TooltipContent side="top">
-                      {api.isDemoMode() ? t("trae.page.accounts.demoDisabled") : t("trae.page.accounts.checkinRefreshAll")}
+                      {api.isDemoMode() ? t("trae.page.accounts.demoDisabled") : variant === "global" ? t("trae.page.accounts.refreshCreditsOnly") : t("trae.page.accounts.checkinRefreshAll")}
                     </TooltipContent>
                   </Tooltip>
                 </div>
@@ -1061,6 +1088,7 @@ export default function TraeAccountsPage() {
                     busy={busy}
                     switchBusy={switchBusy}
                     featuresDisabled={api.isDemoMode()}
+                    region={variant}
                     /* 「把这个账号挂到哪条 Trae 线上」——对应 WorkBuddy 卡片上的
                        WorkBuddy / CodeBuddy IDE / CodeBuddy CLI 三枚按钮。
                        `variant` 取按钮自己那条线（不是当前页面那条）：用户就是要
