@@ -162,10 +162,6 @@ struct LoginSession {
     /// 注意必须用 `notify_one()` 而非 `notify_waiters()`——后者只唤醒**当前**正在
     /// 等待的任务，若取消发生在任务开始 await 之前，信号会被丢掉。
     cancel: Arc<Notify>,
-    /// 发起登录时是否用了合成（网页模式）设备身份。网页模式**不承诺** PKCE
-    /// （`BuildLoginURL` 口径，无 `code_challenge`），回调可能只有
-    /// refreshToken / userJwt，须走 [`CallbackInfo::user_jwt_fallback`]。
-    web_device: bool,
 }
 
 static LOGIN_SESSIONS: OnceLock<Mutex<HashMap<String, LoginSession>>> = OnceLock::new();
@@ -181,7 +177,6 @@ struct SessionView {
     variant: TraeVariant,
     trace_id: String,
     pkce_verifier: String,
-    web_device: bool,
 }
 
 impl Default for SessionView {
@@ -191,7 +186,6 @@ impl Default for SessionView {
             variant: TraeVariant::default(),
             trace_id: String::new(),
             pkce_verifier: String::new(),
-            web_device: false,
         }
     }
 }
@@ -207,7 +201,6 @@ fn session_view(login_id: &str) -> SessionView {
             variant: session.variant,
             trace_id: session.trace_id.clone(),
             pkce_verifier: session.pkce_verifier.clone(),
-            web_device: session.web_device,
         })
         .unwrap_or_default()
 }
@@ -1342,7 +1335,6 @@ pub async fn login_start_for(variant: TraeVariant) -> Result<Value, String> {
                 variant,
                 trace_id: trace_id.clone(),
                 pkce_verifier,
-                web_device: web_mode,
                 cancel: cancel.clone(),
                 ..Default::default()
             },

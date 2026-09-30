@@ -142,14 +142,36 @@ pub fn endpoints_for(variant: variant::TraeVariant) -> &'static variant::Endpoin
     &variant::variant_spec(variant).cn_endpoints
 }
 
+/// 按变体**所属区域**取端点集（[`endpoints_for`] 的区域感知版）。
+///
+/// CN 变体查 CN 表；国际变体查国际表（国际变体没有「另一套」槽，
+/// `cn_endpoints` 槽里放的就是国际端点，`global_endpoints` 恒为 `None`，
+/// 两个入口对国际变体返回同一个值）。
+///
+/// 凡是「拿某变体直接向上游发请求」的路径都应走本函数而不是 [`endpoints_for`]——
+/// 后者只认 CN 表，国际变体拼出来的 URL 会打到 `api.trae.com.cn` 去 404。
+pub fn endpoints_for_region(variant: variant::TraeVariant) -> &'static variant::EndpointSet {
+    let spec = variant::variant_spec(variant);
+    match (variant.region(), &spec.global_endpoints) {
+        (region::TraeRegion::Global, Some(endpoints)) => endpoints,
+        _ => &spec.cn_endpoints,
+    }
+}
+
 /// 签到接口路径。
 pub const TRAE_CHECKIN_PATH: &str = "/trae/api/v2/ug/checkin_credits/claim";
 
 /// 签到状态预检接口路径。
 pub const TRAE_CHECKIN_STATUS_PATH: &str = "/trae/api/v2/ug/checkin_credits/status";
 
-/// 剩余积分查询接口路径。
+/// 剩余积分查询接口路径（CN 端点，`grow-normal` / `api.trae.cn` 域）。
 pub const TRAE_ENTITLEMENT_PATH: &str = "/trae/api/v2/pay/ide_user_ent_usage";
+
+/// 剩余权益查询接口路径（**国际版实测值**，2026-09-30 浏览器抓包：
+/// 国际网页端剩余额度走 `/trae/api/v1/pay/user_current_entitlement_list`，
+/// 域名 `ug-normal.trae.ai`；免费档没有签到积分，额度是请求次数/用量制，
+/// CN 的 `credits_limit` 口径在国际版响应里缺失）。
+pub const TRAE_ENTITLEMENT_PATH_GLOBAL: &str = "/trae/api/v1/pay/user_current_entitlement_list";
 
 /// 令牌交换（ExchangeToken）接口路径 —— **主路径**（抓包固化 2026-09-16）。
 ///

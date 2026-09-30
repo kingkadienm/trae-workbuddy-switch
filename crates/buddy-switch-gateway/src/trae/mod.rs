@@ -61,10 +61,9 @@ use pool::{TraePool, TraePoolSummary};
 /// **不是同一个主机**：对话走 mchost.guru 的 agent 网关。两者不可互换。
 ///
 /// 取值与 [`buddy_switch_core::modules::trae::variant`] 的 CN 端点表逐字一致
-/// （实测两条 CN 产品线都是这个主机）；该表另登记了国际化的
-/// `https://core-normal.trae.ai`，**但从未对真实上游跑通过**。
-/// 想按变体/地区切换出站时，请改 [`TraeGatewayConfig::upstream`] 的取值来源，
-/// 不要在调用点写分支 —— 该字段本来就是为"可重定向出站"设计的（e2e 测试也靠它）。
+/// （实测两条 CN 产品线都是这个主机）；国际池改由 `routes::attempt_once`
+/// 按区域取端点表的 `agent_host`（`https://core-normal.trae.ai`，2026-09-30），
+/// 本常量只作 CN 默认值与「测试 override 未改」的判据。
 pub const TRAE_AGENT_HOST: &str = "https://trae-api-cn.mchost.guru";
 
 /// SOLO 对话接口路径（消耗 IDE 积分，product_id 208）。
@@ -221,7 +220,10 @@ pub struct TraeGatewayState {
     ///
     /// 做成字段而不是直接引用常量，是为了让集成测试能把出站打到**本地 mock 上游**：
     /// 真实 Trae 需要有效 JWT，而鉴权、换号、SSE 转换这三块逻辑恰恰最需要端到端验证。
-    /// 生产代码从不改写它，因此对外行为与写死常量完全一致。
+    ///
+    /// 2026-09-30 起生产路径**按池区域取端点**（CN → 本常量值、国际 → 国际表
+    /// `agent_host`，见 `routes::attempt_once`）：本字段仅在「被显式改离默认值」时
+    /// 对全部变体生效（测试 override），未改时等价于按区域分家的行为。
     pub upstream: String,
 }
 

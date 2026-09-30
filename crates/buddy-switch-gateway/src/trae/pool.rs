@@ -25,6 +25,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use buddy_switch_core::modules::trae::region::TraeRegion;
 use buddy_switch_core::modules::trae::variant::TraeVariant;
 use buddy_switch_core::modules::trae::{account, credits, device};
 
@@ -134,6 +135,12 @@ pub struct TraePoolEntry {
     pub disabled: bool,
     pub cooldown_until: i64,
     pub cooldown_reason: String,
+    /// 该条目归属的产品线变体（`sync_for` 时写入，与池的变体同源）。
+    ///
+    /// 可用性判定需要**区域**维度（国际版免费档零积分是正常态，见
+    /// [`Self::rejection`]），因此条目必须记住自己来自哪条线——`rejection`
+    /// 是条目方法，拿不到池的变体。
+    pub variant: TraeVariant,
 }
 
 impl TraePoolEntry {
@@ -154,7 +161,18 @@ impl TraePoolEntry {
         self.credits.map(|value| value <= 0.0).unwrap_or(false)
     }
 
+    /// 该账号所属区域（由池在 `sync_for` 时写入；`Default` 构造的池是国内区域）。
+    fn region(&self) -> TraeRegion {
+        self.variant.region()
+    }
+
     /// 不可路由的原因；`None` 表示可用。
+    ///
+    /// **国际版免费档例外**（2026-09-30）：Global 没有签到/积分体系，免费计划的
+    /// `credits_limit` 本就为 0（额度形态是 $1 基础用量 + 5000 次自动补全，见
+    /// `variant.rs` 端点表注释）——积分恒 0 是**正常态**而非「没额度」，因此国际版
+    /// 账号不因「零积分」被排除，可用性完全交给冷却/会话失效（上游 401/1005/429
+    /// 仍会经 [`Self::apply_error`] 冷却兜底）。国内版维持原判定。
     pub fn rejection(&self, now: i64) -> Option<&'static str> {
         if self.disabled {
             Some("会话失效（需重新登录）")
@@ -162,10 +180,25 @@ impl TraePoolEntry {
             Some("冷却中")
         } else if self.credits_expired(now) {
             Some("积分已过期")
-        } else if self.no_credits() {
+        } else if self.no_credits() && self.region() != TraeRegion::Global {
             Some("零积分")
         } else {
             None
+        }
+    }
+
+    /// 明细视图里的状态字串：国际版免费档零积分显示「免费额度」而非 `no_credits`。
+    fn credits_status(&self, now: i64) -> &str {
+        if self.credits_expired(now) {
+            "expired"
+        } else if self.no_credits() {
+            if self.region() == TraeRegion::Global {
+                "free_plan"
+            } else {
+                "no_credits"
+            }
+        } else {
+            "available"
         }
     }
 }
@@ -268,6 +301,7 @@ impl TraePool {
                         .unwrap_or(false),
                     cooldown_until: cooldown.map(|entry| entry.until).unwrap_or(0),
                     cooldown_reason: cooldown.map(|entry| entry.reason.clone()).unwrap_or_default(),
+                    variant,
                     uid,
                 }
             })
@@ -388,7 +422,7 @@ impl TraePool {
                 summary.cooling += 1;
             } else if entry.credits_expired(now) {
                 summary.expired += 1;
-            } else if entry.no_credits() {
+            } else if entry.no_credits() && entry.variant.region() != TraeRegion::Global {
                 summary.zero_credits += 1;
             } else {
                 summary.available += 1;
@@ -408,12 +442,8 @@ impl TraePool {
                     "disabled"
                 } else if entry.cooldown_until > now {
                     "cooling"
-                } else if entry.credits_expired(now) {
-                    "expired"
-                } else if entry.no_credits() {
-                    "no_credits"
                 } else {
-                    "available"
+                    entry.credits_status(now)
                 };
                 json!({
                     "uid": entry.uid,
@@ -502,7 +532,14 @@ mod tests {
             disabled: false,
             cooldown_until: 0,
             cooldown_reason: String::new(),
+            variant: TraeVariant::default(),
         }
+    }
+
+    fn entry_for(uid: &str, variant: TraeVariant, credits: Option<f64>) -> TraePoolEntry {
+        let mut item = entry(uid, credits, None);
+        item.variant = variant;
+        item
     }
 
     fn pool_with(entries: Vec<TraePoolEntry>) -> TraePool {
@@ -574,6 +611,48 @@ mod tests {
 
         item.disabled = true;
         assert_eq!(item.rejection(now), Some("会话失效（需重新登录）"));
+    }
+
+    #[test]
+    fn global_zero_credits_is_not_a_rejection_but_cn_stays() {
+        let now = 1_000_000;
+        // 国际版免费档：credits_limit=0（$1 基础用量 + 5000 次自动补全），零积分是正常态，
+        // 不得被「零积分」排除——否则国际版 Free 账号永远进不了池。
+        let global = entry_for("g", TraeVariant::Global, Some(0.0));
+        assert!(global.rejection(now).is_none(), "Global 零积分不应不可路由");
+        assert_eq!(global.credits_status(now), "free_plan");
+
+        // 同形状国内账号：零积分依旧不可路由。
+        let cn = entry_for("c", TraeVariant::default(), Some(0.0));
+        assert_eq!(cn.rejection(now), Some("零积分"));
+
+        // Global 账号冷却/会话失效判定与国内一致（区域只豁免「零积分」，不豁免治理）。
+        let mut cooling = entry_for("gc", TraeVariant::Global, Some(0.0));
+        cooling.cooldown_until = now + 60;
+        assert_eq!(cooling.rejection(now), Some("冷却中"));
+        cooling.cooldown_until = 0;
+        cooling.disabled = true;
+        assert_eq!(cooling.rejection(now), Some("会话失效（需重新登录）"));
+    }
+
+    #[test]
+    fn global_pool_picks_zero_credit_free_plan_account() {
+        let now = 1_000_000;
+        let only = entry_for("g", TraeVariant::Global, Some(0.0));
+        let mut pool = TraePool::for_variant(TraeVariant::Global);
+        pool.entries = vec![only];
+
+        let picked = pool.pick(now, &HashSet::new()).expect("Global 免费档应可选");
+        assert_eq!(picked.uid, "g");
+
+        let summary = pool.summary(now);
+        assert_eq!(summary.available, 1, "免费档零积分计入可用，而非 zero_credits");
+        assert_eq!(summary.zero_credits, 0);
+
+        // 明细视图：免费档显示 free_plan，诊断文案不得再报「零积分」。
+        let status = pool.status_list(now);
+        assert_eq!(status[0]["status"], "free_plan");
+        assert_eq!(pool.diagnose(now), vec!["g(g:可用,积分=0)".to_string()]);
     }
 
     #[test]

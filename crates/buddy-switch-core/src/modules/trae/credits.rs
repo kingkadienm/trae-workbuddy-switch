@@ -21,7 +21,8 @@ use crate::modules::trae::device::DeviceEntry;
 use crate::modules::trae::jwt;
 use crate::modules::trae::paths;
 use crate::modules::trae::store;
-use crate::modules::trae::{TRAE_APP_VERSION, TRAE_ENTITLEMENT_PATH};
+use crate::modules::trae::{TRAE_APP_VERSION, TRAE_ENTITLEMENT_PATH, TRAE_ENTITLEMENT_PATH_GLOBAL};
+use crate::modules::trae::region::TraeRegion;
 use crate::modules::trae::variant::TraeVariant;
 
 // ---------------------------------------------------------------------------
@@ -753,8 +754,23 @@ fn round2(value: f64) -> f64 {
 pub async fn calc_remaining_credits(
     jwt_value: &str,
 ) -> Result<(f64, Option<i64>, f64, Vec<CreditPackage>), String> {
-    let device = device_for_jwt(jwt_value)?;
-    let (_status, body) = post_json_parsed(TRAE_ENTITLEMENT_PATH, jwt_value, &device).await?;
+    calc_remaining_credits_for(TraeVariant::default(), jwt_value).await
+}
+
+/// 按**变体**查询剩余积分：CN 走 [`TRAE_ENTITLEMENT_PATH`]（`credits_limit` 口径），
+/// 国际版走 [`TRAE_ENTITLEMENT_PATH_GLOBAL`]（免费档无签到积分，`credits_limit` 缺失时
+/// 返回 0 并原样保留逐包明细，供 UI 展示「Free plan」额度形态）。
+pub async fn calc_remaining_credits_for(
+    variant: TraeVariant,
+    jwt_value: &str,
+) -> Result<(f64, Option<i64>, f64, Vec<CreditPackage>), String> {
+    let device = device_for_jwt_for(variant, jwt_value)?;
+    let path = if variant.region() == TraeRegion::Global {
+        TRAE_ENTITLEMENT_PATH_GLOBAL
+    } else {
+        TRAE_ENTITLEMENT_PATH
+    };
+    let (_status, body) = post_json_parsed_for(variant, path, jwt_value, &device).await?;
 
     let packs = body
         .get("user_entitlement_pack_list")
@@ -856,7 +872,7 @@ pub async fn refresh_remaining_for_variant(
 ) -> Result<f64, String> {
     let account =
         crate::modules::trae::account::find_for(variant, user_id).ok_or("账号不存在")?;
-    let (credits, expire_at, _purchased, packages) = calc_remaining_credits(&account.jwt).await?;
+    let (credits, expire_at, _purchased, packages) = calc_remaining_credits_for(variant, &account.jwt).await?;
     let mut remaining = load_remaining_for(variant);
     remaining.credits.insert(user_id.to_string(), credits);
     if let Some(expire_at) = expire_at {
@@ -887,7 +903,7 @@ pub async fn refresh_all_remaining_for(variant: TraeVariant) -> usize {
     let mut purchased_today = 0.0_f64;
 
     for (uid, account) in &accounts {
-        match calc_remaining_credits(&account.jwt).await {
+        match calc_remaining_credits_for(variant, &account.jwt).await {
             Ok((credits, expire_at, purchased, packages)) => {
                 remaining.credits.insert(uid.clone(), credits);
                 if let Some(expire_at) = expire_at {

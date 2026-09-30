@@ -40,7 +40,7 @@ use super::payload;
 use super::pool::{classify_http, classify_solo, PickedTraeAccount, TraeErrKind, TraePool};
 use super::sse::{self, TokenUsage};
 use super::{
-    now_secs, TraeGatewayState, TRAE_APP_ID, TRAE_IDE_VERSION,
+    now_secs, TraeGatewayState, TRAE_AGENT_HOST, TRAE_APP_ID, TRAE_IDE_VERSION,
     TRAE_IDE_VERSION_CODE, TRAE_LLM_CHAT_PATH,
 };
 
@@ -405,6 +405,19 @@ async fn attempt_once(
     }?;
     tried.insert(picked.uid.clone());
 
+    // **出站主机随池的区域走**（2026-09-30）：CN 池 → CN agent 网关（`TRAE_AGENT_HOST`
+    // 常量值），国际池 → 国际端点表的 `agent_host`（`core-normal.trae.ai`）。
+    // 国际版 JWT 打 CN 上游必然 401，还会被误记成 `SessionDead` 永久禁用该账号。
+    // **测试 override 入口**：`state.upstream` 被显式改离 CN 默认值时，对全部变体生效
+    // （e2e 把出站打到本地 mock）；未改时按区域取端点。
+    let upstream = if state.upstream == TRAE_AGENT_HOST {
+        buddy_switch_core::modules::trae::endpoints_for_region(variant)
+            .agent_host
+            .to_string()
+    } else {
+        state.upstream.clone()
+    };
+
     let converted = payload::prepare_llm_chat_body(
         body,
         default_model,
@@ -413,7 +426,7 @@ async fn attempt_once(
         &picked.machine_id,
     );
 
-    match send_llm_chat(state, &picked, &converted).await {
+    match send_llm_chat(&upstream, state, &picked, &converted).await {
         Ok(response) => Some(AttemptResult::Ok {
             account: picked,
             response,
@@ -456,12 +469,15 @@ async fn attempt_once(
 /// 头部逐字对齐参考实现（`x-ide-token` 用裸 JWT，**不带** `Cloud-IDE-JWT ` 前缀，
 /// 前缀只在 `Authorization` 场景使用）。`accept-encoding` 显式写 `identity`：
 /// 本 crate 的 reqwest 未开 gzip/br/zstd 特性，若上游压缩返回，读出来就是乱码。
+///
+/// `upstream` 由 [`attempt_once`] 按池区域选定（或测试 override）传入，见该函数说明。
 async fn send_llm_chat(
+    upstream: &str,
     state: &TraeGatewayState,
     account: &PickedTraeAccount,
     body: &[u8],
 ) -> Result<reqwest::Response, (u16, String)> {
-    let url = format!("{}{TRAE_LLM_CHAT_PATH}", state.upstream);
+    let url = format!("{upstream}{TRAE_LLM_CHAT_PATH}");
     let trace_id = trace_id();
 
     let response = state

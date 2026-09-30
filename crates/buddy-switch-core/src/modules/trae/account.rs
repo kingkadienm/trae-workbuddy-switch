@@ -923,6 +923,8 @@ impl RefreshExchangeError {
 /// 一个刷新变体（**纯数据**，便于单测断言顺序与签名路径）。
 #[derive(Debug, Clone)]
 pub(crate) struct RefreshVariant {
+    /// 所属变体（日志留痕按它的区域选日志文件）。
+    pub(crate) variant: TraeVariant,
     /// 诊断标签（错误消息里逐变体列出）。
     pub(crate) tag: String,
     /// 完整请求 URL。
@@ -984,7 +986,7 @@ fn build_refresh_variants(
     refresh_token: &str,
     credential: Option<&DeviceCredential>,
 ) -> Vec<RefreshVariant> {
-    let icube_base = crate::modules::trae::endpoints_for(variant).icube_base;
+    let icube_base = crate::modules::trae::endpoints_for_region(variant).icube_base;
     let new_url = format!("{icube_base}{TRAE_EXCHANGE_TOKEN_PATH}");
     let legacy_url = format!("{icube_base}{TRAE_EXCHANGE_TOKEN_LEGACY_PATH}");
 
@@ -1018,6 +1020,7 @@ fn build_refresh_variants(
                 continue;
             };
             variants.push(RefreshVariant {
+                variant,
                 tag: tag.to_string(),
                 url: url.to_string(),
                 sign_path,
@@ -1034,6 +1037,7 @@ fn build_refresh_variants(
 
     // 旧协议兜底：无条件存在（无凭证时唯一路径）。
     variants.push(RefreshVariant {
+        variant,
         tag: "Refresh/Legacy".to_string(),
         url: legacy_url,
         sign_path: "",
@@ -1271,6 +1275,11 @@ async fn try_refresh_variant(
         })?;
 
     let status = response.status().as_u16();
+    // 留痕：每个变体试到的端点与状态码（404 / 10101 / 20403 / 20405 排查时第一眼看这里）。
+    store::append_log(
+        &paths::checkin_log_file_for(plan.variant),
+        &format!("refresh 变体 {} → {}（HTTP {status}）", plan.tag, plan.url),
+    );
     let body: Value = response
         .json()
         .await
@@ -2661,7 +2670,7 @@ hLkrYGiVNhsErnjKIgS7/EIHdsihRANCAARznG0WLhenNiMW5jA3SwFpTNyet2zw\n\
         }
     }
 
-    /// ★ refresh 的 URL 必须由**该变体的 `icube_base`** 拼成，与回调 `host` 无关。
+    /// ★ refresh 的 URL 必须由**该变体所属区域端点表的 `icube_base`** 拼成，与回调 `host` 无关。
     ///
     /// refresh 是**离线触发**（没有浏览器回调），根本没有 host 可传；
     /// `exchange_token_for(variant, refresh_token, device_id)` 的签名里也确实没有 host 形参
@@ -2669,8 +2678,9 @@ hLkrYGiVNhsErnjKIgS7/EIHdsihRANCAARznG0WLhenNiMW5jA3SwFpTNyet2zw\n\
     #[test]
     fn refresh_url_is_built_from_variant_icube_base() {
         let credential = test_credential();
-        for variant in TraeVariant::all() {
-            let base = crate::modules::trae::endpoints_for(variant).icube_base;
+        for spec in crate::modules::trae::variant::all_specs() {
+            let variant = spec.variant;
+            let base = crate::modules::trae::endpoints_for_region(variant).icube_base;
             let variants = build_refresh_variants(variant, "cid", "rt", Some(&credential));
             assert_eq!(variants.len(), 4, "有凭证时必须是四步链");
             for plan in &variants {
@@ -2682,6 +2692,42 @@ hLkrYGiVNhsErnjKIgS7/EIHdsihRANCAARznG0WLhenNiMW5jA3SwFpTNyet2zw\n\
                 assert!(
                     !plan.url.contains("127.0.0.1"),
                     "refresh URL 里出现了回调 host，说明复用了浏览器回调地址: {}",
+                    plan.url
+                );
+            }
+        }
+    }
+
+    /// ★ 国际变体的 refresh URL 必须由**国际端点表的 `icube_base`** 拼成（回归护栏：
+    /// 2026-09 国际版刷新 404 的根因——`endpoints_for` 只认 CN 表，
+    /// 国际变体拼出了 `api.trae.com.cn` 上的 URL）。
+    #[test]
+    fn global_refresh_urls_use_global_icube_base() {
+        use crate::modules::trae::region::TraeRegion;
+        use crate::modules::trae::variant::all_specs;
+        let credential = test_credential();
+        for spec in all_specs() {
+            if spec.variant.region() != TraeRegion::Global {
+                continue;
+            }
+            let base = crate::modules::trae::endpoints_for_region(spec.variant).icube_base;
+            assert!(base.contains("trae.ai"), "国际 iCube 基址漂了: {base}");
+            let variants = build_refresh_variants(spec.variant, "cid", "rt", Some(&credential));
+            for plan in &variants {
+                assert!(
+                    plan.url.starts_with(base),
+                    "{} 的 refresh URL 没走国际 iCube（{}）: {}",
+                    spec.display_name,
+                    base,
+                    plan.url
+                );
+            }
+            // 网页模式链（无凭证）同样必须落在国际基址上——用户报错的那条就是它。
+            for plan in build_refresh_variants(spec.variant, "cid", "rt", None) {
+                assert!(
+                    plan.url.starts_with(base),
+                    "{} 的 legacy 兜底 URL 没走国际 iCube: {}",
+                    spec.display_name,
                     plan.url
                 );
             }
@@ -2756,13 +2802,23 @@ hLkrYGiVNhsErnjKIgS7/EIHdsihRANCAARznG0WLhenNiMW5jA3SwFpTNyet2zw\n\
     /// 与 `oauth.rs` 的 `exchange_request_sends_empty_cloudide_token_header` 构成
     /// **两条路径各自**的护栏：空串头是两条路径共同的硬要求，缺失报 20403、
     /// 带旧 token 报 20405。
+    /// 注意：`try_refresh_variant` 现在会写一条留痕日志（按 `plan.variant` 的区域选文件），
+    /// 必须把 `HomeOverrideGuard` 包在 await 前后（等价于 [`with_temp_home`] 的隔离纪律）。
     #[tokio::test]
     async fn refresh_request_carries_empty_cloudide_token_header() {
         let body = json!({"Result": {"AccessToken": "at-1", "RefreshToken": "rt-2"}}).to_string();
         let (port, captured) = mock_upstream_once(body).await;
 
+        let dir = std::env::temp_dir().join(format!(
+            "buddy-switch-account-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("临时 home 应能创建");
+        let guard = crate::modules::config::HomeOverrideGuard::set(&dir);
+
         let credential = test_credential();
         let plan = RefreshVariant {
+            variant: TraeVariant::TraeWork,
             tag: "Refresh/Proof/P1363".into(),
             url: format!("http://127.0.0.1:{port}{TRAE_EXCHANGE_TOKEN_PATH}"),
             sign_path: TRAE_EXCHANGE_TOKEN_PATH,
@@ -2781,7 +2837,6 @@ hLkrYGiVNhsErnjKIgS7/EIHdsihRANCAARznG0WLhenNiMW5jA3SwFpTNyet2zw\n\
             ),
             with_cloudide_token: true,
         };
-
         let (access, refresh, _) = try_refresh_variant(&plan, Some(&credential.device_id))
             .await
             .expect("mock 上游应返回成功");
@@ -2814,6 +2869,9 @@ hLkrYGiVNhsErnjKIgS7/EIHdsihRANCAARznG0WLhenNiMW5jA3SwFpTNyet2zw\n\
             request.contains(&format!("\"DeviceID\":\"{}\"", credential.device_id)),
             "{request}"
         );
+
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -----------------------------------------------------------------------

@@ -388,7 +388,9 @@ mod tests {
 
         let global = region_endpoints(TraeRegion::Global);
         assert_eq!(global.account_base, "https://grow-normal.trae.ai");
-        assert_eq!(global.icube_base, "https://icube-normal.trae.ai");
+        // ExchangeToken 实际落在 `ug-normal.trae.ai`（线上 404 探测修正，
+        // 客户端自述的 `icube-normal.trae.ai` 两条路径都 404）。
+        assert_eq!(global.icube_base, "https://ug-normal.trae.ai");
         assert_ne!(global.account_base, cn.account_base);
 
         // 授权页域（`bootConfig.consoleHost`）同样按区域分家 —— 它不是 API 域，

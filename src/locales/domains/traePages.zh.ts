@@ -23,6 +23,7 @@ export const zh = {
   "trae.page.accounts.actionDone": "{label}完成",
   "trae.page.accounts.actionFailed": "{label}失败",
   "trae.page.accounts.actionCheckinAll": "签到并刷新积分",
+  "trae.page.accounts.actionRefreshCredits": "刷新剩余权益",
   "trae.page.accounts.actionSwitch": "切换{line}账号",
   "trae.page.accounts.actionSaveLogin": "保存登录态",
   // 保存的目标只能是「该账号此刻登录着的程序位」；一个都没有时如实报错，不静默跳过。
@@ -107,6 +108,8 @@ export const zh = {
   "trae.page.accounts.compactToLoose": "切换为宽松模式",
   "trae.page.accounts.compactToCompact": "切换为紧凑模式",
   "trae.page.accounts.checkinRefreshAll": "签到并刷新全部账号积分",
+  "trae.page.accounts.refreshCreditsOnly": "刷新全部账号剩余权益（国际版无签到体系）",
+  "trae.page.accounts.noCheckinInGlobal": "国际版无签到体系（免费档为请求用量制）",
   "trae.page.accounts.demoDisabled": "演示模式下不可操作",
   "trae.page.accounts.autoCheckinSaveFailed": "自动签到设置保存失败",
   "trae.page.accounts.settingsSaveFailed": "设置保存失败",

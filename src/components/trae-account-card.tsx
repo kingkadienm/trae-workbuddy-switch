@@ -18,7 +18,7 @@ import { TraeMark, TraeVariantMark } from "@/components/product-marks";
 import { useT, type Translate } from "@/lib/i18n";
 import type { TranslationKey } from "@/locales/zh";
 import { cn } from "@/lib/utils";
-import type { TraeAccount, TraeJwtStatus, TraeVariantId } from "@/lib/trae-types";
+import type { TraeAccount, TraeJwtStatus, TraeRegionId, TraeVariantId } from "@/lib/trae-types";
 
 const chipClass = "rounded-md px-1.5 py-0 text-[11px] font-medium";
 
@@ -147,6 +147,8 @@ interface Props {
   switchBusy?: boolean;
   /** 演示模式等场景下禁用所有写操作。 */
   featuresDisabled?: boolean;
+  /** 当前区域（国际版没有签到体系：隐藏签到标签与菜单项）。 */
+  region?: TraeRegionId;
   /** 把该账号挂到指定 Trae 程序上（会重启该程序）。 */
   onSwitchTo?: (account: TraeAccount, variant: TraeVariantId) => void;
   /** 单账号签到。 */
@@ -180,6 +182,7 @@ export function TraeAccountCard({
   busy = null,
   switchBusy = false,
   featuresDisabled = false,
+  region,
   onSwitchTo,
   onCheckin,
   onSaveLogin,
@@ -256,9 +259,11 @@ export function TraeAccountCard({
       <Badge variant={badge.variant} className={cn(chipClass, badge.className)}>
         {badge.text}
       </Badge>
-      <Badge variant={account.checkedToday ? "success" : "secondary"} className={cn(chipClass, !account.checkedToday && "text-muted-foreground")}>
-        {account.checkedToday ? t("trae.comp.card.chip.checked") : t("trae.comp.card.chip.unchecked")}
-      </Badge>
+      {region !== "global" && (
+        <Badge variant={account.checkedToday ? "success" : "secondary"} className={cn(chipClass, !account.checkedToday && "text-muted-foreground")}>
+          {account.checkedToday ? t("trae.comp.card.chip.checked") : t("trae.comp.card.chip.unchecked")}
+        </Badge>
+      )}
       {account.cooldownType &&
         (compact ? (
           <Tooltip>
@@ -420,7 +425,7 @@ export function TraeAccountCard({
         {/* 「手动签到」与 WorkBuddy 卡片菜单同位（刷新之后、删除之前）。
             只在今日未签到时出现：已签到的账号再点一次只会被跳过策略拦下，
             摆一个点不动的入口比不摆更差。 */}
-        {!account.checkedToday && (
+        {!account.checkedToday && region !== "global" && (
           <DropdownMenuItem disabled={featuresDisabled || checkingIn} onSelect={() => onCheckin?.(account)}>
             <CircleCheck />{t("trae.comp.card.menu.checkin")}
           </DropdownMenuItem>

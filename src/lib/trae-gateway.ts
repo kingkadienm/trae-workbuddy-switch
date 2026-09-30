@@ -230,4 +230,10 @@ export const TRAE_POOL_STATUS_LABELS: Record<
     },
     tone: "muted",
   },
+  free_plan: {
+    get label() {
+      return t("shared.trae.poolStatus.freePlan");
+    },
+    tone: "ok",
+  },
 };

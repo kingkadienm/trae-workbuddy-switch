@@ -68,7 +68,7 @@
 //! | 能力 | 国内版（`TRAE SOLO CN`） | 国际版（`TRAE SOLO`） |
 //! |:---|:---|:---|
 //! | `account` | `https://api.trae.cn` | `https://grow-normal.trae.ai` |
-//! | `iCube` | `https://api.trae.com.cn` | `https://icube-normal.trae.ai` |
+//! | `iCube` | `https://api.trae.com.cn` | `https://ug-normal.trae.ai`* |
 //! | `agent` | `https://trae-api-cn.mchost.guru` | `https://core-normal.trae.ai` |
 //! | `ws` | `wss://trae-ws-cn.mchost.guru/custom_model` | `wss://wss-normal.trae.ai/custom_model` |
 //! | `consoleHost`（授权页域） | `https://www.trae.cn` | `https://www.trae.ai` |
@@ -531,7 +531,11 @@ const TRAE_CN_SPEC: VariantSpec = VariantSpec {
 /// `bootConfig.<能力>.trae.normal`（本机 `%LOCALAPPDATA%\Programs\TRAE SOLO`）。
 const GLOBAL_ENDPOINTS: EndpointSet = EndpointSet {
     account_base: "https://grow-normal.trae.ai",
-    icube_base: "https://icube-normal.trae.ai",
+    // ⚠️ 不是客户端自述的 `icube-normal.trae.ai`（2026-09-30 线上探测：
+    // 该主机的两条 ExchangeToken 路径都 404/NLB HTML）。真实上游是
+    // `ug-normal.trae.ai`（网页端实测请求域，对同两条路径返回 JSON 400
+    // 10101 而非 404），iCube 语义在此域由 `ug`（user gateway）承接。
+    icube_base: "https://ug-normal.trae.ai",
     agent_host: "https://core-normal.trae.ai",
     ws_base: Some("wss://wss-normal.trae.ai/custom_model"),
     // 授权页域：国际版客户端 `product.json` 的 `bootConfig.consoleHost` **实测值**
@@ -969,7 +973,9 @@ mod tests {
     fn 国际化端点取自国际版客户端自述值() {
         let expected = EndpointSet {
             account_base: "https://grow-normal.trae.ai",
-            icube_base: "https://icube-normal.trae.ai",
+            // iCube 语义实际落在 `ug-normal.trae.ai`（线上实测，见 `GLOBAL_ENDPOINTS`
+            // 的注释）；客户端自述的 `icube-normal.trae.ai` 对 ExchangeToken 404。
+            icube_base: "https://ug-normal.trae.ai",
             agent_host: "https://core-normal.trae.ai",
             ws_base: Some("wss://wss-normal.trae.ai/custom_model"),
             console_base: "https://www.trae.ai",

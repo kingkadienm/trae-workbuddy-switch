@@ -365,6 +365,24 @@ where
     // 整条链路用同一个变体：账号列表、账号视图、冷却、剩余积分四份数据必须来自
     // 同一条产品线，否则会出现「按 Trae CN 的冷却去过滤 Trae Work 的账号」这种串味。
     let variant = options.variant;
+
+    // 国际版没有签到体系（`/trae/api/v2/ug/checkin_credits/*` 是 CN 端点；国际网页端
+    // 只有 entitlement/usage 类接口，免费档也是请求次数制而非签到积分）。
+    // 手动与定时入口都在这里收口：如实告警 + 落痕后返回 0 账号报告，不再假装处理。
+    if variant.region() == crate::modules::trae::region::TraeRegion::Global {
+        report.warnings.push(format!(
+            "{} 无签到体系，跳过批量签到（国际版没有 checkin_credits 端点）",
+            variant.display_name()
+        ));
+        store::append_log(
+            &paths::checkin_log_file_for(variant),
+            &format!("{} 无签到体系，批量签到入口已短路（0 账号处理）", variant.display_name()),
+        );
+        on_event(&json!({ "type": "start", "total": 0 }));
+        on_event(&json!({ "type": "done", "ok": 0, "already": 0, "failed": 0, "total": 0 }));
+        return report;
+    }
+
     // 一次性读取全部决策依据，交给纯函数 `plan` 决定签谁、按什么顺序签。
     let planned = plan(
         account::entries_for(variant),
@@ -1044,5 +1062,37 @@ mod tests {
             work_planned.is_empty(),
             "Trae Work 库没有这个分组，不应解析出任何账号"
         );
+    }
+
+    /// 国际版没有签到体系：`run_checkin` 对 Global 变体必须**短路**——0 账号处理、
+    // 一条 warning 留痕，不发起任何上游请求（`/trae/api/v2/ug/checkin_credits/*` 是 CN
+    // 端点，国际网页端只有 entitlement/usage 类接口）。这是手动签到、定时签到
+    // （`run_scheduled_checkin` 逐区域各签一轮）与 HTTP `run_checkin_report` 共同的收口点。
+    #[tokio::test]
+    async fn global_variant_checkin_short_circuits_with_zero_accounts() {
+        let dir = std::env::temp_dir().join(format!("trae-checkin-global-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).expect("临时 home 应能创建");
+        let _guard = crate::modules::config::HomeOverrideGuard::set(&dir);
+
+        let mut events: Vec<Value> = Vec::new();
+        let report = run_checkin(
+            CheckinOptions {
+                variant: TraeVariant::Global,
+                ..Default::default()
+            },
+            |event| events.push(event.clone()),
+        )
+        .await;
+
+        assert_eq!(report.total, 0, "国际版没有可签到的账号");
+        assert!(report.results.is_empty());
+        assert!(
+            report.warnings.iter().any(|warning| warning.contains("无签到体系")),
+            "国际版短路必须留一条可追溯的告警: {report:#?}"
+        );
+        // 事件契约不变：start(total=0) + done 各一条，前端进度流不会因为短路而断流。
+        assert_eq!(events.len(), 2, "短路也要成对发 start/done 事件: {events:#?}");
+        drop(_guard);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
