@@ -348,3 +348,13 @@ This project is licensed under the **[PolyForm Noncommercial License 1.0.0](./LI
 - Full text: [LICENSE](./LICENSE)
 - Plain-language summary, what is permitted and what is not, FAQ, and the MIT note for versions before 2026-09-22: [docs/LICENSING.en.md](docs/LICENSING.en.md)
 - For commercial licensing, please contact the author via this repository's Issues.
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=NextAgentX%2Ftrae-workbuddy-switch&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=NextAgentX/trae-workbuddy-switch&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=NextAgentX/trae-workbuddy-switch&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=NextAgentX/trae-workbuddy-switch&type=date&legend=top-left" />
+ </picture>
+</a>

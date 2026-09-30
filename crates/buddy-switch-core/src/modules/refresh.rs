@@ -29,6 +29,32 @@ fn keepalive_running_flag(region: Region) -> &'static AtomicBool {
     }
 }
 
+/// `expiresIn` / `refreshExpiresIn`（相对秒）的合理上界：10 年。
+///
+/// 官方接口在正常情况下回一个正数秒数；但**缺字段与脏值是两种不同的情况**，
+/// 且都必须与「合法值」区分开：
+///
+/// · **缺字段** ⇒ 调用方保留旧到期时间（不臆测）；
+/// · **越界值**（负数、0、荒谬的大数）⇒ 同样保留旧值。
+///
+/// 若不设上界就照写，一个脏值会把 `expiresAt` 写成过去或几百年后 ——
+/// 面板上的有效期进度条与倒计时会跟着显示误导信息，而刷新本身是成功的，
+/// 用户完全看不出问题出在哪个字段。
+///
+/// 依据：上游参照实现与 `ithtelab/workbuddy-manager` 的刷新实现都做同一件事
+/// （后者注释写明「expiresIn 缺省时**保留旧到期时间** —— 拿不到就不要乱写」，
+/// 并显式排除了 `bool` 与越界值）。
+const MAX_RELATIVE_EXPIRY_SECONDS: i64 = 10 * 365 * 86400;
+
+/// 从响应字段里取一个**可信**的相对秒数；缺失或越界一律返回 `None`。
+///
+/// `serde_json` 里 `true` 不是 number，故 `as_i64()` 对布尔已自然返回 `None`，
+/// 不需要额外判 `is_boolean`。
+fn sane_relative_seconds(value: Option<&Value>) -> Option<i64> {
+    let seconds = value?.as_i64()?;
+    (0 < seconds && seconds < MAX_RELATIVE_EXPIRY_SECONDS).then_some(seconds)
+}
+
 /// 刷新单账号 token（CN）。
 pub async fn refresh_account_token(account: Value) -> Value {
     refresh_account_token_for(Region::Cn, account).await
@@ -87,6 +113,13 @@ pub async fn refresh_account_token_for(region: Region, mut account: Value) -> Va
 
     let mut headers = build_auth_headers(&account);
     headers.insert("X-Refresh-Token".to_string(), rt.clone());
+    // ⚠️ 本路径**不发** `X-Auth-Refresh-Source`，而 `upstream::refresh_token`
+    // （server 侧同款实现）发 `workbuddy` —— 两处形态不一致，必有一端不像官方客户端。
+    // 该头的取值本身也未定案（详见 `upstream::refresh_token` 里的长注释：
+    // 本仓取值无出处，外部实测记录称官方客户端发 `plugin`）。
+    //
+    // 这里**刻意不动**：给一条正在正常工作的刷新请求加头，是收益未证的 wire 变更。
+    // 要动就两端一起动，且先抓包。两处实现按仓库约定互指，见 `upstream::refresh_token`。
     let url = format!(
         "{}{WORKBUDDY_API_PREFIX}/auth/token/refresh",
         region_spec(region).billing_base
@@ -127,14 +160,12 @@ pub async fn refresh_account_token_for(region: Region, mut account: Value) -> Va
     {
         account["refresh_token"] = json!(new_rt);
     }
-    // 官方接口只返回相对 expiresIn（秒），需换算为绝对时间戳
+    // 官方接口只返回相对 expiresIn（秒），需换算为绝对时间戳。
+    // 缺字段或越界值都**不动** `expiresAt`（保留旧值），见 `sane_relative_seconds`。
     let new_exp = norm_ts(data.get("expiresAt").or_else(|| data.get("expires_at")));
     let new_exp = match new_exp {
         Some(v) => Some(v),
-        None => data
-            .get("expiresIn")
-            .and_then(|v| v.as_i64())
-            .map(|e| now_ms() + e * 1000),
+        None => sane_relative_seconds(data.get("expiresIn")).map(|e| now_ms() + e * 1000),
     };
     if let Some(v) = new_exp {
         account["expiresAt"] = json!(v);
@@ -153,10 +184,9 @@ pub async fn refresh_account_token_for(region: Region, mut account: Value) -> Va
     }
     let new_rt_exp = match new_rt_exp {
         Some(v) => Some(v),
-        None => data
-            .get("refreshExpiresIn")
-            .and_then(|v| v.as_i64())
-            .map(|e| now_ms() + e * 1000),
+        None => {
+            sane_relative_seconds(data.get("refreshExpiresIn")).map(|e| now_ms() + e * 1000)
+        }
     };
     if let Some(v) = new_rt_exp {
         account["refreshExpiresAt"] = json!(v);
@@ -292,6 +322,38 @@ mod tests {
     fn keepalive_lock() -> std::sync::MutexGuard<'static, ()> {
         // 吞掉中毒：单个用例 panic 不该连带其它用例全红。
         KEEPALIVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `expiresIn` 只接受「正数且不超过 10 年」；缺失、0、负数、荒谬大数一律拒绝。
+    ///
+    /// 拒绝的语义是**保留旧到期时间**（调用方只在 `Some` 时才写 `expiresAt`），
+    /// 所以「拒绝」与「缺失」必须走同一条路 —— 若这里放行一个脏值，
+    /// 面板上的有效期与倒计时会显示误导信息，而刷新本身是成功的，很难归因。
+    #[test]
+    fn relative_expiry_seconds_rejects_missing_and_out_of_range() {
+        // 合法：正常时长
+        assert_eq!(sane_relative_seconds(Some(&json!(3600))), Some(3600));
+        assert_eq!(sane_relative_seconds(Some(&json!(60 * 86400))), Some(60 * 86400));
+        // 缺失 / 非数值形态
+        assert_eq!(sane_relative_seconds(None), None);
+        assert_eq!(sane_relative_seconds(Some(&json!("3600"))), None, "字符串不是合法秒数");
+        assert_eq!(sane_relative_seconds(Some(&json!(true))), None, "布尔不得当 1 用");
+        assert_eq!(sane_relative_seconds(Some(&json!(null))), None);
+        // 越界：0 与负数会把 expiresAt 写到「此刻或过去」
+        assert_eq!(sane_relative_seconds(Some(&json!(0))), None);
+        assert_eq!(sane_relative_seconds(Some(&json!(-1))), None);
+        assert_eq!(sane_relative_seconds(Some(&json!(-86400))), None);
+        // 越界：荒谬大数会把有效期推到几百年后
+        assert_eq!(
+            sane_relative_seconds(Some(&json!(MAX_RELATIVE_EXPIRY_SECONDS))),
+            None,
+            "上界是开区间"
+        );
+        assert_eq!(sane_relative_seconds(Some(&json!(i64::MAX))), None);
+        assert_eq!(
+            sane_relative_seconds(Some(&json!(MAX_RELATIVE_EXPIRY_SECONDS - 1))),
+            Some(MAX_RELATIVE_EXPIRY_SECONDS - 1)
+        );
     }
 
     /// 保活运行标志必须按 region 独立（PRD G1）。

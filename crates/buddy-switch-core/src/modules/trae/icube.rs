@@ -113,6 +113,12 @@ pub(crate) const ICUBE_DC_PREFIX: &str = "iCubeAuthInfo://icube-dc:";
 /// `pub(crate)` 而非私有：`profile.rs` 的导入诊断要**只看键是否存在**（不解密）
 /// 就能说清「凭据在不在」，共用同一个常量避免两处字面量漂移。
 pub(crate) const CLOUDIDE_KEY: &str = "iCubeAuthInfo://icube.cloudide";
+/// **服务端下发**的账号数据缓存（明文 JSON，非 tc 信封）。
+///
+/// 真机实测 4415 字符；**它的存在与否是「这份登录态是不是客户端自己完整写出来的」的稳定标志**：
+/// 完整的登录态有它（9 个键），被外部写坏的那份没有（7 个键，客户端把整份判为无效后把它删了）。
+/// 判据用它而不是「键数」—— 键数会随客户端版本变。见 `profile::client_state_looks_complete`。
+pub(crate) const SERVER_DATA_KEY: &str = "iCubeServerData://icube.cloudide";
 /// 同文件的机器标识（`DeviceInfo.MachineID` 取它）。
 const TELEMETRY_MACHINE_ID: &str = "telemetry.machineId";
 
@@ -556,6 +562,14 @@ struct StorageSnapshot {
     object: Map<String, Value>,
 }
 
+/// 该 userData 目录下 `storage.json` 的路径（**唯一取值点**）。
+///
+/// 读侧（[`load_storage_from_dir`]）与**写前留档**（`profile::backup_storage_before_write`）
+/// 共用它 —— 两处各拼一次路径，迟早出现「读的是 A 文件、备份的是 B 文件」这种只在真机暴露的分叉。
+pub(crate) fn storage_path_in_dir(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("User").join("globalStorage").join("storage.json")
+}
+
 /// 读取**该变体**的 storage.json（目录由 [`platform::select_data_dir_for`] 限定）。
 ///
 /// 参考实现跨变体扫全部候选目录并取第一个命中 —— 本项目**不照抄**（见模块头差异 1）。
@@ -580,10 +594,7 @@ fn load_storage_from_dir(
         .and_then(|name| name.to_str())
         .unwrap_or_default()
         .to_string();
-    let path = dir
-        .join("User")
-        .join("globalStorage")
-        .join("storage.json");
+    let path = storage_path_in_dir(dir);
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| IcubeError::StorageUnreadable(format!("{}: {e}", path.display())))?;
     let value: Value = serde_json::from_str(&raw)

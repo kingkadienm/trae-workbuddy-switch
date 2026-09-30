@@ -207,6 +207,12 @@ fn api_routes() -> Router {
         )
         .route("/api/trae/gateway/status", get(api_trae_gateway_status))
         .route("/api/trae/gateway/models", get(api_trae_gateway_models))
+        // 客户端（上游下发）的模型清单：与上面那条静态清单不同，它读客户端
+        // `state.vscdb` 的缓存，因此随客户端刷新而变（issue #4）。
+        .route(
+            "/api/trae/gateway/client-models",
+            get(api_trae_client_models),
+        )
         // 多 Key 管理（含归属产品线）：GET 列表 / POST 创建，同一路径两种方法。
         .route(
             "/api/trae/gateway/keys",
@@ -1786,8 +1792,26 @@ async fn api_trae_gateway_status(RawQuery(query): RawQuery) -> Response {
     )
 }
 
-async fn api_trae_gateway_models() -> Response {
-    json_ok(buddy_switch_gateway::trae::payload::models_response())
+/// GET /api/trae/gateway/models —— 对外暴露的模型清单（**随上游刷新**）。
+///
+/// 与 `api_trae_client_models` 同源（同一份客户端缓存），形状不同：
+/// 这里是 OpenAI `/v1/models` 形状的扁平去重清单。`variant` 缺失 / 未知 → 默认变体。
+async fn api_trae_gateway_models(RawQuery(query): RawQuery) -> Response {
+    let variant = parse_trae_variant(query_value(query.as_deref(), "variant").as_deref());
+    json_ok(buddy_switch_gateway::trae::payload::models_response_for(variant))
+}
+
+/// GET /api/trae/gateway/client-models —— 客户端（**上游下发**）的模型清单。
+///
+/// 与 [`api_trae_gateway_models`]（静态对外清单）**不是一回事**：这里读客户端
+/// `state.vscdb` 里上游下发的清单缓存（见 core 的 `trae::model_list`），
+/// 因此随客户端刷新而变。`variant` 缺失 / 未知 → 默认变体（TraeWork）。
+async fn api_trae_client_models(RawQuery(query): RawQuery) -> Response {
+    let variant = parse_trae_variant(query_value(query.as_deref(), "variant").as_deref());
+    json_ok(
+        serde_json::to_value(trae::model_list::read_client_model_list(variant))
+            .unwrap_or_else(|error| json!({ "source": "missing", "note": error.to_string() })),
+    )
 }
 
 /// GET /api/trae/gateway/keys —— 多 Key 列表（形状与 Tauri 命令逐字一致）。

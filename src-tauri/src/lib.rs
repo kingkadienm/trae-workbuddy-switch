@@ -260,6 +260,7 @@ pub fn run() {
             commands::save_trae_gateway_config,
             commands::trae_gateway_status,
             commands::get_trae_gateway_models,
+            commands::get_trae_client_models,
             // 多 Key 管理（含归属产品线）+ 打开数据目录（替代旧的单 Key regenerate）。
             commands::list_trae_api_keys,
             commands::create_trae_api_key,

@@ -57,6 +57,7 @@ export const en = {
   "trae.comp.card.currentOf": "Current account in {label}",
   "trae.comp.card.switch.tip": "Switch to this account in {label} (restarts {label})",
   "trae.comp.card.switch.missing": "{label} not detected",
+  "trae.comp.card.switch.noDataDir": "{label} has no client data directory yet — start {label} once and sign in, then save the login state",
   "trae.comp.card.switch.aria": "Switch to {label}",
   "trae.comp.card.switch.ariaBusy": "Switching to {label}",
   "trae.comp.card.switch.busy": "Switching…",
@@ -83,7 +84,8 @@ export const en = {
 
   // ---- Footer buttons ----
   "trae.comp.card.action.saving": "Saving…",
-  "trae.comp.card.action.saveTip": "Back up the current Trae login state into this account slot",
+  "trae.comp.card.action.saveTip": "Save the client's current login state under this account (used to restore when switching); the client will be closed and reopened first",
+  "trae.comp.card.action.saveNoLogin": "This account is not signed in on any Trae client — sign in on the client first, then save",
   "trae.comp.card.action.refreshing": "Refreshing…",
   "trae.comp.card.action.refreshJwtTip": "Exchange the refresh token for a new JWT",
   "trae.comp.card.footer.updatedAt": "Updated {time}",

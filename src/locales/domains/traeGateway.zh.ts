@@ -35,8 +35,20 @@ export const zh = {
   // =====================================================================
   "trae.gateway.models.title": "模型清单",
   "trae.gateway.models.summary": "共 {count} 个 · 默认 {model}",
-  "trae.gateway.models.note": "Trae 模型为客户端常量，不随上游刷新；下方清单即对外暴露的全部模型。",
+  "trae.gateway.models.note": "清单读自 Trae 客户端的本地缓存（上游下发），客户端刷新后这里会跟着变。",
   "trae.gateway.models.empty": "暂无模型数据。",
+  "trae.gateway.models.refresh": "重新读取",
+  "trae.gateway.models.source": "来源",
+  "trae.gateway.models.sourceCache": "客户端缓存",
+  "trae.gateway.models.sourceMissing": "未读取",
+  "trae.gateway.models.readAt": "读取于 {time}",
+  "trae.gateway.models.gatewayCount": "网关对外 {count} 个",
+  "trae.gateway.models.groupCount": "{count} 个",
+  "trae.gateway.models.badgeDefault": "默认",
+  "trae.gateway.models.badgeNew": "新",
+  "trae.gateway.models.badgeBeta": "Beta",
+  "trae.gateway.models.badgeCustom": "自定义",
+  "trae.gateway.models.context": "上下文 {tokens}",
 
   // =====================================================================
   // gateway/trae-request-log.tsx —— 请求日志

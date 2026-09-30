@@ -82,8 +82,13 @@ pub struct CoreEntry {
 ///    - `logs/`：`extract_local_jwt_for` 会扫
 ///      `logs/**/trae.ai-code-completion/completion.log` 里的明文 JWT。
 ///      不清 ⇒ 切到 A 之后导入仍读到 B 的 token，症状就是「切换后账号不变」。
-///    - SQLite 边车文件（`-wal` / `-shm` / `-journal`）：不删会让 SQLite
+///    - SQLite 的 `-wal` / `-shm` / `-journal`：不删会让 SQLite
 ///      下次打开时**回放旧事务**，把上一账号的页写回刚恢复的库里，症状同上。
+///
+/// ⚠️ **`-wal` / `-shm` 同时也在快照清单里**（见 [`CORE_ENTRIES`] 的 2b 两条）——
+/// 两者不矛盾：先清掉客户端那一对**旧的**，再覆盖上快照里那一对**与主库配套的**。
+/// 只做前者会让「强杀时还留在 WAL 里的最新登录写入」永久丢失（2026-09-29 实测症状：
+/// 切换后客户端变成未登录）。`-journal` 只在清除侧 —— 快照不需要它。
 ///
 /// **因此：新增任何凭据来源时，要么把它加进本清单，要么加进清除清单。**
 pub const CORE_ENTRIES: &[CoreEntry] = &[
@@ -101,6 +106,23 @@ pub const CORE_ENTRIES: &[CoreEntry] = &[
         relative: "User/globalStorage/state.vscdb.backup",
         kind: EntryKind::File,
         label: "令牌数据库备份",
+    },
+    // ★★ WAL / SHM 必须与主库**成对快照**（2026-09-29 对照参考实现补上）。
+    //
+    // 我们的关客户端是 `taskkill /F`（强杀），而 SQLite 的 WAL 在**强杀时不会
+    // checkpoint 回主库** —— 最新的登录写入很可能只存在于 `-wal` 里。
+    // 只拷主库 ⇒ 快照缺最新写入；恢复侧又会把客户端的 `-wal`/`-shm` 清掉（防回放旧事务）
+    // ⇒ 最终客户端拿到的是一份**缺最新登录数据**的库 ⇒ 症状正是「切换后变成未登录」。
+    // 顺序上「先清后覆盖」保证拿到的是**快照里那一对**（见 `restore_from_slot_in_dir`）。
+    CoreEntry {
+        relative: "User/globalStorage/state.vscdb-wal",
+        kind: EntryKind::File,
+        label: "令牌数据库 WAL（强杀后最新写入常在此）",
+    },
+    CoreEntry {
+        relative: "User/globalStorage/state.vscdb-shm",
+        kind: EntryKind::File,
+        label: "令牌数据库 SHM（与 WAL 成对）",
     },
     CoreEntry {
         relative: "machineid",
@@ -126,6 +148,19 @@ pub const CORE_ENTRIES: &[CoreEntry] = &[
         relative: "Local Storage/config.db",
         kind: EntryKind::File,
         label: "本地存储",
+    },
+    // ★ `Local Storage/leveldb` 是 **web 侧（icube webview）的登录/偏好 KV**。
+    // 只快照 `config.db` 而不含 leveldb ⇒ 恢复后 webview 侧仍是上一账号的内容，
+    // 与 `storage.json` / `state.vscdb` 对不上（2026-09-29 对照参考实现补上）。
+    CoreEntry {
+        relative: "Local Storage/leveldb",
+        kind: EntryKind::Dir,
+        label: "web 侧登录/偏好 KV",
+    },
+    CoreEntry {
+        relative: "Session Storage",
+        kind: EntryKind::Dir,
+        label: "会话存储",
     },
     CoreEntry {
         relative: "Network",
@@ -160,7 +195,9 @@ const RESTORE_PURGE_RELATIVES: &[&str] = &[
     // ── 明文凭据来源：客户端扩展日志（跨账号累积，且不在快照内） ──
     "logs",
     // ── SQLite 边车文件：三件套都要清，缺一个就会回放 ──
-    // 主库 `state.vscdb` 本身由 `CORE_ENTRIES` 覆盖，这里只处理它的附属文件。
+    // ⚠️ `-wal` / `-shm` 清掉之后**会被快照里那一对覆盖回来**（它们在 `CORE_ENTRIES` 里）——
+    //    清除的目的只是「别让客户端残留的旧 WAL 与快照主库错配」，不是「不要 WAL」。
+    //    只清不补 = 丢掉强杀时尚未 checkpoint 的最新登录写入（2026-09-29 实测症状）。
     "User/globalStorage/state.vscdb-wal",
     "User/globalStorage/state.vscdb-shm",
     "User/globalStorage/state.vscdb-journal",
@@ -969,11 +1006,21 @@ pub fn set_current_account_for(variant: TraeVariant, user_id: &str) -> Result<()
 ///
 /// 读不到（没装 / 没启动过 / 没登录 / 信封解不开）一律 `None`，由调用方决定回落 ——
 /// 本函数**不报错**：状态条少一个账号，远好过整页报错。
-fn client_login_uid_for(variant: TraeVariant) -> Option<String> {
-    let dir = icube::login_state_dir_for(variant)?;
-    let info = icube::cloudide_auth_info_from_dir(&dir, variant).ok()?;
-    // `userId` 直接取（信封自己写的，比解 JWT 更直接）；缺失时才解 token ——
-    // 与 `icube_login_candidate_from_dir` 的回落链**同序**，两处不要各写一套。
+///
+/// `pub(crate)`：模型清单（[`super::model_list`]）也要用「客户端此刻登录的 uid」
+/// 来在多份缓存之间选对那一份，且必须与它读取的目录**同源**。
+pub(crate) fn client_login_uid_for(variant: TraeVariant) -> Option<String> {
+    client_login_uid_in(&icube::login_state_dir_for(variant)?, variant)
+}
+
+/// 从**指定目录**读客户端此刻实际登录的账号（回落链与 [`client_login_uid_for`] **同序**）。
+///
+/// 存在的理由：`client_login_uid_for` 取的是**最近活跃**目录，而备份 / 恢复用的是
+/// **写侧**目录（`snapshot_data_dir_for`）—— 真机上两者可以是不同目录（本仓踩过多次）。
+/// 凡「读到的账号」要与「将要写的那个目录」配套时，必须用本函数，不能借道活跃目录。
+fn client_login_uid_in(dir: &Path, variant: TraeVariant) -> Option<String> {
+    let info = icube::cloudide_auth_info_from_dir(dir, variant).ok()?;
+    // `userId` 直接取（信封自己写的，比解 JWT 更直接）；缺失时才解 token。
     info.user_id
         .filter(|uid| !uid.is_empty())
         .or_else(|| jwt::user_id_of(&jwt::authorization_header(&info.token)))
@@ -1198,6 +1245,104 @@ pub fn backup_to_slot_for(variant: TraeVariant, slot: &str) -> Result<u64, Strin
     Ok(copied)
 }
 
+/// 客户端**当前**登录态是否结构完整。
+///
+/// ## 判据（2026-09-29 真机实测）
+///
+/// | 状态 | `cloudide` 明文键数 | `iCubeServerData` |
+/// |:---|:---|:---|
+/// | 完整（客户端自己登录后写的） | 9 | **在** |
+/// | 被外部写坏的 | 7 | **不在**（客户端把整份判为无效后删掉了它） |
+///
+/// 判据取「服务端下发的那份缓存在不在」，而不是「键数」—— 键数会随客户端版本变。
+/// 读不到 / 解不开 / 缺键一律返回 `false`：**宁可少写一次槽位，也不要把坏状态灌进去**。
+///
+/// ## 为什么必须有这条（第二次报障的根因）
+///
+/// 切换流程的第 2/3 步会把「客户端当前状态」写进**槽位**（`last` 与「当前账号自己的槽位」），
+/// 而这两处写入都是**覆盖**式的。一份**坏的**当前状态因此会被流程**持续回灌**：
+/// 它自报的 uid 与槽位名一致，`ensure_save_target_matches_client` 那条守卫**看不出问题**
+/// —— 守卫查的是「是不是同一个账号」，不是「这份状态完不完整」。
+///
+/// 后果（2026-09-29 12:01 实测）：客户端被写坏后自报 `uid=Jackey`，第 3 步就把这份坏状态
+/// 写回 `profiles/1189017012674171`；用户再切到 Jackey，恢复出来的就是它 ⇒ **又变成未登录**。
+/// 而且 `last`（回滚兜底）同样被它覆盖 ⇒ 回滚能力一起消失。
+fn client_state_looks_complete(dir: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(icube::storage_path_in_dir(dir)) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    value.get(icube::CLOUDIDE_KEY).is_some() && value.get(icube::SERVER_DATA_KEY).is_some()
+}
+
+/// 写前留档保留份数（见 [`backup_storage_before_write`]）。
+const STORAGE_BACKUP_KEEP: usize = 20;
+
+/// 写客户端登录态**之前**，把 `storage.json` 留一份带时间戳的档（**只增不改**）。
+///
+/// ## 为什么不能只靠 `last` 槽位（2026-09-29 事故的根因之一）
+///
+/// `last` 每切一次就被 [`backup_to_slot_for`] **整体覆盖** —— 它是「上一次的状态」，
+/// 不是「历史」。事故当天，唯一一份原始 `cloudide`（含**服务端下发**的 `account` 富对象）
+/// 就是这么没的：当前状态一旦被写坏，`last` 也跟着变成坏的，**再没有可回退的副本**，
+/// 只能靠账号库里的 JWT 重建一份**残缺**的登录态。
+///
+/// 本函数提供那个缺失的「只增不改的载体」：按 UTC 时间戳命名，**永不覆盖**。
+///
+/// ## 形态与保留策略
+///
+/// `trae/backups/storage/<变体>/<UTC 时间戳>.json`。文件名带毫秒 ⇒ 同一秒内两次调用
+/// 也不会互相覆盖。只保留最近 [`STORAGE_BACKUP_KEEP`] 份（文件名即时间戳，字典序 = 时间序）。
+///
+/// ## 失败**不阻断**写入
+///
+/// 与 `region_migrate::write_backup` 同一取舍：磁盘满 / 权限异常时留档失败，
+/// 不该让用户连账号都切不了。但**调用方必须把失败报出来**（`warning` 步），不许静默。
+pub fn backup_storage_before_write(dir: &Path, variant: TraeVariant) -> Result<String, String> {
+    let source = icube::storage_path_in_dir(dir);
+    if !source.is_file() {
+        return Err(format!("客户端还没有 storage.json：{}", source.display()));
+    }
+    let dest_dir = paths::trae_dir()
+        .join("backups")
+        .join("storage")
+        .join(variant.as_str());
+    std::fs::create_dir_all(&dest_dir).map_err(|e| format!("创建留档目录失败：{e}"))?;
+    let stamp = chrono::Utc::now()
+        .format("%Y-%m-%dT%H-%M-%S-%3fZ")
+        .to_string();
+    // 同一毫秒内的两次调用也不能互相覆盖 —— 「只增不改」这条不能靠时钟精度来保证。
+    let mut dest = dest_dir.join(format!("{stamp}.json"));
+    let mut suffix = 2;
+    while dest.exists() {
+        dest = dest_dir.join(format!("{stamp}-{suffix}.json"));
+        suffix += 1;
+    }
+    std::fs::copy(&source, &dest).map_err(|e| format!("留档失败：{e}"))?;
+    prune_storage_backups(&dest_dir, STORAGE_BACKUP_KEEP)?;
+    Ok(dest.to_string_lossy().to_string())
+}
+
+/// 只保留最近 `keep` 份留档。抽出来是为了能用一个小的 `keep` 直接测「只增不改 + 有上限」。
+fn prune_storage_backups(dir: &Path, keep: usize) -> Result<(), String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map_err(|e| format!("读留档目录失败：{e}"))?
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .filter(|name| name.ends_with(".json"))
+        .collect();
+    if names.len() <= keep {
+        return Ok(());
+    }
+    names.sort();
+    for stale in &names[..names.len() - keep] {
+        let _ = std::fs::remove_file(dir.join(stale));
+    }
+    Ok(())
+}
+
 /// 把指定槽位的快照恢复到客户端（默认变体，兼容壳）。
 pub fn restore_from_slot(slot: &str) -> Result<u64, String> {
     restore_from_slot_for(TraeVariant::default(), slot)
@@ -1349,11 +1494,132 @@ pub fn delete_slot_for(variant: TraeVariant, slot: &str) -> Result<(), String> {
     std::fs::remove_dir_all(&dir).map_err(|e| format!("删除快照失败: {e}"))
 }
 
+/// 预检查失败（目标快照不存在）时的**可操作**原因。
+///
+/// ## 为什么必须分两支（2026-09-29 用户报障现场）
+///
+/// 「快照不存在」有**两种成因**，下一步动作完全不同，一句话盖不住：
+///
+/// | 成因 | 事实 | 用户该做什么 |
+/// |:---|:---|:---|
+/// | 客户端数据目录在，只是这个账号没存过 | `profiles*/<uid>` 缺失 | 去点「保存登录态」 |
+/// | 客户端数据目录**不在**（多半是从没启动过） | `%APPDATA%\<客户端>` 缺失 | **保存也做不到**，得先启动客户端并登录 |
+///
+/// 第二支若仍说「请先保存该账号的登录态」，就是个**死循环** —— 用户照着做，
+/// 得到的下一句是「未找到 Trae 客户端数据目录」，永远切不成功。报障原文即：
+/// 「切换成功（提示）但程序没打开、标记也没变」。
+///
+/// ## 判据必须由调用方从**写侧唯一取值点**算出来
+///
+/// `can_save` 只能由 [`snapshot_data_dir_for`]（**写侧**来源，与 [`backup_to_slot_for`]
+/// 的源、[`switch_account`] step 6 的恢复目标**同一个函数**）加 `is_dir()` 得出。
+/// **不得**用 [`platform::select_data_dir_for`]（读 / 展示侧、按活跃度）：它在
+/// 「一个变体多个候选目录」的机器上会给出另一个目录，把「能保存」误判成「不能保存」
+/// —— 那是同一类错误的镜像（见 `ensure_save_target_matches_client` 的 P0 记录）。
+///
+/// ## 第二支复用 [`platform::data_dir_missing_reason`]，不另拼一套说法
+///
+/// 那个函数已经在「导入 / OAuth 前置」两条路径上回答「为什么读不到数据目录」，
+/// 且能区分「装了但从未启动」与「真的没装」。这里再写一句，迟早出现
+/// 「一处说没装、另一处说没启动」的自相矛盾。
+fn missing_snapshot_reason(variant: TraeVariant, target: &str, can_save: bool) -> String {
+    if can_save {
+        format!("账号 {target} 的登录态快照不存在，请先保存该账号的登录态")
+    } else {
+        format!(
+            "账号 {target} 的登录态快照不存在，且现在也无法保存 —— {}",
+            platform::data_dir_missing_reason(variant)
+        )
+    }
+}
+
+/// 切换失败后的**回滚**：把 `last` 槽（切换前的现场）恢复回客户端，并把客户端拉回来。
+///
+/// ## 为什么必须有
+///
+/// 没有它，一次「恢复动作成功、但恢复进去的内容不对」的切换会把用户**留在坏状态**里
+/// （客户端未登录），而 `last` 槽里明明躺着切换前那份好的。用户看到的就只是
+/// 「切了个寂寞」—— 既没换成，还回不去了。
+///
+/// 同类实现的「恢复后校验回滚」正是这一步，它的注释写得很直白：恢复后 0 项、
+/// 或关键文件缺失 ⇒ 判定快照无效 ⇒ **从 `last` 回滚到切换前状态并重启客户端**，
+/// 再报 fatal 说明原因。
+///
+/// ## 失败不再递归
+///
+/// 回滚本身失败时**只把原因并进报错**，不再尝试第二次回滚 —— 把一个失败变成一串失败
+/// 只会让用户更难判断该做什么。
+///
+/// ## 返回
+///
+/// `(步骤列表, None)` = 回滚成功（或客户端已拉回）；
+/// `(步骤列表, Some(原因))` = 回滚失败，调用方应把它并进 fatal。
+///
+/// 刻意**返回步骤而不是直接 emit**：调用点的 `emit` 闭包已经可变借用了 `on_step`，
+/// 再传一个 `&mut dyn FnMut` 进去会撞两次可变借用。返回步骤让调用方按原样 emit，
+/// 既绕开借用冲突，也保证步骤顺序仍由调用方一处决定。
+fn rollback_after_failed_switch(
+    restore_dir: &Path,
+    variant: TraeVariant,
+    launch: bool,
+) -> (Vec<SwitchStep>, Option<String>) {
+    let mut steps = Vec::new();
+
+    match restore_from_slot_in_dir(restore_dir, variant, LAST_SLOT) {
+        Ok(count) => steps.push(SwitchStep::new(
+            "rollback",
+            "ok",
+            format!("已回滚到切换前的状态（{count} 个文件）"),
+        )),
+        Err(error) => {
+            let message = format!("回滚到切换前状态也失败了: {error}");
+            steps.push(SwitchStep::new("rollback", "fail", message.clone()));
+            return (steps, Some(message));
+        }
+    }
+
+    // 回滚的目的是「当作没切过」⇒ 客户端该是开着的。切换流程在关客户端那一步已经把它
+    // 关了，这里必须拉回来，否则用户会面对一个「没切换成功、客户端还关了」的界面。
+    if launch {
+        match platform::detect_install_for(variant).exe {
+            Some(exe) => {
+                if let Err(error) = platform::launch_client_for(variant, &exe, None) {
+                    steps.push(SwitchStep::new(
+                        "rollback",
+                        "skip",
+                        format!("已回滚，但重新启动客户端失败: {error}"),
+                    ));
+                }
+            }
+            None => steps.push(SwitchStep::new(
+                "rollback",
+                "skip",
+                "已回滚，但找不到客户端可执行文件，未能重新启动",
+            )),
+        }
+    }
+    (steps, None)
+}
+
 /// 执行一次完整的账号切换。
 ///
-/// 流程（顺序不可调整，见模块头注释）：
-/// 预检查目标快照 → 保存当前到 `last` → （已知 uid 时）保存当前到其槽位 →
-/// （可选）重置设备标识 → 关闭客户端 → 恢复目标快照 → （可选）启动客户端。
+/// 流程（**顺序不可调整**，见模块头注释）：
+/// ① 预检查目标快照 → ②（可选）重置设备标识 → ③ **关闭客户端** →
+/// ④ 保存当前到 `last` → ④b（已知 uid 时）保存当前到其槽位 →
+/// ⑥ 恢复目标快照 → ⑥b 写前留档 → ⑥.5 复核 → ⑦（可选）启动客户端。
+///
+/// ## ★★ ③ 必须在 ④/④b **之前**（2026-09-29 对照参考实现修正）
+///
+/// 备份是**文件拷贝**，而客户端运行时会**独占锁定**若干登录态文件
+/// （`Network/Cookies`、`Local Storage/leveldb`、`state.vscdb` 的 WAL…）。
+/// 在锁下拷贝只有两种结局：**报错**，或者更糟——**拿到陈旧内容却「看起来成功」**。
+/// 两种情况都会产出一份**坏快照**，恢复后的症状是「切换后客户端变成未登录」。
+///
+/// 本函数原先正是「先备份后关客户端」（第 2/3 步在第 5 步之前），已按参考实现的
+/// `switch_flow` 顺序（先 `stop_app` 再 `backup_current`）改正。
+/// ⚠️ `save_current_login_for`（「保存登录态」按钮）**仍然是旧顺序**——它需要在
+/// 关客户端之前先具备「优雅关闭」（否则强杀会丢用户未保存的编辑器状态），
+/// 而那一步尚未实现。见该函数的说明。
 pub fn switch_account<F>(options: &SwitchOptions, mut on_step: F) -> SwitchOutcome
 where
     F: FnMut(&SwitchStep),
@@ -1374,18 +1640,27 @@ where
     }
 
     // 1. 预检查：目标快照必须存在，否则后面的「关闭客户端」会造成一个无法恢复的中间态。
+    //
+    // ★ 失败原因**分两支**，且判据与 step 6 的恢复目标**同源**（同一个
+    //   `snapshot_data_dir_for` + `is_dir`）—— 见 [`missing_snapshot_reason`]。
+    //
+    // ★★ 这里**曾经**还有第二条路：目标账号没有快照时，用账号库里的凭据合成一份
+    //    登录态**直接写进客户端**（`materialize_login_in_dir`），想做到「与 WorkBuddy
+    //    的切换＝写认证文件同形」。**2026-09-29 真机实测后整条移除**：
+    //    客户端的登录态不是「一个 token」，`cloudide` 明文里还有服务端下发的
+    //    `account` 富对象与 `iCubeServerData` 缓存（账号库里没有、也造不出来）。
+    //    客户端读到缺 `iCubeServerData` 的 `cloudide` 后**把整份登录态判为无效并清掉**
+    //    ⇒ 用户的两个客户端双双变成未登录。实测取证与结论见
+    //    `docs/trae-login-materialize-probe-2026-09-29.md`。
     let target_slot = match paths::profile_dir_for(variant, &target) {
         Some(dir) if dir.is_dir() => dir,
         _ => {
-            emit(
-                &mut outcome,
-                SwitchStep::new(
-                    "fatal",
-                    "fail",
-                    format!("账号 {target} 的登录态快照不存在，请先保存该账号的登录态"),
-                ),
-            );
-            outcome.error = Some("目标快照不存在".into());
+            let can_save = snapshot_data_dir_for(variant)
+                .filter(|dir| dir.is_dir())
+                .is_some();
+            let message = missing_snapshot_reason(variant, &target, can_save);
+            emit(&mut outcome, SwitchStep::new("fatal", "fail", message.clone()));
+            outcome.error = Some(message);
             return outcome;
         }
     };
@@ -1395,67 +1670,7 @@ where
         SwitchStep::new("precheck", "ok", "目标账号快照已就绪"),
     );
 
-    // 2. 保存当前登录态到 last 槽位（强制，可回滚兜底）。
-    let previous_account = current_account_for(variant);
-    match backup_to_slot_for(variant, LAST_SLOT) {
-        Ok(count) => emit(
-            &mut outcome,
-            SwitchStep::new("backup", "ok", format!("当前登录态已保存到 last 槽位（{count} 个文件）")),
-        ),
-        Err(error) => emit(
-            &mut outcome,
-            SwitchStep::new(
-                "backup",
-                "skip",
-                format!("当前登录态未能保存（{error}），继续切换"),
-            ),
-        ),
-    }
-
-    // 3. 若已知当前账号，额外保存到它自己的槽位，使该账号可被再次切回。
-    //
-    // ★ 不变式：**凡把「客户端当前状态」写入「账号槽位」的路径，都必须过守卫；
-    //   `LAST_SLOT`（回滚槽）是唯一豁免。**
-    //
-    // 本步写的是**账号槽位**（`previous` 是 userId），且写入是**覆盖**式的：
-    // `LAST_SLOT` 里已经存了「切换前的现场」，`previous` 原本可能正确的旧快照一旦被
-    // 未登录态覆盖就**不可逆**了（回滚槽救不回来）。所以这一步必须先过
-    // `ensure_save_target_matches_client`，失败时**降级为 skip**、不影响后续切换。
-    //
-    // 注意 `LAST_SLOT` 的豁免理由：它的语义就是「切换前的现场」，必须允许在客户端
-    // 未登录时也照旧写入，否则回滚能力就没了（见第 2 步与守卫的文档）。
-    if let Some(previous) = previous_account.as_deref().filter(|uid| *uid != target) {
-        match ensure_save_target_matches_client(variant, previous) {
-            Err(error) => emit(
-                &mut outcome,
-                SwitchStep::new(
-                    "backup-current",
-                    "skip",
-                    format!("跳过更新 {previous} 的快照：{error}"),
-                ),
-            ),
-            Ok(()) => match backup_to_slot_for(variant, previous) {
-                Ok(count) => emit(
-                    &mut outcome,
-                    SwitchStep::new(
-                        "backup-current",
-                        "ok",
-                        format!("当前账号 {previous} 的登录态已更新（{count} 个文件）"),
-                    ),
-                ),
-                Err(error) => emit(
-                    &mut outcome,
-                    SwitchStep::new(
-                        "backup-current",
-                        "skip",
-                        format!("更新 {previous} 失败: {error}"),
-                    ),
-                ),
-            },
-        }
-    }
-
-    // 4. 设备标识重置（可选）。
+    // 2. 设备标识重置（可选）。
     if options.reset_device {
         match crate::modules::trae::platform::reset_device_identity_for(variant) {
             Ok(report) => {
@@ -1475,7 +1690,7 @@ where
         }
     }
 
-    // 5. 关闭客户端（恢复文件时若客户端在运行，会被其内存缓存覆盖回去）。
+    // 3. 关闭客户端（**必须先关**：备份与恢复都在文件锁下会失败/拿到陈旧内容）。
     match platform::kill_client_for(variant) {
         Ok(true) => emit(
             &mut outcome,
@@ -1493,6 +1708,119 @@ where
             );
             outcome.error = Some(error);
             return outcome;
+        }
+    }
+
+    // 4. 保存当前登录态到 last 槽位（强制，可回滚兜底）。
+    //
+    // ★ 但**结构不完整的当前状态不许覆盖 last**：`last` 是回滚兜底，被一份坏状态盖掉
+    //   就等于回滚能力一起消失（2026-09-29 实测发生过）。见 [`client_state_looks_complete`]。
+    //
+    // ★★ `previous_account` 取**客户端此刻实际登录的账号**，而不是 `current_account.txt`
+    //    这个标记文件（2026-09-29 修正）。标记文件只在「本程序成功切过/存过」之后才更新，
+    //    而用户完全可能刚在客户端里**手动登录**了另一个账号 —— 此时标记还停在旧值。
+    //
+    //    后果（第 4b 步）：拿旧值当 `previous` ⇒ 守卫发现「客户端登录的是 B、却要写 A 的槽位」
+    //    ⇒ 跳过 ⇒ **B 的快照永远建不出来**。用户于是以为「必须手动点一次保存登录态」，
+    //    而这正是「明明登录过了，却还是要我先存快照」这个抱怨的机制。
+    //    取实测值后：手动登录 B、再切到 A，**B 的快照会被自动补上**。
+    //
+    //    目录取**写侧**（`snapshot_data_dir_for`，与第 4b 步的备份目标同源）——
+    //    不能借道 `client_login_uid_for` 的「最近活跃」目录，那是另一个来源。
+    let client_dir = snapshot_data_dir_for(variant).filter(|dir| dir.is_dir());
+    let previous_account = client_dir
+        .as_deref()
+        .and_then(|dir| client_login_uid_in(dir, variant))
+        .or_else(|| current_account_for(variant));
+    let current_state_complete = client_dir
+        .as_deref()
+        .map(client_state_looks_complete)
+        .unwrap_or(false);
+    if current_state_complete {
+        match backup_to_slot_for(variant, LAST_SLOT) {
+            Ok(count) => emit(
+                &mut outcome,
+                SwitchStep::new("backup", "ok", format!("当前登录态已保存到 last 槽位（{count} 个文件）")),
+            ),
+            Err(error) => emit(
+                &mut outcome,
+                SwitchStep::new(
+                    "backup",
+                    "skip",
+                    format!("当前登录态未能保存（{error}），继续切换"),
+                ),
+            ),
+        }
+    } else {
+        emit(
+            &mut outcome,
+            SwitchStep::new(
+                "backup",
+                "skip",
+                "客户端当前登录态不完整（缺服务端数据），不覆盖 last 槽位 —— 保留上一次可回滚的现场",
+            ),
+        );
+    }
+
+    // 4b. 若已知当前账号，额外保存到它自己的槽位，使该账号可被再次切回。
+    //
+    // ★ 不变式：**凡把「客户端当前状态」写入「账号槽位」的路径，都必须过守卫；
+    //   `LAST_SLOT`（回滚槽）是唯一豁免。**
+    //
+    // 本步写的是**账号槽位**（`previous` 是 userId），且写入是**覆盖**式的：
+    // `LAST_SLOT` 里已经存了「切换前的现场」，`previous` 原本可能正确的旧快照一旦被
+    // 未登录态覆盖就**不可逆**了（回滚槽救不回来）。所以这一步必须先过
+    // `ensure_save_target_matches_client`，失败时**降级为 skip**、不影响后续切换。
+    //
+    // ★★ 但 `ensure_save_target_matches_client` 只查「是不是同一个账号」，**查不出
+    //   「这份状态完不完整」**。2026-09-29 第二次报障正是这么来的：客户端被写坏后
+    //   自报 `uid=Jackey`，本步就把那份坏状态写回 `profiles/1189017012674171`，
+    //   用户再切到 Jackey 恢复出来的就是它 ⇒ 又变成未登录。所以**先过完整性判定**。
+    //
+    // 注意 `LAST_SLOT` 的豁免理由：它的语义就是「切换前的现场」，必须允许在客户端
+    // 未登录时也照旧写入，否则回滚能力就没了（见第 2 步与守卫的文档）。
+    if let Some(previous) = previous_account.as_deref().filter(|uid| *uid != target) {
+        if !current_state_complete {
+            emit(
+                &mut outcome,
+                SwitchStep::new(
+                    "backup-current",
+                    "skip",
+                    format!(
+                        "跳过更新 {previous} 的快照：客户端当前登录态不完整（缺服务端数据）——\
+                         写进去会把坏状态灌回槽位，之后切到该账号会恢复出未登录"
+                    ),
+                ),
+            );
+        } else {
+            match ensure_save_target_matches_client(variant, previous) {
+                Err(error) => emit(
+                    &mut outcome,
+                    SwitchStep::new(
+                        "backup-current",
+                        "skip",
+                        format!("跳过更新 {previous} 的快照：{error}"),
+                    ),
+                ),
+            Ok(()) => match backup_to_slot_for(variant, previous) {
+                Ok(count) => emit(
+                    &mut outcome,
+                    SwitchStep::new(
+                        "backup-current",
+                        "ok",
+                        format!("当前账号 {previous} 的登录态已更新（{count} 个文件）"),
+                    ),
+                ),
+                Err(error) => emit(
+                    &mut outcome,
+                    SwitchStep::new(
+                        "backup-current",
+                        "skip",
+                        format!("更新 {previous} 失败: {error}"),
+                    ),
+                ),
+            },
+            }
         }
     }
 
@@ -1523,7 +1851,52 @@ where
             return outcome;
         }
     };
+
+    // 6b. ★ 写前留档：把**即将被覆盖的那份** `storage.json` 复制到只增不改的时间戳文件里。
+    //
+    // 位置刻意在这里（目录已定、尚未写入）。失败只报警告不阻断 —— 留档是保险，
+    // 不该让用户因此切不了账号；但也**不许静默**，所以状态是 `skip` 而不是 `ok`。
+    match backup_storage_before_write(&restore_dir, variant) {
+        Ok(path) => emit(
+            &mut outcome,
+            SwitchStep::new("backup-storage", "ok", format!("写前已留档：{path}")),
+        ),
+        Err(error) => emit(
+            &mut outcome,
+            SwitchStep::new(
+                "backup-storage",
+                "skip",
+                format!("写前留档失败（不阻断切换）：{error}"),
+            ),
+        ),
+    }
+
     match restore_from_slot_in_dir(&restore_dir, variant, &target) {
+        // ★ 0 项恢复 = 快照空或损坏。此时客户端的旧凭据**已经被清过**
+        //   （`restore_from_slot_in_dir` 先跑 `purge_restore_relatives`），继续往下走
+        //   只会把用户留在一个坏状态里 ⇒ 立刻从 `last` 回滚。
+        Ok(0) => {
+            emit(
+                &mut outcome,
+                SwitchStep::new("restore", "fail", "目标快照为空或损坏（0 项恢复）"),
+            );
+            let (steps, rollback_error) = rollback_after_failed_switch(&restore_dir, variant, true);
+            for step in steps {
+                emit(&mut outcome, step);
+            }
+            let message = match rollback_error {
+                None => format!(
+                    "账号 {target} 的快照为空或损坏，已回滚到切换前状态。\
+                     请在 Trae 客户端里登录 {target} 后重新保存该账号的登录态，再切换。"
+                ),
+                Some(reason) => format!(
+                    "账号 {target} 的快照为空或损坏，且{reason}。请在客户端里确认当前登录状态。"
+                ),
+            };
+            emit(&mut outcome, SwitchStep::new("fatal", "fail", message.clone()));
+            outcome.error = Some(message);
+            return outcome;
+        }
         Ok(count) => emit(
             &mut outcome,
             SwitchStep::new("restore", "ok", format!("已恢复 {target} 的登录态（{count} 个文件）")),
@@ -1552,12 +1925,32 @@ where
             SwitchStep::new("verify", "ok", format!("已确认客户端当前登录为 {target}")),
         ),
         RestoreCheck::Mismatch { actual } => {
-            let message = format!(
-                "切换未生效：恢复后客户端实际登录的是 {actual}，而不是目标账号 {target}。\
-                 该槽位的快照可能是在「保存守卫」上线前被写坏的（内容属于另一个账号）。\
-                 请在 Trae 客户端里登录 {target} 后重新保存该账号的登录态，再切换。"
+            // ★ 恢复动作成功、但恢复进去的**内容属于别人** ⇒ 立刻回滚，
+            //   别把用户留在一个「切了但没换人」的坏状态里（`last` 里有切换前那份好的）。
+            emit(
+                &mut outcome,
+                SwitchStep::new(
+                    "verify",
+                    "fail",
+                    format!("恢复后客户端实际登录的是 {actual}，不是目标账号 {target}"),
+                ),
             );
-            emit(&mut outcome, SwitchStep::new("verify", "fail", message.clone()));
+            let (steps, rollback_error) = rollback_after_failed_switch(&restore_dir, variant, true);
+            for step in steps {
+                emit(&mut outcome, step);
+            }
+            let message = match rollback_error {
+                None => format!(
+                    "切换未生效：恢复后客户端实际登录的是 {actual}，而不是目标账号 {target}。\
+                     该槽位的快照可能是在「保存守卫」上线前被写坏的（内容属于另一个账号），\
+                     已回滚到切换前状态。请在 Trae 客户端里登录 {target} 后重新保存该账号的登录态，再切换。"
+                ),
+                Some(reason) => format!(
+                    "切换未生效：恢复后客户端实际登录的是 {actual}，而不是目标账号 {target}，\
+                     且{reason}。请在客户端里确认当前登录状态。"
+                ),
+            };
+            emit(&mut outcome, SwitchStep::new("fatal", "fail", message.clone()));
             outcome.error = Some(message);
             return outcome;
         }
@@ -1781,13 +2174,70 @@ pub fn save_current_login(user_id: &str) -> Result<u64, String> {
 /// 保存当前登录态到指定账号槽位（不切换、不重启客户端；按变体分家）。
 ///
 /// 先过 [`ensure_save_target_matches_client`]：客户端登录着谁，就只能存进谁的槽位。
+/// ## ★★ 会**先关闭客户端、备份、再重新拉起**（2026-09-29 修正）
+///
+/// 备份是**文件拷贝**，而 `Network/Cookies`、`Local Storage/leveldb`、`state.vscdb`
+/// 的 WAL 在客户端运行时被**独占锁定**：拷贝要么报错，要么更糟地拿到**陈旧内容却
+/// 「看起来成功」**—— 产出一份**坏快照**，之后切到该账号就恢复出未登录。
+///
+/// 本函数原先正是「客户端运行时直接拷」，已改为「**先关 → 备份 → 跑过才拉回**」
+/// （与同类实现的 `SaveCurrentLogin` 同序）。关客户端走
+/// [`platform::kill_client_for`] 的**三级策略**（优雅关闭 → 强杀 → 等退出）——
+/// 优雅关闭这一步是这条修正的**前置**：没有它，「保存登录态」就成了一次强杀，
+/// 会把用户未保存的编辑器状态一起带走。
+///
+/// 只在该客户端**本来就在运行**时才重新拉起 —— 不给用户凭空开一个窗口。
 pub fn save_current_login_for(variant: TraeVariant, user_id: &str) -> Result<u64, String> {
     ensure_save_target_matches_client(variant, user_id)?;
-    let count = backup_to_slot_for(variant, user_id)?;
+
+    // ★★ 先确认「确实有东西可备份」，**再**决定要不要关客户端（2026-09-29 修正）。
+    //
+    // 源目录不存在时**直接返回 `backup_to_slot_for` 的报错、完全不碰客户端**：
+    // ① 保留守卫「源目录不存在 ⇒ 放行、报错交给下游」的既定语义
+    //    （见 `save_guard_fails_open_only_when_the_source_dir_is_absent`）；
+    // ② 更要紧的是——**没有东西可备份却先把用户的客户端关了**，是纯粹的破坏：
+    //    实测踩到过（既有用例走这条路径时，把用户正在用的 Trae 关掉，并因为随后
+    //    反复查进程而把测试挂住 12 分钟）。
+    if snapshot_data_dir_for(variant).filter(|dir| dir.is_dir()).is_none() {
+        return backup_to_slot_for(variant, user_id);
+    }
+
+    let was_running = platform::is_running_for(variant);
+    if was_running {
+        platform::kill_client_for(variant)?;
+    }
+
+    let backup = backup_to_slot_for(variant, user_id);
+
+    // 无论备份成败都要把客户端拉回来 —— 否则「保存登录态」失败一次就把用户的 IDE 关了。
+    let restart = if was_running {
+        match platform::detect_install_for(variant).exe {
+            Some(exe) => platform::launch_client_for(variant, &exe, None),
+            None => Err("找不到客户端可执行文件，未能重新启动".to_string()),
+        }
+    } else {
+        Ok(())
+    };
+
+    let count = match backup {
+        Ok(count) => count,
+        Err(error) => {
+            if let Err(restart_error) = restart {
+                store::append_log(
+                    &paths::switcher_log_file_for(variant),
+                    &format!("保存登录态失败后重新启动客户端也失败: {restart_error}"),
+                );
+            }
+            return Err(error);
+        }
+    };
+    // 备份已经成功，此时启动失败要如实报出来（否则用户以为客户端还开着）。
+    restart?;
+
     let _ = set_current_account_for(variant, user_id);
     store::append_log(
         &paths::switcher_log_file_for(variant),
-        &format!("保存登录态: user={user_id} 文件数={count}"),
+        &format!("保存登录态: user={user_id} 文件数={count}（已先关闭客户端再备份）"),
     );
     Ok(count)
 }
@@ -1858,17 +2308,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn core_entries_cover_the_nine_login_state_categories() {
-        // 参考实现精准备份 9 类文件；这里允许更多，但每个关键类别都必须在列。
+    fn core_entries_cover_the_login_state_categories() {
+        // 与参考实现的精准备份清单逐条对齐（**允许更多，但这几类必须在列**）。
+        // 2026-09-29 补上四项：SQLite 的 `-wal`/`-shm`（强杀时最新登录写入常只在这里）
+        // 与 `Local Storage/leveldb` / `Session Storage`（web 侧登录 KV）。
+        // 漏掉它们 ⇒ 快照缺最新登录数据 ⇒ 客户端恢复后变成未登录。
         let relatives: Vec<&str> = CORE_ENTRIES.iter().map(|e| e.relative).collect();
         for required in [
             "User/globalStorage/storage.json",
             "User/globalStorage/state.vscdb",
+            "User/globalStorage/state.vscdb-wal",
+            "User/globalStorage/state.vscdb-shm",
             "machineid",
             "aha",
             "Preferences",
             "Local State",
+            "Local Storage/leveldb",
             "Local Storage/config.db",
+            "Session Storage",
             "Network",
             "Partitions/trae-webview",
         ] {
@@ -1877,7 +2334,30 @@ mod tests {
                 "核心文件清单缺少 {required}"
             );
         }
-        assert!(CORE_ENTRIES.len() >= 9, "至少覆盖 9 类核心文件");
+        assert!(CORE_ENTRIES.len() >= 13, "至少覆盖 13 类核心文件");
+    }
+
+    /// ★ `-wal` / `-shm` 必须**同时在**「快照清单」与「清除清单」里。
+    ///
+    /// 只在清除侧 ⇒ 强杀时尚未 checkpoint 的最新登录写入被永久丢掉（症状：恢复后客户端
+    /// 变成未登录，2026-09-29 实测）；只在快照侧 ⇒ 客户端残留的旧 WAL 与快照主库错配，
+    /// SQLite 打开时回放上一账号的事务。**两条都不能省。**
+    #[test]
+    fn sqlite_sidecars_are_both_snapshotted_and_purged() {
+        let relatives: Vec<&str> = CORE_ENTRIES.iter().map(|e| e.relative).collect();
+        for sidecar in [
+            "User/globalStorage/state.vscdb-wal",
+            "User/globalStorage/state.vscdb-shm",
+        ] {
+            assert!(
+                relatives.contains(&sidecar),
+                "{sidecar} 必须在**快照**清单里（否则强杀时留在 WAL 的最新登录写入会丢）"
+            );
+            assert!(
+                RESTORE_PURGE_RELATIVES.contains(&sidecar),
+                "{sidecar} 必须在**清除**清单里（否则客户端残留的旧 WAL 会与快照主库错配）"
+            );
+        }
     }
 
     #[test]
@@ -2626,11 +3106,163 @@ mod tests {
         };
         let outcome = switch_account(&options, |_| {});
         assert!(!outcome.success);
-        assert_eq!(outcome.error.as_deref(), Some("目标快照不存在"));
+        // 文案本身由 `missing_snapshot_reason_distinguishes_cannot_save_from_not_saved`
+        // 分两支钉住（这里取哪一支取决于**本机有没有该变体的客户端数据目录**，
+        // 断言具体措辞会让本用例在换台机器后假失败）。本用例只管三件事：
+        // 失败原因**点明是哪个账号**、直接 fatal、**不碰客户端**。
+        let error = outcome.error.expect("失败必须给出原因");
+        assert!(
+            error.contains("definitely_no_such_account_slot"),
+            "失败原因必须点明是哪个账号（否则用户无从下手）: {error}"
+        );
         let stages: Vec<&str> = outcome.steps.iter().map(|s| s.stage).collect();
         // 预检查失败 → 直接 fatal，不进入停止/恢复流程
         assert_eq!(stages.first().copied(), Some("fatal"));
         assert!(!stages.contains(&"stop"));
+    }
+
+    /// ★ 「客户端当前登录态是否完整」必须认**服务端下发的那份缓存**在不在。
+    ///
+    /// 反例（改坏会红）：把判据改成「只看 `cloudide` 在不在」⇒ 被写坏的那份
+    /// （有 `cloudide`、**没有** `iCubeServerData`）会被判成完整，于是它被写回槽位，
+    /// 用户切到该账号又变成未登录 —— 这正是 2026-09-29 的第二次报障。
+    #[test]
+    fn client_state_completeness_requires_the_server_data_cache() {
+        let dir = std::env::temp_dir().join(format!(
+            "buddy-switch-state-complete-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(dir.join("User").join("globalStorage")).expect("建临时 userData");
+        let storage = icube::storage_path_in_dir(&dir);
+
+        // ① 完整：两个键都在（真机 9 键状态的必要项）。
+        std::fs::write(
+            &storage,
+            r#"{"iCubeAuthInfo://icube.cloudide":"x","iCubeServerData://icube.cloudide":"{}"}"#,
+        )
+        .expect("铺完整态");
+        assert!(client_state_looks_complete(&dir), "两个键都在必须判为完整");
+
+        // ② 被写坏的：只有 `cloudide` —— 复刻 2026-09-29 那份 7 键状态。
+        std::fs::write(&storage, r#"{"iCubeAuthInfo://icube.cloudide":"x"}"#).expect("铺坏态");
+        assert!(
+            !client_state_looks_complete(&dir),
+            "缺服务端数据必须判为**不完整**（否则坏状态会被回灌进槽位）"
+        );
+
+        // ③ 读不到 / 不是 JSON ⇒ 一律不完整（宁可少写一次槽位，也不要把坏状态灌进去）。
+        std::fs::remove_file(&storage).expect("删 storage");
+        assert!(!client_state_looks_complete(&dir));
+        std::fs::write(&storage, "not json").expect("铺非 JSON");
+        assert!(!client_state_looks_complete(&dir));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ 写前留档必须**只增不改**：连续两次留档要得到**两个**文件，内容各自保留。
+    ///
+    /// 反例（改坏会红）：文件名不带时间戳（或同名直接覆盖）⇒ 第二次盖掉第一次，
+    /// `assert_ne!(first, second)` 失败。**这条正是 2026-09-29 事故缺的那块**：
+    /// `last` 槽位每切一次就被整体覆盖，于是「唯一一份原始登录态」没有副本可回退，
+    /// 只能拿账号库里的 JWT 重建一份**残缺**的。
+    #[test]
+    fn backup_storage_before_write_never_overwrites() {
+        let home = std::env::temp_dir().join(format!(
+            "buddy-switch-storage-backup-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let client = home.join("TRAE SOLO CN");
+        std::fs::create_dir_all(client.join("User").join("globalStorage")).expect("建临时 userData");
+        let storage = icube::storage_path_in_dir(&client);
+        let guard = crate::modules::config::HomeOverrideGuard::set(&home);
+
+        std::fs::write(&storage, r#"{"first":1}"#).expect("铺第一版");
+        let first = backup_storage_before_write(&client, TraeVariant::TraeWork).expect("第一次留档");
+        std::fs::write(&storage, r#"{"second":2}"#).expect("铺第二版");
+        let second =
+            backup_storage_before_write(&client, TraeVariant::TraeWork).expect("第二次留档");
+
+        assert_ne!(first, second, "两次留档必须是两个文件，不能互相覆盖");
+        assert_eq!(
+            std::fs::read_to_string(&first).expect("读第一份"),
+            r#"{"first":1}"#,
+            "第一份的内容必须原样留着"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&second).expect("读第二份"),
+            r#"{"second":2}"#
+        );
+
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// ★ 留档不能无限增长：只保留文件名最大的 `keep` 份（文件名即 UTC 时间戳 ⇒ 字典序 = 时间序）。
+    #[test]
+    fn prune_storage_backups_keeps_the_newest() {
+        let dir = std::env::temp_dir().join(format!(
+            "buddy-switch-storage-prune-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        for name in ["c.json", "a.json", "d.json", "b.json"] {
+            std::fs::write(dir.join(name), "x").expect("铺留档");
+        }
+        prune_storage_backups(&dir, 2).expect("裁剪");
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .expect("列目录")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec!["c.json".to_string(), "d.json".to_string()],
+            "必须保留文件名最大的两份"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ 预检查失败的两支文案：**有数据目录** ⇒ 让用户去保存；**没有** ⇒ 必须解释为什么存不了。
+    ///
+    /// 反例（改坏会红）：两支合并回一句「请先保存该账号的登录态」—— 那在「客户端装了
+    /// 但从没启动过」的机器上是**死循环**（保存同样做不到），正是 2026-09-29 的报障现场：
+    /// 用户看到「切换TraeCode账号完成」，而真机后端其实返回 `success:false`。
+    ///
+    /// 判据 `can_save` 是显式入参，因此**两支都能在本机被跑到**（不受本机装没装影响），
+    /// 不会退化成「只有一支恒真的空护栏」。
+    #[test]
+    fn missing_snapshot_reason_distinguishes_cannot_save_from_not_saved() {
+        // 第二支会经 `platform::data_dir_missing_reason` → `detect_install_for` → `settings::load()`
+        // 读 `store_dir()`，必须持 env 锁（见验证纪律「无参全局路径函数」一条）。
+        let _lock = crate::modules::config::env_lock();
+        let variant = TraeVariant::default();
+        let target = "u-target";
+
+        let saved_able = missing_snapshot_reason(variant, target, true);
+        assert!(saved_able.contains(target), "{saved_able}");
+        assert!(
+            saved_able.contains("请先保存该账号的登录态"),
+            "有数据目录 ⇒ 结论就是「去保存」: {saved_able}"
+        );
+        assert!(
+            !saved_able.contains("无法保存"),
+            "有数据目录时不得说存不了: {saved_able}"
+        );
+
+        let cannot_save = missing_snapshot_reason(variant, target, false);
+        assert!(cannot_save.contains(target), "{cannot_save}");
+        assert!(
+            !cannot_save.contains("请先保存该账号的登录态"),
+            "没有数据目录时不得再让用户去保存（那是死循环）: {cannot_save}"
+        );
+        // 复用 `data_dir_missing_reason` 的结论：两处不得各说一套（改坏任一侧即红）。
+        assert!(
+            cannot_save.contains(&platform::data_dir_missing_reason(variant)),
+            "第二支必须逐字复用 data_dir_missing_reason 的结论: {cannot_save}"
+        );
+        // 两支必须**真的不同** —— 否则「分两支」是假的。
+        assert_ne!(saved_able, cannot_save);
     }
 
     #[test]

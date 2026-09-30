@@ -10,6 +10,8 @@ import type {
   TraeApiKeyRecord,
   TraeCapabilities,
   TraeCheckinStatus,
+  TraeClientModel,
+  TraeClientModelList,
   TraeCreditsOverview,
   TraeEnvStatus,
   TraeVariantsStatus,
@@ -1040,6 +1042,58 @@ function demoTraeGatewayModels(): unknown {
 }
 
 /**
+ * 演示用的**客户端（上游下发）**模型清单。
+ *
+ * 刻意与 `demoTraeGatewayModels` 的静态清单**不同**（多出 `Doubao-Seed-Evolving`、
+ * `deepseek-v4.1-flash` 这类真实名字，且按 function 分成两组）—— 截图要能看出
+ * 「这是客户端里那份随上游刷新的清单，不是写死的对外清单」，否则演示站会掩盖两者的差别。
+ * 目录与 uid 一律是**明显的虚构值**，不照抄任何真机数据。
+ */
+function demoTraeClientModels(): TraeClientModelList {
+  const model = (
+    name: string,
+    displayName: string,
+    isDefault = false,
+  ): TraeClientModel => ({
+    name,
+    displayName,
+    modelType: "reasoning_model",
+    multimodal: true,
+    isDefault,
+    isPreset: true,
+    isNew: false,
+    isBeta: false,
+    contextWindow: 256000,
+    promptMaxTokens: 224000,
+  });
+  return {
+    variant: "trae_work",
+    variantLabel: "Trae Work",
+    source: "client-cache",
+    readAt: 1753600000000,
+    dataDir: "C:\\Users\\Demo\\AppData\\Roaming\\TRAE SOLO CN",
+    uid: "7000000000000001",
+    groups: [
+      {
+        function: "solo_work_lite",
+        models: [
+          model("Doubao-Seed-Evolving", "Seed-Evolving"),
+          model("Doubao-Seed-2.1-Pro", "Seed-2.1-Pro-0915"),
+          model("deepseek-v4.1-flash", "DeepSeek-V4.1-Flash"),
+          model("glm-5.3", "GLM-5.3"),
+          model("kimi-k3", "Kimi-K3"),
+        ],
+      },
+      {
+        function: "solo_coder",
+        models: [model("Doubao-Seed-2.0-Code", "Doubao-Seed-2.0-Code", true)],
+      },
+    ],
+    note: null,
+  };
+}
+
+/**
  * 演示用的 Trae 多 Key 列表（含**两个区域**各一把 + 一条历史归属）。
  *
  * 刻意给出不同 `variant`（`cn` / `global`；第三条保留改造前的 `trae_work`）与一条已吊销：
@@ -1272,6 +1326,7 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "get_trae_gateway_config": return demoTraeGatewayConfig();
     case "trae_gateway_status": return demoTraeGatewayStatus();
     case "get_trae_gateway_models": return demoTraeGatewayModels();
+    case "get_trae_client_models": return demoTraeClientModels();
     case "list_trae_api_keys": return demoTraeApiKeys();
     case "get_trae_gateway_logs": return demoTraeGatewayLogs();
     default: throw new Error(t("shared.demo.error.missingReadOnly", { command }));

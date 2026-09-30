@@ -668,6 +668,59 @@ export interface TraeGatewayModel {
 }
 
 /**
+ * 客户端（**上游下发**）的模型清单（`get_trae_client_models`）。
+ *
+ * 数据源是 Trae 客户端 `state.vscdb` 里上游下发的清单缓存，因此**随客户端刷新而变**。
+ * 读不到时 `source === "missing"`、`groups` 为空数组、`note` 给出可读原因。
+ *
+ * 字段一律 camelCase（后端已 `rename_all = "camelCase"`）；且**所有字段都已被后端
+ * 归一**（脏值不会传到这里）—— 展示层不必再判类型。
+ */
+export interface TraeClientModelList {
+  /** 变体标识（`trae_work` / `trae_cn` / `global` / `global_trae_code`）。 */
+  variant: TraeVariantId;
+  /** 变体展示名（`Trae Work` / `Trae` …）。 */
+  variantLabel: string;
+  /** `"client-cache"`（读到了）或 `"missing"`（没读到）。 */
+  source: "client-cache" | "missing" | string;
+  /** 本次读取时间（毫秒时间戳）。 */
+  readAt: number;
+  /** 读到的 `state.vscdb` 所在 userData 目录。 */
+  dataDir: string | null;
+  /** 命中的缓存键里的 uid。 */
+  uid: string | null;
+  /** 按 function 分组（`solo_work_lite` / `solo_coder` …；取值按产品线不同）。 */
+  groups: TraeClientModelGroup[];
+  /** 读不到的原因，或「客户端里存有多份缓存」这类提示。 */
+  note: string | null;
+}
+
+/** 客户端模型清单的一个 function 分组。 */
+export interface TraeClientModelGroup {
+  function: string;
+  models: TraeClientModel[];
+}
+
+/** 客户端模型清单里的单个模型（字段已由后端归一）。 */
+export interface TraeClientModel {
+  /** 模型标识（上游 `name`，如 `deepseek-v4.1-flash`）。 */
+  name: string;
+  /** 展示名（上游 `display_name`）；取不到时后端已回落成 `name`。 */
+  displayName: string;
+  /** `reasoning_model` / `chat_model` …；取不到为空串。 */
+  modelType: string;
+  multimodal: boolean;
+  isDefault: boolean;
+  isPreset: boolean;
+  isNew: boolean;
+  isBeta: boolean;
+  /** 默认上下文窗口；取不到为 `null`。 */
+  contextWindow: number | null;
+  /** 单次回复上限；取不到为 `null`。 */
+  promptMaxTokens: number | null;
+}
+
+/**
  * 单条 Trae API Key（`list_trae_api_keys` 的 `keys[]`）。
  *
  * **不含 hash 与明文**：服务端只下发脱敏白名单（`prefix` / `name` / `variant`…），

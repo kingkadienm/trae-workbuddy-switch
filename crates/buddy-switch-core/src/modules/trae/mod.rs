@@ -98,6 +98,8 @@ pub mod handlers;
 pub mod icube;
 pub mod jwt;
 pub mod logs;
+/// 客户端模型清单（读 `state.vscdb` 里上游下发的 `model_list_map`，见模块头）。
+pub mod model_list;
 pub mod oauth;
 pub mod oauth_client;
 /// OAuth 回调结果页（浏览器里那一页的 HTML 渲染，见模块头）。

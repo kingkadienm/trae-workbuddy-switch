@@ -17,6 +17,9 @@
 
 use serde_json::{json, Map, Value};
 
+use buddy_switch_core::modules::trae::model_list::ClientModelList;
+use buddy_switch_core::modules::trae::variant::TraeVariant;
+
 use super::{TRAE_APP_ID, TRAE_FUNCTION, TRAE_IDE_VERSION, TRAE_IDE_VERSION_CODE};
 
 /// 模型显示名 → `(config_name, model_name)`。
@@ -45,7 +48,16 @@ pub fn model_config(model: &str) -> (&'static str, &'static str) {
     }
 }
 
-/// 网关对外暴露的模型清单（`/v1/models`）。
+/// 网关对外暴露的模型清单（**静态兜底**，`/v1/models` 读不到客户端清单时才用）。
+///
+/// ⚠️ **内容已滞后**（本机实测：客户端里早已是 `deepseek-v4.1-flash`、
+/// `Doubao-Seed-Evolving`、`step-5-preview`、`qwen3.8-max` 等，而这里的
+/// `sagitta` / `aquila` 在客户端里**根本不存在**）。它现在只保证「客户端没启动过 /
+/// 没登录时，`/v1/models` 不至于返回空表」。
+///
+/// ⚠️ 改这里的名字**必须同时看 [`model_config`]** —— 那张映射表是按这里的名字
+/// 写的（例如 `deepseek-v4-flash` → `DeepSeek-V4-Flash`），改名会让映射落到默认分支。
+/// 而映射正确与否**只能靠实测上游认哪个名字**，不能照抄客户端清单的显示名。
 pub const MODEL_NAMES: &[&str] = &[
     "doubao-seed-2.1-pro",
     "doubao-seed-2.1-turbo",
@@ -65,18 +77,77 @@ pub const MODEL_NAMES: &[&str] = &[
     "aquila",
 ];
 
-/// `/v1/models` 的响应体。
+/// 静态兜底清单的上下文窗口（客户端清单里取不到时沿用，保持既有形状不变）。
+const DEFAULT_CONTEXT_LENGTH: i64 = 131_072;
+
+/// `/v1/models` 的响应体（**静态兜底清单**）。
+///
+/// 只在客户端清单读不到时才被用到，见 [`models_response_for`]。
 pub fn models_response() -> Value {
+    models_response_from(
+        MODEL_NAMES
+            .iter()
+            .map(|name| (*name, None))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// `/v1/models` 的响应体 —— **按变体读客户端（上游下发）的清单**，读不到回落静态。
+///
+/// ## 为什么对外清单也要跟着客户端走（issue #4）
+///
+/// Trae 的模型清单由服务端下发，客户端拉取后落在 `state.vscdb`
+/// （见 `buddy_switch_core::modules::trae::model_list`）。网关对外暴露的清单
+/// **必须与客户端里那份一致** —— 否则用户照着 `/v1/models` 列出的名字去调用，
+/// 很可能传的是上游根本不认的旧名（本仓实测：静态清单里的 `deepseek-v4-flash`
+/// 在客户端里早已是 `deepseek-v4.1-flash`，而 `sagitta` / `aquila` **根本不存在**）。
+///
+/// ## 为什么读不到要**回落**而不是报错
+///
+/// 客户端没启动过 / 没登录时读不到清单。此时报错会让 OpenAI 客户端连「列模型」
+/// 都失败（开箱即空）；回落静态清单至少保证**可用**，代价是名字可能过时。
+/// 两者相权取回落 —— 与「网关不因管理面缺数据而拒绝服务」的既有取向一致。
+pub fn models_response_for(variant: TraeVariant) -> Value {
+    let list = buddy_switch_core::modules::trae::model_list::read_client_model_list(variant);
+    if list.groups.is_empty() {
+        return models_response();
+    }
+
+    models_response_from(dedupe_entries(&list))
+}
+
+/// 把客户端清单展平成 `(模型名, 上下文窗口)`，并**按出现顺序去重**。
+///
+/// 去重是必需的：同一个模型会在多个 function 分组里重复出现（本机实测
+/// `solo_work_lite` 与 `solo_work_remote` 内容完全相同）。
+/// **保序**（而不是排序）是为了让 `/v1/models` 的顺序与客户端里看到的一致。
+fn dedupe_entries(list: &ClientModelList) -> Vec<(&str, Option<i64>)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut entries: Vec<(&str, Option<i64>)> = Vec::new();
+    for group in &list.groups {
+        for model in &group.models {
+            if seen.insert(model.name.as_str()) {
+                entries.push((model.name.as_str(), model.context_window));
+            }
+        }
+    }
+    entries
+}
+
+/// 把 `(模型名, 上下文窗口)` 组装成 OpenAI `/v1/models` 形状。
+///
+/// 两条来源（客户端清单 / 静态兜底）共用本函数 —— 形状只有一处，不会漂移。
+fn models_response_from(entries: Vec<(&str, Option<i64>)>) -> Value {
     json!({
         "object": "list",
-        "data": MODEL_NAMES
-            .iter()
-            .map(|name| json!({
+        "data": entries
+            .into_iter()
+            .map(|(name, context_window)| json!({
                 "id": name,
                 "object": "model",
                 "created": 1_753_600_000,
                 "owned_by": "trae",
-                "context_length": 131_072,
+                "context_length": context_window.unwrap_or(DEFAULT_CONTEXT_LENGTH),
             }))
             .collect::<Vec<_>>(),
     })
@@ -287,6 +358,7 @@ fn normalize_tools(object: &mut Map<String, Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use buddy_switch_core::modules::trae::model_list::{ClientModel, ClientModelGroup};
 
     fn prepared(body: Value) -> Value {
         let bytes = serde_json::to_vec(&body).unwrap();
@@ -433,5 +505,71 @@ mod tests {
         assert_eq!(data.len(), MODEL_NAMES.len());
         assert_eq!(data[0]["object"], "model");
         assert_eq!(response["object"], "list");
+    }
+
+    /// 客户端清单里的**真实**上下文窗口优先；取不到时回落既有常量（形状不退化）。
+    #[test]
+    fn models_response_from_uses_real_context_window_and_falls_back() {
+        let response = models_response_from(vec![("a", Some(256_000)), ("b", None)]);
+        let data = response["data"].as_array().unwrap();
+
+        assert_eq!(data[0]["id"], "a");
+        assert_eq!(data[0]["context_length"], 256_000);
+        assert_eq!(data[1]["id"], "b");
+        assert_eq!(
+            data[1]["context_length"], DEFAULT_CONTEXT_LENGTH,
+            "取不到窗口必须回落成数值，不能是 null —— 老客户端会直接读这个字段"
+        );
+    }
+
+    /// ★ 去重必须**保序**（不是排序）：同一模型在多个 function 分组里重复出现，
+    /// 但 `/v1/models` 不该列出重复项，且顺序要与客户端里看到的一致。
+    #[test]
+    fn dedupe_entries_keeps_first_occurrence_order() {
+        let list = ClientModelList {
+            variant: "trae_work".into(),
+            variant_label: "Trae Work".into(),
+            source: "client-cache".into(),
+            read_at: 0,
+            data_dir: None,
+            uid: None,
+            groups: vec![
+                ClientModelGroup {
+                    function: "a".into(),
+                    models: vec![client_model("m1", Some(1)), client_model("m2", None)],
+                },
+                ClientModelGroup {
+                    function: "b".into(),
+                    models: vec![client_model("m2", Some(2)), client_model("m3", None)],
+                },
+            ],
+            note: None,
+        };
+
+        let entries = dedupe_entries(&list);
+        assert_eq!(
+            entries.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            vec!["m1", "m2", "m3"],
+            "重复的 m2 只能出现一次，且位置保持在首次出现处"
+        );
+        assert_eq!(
+            entries[1].1, None,
+            "保留**首次**出现那份的上下文窗口（m2 首次出现时没有窗口）"
+        );
+    }
+
+    fn client_model(name: &str, context_window: Option<i64>) -> ClientModel {
+        ClientModel {
+            name: name.to_string(),
+            display_name: name.to_string(),
+            model_type: String::new(),
+            multimodal: false,
+            is_default: false,
+            is_preset: true,
+            is_new: false,
+            is_beta: false,
+            context_window,
+            prompt_max_tokens: None,
+        }
     }
 }

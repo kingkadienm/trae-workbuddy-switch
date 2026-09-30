@@ -1700,10 +1700,39 @@ pub async fn trae_gateway_status(app: tauri::AppHandle, variant: Option<String>)
     .await
 }
 
-/// GET /api/trae/gateway/models —— 对外暴露的模型清单（静态）。
+/// GET /api/trae/gateway/models —— 对外暴露的模型清单（**随上游刷新**）。
+///
+/// 与 [`get_trae_client_models`] **同源**（都读客户端 `state.vscdb` 里的上游清单），
+/// 区别只在形状：这里是 OpenAI `/v1/models` 形状的**扁平去重**清单 ——
+/// 也就是外部客户端连本网关时列出的那份；那边是带元数据的分组视图。
+///
+/// `variant` 决定读哪条产品线；缺失 / 未知 → 默认变体（TraeWork）。
+/// 客户端清单读不到时**回落静态兜底清单**，保证「列模型」不会失败。
 #[tauri::command]
-pub fn get_trae_gateway_models() -> Value {
-    buddy_switch_gateway::trae::payload::models_response()
+pub fn get_trae_gateway_models(variant: Option<String>) -> Value {
+    let variant = parse_trae_variant(variant.as_deref());
+    buddy_switch_gateway::trae::payload::models_response_for(variant)
+}
+
+/// GET /api/trae/gateway/client-models —— 客户端（**上游下发**）的模型清单。
+///
+/// 与 [`get_trae_gateway_models`] **同源**（同一份客户端缓存），但形状不同：
+/// 这里是**分组 + 元数据**（展示名 / 上下文窗口 / 是否默认 / 是否 Beta …），
+/// 供「API 服务」页的模型卡渲染；那边是扁平去重后的 OpenAI 形状。
+///
+/// `variant` 决定读哪条产品线的客户端；缺失 / 未知 → 默认变体（TraeWork）。
+/// 读不到（客户端没启动过 / 没登录 / 还没拉过清单）**不是错误**：返回
+/// `source = "missing"` 与可读的 `note`，由界面呈现空态。
+#[tauri::command]
+pub fn get_trae_client_models(variant: Option<String>) -> Value {
+    let variant = parse_trae_variant(variant.as_deref());
+    match serde_json::to_value(trae::model_list::read_client_model_list(variant)) {
+        Ok(value) => value,
+        Err(error) => json!({
+            "source": "missing",
+            "note": format!("序列化客户端模型清单失败: {error}"),
+        }),
+    }
 }
 
 /// GET /api/trae/gateway/keys —— 多 Key 列表（含归属产品线）。

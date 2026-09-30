@@ -27,8 +27,20 @@ export const en = {
   // =====================================================================
   "trae.gateway.models.title": "Model list",
   "trae.gateway.models.summary": "{count} total · default {model}",
-  "trae.gateway.models.note": "Trae models are client-side constants and never refresh from upstream; the list below is exactly what is exposed.",
+  "trae.gateway.models.note": "This list is read from the Trae client's local cache (pushed by upstream), so it follows the client's refresh.",
   "trae.gateway.models.empty": "No model data yet.",
+  "trae.gateway.models.refresh": "Reload",
+  "trae.gateway.models.source": "Source",
+  "trae.gateway.models.sourceCache": "Client cache",
+  "trae.gateway.models.sourceMissing": "Not loaded",
+  "trae.gateway.models.readAt": "Read at {time}",
+  "trae.gateway.models.gatewayCount": "{count} exposed by gateway",
+  "trae.gateway.models.groupCount": "{count}",
+  "trae.gateway.models.badgeDefault": "Default",
+  "trae.gateway.models.badgeNew": "New",
+  "trae.gateway.models.badgeBeta": "Beta",
+  "trae.gateway.models.badgeCustom": "Custom",
+  "trae.gateway.models.context": "Context {tokens}",
 
   // =====================================================================
   // gateway/trae-request-log.tsx —— request log

@@ -64,6 +64,9 @@ export const zh = {
   "trae.comp.card.currentOf": "{label} 当前账号",
   "trae.comp.card.switch.tip": "切换为 {label} 当前账号（会重启 {label}）",
   "trae.comp.card.switch.missing": "未检测到 {label}",
+  // 「装了但没数据目录」是第三种形态，与「没装」的下一步动作**完全不同**：
+  // 装了要去启动一次，没装要去安装。合成一句话会让用户按错的指引操作。
+  "trae.comp.card.switch.noDataDir": "{label} 还没有客户端数据目录 —— 先启动一次 {label} 并登录，再保存登录态",
   "trae.comp.card.switch.aria": "切换到 {label}",
   "trae.comp.card.switch.ariaBusy": "正在切换到 {label}",
   "trae.comp.card.switch.busy": "切换中…",
@@ -90,7 +93,12 @@ export const zh = {
 
   // ---- 页脚按钮 ----
   "trae.comp.card.action.saving": "保存中…",
-  "trae.comp.card.action.saveTip": "把当前 Trae 登录态备份到该账号槽位",
+  // ★ 必须说明「会先关客户端」：备份是文件拷贝，客户端运行时 Cookie / leveldb / SQLite WAL
+  //   被独占锁定，此时拷出来的快照是坏的（切过去会变成未登录）。用户得知道客户端会重启一次。
+  "trae.comp.card.action.saveTip": "把客户端此刻的登录态保存到该账号名下（切换时用它恢复）；会先关闭并重新打开客户端",
+  // 保存的目标只能是「该账号此刻登录着的那个程序位」—— 一个都没有时后端守卫也会拒绝，
+  // 所以就地禁用并说明，别让用户点了再吃一句看不懂的拒绝。
+  "trae.comp.card.action.saveNoLogin": "该账号当前没有登录在任何 Trae 客户端上 —— 先在客户端里登录它，再保存",
   "trae.comp.card.action.refreshing": "刷新中…",
   "trae.comp.card.action.refreshJwtTip": "用 refresh token 换一份新的 JWT",
   "trae.comp.card.footer.updatedAt": "{time} 更新",

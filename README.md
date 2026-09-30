@@ -349,3 +349,13 @@ npm/                     # npm 包（**尚未发布**）：主包 @nextagentx/bu
 - 条款全文：[LICENSE](./LICENSE)
 - 白话说明、允许与禁止的具体情形、常见问题、以及 2026-09-22 之前版本的 MIT 说明：[docs/LICENSING.md](docs/LICENSING.md)
 - 如需商业授权，请通过本仓库 Issues 联系作者。
+
+## Star 趋势
+
+<a href="https://www.star-history.com/?repos=NextAgentX%2Ftrae-workbuddy-switch&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=NextAgentX/trae-workbuddy-switch&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=NextAgentX/trae-workbuddy-switch&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=NextAgentX/trae-workbuddy-switch&type=date&legend=top-left" />
+ </picture>
+</a>

@@ -80,6 +80,27 @@ import { useTraeVariant } from "@/lib/use-trae-variant";
 const UNGROUPED = "__ungrouped__";
 
 /**
+ * 一次动作的**结果判定**（由调用方按后端报告如实给出）。
+ *
+ * ## 为什么要有这个类型（2026-09-29）
+ *
+ * 本仓不少后端写操作的失败是**正常返回的报告**，不是传输错误：
+ * 切换账号回 `success:false` + `steps`、批量签到回 `failed: n`。
+ * 而动作外壳原先只认「Promise 有没有 reject」⇒ 这些失败全被弹成「{label}完成」。
+ * 报障原文：「切换成功，但是程序没有被打开，标记状态也没有变更」。
+ *
+ * 把「报成功还是报失败」变成**显式的返回值**，调用方就必须表态；
+ * 省略 `message` 时按 `level` 取默认文案（success → 「{label}完成」，
+ * 其余 → 「{label}失败」）。
+ */
+type ActionVerdict = {
+  level: "success" | "warning" | "error";
+  /** 省略时按 `level` 取默认文案。 */
+  message?: string;
+  description?: string;
+};
+
+/**
  * 账号页的快照。
  *
  * 这些数据**必须一起**缓存：卡片上的程序切换按钮要同时用到账号、程序位与各区域
@@ -340,7 +361,20 @@ export default function TraeAccountsPage() {
     return () => dispose?.();
   }, []);
 
-  /** 统一的动作执行：加忙标记、成功提示、失败提示、随后刷新聚合数据。 */
+  /**
+   * 统一的动作执行：加忙标记、**判定结果**、提示、随后刷新聚合数据。
+   *
+   * ## ★ 为什么第 6 个参数是「判定」而不是「自定义成功文案」（2026-09-29 改）
+   *
+   * 旧签名只给了一个 `successMessage`（返回 `null` 就用默认的「{label}完成」）。
+   * 它的语义**预设了成功** —— 于是「后端正常返回一份带失败的报告」这类动作
+   * （切换的 `success:false`、签到的 `failed: n`）在界面上**永远报「完成」**，
+   * 而调用方连改口的机会都没有。报障原文：「切换成功，但是程序没有被打开」。
+   *
+   * 现在改成返回一份**判定**（`ActionVerdict`），由调用方按后端报告如实表态；
+   * 不传时保持旧行为（成功 → 「{label}完成」）。这样「失败也报完成」这类缺陷
+   * 在**签名层面**就写不出来了，而不是靠每个调用点各自记得。
+   */
   async function run<T>(
     key: string,
     /** 动作的文案键；渲染时才取词，切换语言后同一枚按钮读到的就是新语言。 */
@@ -348,21 +382,25 @@ export default function TraeAccountsPage() {
     action: () => Promise<T>,
     labelParams?: Record<string, string | number>,
     after?: (result: T) => void,
-    /**
-     * 自定义成功文案；返回 `null` 表示用默认的「{label}完成」。
-     *
-     * 用途：有些操作「成功」与「什么都没做」都算成功（如全部签到遇到
-     * 「今日已全部签过」），统一报「完成」会让用户以为刚签了一遍。
-     */
-    successMessage?: (result: T) => string | null,
+    verdictOf?: (result: T) => ActionVerdict,
   ) {
     setBusy(key);
     const label = t(labelKey, labelParams);
     try {
       const result = await action();
       after?.(result);
-      const custom = successMessage?.(result);
-      toast.success(custom ?? t("trae.page.accounts.actionDone", { label }));
+      const verdict = verdictOf?.(result) ?? { level: "success" as const };
+      const message =
+        verdict.message ??
+        t(
+          verdict.level === "success"
+            ? "trae.page.accounts.actionDone"
+            : "trae.page.accounts.actionFailed",
+          { label },
+        );
+      const emit =
+        verdict.level === "error" ? toast.error : verdict.level === "warning" ? toast.warning : toast.success;
+      emit(message, { description: verdict.description });
       await loadAll();
     } catch (e) {
       toast.error(t("trae.page.accounts.actionFailed", { label }), { description: api.asError(e) });
@@ -455,9 +493,30 @@ export default function TraeAccountsPage() {
       },
       undefined,
       (result) => setReport(result),
-      // 「跳过今日已签到」打开时，一轮只处理**本轮还没签过的**账号：全都签过时
-      // `total` 为 0，报「签到并刷新积分完成」会让人以为刚签了一遍。
-      (result) => (result.total === 0 ? t("trae.page.accounts.noNeedCheckin") : null),
+      // ★ 判定必须按**后端报告**如实给（2026-09-29）：批量签到是「跑完了」，
+      //   但「跑完」不等于「成功」—— 全部失败时还报「签到并刷新积分完成」就是谎报，
+      //   与切换那条是同一个毛病。口径对齐 WorkBuddy 的 `AccountsPage.onRefreshCredits`：
+      //   全失败 ⇒ `error`；部分失败 ⇒ 仍算成功，但描述里点出失败数；
+      //   一轮没轮到任何账号（「跳过今日已签」全命中）⇒ 明说「没有需要签到的账号」。
+      (result) => {
+        if (result.total === 0) {
+          return { level: "success" as const, message: t("trae.page.accounts.noNeedCheckin") };
+        }
+        const parts: string[] = [];
+        if (result.totalOk > 0) {
+          parts.push(t("trae.page.accounts.checkinBatchSuccess", { n: result.totalOk }));
+        }
+        if (result.already > 0) {
+          parts.push(t("trae.page.accounts.checkinBatchAlready", { n: result.already }));
+        }
+        if (result.failed > 0) {
+          parts.push(t("trae.page.accounts.checkinBatchFailed", { n: result.failed }));
+        }
+        const description = parts.join(t("shared.punct.comma"));
+        return result.failed === result.total
+          ? { level: "error" as const, description }
+          : { level: "success" as const, description };
+      },
     );
   }
 
@@ -587,6 +646,12 @@ export default function TraeAccountsPage() {
       variant: program.variant,
       label: program.label,
       installed: program.installed,
+      // ★ 「装了」不等于「能用」：客户端从未启动过时它的 userData 目录压根不存在
+      //   （本机：`Trae CN.exe` 装着、`%APPDATA%\Trae CN` 没有）⇒ 快照存不出也恢复不进，
+      //   这个程序位上的切换**永远不可能成功**。取**写侧**目录的存在性
+      //   （`writeDataDirExists`，与后端保存 / 恢复用的是同一个 `snapshot_data_dir_for`），
+      //   而不是读侧的 `dataDirExists` —— 后者在「一个变体多个候选目录」时会指向另一个目录。
+      hasDataDir: program.writeDataDirExists,
       // 登录态是**客户端级**的：比的是 `userId`（身份）而不是 `name`（展示名）
       // —— 后者改名即失配。`logins` 读不到时是 `null`，不能让 `null` 与空 userId 相互匹配。
       current:
@@ -999,7 +1064,14 @@ export default function TraeAccountsPage() {
                     /* 「把这个账号挂到哪条 Trae 线上」——对应 WorkBuddy 卡片上的
                        WorkBuddy / CodeBuddy IDE / CodeBuddy CLI 三枚按钮。
                        `variant` 取按钮自己那条线（不是当前页面那条）：用户就是要
-                       在当前页面上给另一条线挂账号，用页面的 `variant` 会挂错线。 */
+                       在当前页面上给另一条线挂账号，用页面的 `variant` 会挂错线。
+
+                       ★ 失败**不需要**这里兜底：`api.traeSwitchAccount` 在
+                       `outcome.success === false` 时抛错（见该函数的说明），
+                       `run()` 的 catch 会报「{label}失败」并带上后端给的可操作原因。
+                       曾经这里用 `after` 补一条 error toast，而 `run()` 的成功 toast
+                       是**无条件**弹的 ⇒ 用户同时收到「完成」与「未完成」，
+                       绿勾那条还在，正是「谎报成功」的来源（2026-09-29 报障）。 */
                     onSwitchTo={(target, programVariant) =>
                       void run(
                         `switch-${target.userId}@${programVariant}`,
@@ -1011,18 +1083,43 @@ export default function TraeAccountsPage() {
                             variant: programVariant,
                           }),
                         { line: traeVariantLabel(programVariant) },
-                        (outcome) => {
-                          if (!outcome.success) {
-                            const last = outcome.steps[outcome.steps.length - 1];
-                            toast.error(t("trae.page.accounts.switchIncomplete"), { description: outcome.error ?? last?.message });
-                          }
-                        },
                       )
                     }
                     onCheckin={(target) => void checkinOne(target)}
-                    onSaveLogin={(target) =>
-                      void run(`save-${target.userId}`, "trae.page.accounts.actionSaveLogin", () => api.traeSaveLogin(target.userId, variant))
-                    }
+                    /* 「保存登录态」＝把客户端**此刻**的登录态存到这个账号名下，
+                       因此目标只能是「这个账号当前登录着的那个程序位」。
+                       此前这里传的是页面所属的**区域**（`variant`），而区域只能推出
+                       该区域的主程序（`cn` → TraeWork）⇒ 两个后果：
+                       ① **TraeCode 的快照永远存不出来**，它的切换按钮是条死路
+                          （2026-09-29 报障里那枚按钮点不动就是这个原因）；
+                       ② 目标与客户端实际登录不符时被后端保存守卫拒绝，用户收到一句
+                          看不懂的「客户端当前登录的是另一个账号…」（本机实测复现过）。
+
+                       ⚠️ 这里**重新算一遍** `current` 而不是复用卡片渲染时的那份：
+                       卡片可能已经渲染了几十秒，期间 `logins` 被轮询刷新过 ⇒
+                       按钮的 disabled 与此刻的事实可能不一致。一个都没命中就如实报错，
+                       不要静默什么都不做（那正是本次要修的毛病）。 */
+                    onSaveLogin={(target) => {
+                      const targets = programsFor(target).filter((program) => program.current);
+                      if (targets.length === 0) {
+                        toast.error(t("trae.page.accounts.saveLoginNoProgram"), {
+                          description: target.name || target.userId,
+                        });
+                        return;
+                      }
+                      void run(
+                        `save-${target.userId}`,
+                        "trae.page.accounts.actionSaveLogin",
+                        async () => {
+                          let fileCount = 0;
+                          for (const program of targets) {
+                            const result = await api.traeSaveLogin(target.userId, program.variant);
+                            fileCount += result.fileCount;
+                          }
+                          return fileCount;
+                        },
+                      );
+                    }}
                     onRefreshJwt={(target) =>
                       void run(`jwt-${target.userId}`, "trae.page.accounts.actionRefreshJwt", () => api.traeRefreshJwt(target.userId, variant))
                     }

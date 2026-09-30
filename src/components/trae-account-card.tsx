@@ -108,6 +108,20 @@ export interface TraeProgram {
   label: string;
   /** 本机是否检测到该程序（未检测到时按钮禁用，理由写进 tooltip）。 */
   installed: boolean;
+  /**
+   * 该程序位有没有**可读写的客户端数据目录**（后端 `writeDataDirExists`）。
+   *
+   * ## 为什么「装了」还不够（2026-09-29 报障）
+   *
+   * 装了 ≠ 用过。客户端**从未启动过**时，它的 userData 目录压根不存在
+   * （本机实测：`D:\Programs\Trae CN\Trae CN.exe` 装着，`%APPDATA%\Trae CN` 没有）
+   * ⇒ 既存不出快照、也恢复不进去，这个程序位上的「切换」**永远不可能成功**。
+   *
+   * 只按 `installed` 判定可用，会渲染出一枚**看着能点、点了必然失败**的按钮 ——
+   * 用户看到的是「切换成功但什么都没发生」。有了本字段，按钮才能如实表达
+   * 「现在切得过去吗」，并在 tooltip 里说清下一步该做什么。
+   */
+  hasDataDir: boolean;
   /** 该账号是否正是这个程序的当前账号（由该线登录态快照的 `currentAccount` 判定）。 */
   current: boolean;
 }
@@ -278,10 +292,28 @@ export function TraeAccountCard({
     </>
   );
 
+  /**
+   * 程序按钮的 tooltip：**先说清为什么不能点，再说点了会怎样**。
+   *
+   * 三种不可用/可用形态互斥，顺序即优先级：没装 → 装了但没数据目录 → 可切。
+   * 「装了但没数据目录」这一支此前缺失，于是那种按钮被当成可切（报障来源）。
+   */
   const switchTooltip = (program: TraeProgram) =>
-    program.installed
-      ? t("trae.comp.card.switch.tip", { label: program.label })
-      : t("trae.comp.card.switch.missing", { label: program.label });
+    !program.installed
+      ? t("trae.comp.card.switch.missing", { label: program.label })
+      : program.hasDataDir
+        ? t("trae.comp.card.switch.tip", { label: program.label })
+        : t("trae.comp.card.switch.noDataDir", { label: program.label });
+
+  /**
+   * 「保存登录态」是否可用：**该账号必须此刻正登录在某个程序上**。
+   *
+   * 语义上「保存登录态」＝「把客户端**此刻**的登录态存到这个账号名下」，
+   * 因此唯一有效的目标就是「这个账号当前登录着的那个程序位」；一个都没有时
+   * 后端保存守卫也会拒绝（本机实测会回「客户端当前登录的是另一个账号…」）。
+   * 与其让用户点了再吃一句看不懂的拒绝，不如就地禁用并说明。
+   */
+  const canSaveLogin = programs.some((program) => program.current);
 
   /**
    * 单个程序的控件。
@@ -333,7 +365,7 @@ export function TraeAccountCard({
         variant="outline"
         size="icon"
         className="size-7 rounded-lg"
-        disabled={featuresDisabled || switchBusy || !program.installed || !onSwitchTo}
+        disabled={featuresDisabled || switchBusy || !program.installed || !program.hasDataDir || !onSwitchTo}
         onClick={() => onSwitchTo?.(account, program.variant)}
         aria-label={busyHere ? t("trae.comp.card.switch.ariaBusy", { label: program.label }) : t("trae.comp.card.switch.aria", { label: program.label })}
         aria-busy={busyHere}
@@ -345,7 +377,7 @@ export function TraeAccountCard({
         variant="outline"
         size="sm"
         className="h-7 rounded-full px-2.5 pr-3.5 text-xs"
-        disabled={featuresDisabled || switchBusy || !program.installed || !onSwitchTo}
+        disabled={featuresDisabled || switchBusy || !program.installed || !program.hasDataDir || !onSwitchTo}
         onClick={() => onSwitchTo?.(account, program.variant)}
         aria-label={busyHere ? t("trae.comp.card.switch.ariaBusy", { label: program.label }) : t("trae.comp.card.switch.aria", { label: program.label })}
         aria-busy={busyHere}
@@ -377,7 +409,7 @@ export function TraeAccountCard({
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-44">
-        <DropdownMenuItem disabled={featuresDisabled || saving} onSelect={() => onSaveLogin(account)}>
+        <DropdownMenuItem disabled={featuresDisabled || saving || !canSaveLogin} onSelect={() => onSaveLogin(account)}>
           <Save />{t("trae.comp.card.menu.save")}
         </DropdownMenuItem>
         {account.hasRefreshToken && (
@@ -601,7 +633,7 @@ export function TraeAccountCard({
                     variant="outline"
                     size="sm"
                     className="h-7 rounded-full px-2.5 pr-3.5 text-xs"
-                    disabled={saving}
+                    disabled={saving || !canSaveLogin}
                     onClick={() => onSaveLogin(account)}
                     aria-busy={saving}
                   >
@@ -609,7 +641,11 @@ export function TraeAccountCard({
                     <span>{saving ? t("trae.comp.card.action.saving") : t("trae.comp.card.menu.save")}</span>
                   </Button>
                 </TooltipTrigger>
-                <TooltipContent side="top">{t("trae.comp.card.action.saveTip")}</TooltipContent>
+                <TooltipContent side="top">
+                  {canSaveLogin
+                    ? t("trae.comp.card.action.saveTip")
+                    : t("trae.comp.card.action.saveNoLogin")}
+                </TooltipContent>
               </Tooltip>
             )}
 

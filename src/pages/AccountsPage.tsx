@@ -868,8 +868,15 @@ function RegionPanel({ region }: { region: Region }) {
    * （从未点过「从本机导入」，或账号库刚丢）—— 那时页签写着「已登录: …」，
    * 下面却是一张「未检测到 WorkBuddy …」的卡片，同一屏自相矛盾
    * （2026-09-24 用户报障）。已登录时改走正常面板 + 下方的「当前登录」提示卡片。
+   *
+   * ⚠️⚠️ `!error` 这一项同样不可省：**「这次没取到」与「确实没有账号」是两件事**。
+   * 少了它，账号库读取失败时会渲染出「未检测到 WorkBuddy / 未登录」外加一串
+   * 「可能原因：未安装客户端…」—— 那是在**诊断一个不存在的问题**；而真正的错误
+   * 反而一句都不显示（下方 `error &&` 那条 Alert 位于**非空态**分支内，
+   * 空态分支根本走不到它）。用户会去重装客户端，而问题只是取数失败。
+   * 加了门控后，失败时会落到正常分支并显示错误 Alert + 「重新检测」。
    */
-  const showEmpty = accounts.length === 0 && !current;
+  const showEmpty = accounts.length === 0 && !current && !error;
   const mismatch = status?.regionMismatch ?? null;
   const expectedAuthFile = status?.authFile || descriptor.authFilename;
 
@@ -1012,7 +1019,18 @@ function RegionPanel({ region }: { region: Region }) {
           {error && (
             <Alert variant="destructive" className="mb-4">
               <AlertTitle>{t("wbAccounts.page.loadFailed")}</AlertTitle>
-              <AlertDescription>{error}</AlertDescription>
+              <AlertDescription>
+                <p>{error}</p>
+                {/* 失败态必须给一条出路：没有它，用户唯一能做的就是重启应用。 */}
+                <Button
+                  className="mt-2"
+                  size="sm"
+                  variant="outline"
+                  onClick={() => void onRecheck()}
+                >
+                  {t("wbAccounts.empty.recheck")}
+                </Button>
+              </AlertDescription>
             </Alert>
           )}
 

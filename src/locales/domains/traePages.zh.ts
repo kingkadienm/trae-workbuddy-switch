@@ -25,6 +25,8 @@ export const zh = {
   "trae.page.accounts.actionCheckinAll": "签到并刷新积分",
   "trae.page.accounts.actionSwitch": "切换{line}账号",
   "trae.page.accounts.actionSaveLogin": "保存登录态",
+  // 保存的目标只能是「该账号此刻登录着的程序位」；一个都没有时如实报错，不静默跳过。
+  "trae.page.accounts.saveLoginNoProgram": "该账号当前没有登录在任何 Trae 客户端上，无法保存登录态",
   "trae.page.accounts.actionRefreshJwt": "刷新 JWT",
   "trae.page.accounts.actionClearCooldown": "清除冷却",
   "trae.page.accounts.actionThaw": "解除冷却",
@@ -48,6 +50,10 @@ export const zh = {
   "trae.page.accounts.checkinFailedDesc": "{name}：{reason}",
   "trae.page.accounts.checkinSuccess": "签到成功",
   "trae.page.accounts.checkinSuccessDesc": "{name}：+{delta} 积分",
+  // ---- 批量签到的结果摘要（口径对齐 WorkBuddy 的 `wbAccounts.toast.checkinBatch*`）----
+  "trae.page.accounts.checkinBatchSuccess": "{n} 个签到成功",
+  "trae.page.accounts.checkinBatchAlready": "{n} 个已签到",
+  "trae.page.accounts.checkinBatchFailed": "{n} 个失败",
 
   // ---- 导入本机账号 ----
   "trae.page.accounts.importLocalDone": "已导入本机账号",

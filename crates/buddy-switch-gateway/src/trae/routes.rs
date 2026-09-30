@@ -169,12 +169,29 @@ fn parse_variant_query(query: Option<&str>) -> TraeVariant {
         .unwrap_or_default()
 }
 
-/// `GET /v1/models`：静态模型清单。
+/// `GET /v1/models`：**随上游刷新**的模型清单（issue #4）。
 ///
-/// 不发上游探测：Trae 没有 `/v1/models`，模型名是客户端侧常量。返回静态清单
-/// 可以让 OpenAI 客户端（Cherry Studio / NextChat / Continue…）正常列出模型。
-pub async fn models() -> Response {
-    json_response(StatusCode::OK, payload::models_response())
+/// 清单来源与「API 服务」页的模型卡**同源**：读该 Key **归属产品线**的客户端
+/// `state.vscdb` 缓存（上游下发）。归属由鉴权中间件经请求扩展传入。
+///
+/// ## 两处刻意的取舍
+///
+/// 1. **归属用必需提取器**（不是 `Option<Extension<…>>`）：中间件对除 `/health`
+///    外的所有路由都会注入它，**拿不到就说明鉴权链断了** —— 那属于配置错误，
+///    应当 500 响亮失败，而不是静默回落默认变体（那会把「链断了」伪装成正常）。
+/// 2. **读库放进阻塞池**：`models_response_for` 会同步读 SQLite（客户端可能在写，
+///    最多等 core 侧设的 `busy_timeout` 那个窗口）。直接在 async handler 里做会占住 worker。
+///
+/// 客户端没启动过 / 没登录时读不到 ⇒ 回落静态清单（见 [`payload::models_response_for`]），
+/// 保证 OpenAI 客户端**开箱即可列出模型**，而不是返回空表或报错。
+pub async fn models(Extension(key_variant): Extension<TraeKeyVariant>) -> Response {
+    let variant = key_variant.0;
+    // `models_response_for` 自己**不失败**（读不到就回落静态清单），所以这里的
+    // `JoinError` 只可能是运行时正在关闭 —— 用静态清单兜底，别让「列模型」挂掉。
+    let body = tokio::task::spawn_blocking(move || payload::models_response_for(variant))
+        .await
+        .unwrap_or_else(|_| payload::models_response());
+    json_response(StatusCode::OK, body)
 }
 
 /// `POST /v1/chat/completions`。

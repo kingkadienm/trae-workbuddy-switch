@@ -32,31 +32,54 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
 }
 
 /// 原子写文本。
+///
+/// 实现与 [`crate::modules::config::atomic_write`] 逐项对齐（模块头声称「同源」，
+/// 此前其实不一致，2026-09-29 补齐）：
+///
+/// 1. **临时文件名必须唯一**（追加 uuid）。固定 `<path>.tmp` 在**并发写同一文件**时
+///    会让两次写共用同一个临时文件：先完成者 rename 成功后该临时文件已不存在，
+///    后完成者的 rename 失败，而它的收尾清理会把对方刚写好的内容一并删掉
+///    （管理端实现 `ithtelab/workbuddy-manager` 的 `_atomic_write_json` 记录了
+///    这个现场：4 个并发线程全部报错、且原文件消失）。
+/// 2. **不预先删除目标文件**。原实现在 rename 前 `remove_file(path)`，
+///    于是「删除成功、rename 尚未执行」之间存在一个**目标文件不存在的窗口** ——
+///    进程若在此刻崩溃/断电，文件就真的没了，而这正是原子写要避免的情形。
+///    注释原先写「Windows 上 rename 不覆盖已存在的目标」，**这句是错的**：
+///    Rust 的 `std::fs::rename` 在 Windows 走 `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`，
+///    会覆盖已存在的目标。本仓的主写入路径 `config::atomic_write` 一直是直接
+///    rename 到已存在文件上（账号库、签到配置每天都在走），这就是现成的反证。
 pub fn atomic_write_text(path: &Path, text: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
     }
     let tmp = tmp_path(path);
-    {
+    let write_result = (|| -> Result<(), String> {
         let mut file =
             std::fs::File::create(&tmp).map_err(|e| format!("创建临时文件失败: {e}"))?;
         file.write_all(text.as_bytes())
             .map_err(|e| format!("写入失败: {e}"))?;
         file.flush().map_err(|e| format!("刷新失败: {e}"))?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        // 失败时清掉临时文件，别在目录里留垃圾（同 `config::atomic_write` 的意图）。
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
     }
-    // Windows 上 rename 不覆盖已存在的目标，需先删除；这与仓库既有
-    // `config::atomic_write` 的处理方式保持一致。
-    if path.exists() {
-        let _ = std::fs::remove_file(path);
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("替换文件失败: {e}"));
     }
-    std::fs::rename(&tmp, path).map_err(|e| format!("替换文件失败: {e}"))
+    Ok(())
 }
 
-/// 临时文件路径：保留原扩展名并追加 `.tmp`，避免 `with_extension` 把
-/// `checkin_accounts.json` 变成 `checkin_accounts.tmp`（丢扩展名后不易排查）。
+/// 临时文件路径：保留原扩展名并追加 `.tmp-<uuid>`。
+///
+/// 不用 `with_extension`（会把 `checkin_accounts.json` 变成 `checkin_accounts.tmp`，
+/// 丢扩展名后不易排查）；uuid 后缀保证并发写各自独立（见 `atomic_write_text` 第 1 条）。
 fn tmp_path(path: &Path) -> std::path::PathBuf {
     let mut name = path.file_name().map(|s| s.to_os_string()).unwrap_or_default();
-    name.push(".tmp");
+    name.push(format!(".tmp-{}", uuid::Uuid::new_v4().simple()));
     path.with_file_name(name)
 }
 
@@ -171,6 +194,18 @@ mod tests {
         assert_eq!(read_json::<Sample>(&empty), Sample::default());
     }
 
+    /// 目录里残留的临时文件（`atomic_write_text` 的 uuid 后缀形态）。
+    fn leftover_temp_files(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.contains(".tmp-"))
+            .collect();
+        names.sort();
+        names
+    }
+
     #[test]
     fn write_json_is_atomic_and_roundtrips() {
         let dir = temp_dir("write");
@@ -180,17 +215,28 @@ mod tests {
         write_json(&path, &Sample { a: 7, b: "x".into() }).unwrap();
         assert_eq!(read_json::<Sample>(&path), Sample { a: 7, b: "x".into() });
         // 临时文件必须已被 rename 掉，不能残留。
-        assert!(!tmp_path(&path).exists(), "临时文件应已重命名");
+        //
+        // 断言**整目录**而不是 `!tmp_path(&path).exists()`：临时名现在带 uuid，
+        // 再调一次 `tmp_path` 会得到另一个随机名、永远不存在，那条断言就恒真了。
+        assert_eq!(
+            leftover_temp_files(&dir),
+            Vec::<String>::new(),
+            "不得残留临时文件"
+        );
     }
 
     #[test]
-    fn tmp_path_keeps_original_extension() {
+    fn tmp_path_keeps_original_extension_and_is_unique() {
         let path = std::path::Path::new("/tmp/checkin_accounts.json");
         let tmp = tmp_path(path);
-        assert_eq!(
-            tmp.file_name().and_then(|s| s.to_str()),
-            Some("checkin_accounts.json.tmp")
+        let name = tmp.file_name().and_then(|s| s.to_str()).unwrap_or_default();
+        assert!(
+            name.starts_with("checkin_accounts.json.tmp-"),
+            "必须保留原扩展名（不得被 with_extension 吃掉），实际 {name}"
         );
+        // 唯一性：并发写同一文件时两次写必须各自独立，
+        // 否则后完成者的清理会删掉先完成者刚写好的内容。
+        assert_ne!(tmp_path(path), tmp, "两次派生的临时路径必须不同");
     }
 
     #[test]

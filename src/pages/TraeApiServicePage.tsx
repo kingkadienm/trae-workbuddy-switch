@@ -34,7 +34,7 @@ import {
   normalizeTraeGatewayStatus,
   toTraeGatewayConfigRaw,
 } from "@/lib/trae-gateway";
-import type { TraeGatewayConfig, TraeGatewayLogEntry, TraeGatewayModel, TraeGatewayStatus } from "@/lib/trae-types";
+import type { TraeClientModelList, TraeGatewayConfig, TraeGatewayLogEntry, TraeGatewayStatus } from "@/lib/trae-types";
 import { cn } from "@/lib/utils";
 import { useCachedResource } from "@/lib/use-cached-resource";
 import { useTraeVariant } from "@/lib/use-trae-variant";
@@ -54,7 +54,22 @@ const LAN = "0.0.0.0";
 interface ApiServiceSnapshot {
   config: TraeGatewayConfig;
   status: TraeGatewayStatus | null;
-  models: TraeGatewayModel[];
+  /**
+   * **客户端（上游下发）**的模型清单（issue #4）。
+   *
+   * 与「网关对外暴露的静态清单」（`get_trae_gateway_models`）**不是一回事**：
+   * 这份读自 Trae 客户端 `state.vscdb` 的上游清单缓存，因此随客户端刷新而变。
+   * 读不到时为 `source = "missing"` 的结构（**不是** `null`）—— 界面据此呈现空态与原因。
+   */
+  clientModels: TraeClientModelList | null;
+  /**
+   * **网关对外清单**的模型数（`get_trae_gateway_models`）。
+   *
+   * 与 `clientModels` **同源**（同一份客户端缓存），但那边是分组视图、这边是
+   * 扁平去重后的条数 —— 也就是外部客户端连本网关时**实际看到**的模型数。
+   * 两者口径不同（分组里同一模型会重复出现），故分开呈现而不是互相推算。
+   */
+  gatewayModelCount: number | null;
   logs: TraeGatewayLogEntry[];
 }
 
@@ -77,7 +92,14 @@ interface ApiServiceSnapshot {
  * **骨架与 WorkBuddy 刻意同构**（容器宽度、页头字号、卡片节奏、工具条排布），
  * 但下列控件因 Trae 无对应能力而**不出现**：`Region` Tabs / 「按版本」双条目 /
  * `AccountStrategyCard`（Trae 无 `accountStrategy`）——分别以单条 Base URL、
- * 账号池卡替代。模型区**不加刷新按钮**（模型名是客户端常量，刷新永不改变结果）。
+ * 账号池卡替代。
+ *
+ * ## 模型清单：数据源已换成**客户端缓存**（issue #4）
+ *
+ * 上一版这里的清单来自 `get_trae_gateway_models`（网关对外暴露的**静态**常量），
+ * 因此当时刻意不加刷新按钮 —— 刷新永不改变结果。issue #4 之后改用
+ * `get_trae_client_models`（读客户端 `state.vscdb` 里上游下发的清单缓存），
+ * 清单**随客户端刷新而变**，刷新按钮因此恢复。
  */
 export default function TraeApiServicePage() {
   const t = useT();
@@ -87,18 +109,22 @@ export default function TraeApiServicePage() {
   const [clearing, setClearing] = useState(false);
   const [riskOpen, setRiskOpen] = useState(false);
   const [openingDir, setOpeningDir] = useState(false);
+  /** 模型清单「重新读取」的进行中状态（只驱动按钮的转圈，不参与快照）。 */
+  const [refreshingModels, setRefreshingModels] = useState(false);
 
   const loadSnapshot = useCallback(async (): Promise<ApiServiceSnapshot> => {
-    const [configRaw, statusRaw, modelsRaw, logsRaw] = await Promise.all([
+    const [configRaw, statusRaw, clientModels, gatewayModelsRaw, logsRaw] = await Promise.all([
       api.getTraeGatewayConfig(),
       api.getTraeGatewayStatus(variant),
-      api.getTraeGatewayModels(),
+      api.getTraeClientModels(variant),
+      api.getTraeGatewayModels(variant),
       api.getTraeGatewayLogs(),
     ]);
     return {
       config: normalizeTraeGatewayConfig(configRaw),
       status: normalizeTraeGatewayStatus(statusRaw),
-      models: readModels(modelsRaw),
+      clientModels,
+      gatewayModelCount: readModelCount(gatewayModelsRaw),
       logs: normalizeTraeGatewayLogs(logsRaw),
     };
   }, [variant]);
@@ -117,8 +143,25 @@ export default function TraeApiServicePage() {
 
   const config = snapshot?.config ?? DEFAULT_TRAE_GATEWAY_CONFIG;
   const status = snapshot?.status ?? null;
-  const models = snapshot?.models ?? [];
+  const clientModels = snapshot?.clientModels ?? null;
+  const gatewayModelCount = snapshot?.gatewayModelCount ?? null;
   const logs = snapshot?.logs ?? [];
+
+  /**
+   * 「重新读取」模型清单。
+   *
+   * 走快照的 `refresh`（而不是自己再发一次请求）：这样「重新读取」与「切产品线后加载」
+   * 共用同一条链路，不会出现两份互不一致的快照。失败时不额外弹错 —— 卡片自身会显示
+   * `source = missing` 与后端给出的原因，页面顶部的错误条也会出现。
+   */
+  const onRefreshModels = useCallback(async () => {
+    setRefreshingModels(true);
+    try {
+      await loadAll();
+    } finally {
+      setRefreshingModels(false);
+    }
+  }, [loadAll]);
 
   /**
    * 端口输入框的草稿值。
@@ -423,8 +466,15 @@ export default function TraeApiServicePage() {
       {/* ---- 账号池 ---- */}
       <TraeAccountPoolCard status={status} className="mb-6" />
 
-      {/* ---- 模型清单（无刷新按钮：模型名是客户端常量） ---- */}
-      <TraeModelList models={models} defaultModel={config.defaultModel} className="mb-6" />
+      {/* ---- 模型清单（读客户端缓存，可重新读取：见 TraeModelList 的模块头） ---- */}
+      <TraeModelList
+        data={clientModels}
+        defaultModel={config.defaultModel}
+        gatewayModelCount={gatewayModelCount}
+        refreshing={refreshingModels}
+        onRefresh={() => void onRefreshModels()}
+        className="mb-6"
+      />
 
       {/* ---- 接入指引（单条 Base URL，无 region Tabs） ---- */}
       <TraeIntegrationGuide
@@ -462,22 +512,13 @@ export default function TraeApiServicePage() {
   );
 }
 
-/** `get_trae_gateway_models` 返回 OpenAI `/v1/models` 形状，这里只取 `data`。 */
-function readModels(raw: unknown): TraeGatewayModel[] {
+/**
+ * `get_trae_gateway_models` 返回 OpenAI `/v1/models` 形状，这里只取**条数**。
+ *
+ * 形状解析只做这一件事（取 `data.length`）：卡片展示的是客户端分组清单，
+ * 这里只需要「网关对外会列出几个」这一个数，不必再建一份模型类型。
+ */
+function readModelCount(raw: unknown): number | null {
   const record = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
-  const list = Array.isArray(record.data) ? record.data : [];
-  return list
-    .map((item) => {
-      if (!item || typeof item !== "object") return null;
-      const entry = item as Record<string, unknown>;
-      const id = typeof entry.id === "string" ? entry.id : null;
-      if (!id) return null;
-      return {
-        id,
-        object: typeof entry.object === "string" ? entry.object : "model",
-        created: typeof entry.created === "number" ? entry.created : 0,
-        owned_by: typeof entry.owned_by === "string" ? entry.owned_by : "trae",
-      };
-    })
-    .filter((item): item is TraeGatewayModel => item !== null);
+  return Array.isArray(record.data) ? record.data.length : null;
 }

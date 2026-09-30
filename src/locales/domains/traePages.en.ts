@@ -18,6 +18,7 @@ export const en = {
   "trae.page.accounts.actionCheckinAll": "Check in and refresh credits",
   "trae.page.accounts.actionSwitch": "Switch {line} account",
   "trae.page.accounts.actionSaveLogin": "Save sign-in state",
+  "trae.page.accounts.saveLoginNoProgram": "This account is not signed in on any Trae client, so its sign-in state cannot be saved",
   "trae.page.accounts.actionRefreshJwt": "Refresh JWT",
   "trae.page.accounts.actionClearCooldown": "Clear cooldown",
   "trae.page.accounts.actionThaw": "Clear cooldown",
@@ -41,6 +42,10 @@ export const en = {
   "trae.page.accounts.checkinFailedDesc": "{name}: {reason}",
   "trae.page.accounts.checkinSuccess": "Check-in succeeded",
   "trae.page.accounts.checkinSuccessDesc": "{name}: +{delta} credits",
+  // ---- Batch check-in summary (mirrors WorkBuddy's `wbAccounts.toast.checkinBatch*`) ----
+  "trae.page.accounts.checkinBatchSuccess": "{n} checked in",
+  "trae.page.accounts.checkinBatchAlready": "{n} already checked in",
+  "trae.page.accounts.checkinBatchFailed": "{n} failed",
 
   // ---- Import local account ----
   "trae.page.accounts.importLocalDone": "Local account imported",

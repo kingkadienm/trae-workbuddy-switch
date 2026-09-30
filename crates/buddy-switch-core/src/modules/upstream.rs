@@ -437,6 +437,24 @@ impl UpstreamClient {
         );
         let mut headers = common_headers(region);
         headers.insert("X-Refresh-Token".to_string(), refresh_token);
+        // ⚠️ **此值出处不明，且与外部实测记录冲突 —— 改动前必须先抓包确认。**
+        //
+        // 本仓约定（见 `modules::trae::mod` 的「契约常量必须与抓包固化值逐字节一致」）：
+        // 从抓包/参考实现抄来的字面量都要有出处。这一条没有：
+        // `git log -S "X-Auth-Refresh-Source"` 只能追到初始提交
+        // （`chore: 初始化 Git 版本管理并纳入项目源码`），此前无版本历史，
+        // 也没有任何断言把它钉在某个抓包值上。
+        //
+        // 外部实测记录（`ithtelab/workbuddy-manager`，`server/services/tencent.py`
+        // 的 `refresh_token` 注释）称官方客户端在此头发的是 **`plugin`**：
+        // 「`X-Auth-Refresh-Source: plugin` 是官方客户端的刷新渠道标识，
+        //   缺了可能被风控当异常来源（上游 D3 实测）」。
+        //
+        // 该记录**不足以直接改**：它是另一个项目对另一个上游的观测，
+        // 且刷新在当前取值下确实能成功（说明服务端不以此为门禁）。
+        // 但两端取值不同意味着**必有一端不像官方客户端** —— 需要一次抓包定案。
+        // 定案前不要「顺手对齐」成 `plugin`：那是拿未验证的第三方结论
+        // 替换另一个未验证的取值，风险对等而收益不明。
         headers.insert("X-Auth-Refresh-Source".to_string(), "workbuddy".to_string());
         if let Some(eid) =
             account::get_str(acc, "enterpriseId").or_else(|| account::get_str(acc, "enterprise_id"))

@@ -4,7 +4,7 @@
 //! `POST /v2/billing/meter/get-user-resource` 仍作为兼容回退。
 //! 这里仅返回脱敏后的资源摘要，不把 token 或完整响应交给前端。
 
-use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone};
+use chrono::{Local, NaiveDate, NaiveDateTime};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
@@ -59,6 +59,25 @@ fn first_number(value: &Value, keys: &[&str]) -> Option<f64> {
         .find_map(|key| parse_number(value.get(*key)))
 }
 
+/// 腾讯 billing 接口返回的**墙钟**时区：固定 UTC+8，**与运行机器的时区无关**。
+///
+/// 依据：上游参照实现用 `time.ParseInLocation(layout, s, UTC+8)` 解析套餐到期时间；
+/// 管理端实现（`ithtelab/workbuddy-manager`）在注释里同样明确记录
+/// 「腾讯给的是 UTC+8 墙钟，与容器时区无关 —— 必须显式带 +08:00 解析」，
+/// 并指出按本机时区解析会让到期时刻整体偏移数小时、倒计时跟着错。
+const CN_WALLCLOCK_UTC_OFFSET_SECONDS: i64 = 8 * 3600;
+
+/// 把腾讯返回的「UTC+8 墙钟」无时区时间转成绝对毫秒时间戳。
+///
+/// 做法：先按 UTC 解释拿到中间值，再减去 8 小时偏移 —— 等价于把它当作 `+08:00`
+/// 时刻解析，但**不受本机时区影响**。
+///
+/// 相对 `Local.from_local_datetime` 另有一个好处：固定偏移没有夏令时跳变，
+/// 不会出现「DST 缺口那一小时解析出 `None`」的静默丢失。
+fn cn_wallclock_to_epoch_ms(naive: NaiveDateTime) -> i64 {
+    naive.and_utc().timestamp_millis() - CN_WALLCLOCK_UTC_OFFSET_SECONDS * 1000
+}
+
 fn parse_timestamp_ms(value: Option<&Value>) -> Option<i64> {
     let value = value?;
     if let Some(number) = parse_number(Some(value)) {
@@ -75,26 +94,21 @@ fn parse_timestamp_ms(value: Option<&Value>) -> Option<i64> {
         return None;
     }
 
+    // 带显式时区的形态原样采信（它自带偏移，与本机时区无关）。
     if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(text) {
         return Some(parsed.timestamp_millis());
     }
+    // 以下三种都**不带时区**，按腾讯的 UTC+8 墙钟解释，见上方常量说明。
     if let Ok(parsed) = NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S") {
-        return Local
-            .from_local_datetime(&parsed)
-            .single()
-            .map(|date| date.timestamp_millis());
+        return Some(cn_wallclock_to_epoch_ms(parsed));
     }
     if let Ok(parsed) = NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f") {
-        return Local
-            .from_local_datetime(&parsed)
-            .single()
-            .map(|date| date.timestamp_millis());
+        return Some(cn_wallclock_to_epoch_ms(parsed));
     }
     NaiveDate::parse_from_str(text, "%Y-%m-%d")
         .ok()
         .and_then(|date| date.and_hms_opt(23, 59, 59))
-        .and_then(|date| Local.from_local_datetime(&date).single())
-        .map(|date| date.timestamp_millis())
+        .map(cn_wallclock_to_epoch_ms)
 }
 
 fn value_at_path<'a>(mut current: &'a Value, path: &[&str]) -> Option<&'a Value> {
@@ -948,7 +962,40 @@ mod tests {
             parse_timestamp_ms(Some(&json!(1_800_000_000_000_i64))),
             Some(1_800_000_000_000)
         );
-        assert!(parse_timestamp_ms(Some(&json!("2099-01-02 03:04:05"))).is_some());
+        // 无时区的墙钟字符串**必须**按 UTC+8 解释（见下个用例的精确断言）。
+        assert_eq!(
+            parse_timestamp_ms(Some(&json!("2099-01-02 03:04:05"))),
+            Some(4_070_977_445_000)
+        );
+    }
+
+    /// 腾讯返回的无时区时间戳是 **UTC+8 墙钟**，不是本机时区时间。
+    ///
+    /// 本用例断言的是**绝对时刻**，因此在任何机器时区下结果都必须相同 ——
+    /// 若有人把实现改回 `Local.from_local_datetime`，在非 UTC+8 的机器上会真的变红
+    /// （在 UTC+8 机器上两者恰好相等，所以这个断言是「钉死语义」而不是「钉死实现」）。
+    #[test]
+    fn wallclock_timestamps_are_utc_plus_8_regardless_of_machine_timezone() {
+        // 2000-01-01 00:00:00 (+08:00) == 1999-12-31T16:00:00Z == 946656000 秒
+        assert_eq!(
+            parse_timestamp_ms(Some(&json!("2000-01-01 00:00:00"))),
+            Some(946_656_000_000)
+        );
+        // 带小数的同款墙钟
+        assert_eq!(
+            parse_timestamp_ms(Some(&json!("2000-01-01 00:00:00.250"))),
+            Some(946_656_000_250)
+        );
+        // 只有日期时按当天 23:59:59（+08:00）
+        assert_eq!(
+            parse_timestamp_ms(Some(&json!("2000-01-01"))),
+            Some(946_656_000_000 + (23 * 3600 + 59 * 60 + 59) * 1000)
+        );
+        // 显式带时区的形态原样采信，不受 UTC+8 约定影响
+        assert_eq!(
+            parse_timestamp_ms(Some(&json!("2000-01-01T00:00:00Z"))),
+            Some(946_684_800_000)
+        );
     }
 
     #[test]
