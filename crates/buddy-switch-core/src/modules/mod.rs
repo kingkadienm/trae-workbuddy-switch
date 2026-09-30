@@ -12,6 +12,7 @@ pub mod connector;
 pub mod credit_usage;
 pub mod credits;
 pub mod cst;
+pub mod doubao;
 pub mod error_code;
 pub mod export_import;
 pub mod growth;

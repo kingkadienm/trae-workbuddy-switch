@@ -452,6 +452,45 @@ pub struct CooldownsFile {
     pub updated_at: Option<String>,
 }
 
+/// 权益包元信息缓存（按账号分）。
+///
+/// 从 `user_entitlement_pack_list` 中提取 Work/通用积分 + 会员到期 + 套餐身份，
+/// 供 `list_account_views_for` **同步读取**写入账号视图。
+///
+/// 由 `refresh_all_remaining_for` 在刷新积分时**异步回写**。
+///
+/// **序列化为 camelCase**：同 `CheckinSummary`，该结构只在本模块读写，
+/// 不存在外部工具兼容问题。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EntitlementMeta {
+    #[serde(default)]
+    /// 套餐身份（Free / Lite / Pro / 会员 Lite …），从 pack 的 `display_desc` 提取。
+    pub pay_identity: Option<String>,
+    /// Work 积分剩余（product_id == 209 的包的 `credits_limit - credits_amount` 合计）。
+    pub work_credits: Option<f64>,
+    /// 通用积分剩余（非 product_id 209 的包合计）。
+    pub general_credits: Option<f64>,
+    /// 会员到期时间（Unix 秒；无会员时 `None`）。
+    pub membership_expire: Option<i64>,
+    /// 下次扣款日（Unix 秒；无自动续费或非会员时 `None`）。
+    pub membership_next_billing: Option<i64>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+/// 权益包元信息缓存文件（uid → meta map + 更新时间）。
+///
+/// 顶层结构类似 `RemainingCreditsFile`：HashMap 按 user_id 索引，
+/// 供 `list_account_views_for` 一次性读入后遍历。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EntitlementMetaFile {
+    #[serde(default)]
+    pub entries: HashMap<String, EntitlementMeta>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
 /// 最近一次签到摘要。
 ///
 /// **序列化为 camelCase**：该结构既落盘（`checkin_summary.json`）又直接进入
@@ -520,6 +559,120 @@ pub fn save_remaining_for(
     remaining: &RemainingCreditsFile,
 ) -> Result<(), String> {
     store::write_json(&paths::remaining_credits_file_for(variant), remaining)
+}
+
+// ---------------------------------------------------------------------------
+// 权益包元信息缓存（套餐身份 + Work/通用积分 + 会员到期）
+// ---------------------------------------------------------------------------
+
+/// 从 `user_entitlement_pack_list` 的原始响应体中提取每账号的权益元信息。
+///
+/// 对 packs 数组的每个元素：
+/// - `pay_identity`：首个 `group_name` 或 `display_desc` 含「会员」的包的 `display_desc`
+///   （如「会员 Lite 连续包月」）；无会员包时为 `None`。
+/// - `work_credits`：product_id == 209 的包的剩余总和。
+/// - `general_credits`：其余包的剩余总和。
+/// - `membership_expire`：会员包中最大的 `end_time`/`expire_time`。
+/// - `membership_next_billing`：会员包的 `next_billing_time`（> 86400 才取，0/1970 表示无自动续费）。
+///
+/// **纯函数**：不读不写任何文件，便于单测。
+pub fn parse_entitlement_meta(packs: &[Value]) -> EntitlementMeta {
+    let mut meta = EntitlementMeta::default();
+    let now_ts = chrono::Utc::now().timestamp();
+
+    for pack in packs {
+        let base = pack.get("entitlement_base_info");
+        let limit = base
+            .and_then(|e| e.get("quota"))
+            .and_then(|q| q.get("credits_limit"))
+            .and_then(|v| v.as_f64());
+        let Some(limit) = limit else { continue };
+
+        let used = pack
+            .get("usage")
+            .and_then(|u| u.get("credits_amount"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let remaining = (limit - used).max(0.0);
+
+        let product_id = base
+            .and_then(|e| e.get("product_id"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+
+        if product_id == 209 {
+            meta.work_credits = Some(meta.work_credits.unwrap_or(0.0) + remaining);
+        } else {
+            meta.general_credits = Some(meta.general_credits.unwrap_or(0.0) + remaining);
+        }
+
+        // 会员包检测：group_name 或 display_desc 含「会员」
+        let group_name = pack
+            .get("group_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let display_desc = pack
+            .get("display_desc")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if group_name.contains("会员") || display_desc.contains("会员") {
+            // 套餐身份（取首个含「会员」的包的 display_desc）
+            if meta.pay_identity.is_none() && !display_desc.is_empty() {
+                meta.pay_identity = Some(display_desc.to_string());
+            }
+
+            // 到期时间
+            let end = pack
+                .get("entitlement_base_info")
+                .and_then(|e| e.get("end_time"))
+                .and_then(|v| v.as_i64())
+                .or_else(|| pack.get("expire_time").and_then(|v| v.as_i64()));
+            if let Some(end) = end {
+                if end > now_ts {
+                    meta.membership_expire = Some(meta.membership_expire.map_or(end, |e| e.max(end)));
+                    let nb = pack
+                        .get("next_billing_time")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    if nb > 86400 {
+                        meta.membership_next_billing = Some(nb);
+                    }
+                }
+            }
+        }
+    }
+
+    // 保留 2 位小数
+    let r2 = |v: f64| ((v * 100.0).round() / 100.0).max(0.0);
+    meta.work_credits = meta.work_credits.map(r2);
+    meta.general_credits = meta.general_credits.map(r2);
+    meta
+}
+
+/// 写入权益包元信息缓存（默认变体，兼容壳）。
+pub fn save_entitlement_meta(meta: &EntitlementMetaFile) -> Result<(), String> {
+    save_entitlement_meta_for(TraeVariant::default(), meta)
+}
+
+/// 写入权益包元信息缓存（按变体分家）。
+pub fn save_entitlement_meta_for(
+    variant: TraeVariant,
+    meta: &EntitlementMetaFile,
+) -> Result<(), String> {
+    store::write_json(&paths::entitlement_meta_file_for(variant), meta)
+}
+
+/// 读取权益包元信息缓存文件（默认变体，兼容壳）。
+pub fn load_entitlement_meta_file() -> EntitlementMetaFile {
+    load_entitlement_meta_file_for(TraeVariant::default())
+}
+
+/// 读取权益包元信息缓存文件（按变体分家）。
+///
+/// 缺文件或反序列化失败时返回 `EntitlementMetaFile::default()`（空 map），
+/// 不 panic——这是升级零回归的必要条件。
+pub fn load_entitlement_meta_file_for(variant: TraeVariant) -> EntitlementMetaFile {
+    store::read_json(&paths::entitlement_meta_file_for(variant))
 }
 
 /// 读取签到积分明细（默认变体，兼容壳）。
@@ -757,6 +910,27 @@ pub async fn calc_remaining_credits(
     calc_remaining_credits_for(TraeVariant::default(), jwt_value).await
 }
 
+/// 获取原始 `user_entitlement_pack_list`（JSON 数组），供积分计算和权益元信息共用。
+///
+/// 提取此函数是为了让 `refresh_all_remaining_for` 无需第二次网络请求即可
+/// 写入 `entitlement_meta.json`。
+async fn fetch_entitlement_packs_for(
+    variant: TraeVariant,
+    jwt: &str,
+) -> Result<Vec<Value>, String> {
+    let device = device_for_jwt_for(variant, jwt)?;
+    let path = if variant.region() == TraeRegion::Global {
+        TRAE_ENTITLEMENT_PATH_GLOBAL
+    } else {
+        TRAE_ENTITLEMENT_PATH
+    };
+    let (_status, body) = post_json_parsed_for(variant, path, jwt, &device).await?;
+    body.get("user_entitlement_pack_list")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.clone())
+        .ok_or_else(|| "响应中缺少 user_entitlement_pack_list".to_string())
+}
+
 /// 按**变体**查询剩余积分：CN 走 [`TRAE_ENTITLEMENT_PATH`]（`credits_limit` 口径），
 /// 国际版走 [`TRAE_ENTITLEMENT_PATH_GLOBAL`]（免费档无签到积分，`credits_limit` 缺失时
 /// 返回 0 并原样保留逐包明细，供 UI 展示「Free plan」额度形态）。
@@ -764,18 +938,7 @@ pub async fn calc_remaining_credits_for(
     variant: TraeVariant,
     jwt_value: &str,
 ) -> Result<(f64, Option<i64>, f64, Vec<CreditPackage>), String> {
-    let device = device_for_jwt_for(variant, jwt_value)?;
-    let path = if variant.region() == TraeRegion::Global {
-        TRAE_ENTITLEMENT_PATH_GLOBAL
-    } else {
-        TRAE_ENTITLEMENT_PATH
-    };
-    let (_status, body) = post_json_parsed_for(variant, path, jwt_value, &device).await?;
-
-    let packs = body
-        .get("user_entitlement_pack_list")
-        .and_then(|value| value.as_array())
-        .ok_or("响应中缺少 user_entitlement_pack_list")?;
+    let packs = fetch_entitlement_packs_for(variant, jwt_value).await?;
 
     // 固定 UTC+8：上游时间戳按北京时间切日，若用本地时区，
     // 身处非 +08 时区的用户会算错「今日购买」。
@@ -796,7 +959,7 @@ pub async fn calc_remaining_credits_for(
     let mut earliest_expire: Option<i64> = None;
     let mut purchased_today = 0.0_f64;
 
-    for pack in packs {
+    for pack in &packs {
         let base = pack.get("entitlement_base_info");
         let limit = base
             .and_then(|info| info.get("quota"))
@@ -843,7 +1006,7 @@ pub async fn calc_remaining_credits_for(
         round2(total),
         earliest_expire,
         round2(purchased_today),
-        parse_credit_packages(packs, now_ts),
+        parse_credit_packages(&packs, now_ts),
     ))
 }
 
@@ -872,6 +1035,7 @@ pub async fn refresh_remaining_for_variant(
 ) -> Result<f64, String> {
     let account =
         crate::modules::trae::account::find_for(variant, user_id).ok_or("账号不存在")?;
+    let packs = fetch_entitlement_packs_for(variant, &account.jwt).await?;
     let (credits, expire_at, _purchased, packages) = calc_remaining_credits_for(variant, &account.jwt).await?;
     let mut remaining = load_remaining_for(variant);
     remaining.credits.insert(user_id.to_string(), credits);
@@ -881,6 +1045,13 @@ pub async fn refresh_remaining_for_variant(
     remaining.packages.insert(user_id.to_string(), packages);
     remaining.updated_at = Some(store::now_iso());
     save_remaining_for(variant, &remaining)?;
+
+    // 同时写入权益元信息
+    let mut meta_file = load_entitlement_meta_file_for(variant);
+    meta_file.entries.insert(user_id.to_string(), parse_entitlement_meta(&packs));
+    meta_file.updated_at = Some(store::now_iso());
+    save_entitlement_meta_for(variant, &meta_file)?;
+
     Ok(credits)
 }
 
@@ -901,43 +1072,63 @@ pub async fn refresh_all_remaining_for(variant: TraeVariant) -> usize {
     let mut succeeded = 0usize;
     let mut thawed = 0usize;
     let mut purchased_today = 0.0_f64;
+    // 收集各账号的权益包 raw packs，统一在循环结束后写 meta 缓存。
+    let mut meta_map: HashMap<String, EntitlementMeta> = HashMap::new();
 
     for (uid, account) in &accounts {
-        match calc_remaining_credits_for(variant, &account.jwt).await {
-            Ok((credits, expire_at, purchased, packages)) => {
-                remaining.credits.insert(uid.clone(), credits);
-                if let Some(expire_at) = expire_at {
-                    remaining.expire_times.insert(uid.clone(), expire_at);
-                }
-                remaining.packages.insert(uid.clone(), packages);
-                purchased_today += purchased;
-                succeeded += 1;
+        match fetch_entitlement_packs_for(variant, &account.jwt).await {
+            Ok(packs) => {
+                // 解析积分（同 calc_remaining_credits_for 的逻辑）
+                match calc_remaining_credits_for(variant, &account.jwt).await {
+                    Ok((credits, expire_at, purchased, packages)) => {
+                        remaining.credits.insert(uid.clone(), credits);
+                        if let Some(expire_at) = expire_at {
+                            remaining.expire_times.insert(uid.clone(), expire_at);
+                        }
+                        remaining.packages.insert(uid.clone(), packages);
+                        purchased_today += purchased;
+                        succeeded += 1;
 
-                let thawable = credits > 0.0
-                    && cooldowns
-                        .cooldowns
-                        .get(uid)
-                        .map(|entry| {
-                            !entry.error_type.is_empty() && entry.error_type != "SessionDead"
-                        })
-                        .unwrap_or(false);
-                if thawable {
-                    cooldowns.cooldowns.remove(uid);
-                    thawed += 1;
-                    store::append_log(
-                        &paths::app_log_file(),
-                        &format!(
-                            "自动解冻账号 {uid} [{}]: 剩余积分 {credits}，冷却已清除",
-                            variant.display_name()
-                        ),
-                    );
+                        // 同时解析权益元信息
+                        meta_map.insert(uid.clone(), parse_entitlement_meta(&packs));
+
+                        let thawable = credits > 0.0
+                            && cooldowns
+                                .cooldowns
+                                .get(uid)
+                                .map(|entry| {
+                                    !entry.error_type.is_empty() && entry.error_type != "SessionDead"
+                                })
+                                .unwrap_or(false);
+                        if thawable {
+                            cooldowns.cooldowns.remove(uid);
+                            thawed += 1;
+                            store::append_log(
+                                &paths::app_log_file(),
+                                &format!(
+                                    "自动解冻账号 {uid} [{}]: 剩余积分 {credits}，冷却已清除",
+                                    variant.display_name()
+                                ),
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        store::append_log(
+                            &paths::app_log_file(),
+                            &format!(
+                                "获取剩余积分失败 [{} / {}]: {error}",
+                                variant.display_name(),
+                                account.name
+                            ),
+                        );
+                    }
                 }
             }
             Err(error) => {
                 store::append_log(
                     &paths::app_log_file(),
                     &format!(
-                        "获取剩余积分失败 [{} / {}]: {error}",
+                        "获取权益包失败 [{} / {}]: {error}",
                         variant.display_name(),
                         account.name
                     ),
@@ -950,6 +1141,15 @@ pub async fn refresh_all_remaining_for(variant: TraeVariant) -> usize {
     let _ = save_remaining_for(variant, &remaining);
     record_daily_snapshot_for(variant, purchased_today);
 
+    // 批量写入权益元信息缓存（uid → meta map）
+    if !meta_map.is_empty() {
+        let meta_file = EntitlementMetaFile {
+            entries: meta_map,
+            updated_at: Some(store::now_iso()),
+        };
+        let _ = store::write_json(&paths::entitlement_meta_file_for(variant), &meta_file);
+    }
+
     if thawed > 0 {
         cooldowns.updated_at = Some(store::now_iso());
         let _ = store::write_json(&paths::cooldowns_file_for(variant), &cooldowns);
@@ -959,7 +1159,6 @@ pub async fn refresh_all_remaining_for(variant: TraeVariant) -> usize {
 
 // ---------------------------------------------------------------------------
 // 冷却
-// ---------------------------------------------------------------------------
 
 /// 按 HTTP 状态码与业务码分类错误，返回 `(错误类型, 冷却秒数)`。
 ///

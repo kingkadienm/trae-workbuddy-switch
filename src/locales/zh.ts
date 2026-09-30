@@ -1,5 +1,6 @@
 import { zh as shell } from "./domains/shell.zh";
 import { zh as shared } from "./domains/shared.zh";
+import { zh as doubaoPages } from "./domains/doubaoPages.zh";
 import { zh as traeComponents } from "./domains/traeComponents.zh";
 import { zh as traeGateway } from "./domains/traeGateway.zh";
 import { zh as traePages } from "./domains/traePages.zh";
@@ -33,6 +34,7 @@ export const zh = {
   ...wbSettings,
   ...wbAccounts,
   ...wbStats,
+  ...doubaoPages,
   ...traePages,
   ...traeStats,
   ...traeComponents,

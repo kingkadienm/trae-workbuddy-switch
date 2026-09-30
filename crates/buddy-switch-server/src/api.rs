@@ -17,7 +17,7 @@ use rust_embed::RustEmbed;
 use serde_json::{json, Value};
 
 use buddy_switch_core::modules::{
-    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, config, credit_usage, credits, export_import,
+    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, config, credit_usage, credits, doubao, export_import,
     migrate, oauth, process, refresh, region::Region, region::RegionFilter, rotate, schedule, scheduler,
     session, switch, token_stats, trae, travel, update,
 };
@@ -211,6 +211,25 @@ fn api_routes() -> Router {
         .route("/api/trae/switch", post(api_trae_switch))
         .route("/api/trae/device/reset", post(api_trae_reset_device))
         .route("/api/trae/settings", get(api_trae_settings).post(api_trae_save_settings))
+        // ---- 豆包模块 ----
+        .route("/api/doubao/accounts", get(api_doubao_accounts))
+        .route("/api/doubao/detect-uid", get(api_doubao_detect_uid))
+        .route("/api/doubao/accounts/save", post(api_doubao_account_save))
+        .route("/api/doubao/accounts/delete", post(api_doubao_account_remove))
+        .route("/api/doubao/keepalive", post(api_doubao_keepalive))
+        .route("/api/doubao/history", get(api_doubao_history))
+        .route("/api/doubao/chatdata/backup", post(api_doubao_chatdata_backup))
+        .route("/api/doubao/chatdata/restore", post(api_doubao_chatdata_restore))
+        .route("/api/doubao/chatdata/info", post(api_doubao_chatdata_info))
+        .route("/api/doubao/export-chats", post(api_doubao_export_chats))
+        .route("/api/doubao/quota", post(api_doubao_quota))
+        .route("/api/doubao/quota/task", post(api_doubao_quota_task_register))
+        .route("/api/doubao/quota/task/status", get(api_doubao_quota_task_status))
+        .route("/api/doubao/quota/task/delete", post(api_doubao_quota_task_unregister))
+        .route("/api/doubao/renew", post(api_doubao_renew))
+        .route("/api/doubao/renew/task", post(api_doubao_renew_task_register))
+        .route("/api/doubao/renew/task/status", get(api_doubao_renew_task_status))
+        .route("/api/doubao/renew/task/delete", post(api_doubao_renew_task_unregister))
         // ---- Trae API 网关（管理面；网关本体走独立端口 7864，**不** merge 进本 Router）----
         .route(
             "/api/trae/gateway/config",
@@ -1853,6 +1872,167 @@ async fn api_trae_reset_device(Json(body): Json<Value>) -> Response {
         Ok(Ok(value)) => json_ok(value),
         Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
         Err(error) => json_err(format!("重置设备标识失败: {error}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 豆包模块
+// ---------------------------------------------------------------------------
+
+/// GET /api/doubao/accounts —— 列出全部豆包账号。
+async fn api_doubao_accounts() -> Response {
+    match doubao::handlers::doubao_accounts_list() {
+        Ok(accounts) => json_ok(json!({ "accounts": accounts })),
+        Err(error) => json_err(error, StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// GET /api/doubao/detect-uid —— 探测当前豆包客户端登录 UID。
+async fn api_doubao_detect_uid() -> Response {
+    match doubao::handlers::doubao_detect_uid() {
+        Ok(uid) => json_ok(json!({ "uid": uid })),
+        Err(error) => json_err(error, StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/doubao/accounts/save —— 保存/切换豆包账号。
+async fn api_doubao_account_save(Json(body): Json<Value>) -> Response {
+    let user_id = body.get("userId").and_then(|v| v.as_str()).unwrap_or("");
+    let name = body.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let note = body.get("note").and_then(|v| v.as_str()).map(|s| s.to_string());
+    match doubao::handlers::doubao_account_save(user_id.to_string(), name, note) {
+        Ok(account) => json_ok(json!({ "account": account })),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// DELETE /api/doubao/accounts —— 移除豆包账号。
+async fn api_doubao_account_remove(Json(body): Json<Value>) -> Response {
+    let user_id = body.get("userId").and_then(|v| v.as_str()).unwrap_or("");
+    let remove_snapshot = body.get("removeSnapshot").and_then(|v| v.as_bool()).unwrap_or(false);
+    match doubao::handlers::doubao_account_remove(user_id.to_string(), remove_snapshot) {
+        Ok(()) => json_ok(json!({ "ok": true })),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/doubao/keepalive —— 手动触发保活。
+async fn api_doubao_keepalive() -> Response {
+    match doubao::handlers::doubao_keepalive_run() {
+        Ok(()) => json_ok(json!({ "ok": true })),
+        Err(error) => json_err(error, StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// GET /api/doubao/history —— 获取对话历史（占位）。
+async fn api_doubao_history() -> Response {
+    match doubao::chats::doubao_history() {
+        Ok(history) => json_ok(json!({ "history": history })),
+        Err(error) => json_err(error, StatusCode::NOT_IMPLEMENTED),
+    }
+}
+
+/// POST /api/doubao/chatdata/backup —— 备份聊天数据（占位）。
+async fn api_doubao_chatdata_backup(Json(body): Json<Value>) -> Response {
+    let user_id = body.get("userId").and_then(|v| v.as_str()).unwrap_or("");
+    match doubao::chats::doubao_chatdata_backup(user_id.to_string()) {
+        Ok(result) => json_ok(json!({ "result": result })),
+        Err(error) => json_err(error, StatusCode::NOT_IMPLEMENTED),
+    }
+}
+
+/// POST /api/doubao/chatdata/restore —— 恢复聊天数据（占位）。
+async fn api_doubao_chatdata_restore(Json(body): Json<Value>) -> Response {
+    let user_id = body.get("userId").and_then(|v| v.as_str()).unwrap_or("");
+    match doubao::chats::doubao_chatdata_restore(user_id.to_string()) {
+        Ok(result) => json_ok(json!({ "result": result })),
+        Err(error) => json_err(error, StatusCode::NOT_IMPLEMENTED),
+    }
+}
+
+/// GET /api/doubao/chatdata/info —— 获取聊天数据信息（占位）。
+async fn api_doubao_chatdata_info(Json(body): Json<Value>) -> Response {
+    let user_id = body.get("userId").and_then(|v| v.as_str()).unwrap_or("");
+    match doubao::chats::doubao_chatdata_info(user_id.to_string()) {
+        Ok(info) => json_ok(json!({ "info": info })),
+        Err(error) => json_err(error, StatusCode::NOT_IMPLEMENTED),
+    }
+}
+
+/// POST /api/doubao/export-chats —— 导出对话（占位）。
+async fn api_doubao_export_chats(Json(body): Json<Value>) -> Response {
+    let user_id = body.get("userId").and_then(|v| v.as_str()).unwrap_or("");
+    match doubao::chats::doubao_export_chats(user_id.to_string()) {
+        Ok(result) => json_ok(json!({ "result": result })),
+        Err(error) => json_err(error, StatusCode::NOT_IMPLEMENTED),
+    }
+}
+
+/// GET /api/doubao/quota —— 查询会员额度（占位）。
+async fn api_doubao_quota(Json(body): Json<Value>) -> Response {
+    let user_id = body.get("userId").and_then(|v| v.as_str()).unwrap_or("");
+    match doubao::quota::doubao_quota_fetch(user_id.to_string()) {
+        Ok(quota) => json_ok(json!({ "quota": quota })),
+        Err(error) => json_err(error, StatusCode::NOT_IMPLEMENTED),
+    }
+}
+
+/// POST /api/doubao/quota/task —— 注册额度查询定时任务（占位）。
+async fn api_doubao_quota_task_register(Json(body): Json<Value>) -> Response {
+    let time = body.get("time").and_then(|v| v.as_str()).unwrap_or("");
+    match doubao::quota::doubao_quota_task_register(time.to_string()) {
+        Ok(()) => json_ok(json!({ "ok": true })),
+        Err(error) => json_err(error, StatusCode::NOT_IMPLEMENTED),
+    }
+}
+
+/// GET /api/doubao/quota/task/status —— 查询额度任务状态（占位）。
+async fn api_doubao_quota_task_status() -> Response {
+    match doubao::quota::doubao_quota_task_status() {
+        Ok(status) => json_ok(json!({ "status": status })),
+        Err(error) => json_err(error, StatusCode::NOT_IMPLEMENTED),
+    }
+}
+
+/// DELETE /api/doubao/quota/task —— 注销额度定时任务（占位）。
+async fn api_doubao_quota_task_unregister() -> Response {
+    match doubao::quota::doubao_quota_task_unregister() {
+        Ok(()) => json_ok(json!({ "ok": true })),
+        Err(error) => json_err(error, StatusCode::NOT_IMPLEMENTED),
+    }
+}
+
+/// POST /api/doubao/renew —— 手动触发会话续期（占位）。
+async fn api_doubao_renew(Json(body): Json<Value>) -> Response {
+    let user_id = body.get("userId").and_then(|v| v.as_str()).unwrap_or("");
+    match doubao::session::doubao_renew_run(user_id.to_string()) {
+        Ok(result) => json_ok(json!({ "result": result })),
+        Err(error) => json_err(error, StatusCode::NOT_IMPLEMENTED),
+    }
+}
+
+/// POST /api/doubao/renew/task —— 注册续期定时任务（占位）。
+async fn api_doubao_renew_task_register(Json(body): Json<Value>) -> Response {
+    let time = body.get("time").and_then(|v| v.as_str()).unwrap_or("");
+    match doubao::session::doubao_renew_task_register(time.to_string()) {
+        Ok(()) => json_ok(json!({ "ok": true })),
+        Err(error) => json_err(error, StatusCode::NOT_IMPLEMENTED),
+    }
+}
+
+/// GET /api/doubao/renew/task/status —— 查询续期任务状态（占位）。
+async fn api_doubao_renew_task_status() -> Response {
+    match doubao::session::doubao_renew_task_status() {
+        Ok(status) => json_ok(json!({ "status": status })),
+        Err(error) => json_err(error, StatusCode::NOT_IMPLEMENTED),
+    }
+}
+
+/// DELETE /api/doubao/renew/task —— 注销续期定时任务（占位）。
+async fn api_doubao_renew_task_unregister() -> Response {
+    match doubao::session::doubao_renew_task_unregister() {
+        Ok(()) => json_ok(json!({ "ok": true })),
+        Err(error) => json_err(error, StatusCode::NOT_IMPLEMENTED),
     }
 }
 

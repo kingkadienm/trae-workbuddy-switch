@@ -84,6 +84,14 @@ export const zh = {
   "trae.comp.card.credits.remaining": "剩余积分",
   "trae.comp.card.credits.unknown": "积分未查询",
   "trae.comp.card.credits.notQueried": "尚未查询到积分，点右上角菜单「刷新积分」重试",
+  "trae.comp.card.credits.work": "Work",
+  "trae.comp.card.credits.general": "通用",
+  "trae.comp.card.credits.workTooltip": "Work 积分",
+  "trae.comp.card.credits.generalTooltip": "通用积分",
+  "trae.comp.card.membership.expire": "会员到期：{date}",
+  "trae.comp.card.membership.nextBilling": "下次扣款：{date}",
+  "trae.comp.card.membership.none": "非会员",
+  "trae.comp.card.payIdentity": "{identity}",
   "trae.comp.card.section.expiring": "近期到期",
   "trae.comp.card.section.info": "账号信息",
   "trae.comp.card.package.fallback": "积分包",
@@ -122,6 +130,9 @@ export const zh = {
   "trae.comp.card.detail.jwtAutoOn": "已开启",
   "trae.comp.card.detail.jwtAutoOff": "可手动刷新",
   "trae.comp.card.detail.noRefreshToken": "无 refresh token",
+  "trae.comp.card.detail.membershipExpire": "会员到期",
+  "trae.comp.card.detail.membershipNextBilling": "下次扣款",
+  "trae.comp.card.detail.payIdentity": "套餐身份",
 
   // =====================================================================
   // trae-oauth-login-dialog.tsx —— OAuth 网页登录

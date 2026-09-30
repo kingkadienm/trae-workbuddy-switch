@@ -258,6 +258,25 @@ const ROUTES: Record<string, Route> = {
   trae_restore_profile: { method: "POST", path: "/api/trae/profiles/restore" },
   trae_delete_profile: { method: "POST", path: "/api/trae/profiles/delete" },
   trae_reset_device: { method: "POST", path: "/api/trae/device/reset" },
+  // ---- 豆包模块 ----
+  doubao_accounts_list: { method: "GET", path: "/api/doubao/accounts" },
+  doubao_detect_uid: { method: "GET", path: "/api/doubao/detect-uid" },
+  doubao_account_save: { method: "POST", path: "/api/doubao/accounts/save" },
+  doubao_account_remove: { method: "POST", path: "/api/doubao/accounts/delete" },
+  doubao_keepalive_run: { method: "POST", path: "/api/doubao/keepalive" },
+  doubao_history: { method: "GET", path: "/api/doubao/history" },
+  doubao_chatdata_backup: { method: "POST", path: "/api/doubao/chatdata/backup" },
+  doubao_chatdata_restore: { method: "POST", path: "/api/doubao/chatdata/restore" },
+  doubao_chatdata_info: { method: "POST", path: "/api/doubao/chatdata/info" },
+  doubao_export_chats: { method: "POST", path: "/api/doubao/export-chats" },
+  doubao_quota_fetch: { method: "POST", path: "/api/doubao/quota" },
+  doubao_quota_task_register: { method: "POST", path: "/api/doubao/quota/task" },
+  doubao_quota_task_status: { method: "GET", path: "/api/doubao/quota/task/status" },
+  doubao_quota_task_unregister: { method: "POST", path: "/api/doubao/quota/task/delete" },
+  doubao_renew_run: { method: "POST", path: "/api/doubao/renew" },
+  doubao_renew_task_register: { method: "POST", path: "/api/doubao/renew/task" },
+  doubao_renew_task_status: { method: "GET", path: "/api/doubao/renew/task/status" },
+  doubao_renew_task_unregister: { method: "POST", path: "/api/doubao/renew/task/delete" },
   // Trae API 网关管理面（网关本体走独立端口，见 src/pages/TraeApiServicePage）。
   get_trae_gateway_config: { method: "GET", path: "/api/trae/gateway/config" },
   save_trae_gateway_config: { method: "POST", path: "/api/trae/gateway/config" },
@@ -1633,6 +1652,105 @@ export function getTraeGatewayLogs(): Promise<unknown> {
 /** 清空网关请求日志。 */
 export function clearTraeGatewayLogs(): Promise<{ ok: boolean }> {
   return call("clear_trae_gateway_logs");
+}
+
+// ---- 豆包模块 ----
+
+/** 列出全部豆包账号。 */
+export function doubaoAccountsList(): Promise<{ accounts: any[] }> {
+  return call("doubao_accounts_list");
+}
+
+/** 探测当前豆包客户端登录 UID。 */
+export function doubaoDetectUid(): Promise<{ uid?: string | null }> {
+  return call("doubao_detect_uid");
+}
+
+/** 保存/切换豆包账号。 */
+export function doubaoAccountSave(
+  userId: string,
+  name?: string | null,
+  note?: string | null,
+): Promise<{ account: any }> {
+  return call("doubao_account_save", { userId, name, note });
+}
+
+/** 移除豆包账号。 */
+export function doubaoAccountRemove(
+  userId: string,
+  removeSnapshot?: boolean,
+): Promise<{ ok: boolean }> {
+  return call("doubao_account_remove", { userId, removeSnapshot });
+}
+
+/** 手动触发保活。 */
+export function doubaoKeepaliveRun(): Promise<{ ok: boolean }> {
+  return call("doubao_keepalive_run");
+}
+
+/** 获取对话历史（占位）。 */
+export function doubaoHistory(): Promise<{ history: any[] }> {
+  return call("doubao_history");
+}
+
+/** 备份聊天数据（占位）。 */
+export function doubaoChatdataBackup(userId: string): Promise<{ result: any }> {
+  return call("doubao_chatdata_backup", { userId });
+}
+
+/** 恢复聊天数据（占位）。 */
+export function doubaoChatdataRestore(userId: string): Promise<{ result: any }> {
+  return call("doubao_chatdata_restore", { userId });
+}
+
+/** 获取聊天数据信息（占位）。 */
+export function doubaoChatdataInfo(userId: string): Promise<{ info: any }> {
+  return call("doubao_chatdata_info", { userId });
+}
+
+/** 导出对话（占位）。 */
+export function doubaoExportChats(userId: string): Promise<{ result: any }> {
+  return call("doubao_export_chats", { userId });
+}
+
+/** 查询会员额度（占位）。 */
+export function doubaoQuotaFetch(userId: string): Promise<{ quota: any }> {
+  return call("doubao_quota_fetch", { userId });
+}
+
+/** 注册额度查询定时任务（占位）。 */
+export function doubaoQuotaTaskRegister(time: string): Promise<{ ok: boolean }> {
+  return call("doubao_quota_task_register", { time });
+}
+
+/** 查询额度任务状态（占位）。 */
+export function doubaoQuotaTaskStatus(): Promise<{ status: string }> {
+  return call("doubao_quota_task_status");
+}
+
+/** 注销额度定时任务（占位）。 */
+export function doubaoQuotaTaskUnregister(): Promise<{ ok: boolean }> {
+  return call("doubao_quota_task_unregister");
+}
+
+/** 手动触发会话续期（占位）。 */
+export function doubaoRenewRun(userId: string): Promise<{ result: any }> {
+  return call("doubao_renew_run", { userId });
+}
+
+/** 注册续期定时任务（占位）。 */
+export function doubaoRenewTaskRegister(time: string): Promise<{ ok: boolean }> {
+  return call("doubao_renew_task_register", { time });
+}
+
+/** 查询续期任务状态（占位）。 */
+export function doubaoRenewTaskStatus(): Promise<{ status: string }> {
+  return call("doubao_renew_task_status");
+}
+
+/** 注销续期定时任务（占位）。 */
+export function doubaoRenewTaskUnregister(): Promise<{ ok: boolean }> {
+  return call("doubao_renew_task_unregister");
 }
 
 export type { TraeGatewayLogEntry, TraeGatewayStatus };

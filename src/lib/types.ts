@@ -394,6 +394,69 @@ export interface GrowthQueueStatus {
   }>;
 }
 
+/** 豆包账号（与后端 DoubaoAccountView 对齐）。 */
+export interface DoubaoAccount {
+  userId: string;
+  name: string;
+  note: string;
+  hasSnapshot: boolean;
+  sizeBytes: number;
+  fileCount: number;
+  lastModified: string;
+  isCurrent: boolean;
+  addedAt?: string | null;
+  sessionState: 'ok' | 'expired' | 'unknown' | 'none';
+  sessionId?: string | null;
+  sidGuard?: string | null;
+  sessionExpireAt?: string | null;
+  cookiesSyncedAt?: string | null;
+  lastRenewAt?: string | null;
+  sessionSource?: string | null;
+  ttwid?: string | null;
+  quotaLevel?: string | null;
+  quotaExpireAt?: string | null;
+  quotaSummary?: string | null;
+  quotaCheckedAt?: string | null;
+  lastKeepaliveAt?: string | null;
+}
+
+export interface DoubaoDetectResult {
+  uid?: string | null;
+}
+
+export interface DoubaoSaveResult {
+  account: DoubaoAccount;
+}
+
+export interface DoubaoKeepaliveResult {
+  ok: boolean;
+}
+
+export interface DoubaoChatHistory {
+  history: any[];
+}
+
+export interface DoubaoChatDataResult {
+  result: any;
+}
+
+export interface DoubaoChatDataInfo {
+  info: any;
+}
+
+export interface DoubaoQuota {
+  quota: any;
+}
+
+export interface DoubaoTaskStatus {
+  status: string;
+}
+
+export interface DoubaoRenewResult {
+  result: any;
+}
+
+
 export interface AutoRotateConfig {
   enabled: boolean;
   check_interval_minutes: number;

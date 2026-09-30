@@ -638,12 +638,14 @@ function traeDemoAccounts(): TraeAccount[] {
       ],
       deviceIdMasked: "a1b2…9f", cooldownType: null, cooldownUntil: null, cooldownReason: null,
       hasRefreshToken: true, jwtAutoRefresh: true,
+      workCredits: 120, generalCredits: 0, membershipExpire: null, membershipNextBilling: null, payIdentity: null,
       addedAt: "2026-09-10T02:11:00Z", updatedAt: "2026-09-17T01:54:00Z",
     },
     {
       userId: "7481999", name: t("shared.demo.trae.name.altA"), groupId: "g1", jwt: "", jwtExpHours: 6.2,
       jwtExpTimestamp: atLocalTime(0, 15, 20), jwtStatus: "warn", checkedToday: false,
       credits: 0, remainingCredits: 64.5, creditsExpireAt: futureAt(5),
+      workCredits: 0, generalCredits: 64.5, membershipExpire: null, membershipNextBilling: null, payIdentity: null,
       creditPackages: [
         { packageCode: "pkg_cn_plan", packageName: t("shared.demo.trae.pack.cnPlan"), total: 100, remaining: 64.5, used: 35.5, expireAt: Math.floor(futureAt(5) / 1000), expired: false, expiringSoon: true },
       ],
@@ -657,6 +659,7 @@ function traeDemoAccounts(): TraeAccount[] {
       userId: "7482044", name: t("shared.demo.trae.name.altB"), groupId: "g1", jwt: "", jwtExpHours: -3,
       jwtExpTimestamp: atLocalTime(0, 5, 30), jwtStatus: "expired", checkedToday: false,
       credits: 8, remainingCredits: 8, creditsExpireAt: futureAt(3),
+      workCredits: 0, generalCredits: 8, membershipExpire: null, membershipNextBilling: null, payIdentity: null,
       creditPackages: [
         { packageCode: "pkg_trial", packageName: t("shared.demo.trae.pack.trial"), total: 8, remaining: 8, used: 0, expireAt: Math.floor(futureAt(3) / 1000), expired: false, expiringSoon: true },
       ],

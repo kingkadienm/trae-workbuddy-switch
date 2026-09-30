@@ -309,6 +309,9 @@ pub fn display_name(user_id: &str) -> Option<String> {
 /// - `remainingCredits` / `creditsExpireAt`：剩余积分缓存
 /// - `cooldownType` / `cooldownUntil` / `cooldownReason`：冷却状态（仅未到期时暴露）
 /// - `checkedToday`：今日签到摘要
+/// - `workCredits` / `generalCredits`：Work/通用积分（来自 `entitlement_meta.json`）
+/// - `membershipExpire` / `membershipNextBilling`：会员到期 / 下次扣款（来自 `entitlement_meta.json`）
+/// - `payIdentity`：套餐身份（Free / Lite / Pro …，来自 `entitlement_meta.json`）
 #[allow(clippy::too_many_arguments)]
 pub fn account_view(
     account: &RawAccount,
@@ -320,6 +323,11 @@ pub fn account_view(
     cooldown: Option<&crate::modules::trae::credits::CooldownEntry>,
     checked_today: bool,
     latest_credits: Option<i64>,
+    work_credits: Option<f64>,
+    general_credits: Option<f64>,
+    membership_expire: Option<i64>,
+    membership_next_billing: Option<i64>,
+    pay_identity: Option<&str>,
 ) -> Value {
     let info = jwt::parse(&account.jwt);
     let has_refresh_token = account
@@ -351,6 +359,11 @@ pub fn account_view(
         "credits": latest_credits,
         "remainingCredits": remaining_credits,
         "creditsExpireAt": credits_expire_at,
+        "workCredits": work_credits,
+        "generalCredits": general_credits,
+        "membershipExpire": membership_expire,
+        "membershipNextBilling": membership_next_billing,
+        "payIdentity": pay_identity,
         "deviceIdMasked": device_id.map(store::mask),
         "cooldownType": active_cooldown.map(|entry| entry.error_type.clone()),
         "cooldownUntil": active_cooldown.map(|entry| entry.until),
@@ -378,6 +391,7 @@ pub fn list_account_views_for(variant: TraeVariant) -> Vec<Value> {
     let device_map = device::load_map_for(variant);
     let remaining = crate::modules::trae::credits::load_remaining_for(variant);
     let cooldowns: CooldownsFile = store::read_json(&paths::cooldowns_file_for(variant));
+    let entitlement_meta = crate::modules::trae::credits::load_entitlement_meta_file_for(variant);
 
     // 「今日已签到」的**唯一来源**是当日台账（跨运行累积、按 userId 记），并兜上当日积分明细
     // （升级当天台账还是空的，见 `credits::checked_in_today_for` 的两条理由）。
@@ -421,6 +435,7 @@ pub fn list_account_views_for(variant: TraeVariant) -> Vec<Value> {
                     }
                 })
                 .map(|record| record.credits);
+            let meta = entitlement_meta.entries.get(&uid);
             Some(account_view(
                 account,
                 &uid,
@@ -431,6 +446,11 @@ pub fn list_account_views_for(variant: TraeVariant) -> Vec<Value> {
                 cooldowns.cooldowns.get(&uid),
                 checked_user_ids.contains(&uid),
                 latest_credits,
+                meta.and_then(|m| m.work_credits),
+                meta.and_then(|m| m.general_credits),
+                meta.and_then(|m| m.membership_expire),
+                meta.and_then(|m| m.membership_next_billing),
+                meta.and_then(|m| m.pay_identity.as_deref()),
             ))
         })
         .collect()
@@ -1869,6 +1889,11 @@ mod tests {
             None,
             true,
             Some(30),
+            Some(100.0),
+            Some(50.0),
+            Some(2_000_000_000),
+            Some(2_100_000_000),
+            Some("会员 Lite 连续包月"),
         );
         // 线上形态必须是 camelCase —— 前端 TS 类型按此定义。
         for key in [
@@ -1880,6 +1905,11 @@ mod tests {
             "checkedToday",
             "remainingCredits",
             "creditsExpireAt",
+            "workCredits",
+            "generalCredits",
+            "membershipExpire",
+            "membershipNextBilling",
+            "payIdentity",
             "deviceIdMasked",
             "hasRefreshToken",
             "jwtAutoRefresh",
@@ -1995,7 +2025,7 @@ mod tests {
             reason: "旧错误".into(),
             error_count: 1,
         };
-        let view = account_view(&account, "u", None, None, None, None, Some(&expired), false, None);
+        let view = account_view(&account, "u", None, None, None, None, Some(&expired), false, None, None, None, None, None, None);
         // 已过期的冷却不能继续显示为「冷却中」，否则 UI 会永久禁用账号操作。
         assert!(view.get("cooldownType").unwrap().is_null());
         assert!(view.get("cooldownUntil").unwrap().is_null());
@@ -2006,7 +2036,7 @@ mod tests {
             reason: String::new(),
             error_count: 0,
         };
-        let view = account_view(&account, "u", None, None, None, None, Some(&active), false, None);
+        let view = account_view(&account, "u", None, None, None, None, Some(&active), false, None, None, None, None, None, None);
         assert_eq!(view.get("cooldownType").unwrap().as_str(), Some("SessionDead"));
         // 原因为空时不下发空串，前端用 null 判定「无原因」
         assert!(view.get("cooldownReason").unwrap().is_null());
@@ -2023,12 +2053,12 @@ mod tests {
             updated_at: None,
         };
         // 没有 refresh_token：即便 JWT 无法解析也不该提示「可自动刷新」
-        let view = account_view(&account, "u", None, None, None, None, None, false, None);
+        let view = account_view(&account, "u", None, None, None, None, None, false, None, None, None, None, None, None);
         assert_eq!(view.get("hasRefreshToken").unwrap().as_bool(), Some(false));
         assert_eq!(view.get("jwtAutoRefresh").unwrap().as_bool(), Some(false));
 
         account.refresh_token = Some("rt".into());
-        let view = account_view(&account, "u", None, None, None, None, None, false, None);
+        let view = account_view(&account, "u", None, None, None, None, None, false, None, None, None, None, None, None);
         assert_eq!(view.get("hasRefreshToken").unwrap().as_bool(), Some(true));
         assert_eq!(view.get("jwtAutoRefresh").unwrap().as_bool(), Some(true));
     }

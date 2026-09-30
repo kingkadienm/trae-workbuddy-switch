@@ -664,6 +664,7 @@ mod tests {
             None,
             checked_today,
             None,
+            None, None, None, None, None,
         )
     }
 

@@ -343,6 +343,14 @@ pub fn remaining_credits_file_for(variant: TraeVariant) -> PathBuf {
     scoped_file("remaining_credits.json", variant)
 }
 
+/// 权益包元信息缓存文件（按变体分家）。
+///
+/// 存放从 `user_entitlement_pack_list` 中提取的「套餐身份 + Work 积分 + 会员到期」，
+/// 供 `list_account_views_for` 同步读取写入账号视图。由 `refresh_credits_for` 异步回写。
+pub fn entitlement_meta_file_for(variant: TraeVariant) -> PathBuf {
+    scoped_file("entitlement_meta.json", variant)
+}
+
 /// 账号冷却状态文件（默认变体，兼容壳）。
 pub fn cooldowns_file() -> PathBuf {
     cooldowns_file_for(TraeVariant::default())

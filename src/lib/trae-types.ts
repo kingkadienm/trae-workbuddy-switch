@@ -279,6 +279,16 @@ export interface TraeAccount {
   credits: number | null;
   remainingCredits: number | null;
   creditsExpireAt: number | null;
+  /** Work 积分剩余（product_id == 209）。 */
+  workCredits: number | null;
+  /** 通用积分剩余（非 Work 包合计）。 */
+  generalCredits: number | null;
+  /** 会员到期时间（Unix 秒）。 */
+  membershipExpire: number | null;
+  /** 下次扣款日（Unix 秒）。 */
+  membershipNextBilling: number | null;
+  /** 套餐身份（Free / Lite / Pro / 会员 Lite …）。 */
+  payIdentity: string | null;
   /** 逐包明细；未刷新过积分时为 `null`。 */
   creditPackages: TraeCreditPackage[] | null;
   deviceIdMasked: string | null;

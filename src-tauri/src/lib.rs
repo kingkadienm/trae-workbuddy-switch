@@ -280,6 +280,25 @@ pub fn run() {
             commands::trae_launch_client,
             commands::get_trae_gateway_logs,
             commands::clear_trae_gateway_logs,
+            // ---- 豆包模块 ----
+            commands::doubao_accounts_list,
+            commands::doubao_detect_uid,
+            commands::doubao_account_save,
+            commands::doubao_account_remove,
+            commands::doubao_keepalive_run,
+            commands::doubao_history,
+            commands::doubao_chatdata_backup,
+            commands::doubao_chatdata_restore,
+            commands::doubao_chatdata_info,
+            commands::doubao_export_chats,
+            commands::doubao_quota_fetch,
+            commands::doubao_quota_task_register,
+            commands::doubao_quota_task_status,
+            commands::doubao_quota_task_unregister,
+            commands::doubao_renew_run,
+            commands::doubao_renew_task_register,
+            commands::doubao_renew_task_status,
+            commands::doubao_renew_task_unregister,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

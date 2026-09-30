@@ -75,6 +75,14 @@ export const en = {
   "trae.comp.card.credits.remaining": "Credits left",
   "trae.comp.card.credits.unknown": "Credits not fetched",
   "trae.comp.card.credits.notQueried": "No credits fetched yet. Use “Refresh JWT” in the top-right menu to try again.",
+  "trae.comp.card.credits.work": "Work",
+  "trae.comp.card.credits.general": "General",
+  "trae.comp.card.credits.workTooltip": "Work credits",
+  "trae.comp.card.credits.generalTooltip": "General credits",
+  "trae.comp.card.membership.expire": "Membership expires: {date}",
+  "trae.comp.card.membership.nextBilling": "Next billing: {date}",
+  "trae.comp.card.membership.none": "Free plan",
+  "trae.comp.card.payIdentity": "{identity}",
   "trae.comp.card.section.expiring": "Expiring soon",
   "trae.comp.card.section.info": "Account info",
   "trae.comp.card.package.fallback": "Credit package",
@@ -109,6 +117,9 @@ export const en = {
   "trae.comp.card.detail.jwtAutoOn": "Enabled",
   "trae.comp.card.detail.jwtAutoOff": "Manual refresh only",
   "trae.comp.card.detail.noRefreshToken": "No refresh token",
+  "trae.comp.card.detail.membershipExpire": "Membership expires",
+  "trae.comp.card.detail.membershipNextBilling": "Next billing",
+  "trae.comp.card.detail.payIdentity": "Plan identity",
 
   // =====================================================================
   // trae-oauth-login-dialog.tsx —— OAuth web login

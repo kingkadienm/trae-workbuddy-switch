@@ -1,5 +1,6 @@
 import { en as shell } from "./domains/shell.en";
 import { en as shared } from "./domains/shared.en";
+import { en as doubaoPages } from "./domains/doubaoPages.en";
 import { en as traeComponents } from "./domains/traeComponents.en";
 import { en as traeGateway } from "./domains/traeGateway.en";
 import { en as traePages } from "./domains/traePages.en";
@@ -33,6 +34,7 @@ export const en: Partial<Record<TranslationKey, string>> = {
   ...wbSettings,
   ...wbAccounts,
   ...wbStats,
+  ...doubaoPages,
   ...traePages,
   ...traeStats,
   ...traeComponents,

@@ -9,7 +9,7 @@ use std::sync::Mutex;
 
 use tauri::{Emitter, Manager};
 use buddy_switch_core::modules::{
-    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, credit_usage, credits, export_import, migrate,
+    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, credit_usage, credits, doubao, export_import, migrate,
     oauth, process, refresh, region::Region, region::RegionFilter, rotate, session, switch, token_stats, trae, travel,
     update,
 };
@@ -1821,6 +1821,176 @@ pub async fn save_trae_gateway_config(
         "running": addr.is_some(),
         "addr": addr,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// 豆包模块
+// ---------------------------------------------------------------------------
+
+/// GET /api/doubao/accounts —— 列出全部豆包账号。
+#[tauri::command(rename_all = "camelCase")]
+pub fn doubao_accounts_list() -> Value {
+    match doubao::handlers::doubao_accounts_list() {
+        Ok(views) => json!({ "accounts": views }),
+        Err(error) => json!({ "error": error }),
+    }
+}
+
+/// GET /api/doubao/detect-uid —— 探测当前豆包客户端登录 UID。
+#[tauri::command(rename_all = "camelCase")]
+pub fn doubao_detect_uid() -> Value {
+    match doubao::handlers::doubao_detect_uid() {
+        Ok(uid) => json!({ "uid": uid }),
+        Err(error) => json!({ "error": error }),
+    }
+}
+
+/// POST /api/doubao/accounts —— 保存/切换豆包账号。
+#[tauri::command(rename_all = "camelCase")]
+pub fn doubao_account_save(
+    user_id: String,
+    name: Option<String>,
+    note: Option<String>,
+) -> Value {
+    match doubao::handlers::doubao_account_save(user_id, name, note) {
+        Ok(view) => json!({ "account": view }),
+        Err(error) => json!({ "error": error }),
+    }
+}
+
+/// DELETE /api/doubao/accounts —— 移除豆包账号。
+#[tauri::command(rename_all = "camelCase")]
+pub fn doubao_account_remove(user_id: String, remove_snapshot: bool) -> Value {
+    match doubao::handlers::doubao_account_remove(user_id, remove_snapshot) {
+        Ok(()) => json!({ "ok": true }),
+        Err(error) => json!({ "error": error }),
+    }
+}
+
+/// POST /api/doubao/keepalive —— 手动触发保活。
+#[tauri::command(rename_all = "camelCase")]
+pub fn doubao_keepalive_run() -> Value {
+    match doubao::handlers::doubao_keepalive_run() {
+        Ok(()) => json!({ "ok": true }),
+        Err(error) => json!({ "error": error }),
+    }
+}
+
+/// GET /api/doubao/history —— 获取对话历史（占位）。
+#[tauri::command(rename_all = "camelCase")]
+pub fn doubao_history() -> Value {
+    match doubao::chats::doubao_history() {
+        Ok(history) => json!({ "history": history }),
+        Err(error) => json!({ "error": error }),
+    }
+}
+
+/// POST /api/doubao/chatdata/backup —— 备份聊天数据（占位）。
+#[tauri::command(rename_all = "camelCase")]
+pub fn doubao_chatdata_backup(user_id: String) -> Value {
+    match doubao::chats::doubao_chatdata_backup(user_id) {
+        Ok(result) => json!({ "result": result }),
+        Err(error) => json!({ "error": error }),
+    }
+}
+
+/// POST /api/doubao/chatdata/restore —— 恢复聊天数据（占位）。
+#[tauri::command(rename_all = "camelCase")]
+pub fn doubao_chatdata_restore(user_id: String) -> Value {
+    match doubao::chats::doubao_chatdata_restore(user_id) {
+        Ok(result) => json!({ "result": result }),
+        Err(error) => json!({ "error": error }),
+    }
+}
+
+/// GET /api/doubao/chatdata/info —— 获取聊天数据信息（占位）。
+#[tauri::command(rename_all = "camelCase")]
+pub fn doubao_chatdata_info(user_id: String) -> Value {
+    match doubao::chats::doubao_chatdata_info(user_id) {
+        Ok(info) => json!({ "info": info }),
+        Err(error) => json!({ "error": error }),
+    }
+}
+
+/// POST /api/doubao/export-chats —— 导出对话（占位）。
+#[tauri::command(rename_all = "camelCase")]
+pub fn doubao_export_chats(user_id: String) -> Value {
+    match doubao::chats::doubao_export_chats(user_id) {
+        Ok(result) => json!({ "result": result }),
+        Err(error) => json!({ "error": error }),
+    }
+}
+
+/// GET /api/doubao/quota —— 查询会员额度（占位）。
+#[tauri::command(rename_all = "camelCase")]
+pub fn doubao_quota_fetch(user_id: String) -> Value {
+    match doubao::quota::doubao_quota_fetch(user_id) {
+        Ok(quota) => json!({ "quota": quota }),
+        Err(error) => json!({ "error": error }),
+    }
+}
+
+/// POST /api/doubao/quota/task —— 注册额度查询定时任务（占位）。
+#[tauri::command(rename_all = "camelCase")]
+pub fn doubao_quota_task_register(time: String) -> Value {
+    match doubao::quota::doubao_quota_task_register(time) {
+        Ok(()) => json!({ "ok": true }),
+        Err(error) => json!({ "error": error }),
+    }
+}
+
+/// GET /api/doubao/quota/task/status —— 查询额度任务状态（占位）。
+#[tauri::command(rename_all = "camelCase")]
+pub fn doubao_quota_task_status() -> Value {
+    match doubao::quota::doubao_quota_task_status() {
+        Ok(status) => json!({ "status": status }),
+        Err(error) => json!({ "error": error }),
+    }
+}
+
+/// DELETE /api/doubao/quota/task —— 注销额度定时任务（占位）。
+#[tauri::command(rename_all = "camelCase")]
+pub fn doubao_quota_task_unregister() -> Value {
+    match doubao::quota::doubao_quota_task_unregister() {
+        Ok(()) => json!({ "ok": true }),
+        Err(error) => json!({ "error": error }),
+    }
+}
+
+/// POST /api/doubao/renew —— 手动触发会话续期（占位）。
+#[tauri::command(rename_all = "camelCase")]
+pub fn doubao_renew_run(user_id: String) -> Value {
+    match doubao::session::doubao_renew_run(user_id) {
+        Ok(result) => json!({ "result": result }),
+        Err(error) => json!({ "error": error }),
+    }
+}
+
+/// POST /api/doubao/renew/task —— 注册续期定时任务（占位）。
+#[tauri::command(rename_all = "camelCase")]
+pub fn doubao_renew_task_register(time: String) -> Value {
+    match doubao::session::doubao_renew_task_register(time) {
+        Ok(()) => json!({ "ok": true }),
+        Err(error) => json!({ "error": error }),
+    }
+}
+
+/// GET /api/doubao/renew/task/status —— 查询续期任务状态（占位）。
+#[tauri::command(rename_all = "camelCase")]
+pub fn doubao_renew_task_status() -> Value {
+    match doubao::session::doubao_renew_task_status() {
+        Ok(status) => json!({ "status": status }),
+        Err(error) => json!({ "error": error }),
+    }
+}
+
+/// DELETE /api/doubao/renew/task —— 注销续期定时任务（占位）。
+#[tauri::command(rename_all = "camelCase")]
+pub fn doubao_renew_task_unregister() -> Value {
+    match doubao::session::doubao_renew_task_unregister() {
+        Ok(()) => json!({ "ok": true }),
+        Err(error) => json!({ "error": error }),
+    }
 }
 
 /// GET /api/trae/gateway/status —— 运行状态 + 账号池摘要 + 账号明细 + 诊断。

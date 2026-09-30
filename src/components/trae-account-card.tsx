@@ -1,4 +1,4 @@
-import { ArrowRight, Check, CircleCheck, CircleSlash, Clock3, Coins, Ellipsis, KeyRound, Loader2, Plug, Save, Sparkles, Trash2 } from "lucide-react";
+import { ArrowRight, Check, CircleCheck, CircleSlash, Clock3, Coins, Crown, Ellipsis, KeyRound, Loader2, Plug, Save, Sparkles, Trash2 } from "lucide-react";
 import { useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
@@ -534,6 +534,57 @@ export function TraeAccountCard({
             </div>
           </div>
 
+          {/* Work / 通用积分拆分（仅在刷新后且有区分时展示）。 */}
+          {hasCredits && (account.workCredits !== null || account.generalCredits !== null) ? (
+            <div className={cn("flex items-center gap-3 text-muted-foreground", compact ? "mt-2 text-[11px]" : "mt-3 text-xs")}>
+              {account.workCredits !== null && (
+                <span className="flex items-center gap-1" title={t("trae.comp.card.credits.workTooltip")}>
+                  <span className="font-medium tabular-nums">{formatCredits(account.workCredits)}</span>
+                  <span>{t("trae.comp.card.credits.work")}</span>
+                </span>
+              )}
+              {account.workCredits !== null && account.generalCredits !== null && (
+                <span className="text-muted-foreground/40">|</span>
+              )}
+              {account.generalCredits !== null && (
+                <span className="flex items-center gap-1" title={t("trae.comp.card.credits.generalTooltip")}>
+                  <span className="font-medium tabular-nums">{formatCredits(account.generalCredits)}</span>
+                  <span>{t("trae.comp.card.credits.general")}</span>
+                </span>
+              )}
+              {/* 会员到期 */}
+              {account.membershipExpire !== null && (
+                <>
+                  <span className="text-muted-foreground/40">|</span>
+                  <span className="flex items-center gap-1">
+                    <Crown className="size-3 shrink-0 text-amber-500" aria-hidden="true" />
+                    {account.membershipNextBilling !== null
+                      ? t("trae.comp.card.membership.nextBilling", { date: formatFullDate(account.membershipNextBilling) })
+                      : t("trae.comp.card.membership.expire", { date: formatFullDate(account.membershipExpire) })}
+                  </span>
+                </>
+              )}
+              {/* 套餐身份 */}
+              {account.payIdentity && (
+                <>
+                  <span className="text-muted-foreground/40">|</span>
+                  <Badge variant="secondary" className="h-5 px-1.5 text-[10px] font-normal">{account.payIdentity}</Badge>
+                </>
+              )}
+            </div>
+          ) : account.payIdentity && !hasCredits ? (
+            /* 有套餐身份但未查询到积分时也展示身份 */
+            <div className={cn("flex items-center gap-2 text-muted-foreground", compact ? "mt-2 text-[11px]" : "mt-3 text-xs")}>
+              <Badge variant="secondary" className="h-5 px-1.5 text-[10px] font-normal">{account.payIdentity}</Badge>
+              {account.membershipExpire !== null && (
+                <span className="flex items-center gap-1">
+                  <Crown className="size-3 shrink-0 text-amber-500" aria-hidden="true" />
+                  {t("trae.comp.card.membership.expire", { date: formatFullDate(account.membershipExpire) })}
+                </span>
+              )}
+            </div>
+          ) : null}
+
           {/* 冷却 / 未查询提示：与 WorkBuddy 的积分错误行同形（同一图标位、同一配色语义）。 */}
           {account.cooldownType ? (
             <div className={cn("flex min-w-0 items-center gap-2 text-destructive", compact ? "mt-3 text-[11px]" : "mt-4 text-xs")}>
@@ -713,7 +764,12 @@ export function TraeAccountCard({
                       .join(" / ") || t("trae.comp.card.detail.none"),
                 },
                 { labelKey: "trae.comp.card.credits.remaining", value: account.remainingCredits === null ? t("trae.comp.card.detail.notQueried") : formatCredits(account.remainingCredits) },
+                { labelKey: "trae.comp.card.credits.work", value: account.workCredits !== null ? formatCredits(account.workCredits) : "—" },
+                { labelKey: "trae.comp.card.credits.general", value: account.generalCredits !== null ? formatCredits(account.generalCredits) : "—" },
                 { labelKey: "trae.comp.card.detail.creditsExpiry", value: account.creditsExpireAt ? formatFullDate(account.creditsExpireAt) : t("trae.comp.card.expiry.permanent") },
+                { labelKey: "trae.comp.card.detail.membershipExpire", value: account.membershipExpire ? formatFullDate(account.membershipExpire) : t("trae.comp.card.membership.none") },
+                { labelKey: "trae.comp.card.detail.membershipNextBilling", value: account.membershipNextBilling ? formatFullDate(account.membershipNextBilling) : "—" },
+                { labelKey: "trae.comp.card.detail.payIdentity", value: account.payIdentity || "—" },
                 { labelKey: "trae.comp.card.detail.jwtStatus", value: badge.text },
                 { labelKey: "trae.comp.card.label.jwtExpiry", value: account.jwtExpTimestamp ? `${formatFullDate(account.jwtExpTimestamp)} ${shortTime(account.jwtExpTimestamp).slice(-5)}` : t("trae.comp.card.jwt.unparsable") },
                 { labelKey: "trae.comp.card.detail.jwtAutoRefresh", value: account.hasRefreshToken ? (account.jwtAutoRefresh ? t("trae.comp.card.detail.jwtAutoOn") : t("trae.comp.card.detail.jwtAutoOff")) : t("trae.comp.card.detail.noRefreshToken") },

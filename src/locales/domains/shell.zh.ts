@@ -9,6 +9,7 @@ export const zh = {
   "app.demoBadge": "演示模式",
   "product.workbuddy": "WorkBuddy",
   "product.trae": "TraeWork",
+  "product.doubao": "豆包 Doubao",
   "product.switchAria": "切换产品",
   "product.navAria": "{product} 导航",
 
