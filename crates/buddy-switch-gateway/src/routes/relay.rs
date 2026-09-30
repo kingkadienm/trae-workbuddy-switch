@@ -65,6 +65,8 @@ pub struct RelayFailure {
     pub error: GatewayError,
     /// 最后一次尝试的账号展示名（诊断用）。
     pub account: String,
+    /// 最后一次尝试的账号 uid（用量归因用；无账号时为空）。
+    pub uid: String,
     /// 上游返回体片段（可能为空）。
     pub upstream_message: String,
 }
@@ -135,7 +137,7 @@ pub async fn relay(
         if !uid.is_empty() {
             let acquired = state.pool.write().await.acquire(&uid);
             if !acquired {
-                tried.insert(uid);
+                tried.insert(uid.clone());
                 continue;
             }
         }
@@ -197,7 +199,7 @@ pub async fn relay(
                     disabled
                 };
                 if !uid.is_empty() {
-                    tried.insert(uid);
+                    tried.insert(uid.clone());
                     // 会话粘性：这个账号刚失败 ⇒ 立刻**解绑**，下一轮换号重新绑。
                     // 粘性是优化而非约束，绝不能因为粘性而反复撞同一堵墙。
                     if let Some(key) = sticky_key.as_deref() {
@@ -212,6 +214,7 @@ pub async fn relay(
                         message: message.clone(),
                     },
                     account: account_name,
+                    uid,
                     upstream_message: message,
                 });
 
@@ -234,8 +237,91 @@ pub async fn relay(
             region: request.region,
         },
         account: String::new(),
+        uid: String::new(),
         upstream_message: String::new(),
     }))
+}
+
+/// 失败尝试记入用量桶（panel 口径：失败也计请求数与失败数；无账号可归因时跳过）。
+pub fn record_usage_failure(state: &GatewayState, region: Region, uid: &str, model: &str) {
+    if uid.is_empty() {
+        return;
+    }
+    let now_ms = timeutil::now_ms();
+    if let Ok(mut recorder) = state.usage.lock() {
+        recorder.add(now_ms, region, uid, model, 0, 0, -1, None, false);
+    }
+}
+
+/// 成功尝试记入用量桶（非流式路径；流式路径经 [`relay_usage_sink`] 回报）。
+pub fn record_usage_success(
+    state: &GatewayState,
+    region: Region,
+    uid: &str,
+    model: &str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+) {
+    if uid.is_empty() {
+        return;
+    }
+    let now_ms = timeutil::now_ms();
+    if let Ok(mut recorder) = state.usage.lock() {
+        recorder.add(now_ms, region, uid, model, prompt_tokens, completion_tokens, -1, None, true);
+    }
+}
+
+/// 流式路径的统一用量回报：成本账本（选号用）+ 用量桶（统计页用）。
+///
+/// 双写在同一 sink 里：两路都是同步上下文（流式 `poll_next`），拿不到锁就各自
+/// 跳过——绝不阻塞流式响应。
+pub fn relay_usage_sink(
+    state: &GatewayState,
+    region: Region,
+    uid: &str,
+    model: &str,
+) -> Option<std::sync::Arc<dyn crate::protocol::usage_tap::UsageSink>> {
+    if uid.is_empty() {
+        return None;
+    }
+    Some(std::sync::Arc::new(RelayUsageSink {
+        pool: state.pool.clone(),
+        usage: state.usage.clone(),
+        region,
+        uid: uid.to_string(),
+        model: model.to_string(),
+    }))
+}
+
+struct RelayUsageSink {
+    pool: std::sync::Arc<tokio::sync::RwLock<crate::pool::Pool>>,
+    usage: std::sync::Arc<std::sync::Mutex<buddy_switch_core::modules::usage::UsageRecorder>>,
+    region: Region,
+    uid: String,
+    model: String,
+}
+
+impl crate::protocol::usage_tap::UsageSink for RelayUsageSink {
+    fn record(&self, credit: f64, prompt_tokens: i64, completion_tokens: i64) {
+        let Ok(mut pool) = self.pool.try_write() else {
+            return;
+        };
+        let tokens = prompt_tokens.max(0).saturating_add(completion_tokens.max(0));
+        pool.record_ledger(&self.uid, &self.model, credit, tokens, timeutil::now_ms());
+        if let Ok(mut recorder) = self.usage.lock() {
+            recorder.add(
+                timeutil::now_ms(),
+                self.region,
+                &self.uid,
+                &self.model,
+                prompt_tokens.max(0) as u64,
+                completion_tokens.max(0) as u64,
+                -1,
+                None,
+                true,
+            );
+        }
+    }
 }
 
 /// 选号：优先账号池（有治理状态），池给不出时回落既有策略。
@@ -440,44 +526,6 @@ pub fn is_content_blocked(status: u16, message: &str) -> bool {
         return true;
     }
     message.contains("content policy") || message.contains("内容审核")
-}
-
-/// 账号池的用量回报接收方（流式路径专用）。
-///
-/// 它是在**同步**上下文（`Stream::poll_next`）里被调用的，因此只能用 `try_write`：
-/// 拿不到写锁就跳过本次样本。宁可少记一个样本，也**不能阻塞流式响应**。
-struct PoolUsageSink {
-    pool: std::sync::Arc<tokio::sync::RwLock<crate::pool::Pool>>,
-    uid: String,
-    model: String,
-}
-
-impl crate::protocol::usage_tap::UsageSink for PoolUsageSink {
-    fn record(&self, credit: f64, tokens: i64) {
-        let Ok(mut pool) = self.pool.try_write() else {
-            return;
-        };
-        pool.record_ledger(&self.uid, &self.model, credit, tokens, timeutil::now_ms());
-    }
-}
-
-/// 为当前命中账号构造流式用量回报接收方；uid 为空时返回 `None`（无账号可归因）。
-///
-/// 流式与非流式两条路径**必须**都能回填账本——否则「账本择优」在客户端默认的
-/// 流式模式下等于未启用（详见 `protocol::usage_tap` 的模块文档）。
-pub fn pool_usage_sink(
-    state: &GatewayState,
-    uid: &str,
-    model: &str,
-) -> Option<std::sync::Arc<dyn crate::protocol::usage_tap::UsageSink>> {
-    if uid.is_empty() {
-        return None;
-    }
-    Some(std::sync::Arc::new(PoolUsageSink {
-        pool: state.pool.clone(),
-        uid: uid.to_string(),
-        model: model.to_string(),
-    }))
 }
 
 #[cfg(test)]

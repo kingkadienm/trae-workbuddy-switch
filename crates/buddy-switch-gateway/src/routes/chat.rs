@@ -121,6 +121,8 @@ pub async fn handler(
     match attempt {
         Err(failure) => {
             let http_status = failure.error.status();
+            // 失败尝试也计请求/失败数（panel 口径：重试放大靠这一列看得出来）。
+            relay::record_usage_failure(&state, region, &failure.uid, &model);
             state.log.record(
                 RequestMeta {
                     endpoint: "/v1/chat/completions",
@@ -159,8 +161,8 @@ pub async fn handler(
                     }
                     .to_value(),
                 );
-                // 流式也要回填成本账本，否则「账本择优」在实际流量上等于未启用。
-                let sink = relay::pool_usage_sink(&state, &uid, &model);
+                // 流式也要回填成本账本 + 用量桶，否则「账本择优」在实际流量上等于未启用。
+                let sink = relay::relay_usage_sink(&state, region, &uid, &model);
                 sse_response(SsePassthrough::new(crate::protocol::usage_tap::UsageTap::new(
                     response.bytes_stream(),
                     sink,
@@ -175,6 +177,14 @@ pub async fn handler(
                     relay::record_ledger(&state, &uid, &model, credit, tokens).await;
                 }
                 let completion = accumulator.to_openai_completion(&model);
+                relay::record_usage_success(
+                    &state,
+                    region,
+                    &uid,
+                    &model,
+                    accumulator.prompt_tokens.unwrap_or(0),
+                    accumulator.completion_tokens.unwrap_or(0),
+                );
                 state.log.record(
                     RequestMeta {
                         endpoint: "/v1/chat/completions",

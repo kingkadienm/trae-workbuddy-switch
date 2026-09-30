@@ -9,11 +9,12 @@
 
 use chrono::{Datelike, Local, Timelike};
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use crate::modules::region::{Region, RegionFilter};
+use crate::modules::usage;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Usage {
@@ -1095,6 +1096,183 @@ fn collect_sources_for(region: Region, cutoff: Option<i64>, home: &Path, ide_pro
     }
 }
 
+/// `workbuddy-gateway` 源：本机网关（7863）逐请求用量桶（`modules::usage`，
+/// 移植 panel 的 `internal/usage`：小时桶 90 天 → 折叠日桶长期保留）。
+///
+/// 客户端三源（`.workbuddy/projects` 等）只记录**IDE/CLI 内**的对话；
+/// 经网关中转的调用（如外部 OpenAI 客户端）只存在于网关用量桶里。
+/// 该源缺失时（网关从未跑过）返回「零值源」而非省略，前端来源切换条
+/// 能如实展示「有来源、暂无数据」。
+fn gateway_source(days: Option<i64>, filter: &RegionFilter) -> Value {
+    let now_ms = crate::modules::config::now_ms();
+    // 窗口口径与 panel 一致：`None` → 全部历史；`Some(d)` → 最近 d×24 个整点桶
+    // （日桶不入小时窗口——90 天外的数据本就是日桶，days>90 时被排除属既有约定）。
+    let hours = days.map(|d| d * 24).unwrap_or(0);
+    let recorder = usage::UsageRecorder::load(Some(usage::usage_file()));
+    let snap = usage::snapshot(&recorder, hours, filter, now_ms);
+
+    let summary = gateway_group_value("gateway", snap.totals.clone());
+    let group = |key: &str, agg: &usage::UsageAgg| gateway_group_value(key, agg.clone());
+    let models = snap
+        .by_model
+        .iter()
+        .map(|g| group(&g.key, &g.agg))
+        .collect::<Vec<_>>();
+    let daily_by_model: BTreeMap<String, Vec<Value>> = BTreeMap::new(); // 网关桶没有「按天×模型」交叉序列，前端缺省走 daily
+    let _ = daily_by_model;
+    // daily：按 scope 前缀 d: 的桶（长期）+ 把小时桶按日历日归并（近 90 天）。
+    let mut daily: BTreeMap<String, usage::UsageAgg> = BTreeMap::new();
+    for point in &snap.series {
+        let date_key = if point.scope == "day" {
+            point.t.clone()
+        } else {
+            point
+                .t
+                .split('T')
+                .next()
+                .unwrap_or(&point.t)
+                .to_string()
+        };
+        merge_gateway_agg(&mut daily.entry(date_key).or_default(), &point.agg);
+    }
+    let daily_groups: Vec<Value> = daily
+        .into_iter()
+        .map(|(key, agg)| group(&key, &agg))
+        .collect();
+    let mut hours_map: BTreeMap<String, usage::UsageAgg> = BTreeMap::new();
+    for point in &snap.series {
+        if point.scope != "hour" {
+            continue;
+        }
+        let key = gateway_hour_profile_key(&point.t);
+        merge_gateway_agg(&mut hours_map.entry(key).or_default(), &point.agg);
+    }
+    let hours_groups: Vec<Value> = hours_map
+        .into_iter()
+        .map(|(key, agg)| group(&key, &agg))
+        .collect();
+
+    let (coverage_start, coverage_end) = gateway_coverage(&snap.series, &snap.since);
+
+    json!({
+        "source": "workbuddy-gateway",
+        "summary": summary,
+        "models": models,
+        "projects": [],
+        "sessions": [],
+        "daily": daily_groups,
+        "dailyByModel": {},
+        "hours": hours_groups,
+        "filesScanned": snap.buckets,
+        "parseErrors": 0,
+        "coverageStartAt": coverage_start,
+        "coverageEndAt": coverage_end,
+    })
+}
+
+/// 网关桶的分组值形状（与 `Totals::value` 对齐：cache 恒 0，命中率为 null——
+/// 网关上游不回传 cache 字段，无口径可算）。
+fn gateway_group_value(key: &str, agg: usage::UsageAgg) -> Value {
+    json!({
+        "total": agg.total_tokens,
+        "input": agg.prompt_tokens,
+        "output": agg.completion_tokens,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "uncachedInput": agg.prompt_tokens,
+        "records": agg.requests,
+        "cacheHitRate": None::<u64>,
+        "key": key,
+    })
+}
+
+fn merge_gateway_agg(target: &mut usage::UsageAgg, other: &usage::UsageAgg) {
+    target.requests = target.requests.saturating_add(other.requests);
+    target.errors = target.errors.saturating_add(other.errors);
+    target.prompt_tokens = target.prompt_tokens.saturating_add(other.prompt_tokens);
+    target.completion_tokens = target.completion_tokens.saturating_add(other.completion_tokens);
+    target.total_tokens = target.total_tokens.saturating_add(other.total_tokens);
+}
+
+/// 小时桶 scope（"YYYY-MM-DDTHH"）→ 与客户端三源同形的「周几-小时」画像键。
+fn gateway_hour_profile_key(scope_hour: &str) -> String {
+    let (date, hour) = match scope_hour.split_once('T') {
+        Some((d, h)) => (d, h),
+        None => return scope_hour.to_string(),
+    };
+    let hour = hour.parse::<u32>().unwrap_or(0);
+    let weekday = parse_hour_scope_weekday(date);
+    format!("{weekday}-{hour}")
+}
+
+fn parse_hour_scope_weekday(date: &str) -> u32 {
+    let (y, m, d) = match date.split('-').nth(0) {
+        Some(y) => {
+            let m = date.split('-').nth(1).unwrap_or("1");
+            let d = date.split('-').nth(2).unwrap_or("1");
+            (y, m, d)
+        }
+        None => return 1,
+    };
+    let (y, m, d) = match (y.parse::<i32>(), m.parse::<u32>(), d.parse::<u32>()) {
+        (Ok(y), Ok(m), Ok(d)) => (y, m, d),
+        _ => return 1,
+    };
+    match chrono::NaiveDate::from_ymd_opt(y, m, d) {
+        Some(date) => date.weekday().num_days_from_monday(),
+        None => 1,
+    }
+}
+
+fn gateway_coverage(series: &[usage::UsagePoint], since: &Option<String>) -> (Option<i64>, Option<i64>) {
+    let mut start: Option<i64> = None;
+    let mut end: Option<i64> = None;
+    for point in series {
+        let ts = gateway_scope_start_ms(point.t.as_str(), point.scope);
+        if let Some(ts) = ts {
+            start = Some(start.map_or(ts, |v| v.min(ts)));
+            end = Some(end.map_or(ts, |v| v.max(ts)));
+        }
+    }
+    // 日桶窗口外的 since（最早小时桶）也纳入起点。
+    if let Some(since) = since {
+        let bare = since.strip_prefix('h').unwrap_or(since).strip_prefix(':').unwrap_or(since);
+        if let Some(ts) = gateway_scope_start_ms(bare, "hour") {
+            start = Some(start.map_or(ts, |v| v.min(ts)));
+        }
+    }
+    (start, end)
+}
+
+/// scope 起始毫秒：hour → 该小时起点；day → 当日 00:00。解析失败返回 None。
+fn gateway_scope_start_ms(bare: &str, scope: &str) -> Option<i64> {
+    let local = match scope {
+        "hour" => {
+            let (date, hour) = bare.split_once('T')?;
+            let (y, m, d) = split_date(date)?;
+            let hour = hour.parse::<u32>().ok()?;
+            let naive = chrono::NaiveDate::from_ymd_opt(y, m, d)?.and_hms_opt(hour, 0, 0)?;
+            naive.and_local_timezone(chrono::Local).earliest()?
+        }
+        "day" => {
+            let (y, m, d) = split_date(bare)?;
+            let naive = chrono::NaiveDate::from_ymd_opt(y, m, d)?.and_hms_opt(0, 0, 0)?;
+            naive.and_local_timezone(chrono::Local).earliest()?
+        }
+        _ => return None,
+    };
+    Some(local.timestamp_millis())
+}
+
+fn split_date(date: &str) -> Option<(i32, u32, u32)> {
+    let mut parts = date.split('-');
+    Some((
+        parts.next()?.parse::<i32>().ok()?,
+        parts.next()?.parse::<u32>().ok()?,
+        parts.next()?.parse::<u32>().ok()?,
+    ))
+}
+
 /// 按 region 过滤范围返回 Token 聚合。
 ///
 /// - `Cn` -> 三源（`workbuddy` / `codebuddy-cli` / `codebuddy-ide`）；
@@ -1118,7 +1296,8 @@ pub fn get_statistics_for_filter(filter: RegionFilter, days: Option<i64>) -> Val
     // 单版路径保持既有行为：直接返回该 region 的三源 / 单源。
     if let Some(region) = filter.single() {
         let ide_projects = ide_project_by_session();
-        let sources = collect_sources_for(region, cutoff, &home, &ide_projects);
+        let mut sources = collect_sources_for(region, cutoff, &home, &ide_projects);
+        sources.push(gateway_source(days, &region.into()));
         return json!({
             "region": region.as_str(),
             "generatedAt": generated_at,
@@ -1133,6 +1312,8 @@ pub fn get_statistics_for_filter(filter: RegionFilter, days: Option<i64>) -> Val
     for region in filter.regions() {
         collected.extend(collect_sources_for(region, cutoff, &home, &ide_projects));
     }
+    // 网关源跨两版一份文件（桶自带 realm），只在合并视图追加一次，避免双重计数。
+    collected.push(gateway_source(days, &RegionFilter::All));
 
     // 以 source 名为分组键，保持首次出现顺序（cn 三源在前，global 单源在后）。
     let mut order: Vec<String> = Vec::new();
@@ -1684,7 +1865,11 @@ mod tests {
             .iter()
             .map(|source| source["source"].as_str().unwrap_or_default())
             .collect();
-        assert_eq!(names, ["workbuddy", "codebuddy-cli", "codebuddy-ide"]);
+        // 客户端三源 + 本机网关桶（`workbuddy-gateway`）一并返回。
+        assert_eq!(
+            names,
+            ["workbuddy", "codebuddy-cli", "codebuddy-ide", "workbuddy-gateway"]
+        );
         assert_eq!(value["region"], "cn");
     }
 
@@ -1696,14 +1881,15 @@ mod tests {
             .iter()
             .map(|source| source["source"].as_str().unwrap_or_default())
             .collect();
-        // 国际版只读 `.workbuddy-ai/projects`，不混入 CN 的 CLI/IDE 目录。
-        assert_eq!(names, ["workbuddy-ai"]);
+        // 国际版只读 `.workbuddy-ai/projects`，不混入 CN 的 CLI/IDE 目录；
+        // 网关桶跨两版共用，单独追加一份（桶自带 realm，由 region 过滤裁剪）。
+        assert_eq!(names, ["workbuddy-ai", "workbuddy-gateway"]);
         assert_eq!(value["region"], "global");
     }
 
     #[test]
     fn get_statistics_for_filter_all_returns_four_union_sources() {
-        // 合并视图返回 cn 三源 + global 单源的并集，顶层 region = "all"。
+        // 合并视图返回 cn 三源 + global 单源 + 网关桶（跨域一份）的并集，顶层 region = "all"。
         let value = get_statistics_for_filter(
             crate::modules::region::RegionFilter::All,
             None,
@@ -1715,7 +1901,13 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["workbuddy", "codebuddy-cli", "codebuddy-ide", "workbuddy-ai"]
+            [
+                "workbuddy",
+                "codebuddy-cli",
+                "codebuddy-ide",
+                "workbuddy-ai",
+                "workbuddy-gateway"
+            ]
         );
         assert_eq!(value["region"], "all");
     }

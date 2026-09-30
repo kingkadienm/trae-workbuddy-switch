@@ -122,6 +122,8 @@ pub async fn handler(
     match attempt {
         Err(failure) => {
             let http_status = failure.error.status();
+            // 失败尝试也计请求/失败数（panel 口径）。
+            relay::record_usage_failure(&state, region, &failure.uid, &model);
             state.log.record(
                 RequestMeta {
                     endpoint: "/v1/messages",
@@ -160,7 +162,7 @@ pub async fn handler(
                     }
                     .to_value(),
                 );
-                let sink = relay::pool_usage_sink(&state, &uid, &model);
+                let sink = relay::relay_usage_sink(&state, region, &uid, &model);
                 sse_response(AnthropicSseStream::new(
                     crate::protocol::usage_tap::UsageTap::new(response.bytes_stream(), sink),
                     model,
@@ -178,6 +180,7 @@ pub async fn handler(
                     .and_then(|usage| usage.get("output_tokens"))
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0);
+                relay::record_usage_success(&state, region, &uid, &model, prompt_tokens, completion_tokens);
                 state.log.record(
                     RequestMeta {
                         endpoint: "/v1/messages",

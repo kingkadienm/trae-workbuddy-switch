@@ -27,38 +27,42 @@ use serde_json::Value;
 /// 单帧缓冲区上限：畸形流（永不出现 `\n\n`）不得让内存无界增长。
 const MAX_FRAME_BUFFER_BYTES: usize = 256 * 1024;
 
+/// 流内观测到的用量：`(credit, prompt, completion)`；credit 或 tokens 缺位为 0。
+type ObservedUsage = (f64, i64, i64);
+
 /// 用量回报接收方。
 ///
 /// 抽象成 trait 是为了让单测用记录型替身，不必真的起账号池；
 /// 与 `cat.rs` 的 `CatIo` / `school.rs` 的 `SchoolIo` 是同一套可注入缝思路。
 pub trait UsageSink: Send + Sync + 'static {
-    /// 收到一次上游用量回报；`tokens` 为 prompt + completion 之和。
-    fn record(&self, credit: f64, tokens: i64);
+    /// 收到一次上游用量回报；prompt/completion 缺失时为 0（仍允许 credit>0 写入账本）。
+    fn record(&self, credit: f64, prompt_tokens: i64, completion_tokens: i64);
 }
 
-/// 从一帧 JSON 里提取 `(credit, tokens)`。
+/// 从一帧 JSON 里提取 `(credit, prompt, completion)`。
 ///
 /// 返回 `None` 的情形（都**不得**写入账本）：无 `usage` 字段、`usage` 为 `null`、
 /// **缺 `credit`**（拿不到单价就得不出成本）、`tokens <= 0`。
-pub fn extract_usage(frame: &Value) -> Option<(f64, i64)> {
+pub fn extract_usage(frame: &Value) -> Option<ObservedUsage> {
     let usage = frame.get("usage")?;
     if usage.is_null() {
         return None;
     }
     let credit = usage.get("credit").and_then(Value::as_f64)?;
-    let prompt = usage
+    let mut prompt = usage
         .get("prompt_tokens")
         .and_then(Value::as_i64)
         .unwrap_or(0);
-    let completion = usage
+    let mut completion = usage
         .get("completion_tokens")
         .and_then(Value::as_i64)
         .unwrap_or(0);
-    let tokens = prompt.max(0) + completion.max(0);
-    if tokens <= 0 {
+    prompt = prompt.max(0);
+    completion = completion.max(0);
+    if prompt + completion <= 0 {
         return None;
     }
-    Some((credit, tokens))
+    Some((credit, prompt, completion))
 }
 
 /// `usage` 探针流包装。**不改变字节流**，只在流结束（或出错）时回报一次用量。
@@ -67,7 +71,7 @@ pub struct UsageTap<S> {
     sink: Option<Arc<dyn UsageSink>>,
     buffer: Vec<u8>,
     /// 最近一次见到的用量（后到的帧覆盖先到的）。
-    latest: Option<(f64, i64)>,
+    latest: Option<ObservedUsage>,
     reported: bool,
     finished: bool,
 }
@@ -123,8 +127,10 @@ impl<S> UsageTap<S> {
             return;
         }
         self.reported = true;
-        if let (Some(sink), Some((credit, tokens))) = (self.sink.as_ref(), self.latest) {
-            sink.record(credit, tokens);
+        if let (Some(sink), Some((credit, prompt, completion))) =
+            (self.sink.as_ref(), self.latest)
+        {
+            sink.record(credit, prompt, completion);
         }
     }
 }
@@ -180,18 +186,21 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingSink {
-        calls: Mutex<Vec<(f64, i64)>>,
+        calls: Mutex<Vec<(f64, i64, i64)>>,
     }
 
     impl RecordingSink {
-        fn calls(&self) -> Vec<(f64, i64)> {
+        fn calls(&self) -> Vec<(f64, i64, i64)> {
             self.calls.lock().expect("lock").clone()
         }
     }
 
     impl UsageSink for RecordingSink {
-        fn record(&self, credit: f64, tokens: i64) {
-            self.calls.lock().expect("lock").push((credit, tokens));
+        fn record(&self, credit: f64, prompt_tokens: i64, completion_tokens: i64) {
+            self.calls
+                .lock()
+                .expect("lock")
+                .push((credit, prompt_tokens, completion_tokens));
         }
     }
 
@@ -216,7 +225,7 @@ mod tests {
         ]);
         let collected: Vec<_> = UsageTap::new(stream, Some(sink.clone())).collect().await;
         assert_eq!(collected.len(), 3, "字节必须原样透传，一帧不少");
-        assert_eq!(sink.calls(), vec![(1.5, 15)], "tokens = prompt + completion");
+        assert_eq!(sink.calls(), vec![(1.5, 10, 5)], "prompt/completion 分列回报");
     }
 
     #[tokio::test]
@@ -229,7 +238,7 @@ mod tests {
             "\n\ndata: [DONE]\n\n",
         ]);
         let _ = UsageTap::new(stream, Some(sink.clone())).collect::<Vec<_>>().await;
-        assert_eq!(sink.calls(), vec![(2.0, 10)], "跨块帧必须被重组");
+        assert_eq!(sink.calls(), vec![(2.0, 7, 3)], "跨块帧必须被重组");
     }
 
     #[tokio::test]
@@ -240,7 +249,7 @@ mod tests {
             "data: {\"usage\":{\"credit\":9.0,\"prompt_tokens\":10,\"completion_tokens\":10}}\n\n",
         ]);
         let _ = UsageTap::new(stream, Some(sink.clone())).collect::<Vec<_>>().await;
-        assert_eq!(sink.calls(), vec![(9.0, 20)], "后到的用量应覆盖先到的");
+        assert_eq!(sink.calls(), vec![(9.0, 10, 10)], "后到的用量应覆盖先到的");
     }
 
     #[tokio::test]
@@ -283,7 +292,7 @@ mod tests {
         assert!(collected[1].is_err());
         assert_eq!(
             sink.calls(),
-            vec![(1.5, 15)],
+            vec![(1.5, 10, 5)],
             "流中途异常时已见到的用量仍应回报（否则该次调用永远不记账）"
         );
     }
@@ -305,13 +314,13 @@ mod tests {
         // 负数 token 被钳到 0 后仍为 0 → 拒绝
         assert_eq!(
             extract_usage(&json!({"usage": {"credit": 1.0, "prompt_tokens": -5, "completion_tokens": 2}})),
-            Some((1.0, 2)),
+            Some((1.0, 0, 2)),
             "负数项应被钳制为 0，而不是让求和变成负数"
         );
         // 只有 prompt_tokens 也应可用
         assert_eq!(
             extract_usage(&json!({"usage": {"credit": 0.0, "prompt_tokens": 3}})),
-            Some((0.0, 3)),
+            Some((0.0, 3, 0)),
             "显式 credit=0 是合法样本（免费模型），不同于「缺 credit」"
         );
     }

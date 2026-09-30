@@ -246,6 +246,11 @@ pub struct GatewayState {
     pub started_at: i64,
     /// 账号池（多账号治理：选号 / 冷却 / 熔断 / 账本）。
     pub pool: Arc<RwLock<Pool>>,
+    /// 逐请求用量桶（panel `usage` 口径；供 WB 统计页「workbuddy-gateway」源）。
+    ///
+    /// 同步 `Mutex`：用量记录发生在流式 `poll_next` 的同步上下文（经 UsageSink），
+    /// 拿不到锁就跳过本次样本，绝不阻塞流式响应（同池 sink 的 `try_write` 纪律）。
+    pub usage: Arc<std::sync::Mutex<buddy_switch_core::modules::usage::UsageRecorder>>,
     /// 生效中的系统提示词设置。
     pub prompt: Arc<RwLock<PromptSettings>>,
     /// 内容拦截降级门。
@@ -302,6 +307,12 @@ impl GatewayState {
         let state_file = gateway_state_file();
         pool.load(&state_file, core_config::now_ms());
 
+        let usage = Arc::new(std::sync::Mutex::new(
+            buddy_switch_core::modules::usage::UsageRecorder::load(Some(
+                buddy_switch_core::modules::usage::usage_file(),
+            )),
+        ));
+
         Self {
             config: Arc::new(RwLock::new(config.clone())),
             keys,
@@ -311,6 +322,7 @@ impl GatewayState {
             log,
             started_at: core_config::now_ms(),
             pool: Arc::new(RwLock::new(pool)),
+            usage,
             prompt: Arc::new(RwLock::new(prompt)),
             degrade: Arc::new(RwLock::new(DegradeGate::new())),
             sticky: Arc::new(RwLock::new(StickyTable::new(config.sticky_ttl_ms))),

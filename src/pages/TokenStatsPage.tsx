@@ -64,17 +64,25 @@ const SOURCE_LABELS: Record<SourceKey, string> = {
   "codebuddy-cli": "CodeBuddy CLI",
   "codebuddy-ide": "CodeBuddy IDE",
   "workbuddy-ai": "WorkBuddy AI",
+  "workbuddy-gateway": "WorkBuddy 网关",
 };
 
 /** 各来源的展示顺序（合并视图下按此顺序排列）。 */
-const SOURCE_ORDER: SourceKey[] = ["workbuddy", "codebuddy-cli", "codebuddy-ide", "workbuddy-ai"];
+const SOURCE_ORDER: SourceKey[] = [
+  "workbuddy",
+  "codebuddy-cli",
+  "codebuddy-ide",
+  "workbuddy-ai",
+  "workbuddy-gateway",
+];
 
 function isSourceKey(value: unknown): value is SourceKey {
   return (
     value === "workbuddy" ||
     value === "codebuddy-cli" ||
     value === "codebuddy-ide" ||
-    value === "workbuddy-ai"
+    value === "workbuddy-ai" ||
+    value === "workbuddy-gateway"
   );
 }
 
@@ -1315,9 +1323,10 @@ export default function TokenStatsPage() {
   // 这里再兜底，保证旧后端 / 异常响应下也不会超出该范围的来源集合。
   const visibleSources = useMemo(() => {
     const present = new Set((stats?.sources ?? []).map((item) => item.source));
+    // 网关桶跨两版共用一份文件（桶自带 realm），在任一 region 视图下都可见。
     const allowed =
       region === "global"
-        ? SOURCE_ORDER.filter((key) => key === "workbuddy-ai")
+        ? SOURCE_ORDER.filter((key) => key === "workbuddy-ai" || key === "workbuddy-gateway")
         : region === "cn"
           ? SOURCE_ORDER.filter((key) => key !== "workbuddy-ai")
           : SOURCE_ORDER;
