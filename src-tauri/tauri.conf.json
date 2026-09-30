@@ -47,7 +47,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDgzNTE1NDY4Q0RBNDE2QTQKUldTa0ZxVE5hRlJSZzUvTVlOWlF5UklxTVE3MXkvL1E3OVZTRHNQVzdkZ0k2MHcwWkVXdjdzVFAK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEM2NzMwNDRGNDgxMUUzN0YKUldSLzR4RklUd1J6eG5qK1I1TytISjFURjdNd0t1dVVXVEI5aFVWTDBMb0EvdE51VUlOTHFVb1kK",
       "endpoints": [
         "https://github.com/kingkadienm/trae-workbuddy-switch/releases/latest/download/latest.json",
         "https://github.com/kingkadienm/trae-workbuddy-switch/releases/latest/download/latest-{{target}}-{{arch}}.json",

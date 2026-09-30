@@ -320,8 +320,8 @@ npm/                     # npm 包（**尚未发布**）：主包 @kingkadienm/b
   </thead>
   <tbody>
     <tr>
-      <td><img src="docs/images/donate-wechat.png" alt="微信支付收款码" width="260" /></td>
-      <td><img src="docs/images/donate-alipay.jpg" alt="支付宝收款码" width="260" /></td>
+      <td><img src="docs/images/donate-wechat.jpeg" alt="微信支付收款码" width="260" /></td>
+      <td><img src="docs/images/donate-alipay.jpeg" alt="支付宝收款码" width="260" /></td>
     </tr>
   </tbody>
 </table>
