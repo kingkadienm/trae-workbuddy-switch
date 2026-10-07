@@ -17,14 +17,15 @@ export const en = {
   "app.demoBadge": "Demo",
   "product.workbuddy": "WorkBuddy",
   "product.trae": "TraeWork",
-  "product.doubao": "Doubao",
   "product.switchAria": "Switch product",
   "product.navAria": "{product} navigation",
 
   "nav.accounts": "Accounts",
+  "nav.growth": "Growth tasks",
   "nav.tokenStats": "Token usage",
   "nav.credits": "Credits",
   "nav.apiService": "API service",
+  "nav.modelCatalog": "Model catalog",
   "nav.settings": "Settings",
 
   "sidebar.version": "Version",

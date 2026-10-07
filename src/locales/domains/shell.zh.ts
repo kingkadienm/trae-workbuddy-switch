@@ -9,14 +9,15 @@ export const zh = {
   "app.demoBadge": "演示模式",
   "product.workbuddy": "WorkBuddy",
   "product.trae": "TraeWork",
-  "product.doubao": "豆包 Doubao",
   "product.switchAria": "切换产品",
   "product.navAria": "{product} 导航",
 
   "nav.accounts": "账号管理",
+  "nav.growth": "成长任务",
   "nav.tokenStats": "Token 统计",
   "nav.credits": "积分统计",
   "nav.apiService": "API 服务",
+  "nav.modelCatalog": "模型目录",
   "nav.settings": "设置",
 
   "sidebar.version": "版本",

@@ -1,6 +1,6 @@
 import { Suspense, lazy, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import { BrowserRouter, HashRouter, Navigate, NavLink, Outlet, Route, Routes, useLocation, useNavigate } from "react-router-dom";
-import { ArrowUp, Bot, MessagesSquare, Server, Settings, Sparkles, User } from "lucide-react";
+import { ArrowUp, MessagesSquare, Server, Settings, Sparkles, User } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
@@ -41,6 +41,14 @@ import type { TraeVariantStatus } from "@/lib/trae-types";
 const AccountsPage = lazy(() => import("@/pages/AccountsPage"));
 const ApiServicePage = lazy(() => import("@/pages/ApiServicePage"));
 const CreditStatsPage = lazy(() => import("@/pages/CreditStatsPage"));
+const GrowthTaskCenterPage = lazy(() => import("@/pages/GrowthTaskCenterPage"));
+const ConfigEditorPage = lazy(() => import("@/pages/ConfigEditorPage"));
+const ActivityPage = lazy(() => import("@/pages/ActivityPage"));
+const UnifiedStatsPage = lazy(() => import("@/pages/UnifiedStatsPage"));
+const BatchAccountOperationsPage = lazy(() => import("@/pages/BatchAccountOperationsPage"));
+const ModelCatalogPage = lazy(() => import("@/pages/ModelCatalogPage"));
+const AccountPoolPage = lazy(() => import("@/pages/AccountPoolPage"));
+const RequestLogPage = lazy(() => import("@/pages/RequestLogPage"));
 const TokenStatsPage = lazy(() => import("@/pages/TokenStatsPage"));
 const SettingsPage = lazy(() => import("@/pages/SettingsPage"));
 const TraeAccountsPage = lazy(() => import("@/pages/TraeAccountsPage"));
@@ -48,7 +56,6 @@ const TraeApiServicePage = lazy(() => import("@/pages/TraeApiServicePage"));
 const TraeCreditsPage = lazy(() => import("@/pages/TraeCreditsPage"));
 const TraeSettingsPage = lazy(() => import("@/pages/TraeSettingsPage"));
 const TraeTokenStatsPage = lazy(() => import("@/pages/TraeTokenStatsPage"));
-const DoubaoAccountsPage = lazy(() => import("@/pages/DoubaoAccountsPage"));
 import { useCachedResource } from "@/lib/use-cached-resource";
 import { useTraeVariant } from "@/lib/use-trae-variant";
 import { useCreditAutoRefresh } from "@/lib/use-credit-auto-refresh";
@@ -77,7 +84,7 @@ import { useAccountsStore } from "@/stores/accounts";
  * 变体仍然由 URL 的 `?line=` 承载（`useTraeVariant`）：它决定 Trae 分区内部
  * 看哪条线，并且刷新 / 分享 / 前进后退都能保持。
  */
-type Product = "workbuddy" | "trae" | "doubao";
+type Product = "workbuddy" | "trae";
 
 interface NavItem {
   to: string;
@@ -114,6 +121,10 @@ interface NavItem {
 const PRODUCT_NAV: Record<Product, readonly NavItem[]> = {
   workbuddy: [
     { to: "/", end: true, labelKey: "nav.accounts", icon: User },
+    { to: "/growth", labelKey: "nav.growth", icon: Sparkles },
+    { to: "/model-catalog", labelKey: "nav.modelCatalog", icon: Server },
+    { to: "/account-pool", labelKey: "nav.modelCatalog", icon: Server },
+    { to: "/request-logs", labelKey: "nav.modelCatalog", icon: Server },
     { to: "/token-stats", labelKey: "nav.tokenStats", icon: MessagesSquare },
     { to: "/credit-stats", labelKey: "nav.credits", icon: Sparkles },
     { to: "/api-service", labelKey: "nav.apiService", icon: Server },
@@ -125,9 +136,6 @@ const PRODUCT_NAV: Record<Product, readonly NavItem[]> = {
     { to: "/trae/credits", labelKey: "nav.credits", icon: Sparkles },
     { to: "/trae/api-service", labelKey: "nav.apiService", icon: Server },
     { to: "/trae/settings", labelKey: "nav.settings", icon: Settings },
-  ],
-  doubao: [
-    { to: "/doubao/accounts", labelKey: "nav.accounts", icon: User },
   ],
 };
 
@@ -150,27 +158,22 @@ const PRODUCT_NAV: Record<Product, readonly NavItem[]> = {
  * 本次只改展示名，改标识会牵动路由表与全部 `/trae` 链接。
  */
 const PRODUCT_LABEL_KEY: Record<Product, TranslationKey> = {
-  // 产品名**刻意不翻译**：`WorkBuddy` / `TraeWork` / `Doubao` 是商标，两种语言下写法相同，
+  // 产品名**刻意不翻译**：`WorkBuddy` / `TraeWork` 是商标，两种语言下写法相同，
   // 因此这两个键的 zh/en 值一致。走词表而非硬编码，是为了让「语言切换后侧栏整体重渲染」
   // 这件事在所有文案上保持一致行为，不给未来的改名留特例。
   workbuddy: "product.workbuddy",
   trae: "product.trae",
-  doubao: "product.doubao",
 };
 
 /** 产品首页：切到某产品时，若当前路由不属于它，就落到这里。 */
 const PRODUCT_HOME: Record<Product, string> = {
   workbuddy: "/",
   trae: "/trae/accounts",
-  doubao: "/doubao/accounts",
 };
 
-/** 路由 → 产品。Trae 的全部路由都在 `/trae` 前缀下，Doubao 在 `/doubao` 前缀下，其余归 WorkBuddy。 */
+/** 路由 → 产品。Trae 的全部路由都在 `/trae` 前缀下，其余归 WorkBuddy。 */
 function productFromPath(pathname: string): Product {
-  return pathname === "/doubao" || pathname.startsWith("/doubao/")
-    ? "doubao"
-    : pathname === "/trae" || pathname.startsWith("/trae/") ? "trae"
-    : "workbuddy";
+  return pathname === "/trae" || pathname.startsWith("/trae/") ? "trae" : "workbuddy";
 }
 
 function navLinkClass({ isActive }: { isActive: boolean }): string {
@@ -275,7 +278,7 @@ function ProductSwitch({
       className="mb-3 shrink-0"
     >
       <TabsList
-        className="grid h-9 w-full grid-cols-[auto_auto_auto] justify-center gap-0.5 rounded-xl border border-sidebar-border bg-sidebar-accent/60 p-1"
+        className="grid h-9 w-full grid-cols-[auto_auto] justify-center gap-0.5 rounded-xl border border-sidebar-border bg-sidebar-accent/60 p-1"
         aria-label={t("product.switchAria")}
       >
         <TabsTrigger
@@ -293,16 +296,6 @@ function ProductSwitch({
               （这里不区分区域与程序位，都在页面内部选）。 */}
           <TraeVariantMark variant="trae_work" size={15} />
           <span className="truncate">{t(PRODUCT_LABEL_KEY.trae)}</span>
-        </TabsTrigger>
-        <TabsTrigger
-          value="doubao"
-          className="h-7 w-full min-w-0 gap-1.5 rounded-lg px-1.5 text-xs font-medium data-[state=active]:bg-primary/15 data-[state=active]:shadow-none"
-        >
-          <Bot size={15} />
-          {/* 第三个 Tab：侧栏 220px 扣掉 padding 后放三个「图标+文字」格已接近上限
-              （见上方注释），词表刻意用短名（zh「豆包」/ en「Doubao」），
-              超宽时 `truncate` 兜底。 */}
-          <span className="truncate" title={t(PRODUCT_LABEL_KEY.doubao)}>{t(PRODUCT_LABEL_KEY.doubao)}</span>
         </TabsTrigger>
       </TabsList>
     </Tabs>
@@ -429,11 +422,7 @@ function Layout() {
   // Trae 分区的状态圆点跟随**当前选中的那条产品线**（而不是「Trae 是否有任意一条在跑」）：
   // 在「Trae Work 已关闭、Trae CN 在运行」时，只探「Trae 是否运行」会显示错误的绿灯。
   const running =
-    product === "workbuddy"
-      ? workbuddyRunning
-      : product === "trae"
-        ? Boolean(traeRunning[traeVariant])
-        : false;
+    product === "workbuddy" ? workbuddyRunning : Boolean(traeRunning[traeVariant]);
 
   const hasUnifiedTitleBar =
     api.isDesktop() && typeof navigator !== "undefined" && navigator.userAgent.includes("Macintosh");
@@ -545,9 +534,17 @@ export default function App() {
         <Routes>
           <Route element={<Layout />}>
             <Route path="/" element={<AccountsPage />} />
+            <Route path="/growth" element={<GrowthTaskCenterPage />} />
+            <Route path="/model-catalog" element={<ModelCatalogPage />} />
+            <Route path="/account-pool" element={<AccountPoolPage />} />
+            <Route path="/request-logs" element={<RequestLogPage />} />
             <Route path="/credit-stats" element={<CreditStatsPage />} />
             <Route path="/token-stats" element={<TokenStatsPage />} />
             <Route path="/api-service" element={<ApiServicePage />} />
+      <Route path="/config-editor" element={<ConfigEditorPage />} />
+      <Route path="/activity" element={<ActivityPage />} />
+      <Route path="/unified-stats" element={<UnifiedStatsPage />} />
+      <Route path="/batch-accounts" element={<BatchAccountOperationsPage />} />
             <Route path="/settings" element={<SettingsPage />} />
             {/* Trae 侧与 WorkBuddy 侧逐条同构；`/trae` 本身重定向到账号管理，
                 避免旧书签或外部链接落在空路由上。 */}
@@ -557,9 +554,6 @@ export default function App() {
             <Route path="/trae/credits" element={<TraeCreditsPage />} />
             <Route path="/trae/api-service" element={<TraeApiServicePage />} />
             <Route path="/trae/settings" element={<TraeSettingsPage />} />
-            {/* 豆包侧栏分区 */}
-            <Route path="/doubao" element={<Navigate to="/doubao/accounts" replace />} />
-            <Route path="/doubao/accounts" element={<DoubaoAccountsPage />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>
         </Routes>
