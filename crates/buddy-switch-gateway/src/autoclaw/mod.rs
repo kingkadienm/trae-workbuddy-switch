@@ -298,11 +298,13 @@ impl AutoclawClient {
 
         *req.uri_mut() = target_uri;
 
-        // 注入鉴权头
+        // 注入鉴权头 + zcode 标识（豁免 AutoClaw 白名单限制）。
         if !self.api_key.is_empty() {
             req.headers_mut()
                 .insert("Authorization", format!("Bearer {}", self.api_key).parse().unwrap());
         }
+        req.headers_mut()
+            .insert("X-Harness-Type", "zcode".parse().unwrap());
 
         Ok(req)
     }
