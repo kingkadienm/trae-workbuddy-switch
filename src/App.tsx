@@ -1,6 +1,6 @@
 import { Suspense, lazy, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import { BrowserRouter, HashRouter, Navigate, NavLink, Outlet, Route, Routes, useLocation, useNavigate } from "react-router-dom";
-import { ArrowUp, MessagesSquare, Server, Settings, Sparkles, User } from "lucide-react";
+import { ArrowUp, Bot, MessagesSquare, Server, Settings, Sparkles, User } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
@@ -56,6 +56,7 @@ const TraeApiServicePage = lazy(() => import("@/pages/TraeApiServicePage"));
 const TraeCreditsPage = lazy(() => import("@/pages/TraeCreditsPage"));
 const TraeSettingsPage = lazy(() => import("@/pages/TraeSettingsPage"));
 const TraeTokenStatsPage = lazy(() => import("@/pages/TraeTokenStatsPage"));
+const DoubaoAccountsPage = lazy(() => import("@/pages/DoubaoAccountsPage"));
 import { useCachedResource } from "@/lib/use-cached-resource";
 import { useTraeVariant } from "@/lib/use-trae-variant";
 import { useCreditAutoRefresh } from "@/lib/use-credit-auto-refresh";
@@ -84,7 +85,7 @@ import { useAccountsStore } from "@/stores/accounts";
  * 变体仍然由 URL 的 `?line=` 承载（`useTraeVariant`）：它决定 Trae 分区内部
  * 看哪条线，并且刷新 / 分享 / 前进后退都能保持。
  */
-type Product = "workbuddy" | "trae";
+type Product = "workbuddy" | "trae" | "doubao";
 
 interface NavItem {
   to: string;
@@ -137,6 +138,9 @@ const PRODUCT_NAV: Record<Product, readonly NavItem[]> = {
     { to: "/trae/api-service", labelKey: "nav.apiService", icon: Server },
     { to: "/trae/settings", labelKey: "nav.settings", icon: Settings },
   ],
+  doubao: [
+    { to: "/doubao/accounts", labelKey: "nav.accounts", icon: User },
+  ],
 };
 
 /**
@@ -158,22 +162,27 @@ const PRODUCT_NAV: Record<Product, readonly NavItem[]> = {
  * 本次只改展示名，改标识会牵动路由表与全部 `/trae` 链接。
  */
 const PRODUCT_LABEL_KEY: Record<Product, TranslationKey> = {
-  // 产品名**刻意不翻译**：`WorkBuddy` / `TraeWork` 是商标，两种语言下写法相同，
+  // 产品名**刻意不翻译**：`WorkBuddy` / `TraeWork` / `Doubao` 是商标，两种语言下写法相同，
   // 因此这两个键的 zh/en 值一致。走词表而非硬编码，是为了让「语言切换后侧栏整体重渲染」
   // 这件事在所有文案上保持一致行为，不给未来的改名留特例。
   workbuddy: "product.workbuddy",
   trae: "product.trae",
+  doubao: "product.doubao",
 };
 
 /** 产品首页：切到某产品时，若当前路由不属于它，就落到这里。 */
 const PRODUCT_HOME: Record<Product, string> = {
   workbuddy: "/",
   trae: "/trae/accounts",
+  doubao: "/doubao/accounts",
 };
 
-/** 路由 → 产品。Trae 的全部路由都在 `/trae` 前缀下，其余归 WorkBuddy。 */
+/** 路由 → 产品。Trae 的全部路由都在 `/trae` 前缀下，Doubao 在 `/doubao` 前缀下，其余归 WorkBuddy。 */
 function productFromPath(pathname: string): Product {
-  return pathname === "/trae" || pathname.startsWith("/trae/") ? "trae" : "workbuddy";
+  return pathname === "/doubao" || pathname.startsWith("/doubao/")
+    ? "doubao"
+    : pathname === "/trae" || pathname.startsWith("/trae/") ? "trae"
+    : "workbuddy";
 }
 
 function navLinkClass({ isActive }: { isActive: boolean }): string {
@@ -278,7 +287,7 @@ function ProductSwitch({
       className="mb-3 shrink-0"
     >
       <TabsList
-        className="grid h-9 w-full grid-cols-[auto_auto] justify-center gap-0.5 rounded-xl border border-sidebar-border bg-sidebar-accent/60 p-1"
+        className="grid h-9 w-full grid-cols-[auto_auto_auto] justify-center gap-0.5 rounded-xl border border-sidebar-border bg-sidebar-accent/60 p-1"
         aria-label={t("product.switchAria")}
       >
         <TabsTrigger
@@ -296,6 +305,13 @@ function ProductSwitch({
               （这里不区分区域与程序位，都在页面内部选）。 */}
           <TraeVariantMark variant="trae_work" size={15} />
           <span className="truncate">{t(PRODUCT_LABEL_KEY.trae)}</span>
+        </TabsTrigger>
+        <TabsTrigger
+          value="doubao"
+          className="h-7 w-full min-w-0 gap-1.5 rounded-lg px-1.5 text-xs font-medium data-[state=active]:bg-primary/15 data-[state=active]:shadow-none"
+        >
+          <Bot className="size-3.5" />
+          <span className="truncate">{t(PRODUCT_LABEL_KEY.doubao)}</span>
         </TabsTrigger>
       </TabsList>
     </Tabs>
@@ -554,6 +570,7 @@ export default function App() {
             <Route path="/trae/credits" element={<TraeCreditsPage />} />
             <Route path="/trae/api-service" element={<TraeApiServicePage />} />
             <Route path="/trae/settings" element={<TraeSettingsPage />} />
+            <Route path="/doubao/accounts" element={<DoubaoAccountsPage />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>
         </Routes>

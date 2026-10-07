@@ -17,6 +17,7 @@ export const en = {
   "app.demoBadge": "Demo",
   "product.workbuddy": "WorkBuddy",
   "product.trae": "TraeWork",
+  "product.doubao": "Doubao",
   "product.switchAria": "Switch product",
   "product.navAria": "{product} navigation",
 
