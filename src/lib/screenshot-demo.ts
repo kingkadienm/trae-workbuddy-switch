@@ -4,6 +4,8 @@ import type {
   CreditOfficialUsageModel, CreditStatistics, GatewayConfig, GatewayLogEntry, GatewayStatus,
   GithubConfig, Region, RotateLog, RotateStatus, ScheduleConfig, TokenStatistics, TokenStatsGroup, TokenStatsSource,
   TokenStatsTotals, TravelConfig, TravelStatus,
+  GrowthTask, GrowthScanResult, GrowthQueueStatus,
+  DoubaoAccount,
 } from "./types";
 import type {
   TraeAccount,
@@ -608,6 +610,64 @@ function demoGatewayLogs(): GatewayLogEntry[] {
     { ts: atLocalTime(0, 17, 7), endpoint: "/v1/chat/completions", method: "POST", region: "cn", account: t("shared.demo.account.a"), model: "DeepSeek-V4-Pro", status: 200, latencyMs: 2400, promptTokens: 2100, completionTokens: 900, stream: true },
     { ts: atLocalTime(0, 17, 2), endpoint: "/v1/messages", method: "POST", region: "global", account: t("shared.demo.account.b"), model: "Claude-Sonnet-4.5", status: 429, latencyMs: 300, promptTokens: null, completionTokens: null, stream: true },
   ];
+}
+
+function demoGrowthTasks(): GrowthTask[] {
+  return [
+    { taskCode: "growth_checkin", title: "每日签到", description: "签到领积分", credit: 10, current: 1, target: 1, claimable: true, acceptStatus: "accepted", status: "completed" },
+    { taskCode: "growth_invite", title: "邀请好友", description: "邀请一位好友", credit: 50, current: 0, target: 1, claimable: false, acceptStatus: "accepted", status: "pending" },
+  ];
+}
+
+function demoTasksScanAll(): GrowthScanResult {
+  const accounts = hydratedAccounts().slice(0, 2).map((acc) => ({
+    uid: acc.id,
+    nickname: acc.nickname ?? undefined,
+    growth: demoGrowthTasks(),
+  }));
+  return { ok: true, accounts, pendingCount: 3 };
+}
+
+function demoQueueStatus(): GrowthQueueStatus {
+  return { running: false, total: 0, conc: 1, started: false, startedAt: 0, seq: 0, items: [] };
+}
+
+// ---------------------------------------------------------------------------
+// 豆包模块（演示数据，只读）
+// ---------------------------------------------------------------------------
+
+function demoDoubaoAccounts(): { accounts: DoubaoAccount[] } {
+  return {
+    accounts: [
+      {
+        userId: "doubao-demo-001",
+        name: "主号",
+        note: "演示账号",
+        hasSnapshot: true,
+        sizeBytes: 1024 * 1024 * 128,
+        fileCount: 42,
+        lastModified: "2025-01-15T08:30:00Z",
+        isCurrent: true,
+        addedAt: "2025-01-01T00:00:00Z",
+        sessionState: "ok",
+        sessionId: "demo-session-001",
+        quotaLevel: "free",
+      },
+      {
+        userId: "doubao-demo-002",
+        name: "备用",
+        note: "",
+        hasSnapshot: false,
+        sizeBytes: 0,
+        fileCount: 0,
+        lastModified: "",
+        isCurrent: false,
+        sessionState: "expired",
+        sessionId: null,
+        quotaLevel: null,
+      },
+    ],
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1316,6 +1376,14 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "get_gateway_models": return demoCatalog(args?.region === "global" ? "global" : "cn");
     case "get_account_strategy": return demoStrategyMap();
     case "get_gateway_logs": return { logs: demoGatewayLogs() };
+    // ---- 成长任务（只读；写操作不进这里，由 DemoAction 统一拦截）----
+    case "growth_tasks": return { tasks: demoGrowthTasks() };
+    case "growth_tasks_list": return { tasks: demoGrowthTasks() };
+    case "growth_tasks_scan_all": return demoTasksScanAll();
+    case "growth_queue_status": return demoQueueStatus();
+    // ---- 豆包模块（只读；写操作不进这里，由 DemoAction 统一拦截）----
+    case "doubao_accounts": return demoDoubaoAccounts();
+    case "doubao_detect_uid": return { uid: "demo-doubao-user" };
     // ---- Trae 分区（只读；写操作不进这里，由 DemoAction 统一拦截）----
     case "get_trae_env": return demoTraeEnv();
     case "get_trae_variants": return demoTraeVariants();

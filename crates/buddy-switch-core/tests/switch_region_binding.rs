@@ -306,7 +306,7 @@ fn token_stats_merged_view_contains_all_sources_and_region_all() {
     assert!(names.contains(&"workbuddy-ai"), "合并视图应含 global 源");
     assert!(names.contains(&"workbuddy"), "合并视图应含 cn 源");
 
-    // global 单版只含 workbuddy-ai。
+    // global 单版含 workbuddy-ai 与 workbuddy-gateway（网关使用 global 账号）。
     let global = buddy_switch_core::modules::token_stats::get_statistics_for_filter(
         RegionFilter::Global,
         None,
@@ -317,7 +317,7 @@ fn token_stats_merged_view_contains_all_sources_and_region_all() {
         .iter()
         .filter_map(|source| source["source"].as_str())
         .collect();
-    assert_eq!(global_names, ["workbuddy-ai"]);
+    assert_eq!(global_names, ["workbuddy-ai", "workbuddy-gateway"]);
 }
 
 /// 写入含**孤儿快照**的积分 fixture：`cn-only` / `global-only` / `orphan-42`。

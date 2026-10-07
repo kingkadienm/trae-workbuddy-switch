@@ -383,4 +383,15 @@ export const zh = {
   "wbAccounts.growth.status.done": "完成",
   "wbAccounts.growth.status.skipped": "跳过",
   "wbAccounts.growth.status.error": "失败",
+  // 成长任务中心（独立页）
+  "wbAccounts.growth.scanResult": "扫描结果",
+  "wbAccounts.growth.tasks": "任务",
+  "wbAccounts.growth.logs": "执行日志",
+  "wbAccounts.growth.noAccounts": "暂无账号",
+  "wbAccounts.growth.scanFirst": "请先点击「扫描」加载任务",
+  "wbAccounts.growth.noLogs": "暂无执行日志",
+  "wbAccounts.growth.pending": "待办",
+  "wbAccounts.growth.completed": "已完成",
+  "wbAccounts.growth.actions.accept": "接受",
+  "wbAccounts.growth.actions.claim": "领取",
 } as const;

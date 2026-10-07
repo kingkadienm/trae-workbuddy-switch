@@ -1,7 +1,7 @@
 //! `GET /v1/models`：按 Key 绑定 region 返回模型列表 + 来源标注（P0-4）。
 
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::HeaderMap;
 use axum::response::Response;
 use serde_json::json;
 
@@ -16,7 +16,7 @@ pub async fn handler(State(state): State<GatewayState>, headers: HeaderMap) -> R
     };
 
     let snapshot = state.catalogs.current(record.region);
-    let data: Vec<serde_json::Value> = snapshot
+    let mut data: Vec<serde_json::Value> = snapshot
         .models
         .iter()
         .map(|model| {
@@ -35,8 +35,31 @@ pub async fn handler(State(state): State<GatewayState>, headers: HeaderMap) -> R
         })
         .collect();
 
+    // 合并 AutoClaw 模型（如果已启用且可达）。
+    if state.autoclaw.cached_healthy() {
+        let autoclaw_models = state.autoclaw.known_models().await;
+        if !autoclaw_models.is_empty() {
+            for (id, _) in autoclaw_models {
+                if !data.iter().any(|m| m.get("id").and_then(|v| v.as_str()) == Some(id.as_str())) {
+                    data.push(json!({
+                        "id": id,
+                        "object": "model",
+                        "created": 0,
+                        "owned_by": "autoclaw",
+                        "context_window": 0,
+                        "max_tokens": 0,
+                        "supports_images": false,
+                        "credits": 0,
+                        "badges": [],
+                        "free": false,
+                    }));
+                }
+            }
+        }
+    }
+
     json_response(
-        StatusCode::OK,
+        axum::http::StatusCode::OK,
         json!({
             "object": "list",
             "data": data,

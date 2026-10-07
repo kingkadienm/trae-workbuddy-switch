@@ -8,6 +8,7 @@ import { en as wbAccounts } from "./domains/wbAccounts.en";
 import { en as wbSettings } from "./domains/wbSettings.en";
 import { en as wbStats } from "./domains/wbStats.en";
 import { en as growth } from "./domains/growth.en";
+import { en as doubaoPages } from "./domains/doubaoPages.en";
 import type { TranslationKey } from "./zh";
 
 /**
@@ -39,4 +40,5 @@ export const en: Partial<Record<TranslationKey, string>> = {
   ...traeComponents,
   ...traeGateway,
   ...growth,
+  ...doubaoPages,
 };

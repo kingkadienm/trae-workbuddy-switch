@@ -3110,6 +3110,10 @@ mod tests {
                 "port",
                 "allow_non_loopback",
                 "version",
+                "autoclaw_enabled",
+                "autoclaw_base_url",
+                "autoclaw_healthy",
+                "autoclaw_model_count",
             ]),
             "gateway_status key set must be pinned (snake_case)"
         );
@@ -3138,6 +3142,7 @@ mod tests {
                 "pool",
                 "allow_model_region_prefix",
                 "max_body_mb",
+                "autoclaw",
             ])
         );
 

@@ -8,6 +8,7 @@ import { zh as wbAccounts } from "./domains/wbAccounts.zh";
 import { zh as wbSettings } from "./domains/wbSettings.zh";
 import { zh as wbStats } from "./domains/wbStats.zh";
 import { zh as growth } from "./domains/growth.zh";
+import { zh as doubaoPages } from "./domains/doubaoPages.zh";
 
 /**
  * 文案词表（简体中文）——**键的唯一权威**，按域拆分后在此组合。
@@ -39,6 +40,7 @@ export const zh = {
   ...traeComponents,
   ...traeGateway,
   ...growth,
+  ...doubaoPages,
 } as const;
 
 /** 词表键。`en.ts` 以它为 `Partial` 的上界，故英文侧拼错键名会编译报错。 */

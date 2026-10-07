@@ -373,4 +373,15 @@ export const en = {
   "wbAccounts.growth.status.done": "Done",
   "wbAccounts.growth.status.skipped": "Skipped",
   "wbAccounts.growth.status.error": "Failed",
+  // Growth task center (standalone page)
+  "wbAccounts.growth.scanResult": "Scan results",
+  "wbAccounts.growth.tasks": "Tasks",
+  "wbAccounts.growth.logs": "Run logs",
+  "wbAccounts.growth.noAccounts": "No accounts found",
+  "wbAccounts.growth.scanFirst": "Scan to load tasks",
+  "wbAccounts.growth.noLogs": "No run logs yet",
+  "wbAccounts.growth.pending": "pending",
+  "wbAccounts.growth.completed": "completed",
+  "wbAccounts.growth.actions.accept": "Accept",
+  "wbAccounts.growth.actions.claim": "Claim",
 };

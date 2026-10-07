@@ -28,6 +28,7 @@ import type {
   GithubConfig,
   ImportPreviewAccount,
   ImportResult,
+  AuthsDirImportResult,
   OAuthPollResult,
   OAuthStartResult,
   Region,
@@ -42,6 +43,14 @@ import type {
   TravelConfig,
   TravelStatus,
   UpdateInfo,
+  GrowthTask,
+  GrowthAutoAllItem,
+  GrowthScanResult,
+  GrowthQueueStatus,
+  DoubaoAccount,
+  DoubaoDetectResult,
+  DoubaoSaveResult,
+  DoubaoKeepaliveResult,
 } from "./types";
 import { demoModeEnabled, demoUnavailableMessage } from "./demo-mode";
 import { displayText } from "./display-text";
@@ -56,6 +65,7 @@ import type {
   TraeCapabilities,
   TraeCheckinReport,
   TraeCheckinStatus,
+  TraeClientModelList,
   TraeCreditsOverview,
   TraeDeviceResetReport,
   TraeEnvStatus,
@@ -94,6 +104,10 @@ const DEMO_READ_COMMANDS = new Set([
   "get_github_config", "check_update", "get_launch_at_login_enabled", "switch_progress",
   "get_travel_status", "get_auto_travel_config", "get_schedule_config",
   "get_switch_config",
+  // 成长任务只读命令（演示站需返回虚构数据，否则 build:demo 报错）。
+  "growth_tasks", "growth_tasks_list", "growth_tasks_scan_all", "growth_queue_status",
+  // 豆包只读命令
+  "doubao_accounts", "doubao_detect_uid",
   // API 网关只读命令（演示站需返回虚构数据，否则 build:demo 报错）
   "get_gateway_config", "gateway_status", "list_api_keys", "get_gateway_models",
   "get_account_strategy", "get_gateway_logs",
@@ -104,7 +118,7 @@ const DEMO_READ_COMMANDS = new Set([
   "get_trae_checkin_status",
   "get_trae_credits", "get_trae_token_statistics", "get_trae_logs", "get_trae_profiles",
   "get_trae_settings", "get_trae_gateway_config", "trae_gateway_status",
-  "get_trae_gateway_models", "list_trae_api_keys", "get_trae_gateway_logs",
+  "get_trae_gateway_models", "get_trae_client_models", "list_trae_api_keys", "get_trae_gateway_logs",
 ]);
 
 export function isDemoMode(): boolean {
@@ -147,6 +161,7 @@ const ROUTES: Record<string, Route> = {
   oauth_start: { method: "POST", path: "/api/oauth/start" },
   oauth_status: { method: "POST", path: "/api/oauth/status" },
   import_local: { method: "POST", path: "/api/import-local" },
+  import_auths_dir: { method: "POST", path: "/api/import/auths-dir" },
   export_accounts: { method: "POST", path: "/api/export-accounts" },
   export_accounts_to_path: { method: "POST", path: "/api/export-accounts-to-path" },
   preview_import_accounts: { method: "POST", path: "/api/import/preview" },
@@ -175,8 +190,22 @@ const ROUTES: Record<string, Route> = {
   save_schedule_config: { method: "POST", path: "/api/schedule/config" },
   run_schedule_task: { method: "POST", path: "/api/schedule/run" },
   growth_tasks: { method: "GET", path: "/api/growth/tasks" },
+  growth_tasks_list: { method: "GET", path: "/api/growth/tasks/list" },
   growth_tasks_accept: { method: "POST", path: "/api/growth/tasks/accept" },
+  growth_accept_all: { method: "POST", path: "/api/growth/tasks/accept-all" },
+  growth_task_claim: { method: "POST", path: "/api/growth/tasks/claim" },
+  growth_auto_task: { method: "POST", path: "/api/growth/auto-task" },
+  growth_auto_all: { method: "POST", path: "/api/growth/auto-all" },
+  growth_tasks_scan_all: { method: "GET", path: "/api/growth/scan-all" },
+  growth_run_queue: { method: "POST", path: "/api/growth/run-queue" },
+  growth_queue_status: { method: "GET", path: "/api/growth/queue/status" },
   growth_tasks_run: { method: "POST", path: "/api/growth/tasks/run" },
+  // ---- 豆包模块 ----
+  doubao_accounts: { method: "GET", path: "/api/doubao/accounts" },
+  doubao_detect_uid: { method: "GET", path: "/api/doubao/detect-uid" },
+  doubao_account_save: { method: "POST", path: "/api/doubao/accounts/save" },
+  doubao_account_remove: { method: "POST", path: "/api/doubao/accounts/delete" },
+  doubao_keepalive_run: { method: "POST", path: "/api/doubao/keepalive" },
   rotate_status: { method: "GET", path: "/api/rotate/status" },
   run_rotate: { method: "POST", path: "/api/rotate/run" },
   get_rotate_logs: { method: "GET", path: "/api/rotate/logs" },
@@ -248,6 +277,7 @@ const ROUTES: Record<string, Route> = {
   save_trae_gateway_config: { method: "POST", path: "/api/trae/gateway/config" },
   trae_gateway_status: { method: "GET", path: "/api/trae/gateway/status" },
   get_trae_gateway_models: { method: "GET", path: "/api/trae/gateway/models" },
+  get_trae_client_models: { method: "GET", path: "/api/trae/gateway/client-models" },
   // 多 Key 管理（含归属产品线）：GET 列表 / POST 创建同一路径。
   list_trae_api_keys: { method: "GET", path: "/api/trae/gateway/keys" },
   create_trae_api_key: { method: "POST", path: "/api/trae/gateway/keys" },
@@ -863,15 +893,6 @@ export function saveAutoRotateConfig(config: AutoRotateConfig): Promise<AutoRota
 // 定时任务排程（六类任务，全局单份，无需 region）
 // ---------------------------------------------------------------------------
 
-export interface GrowthTask {
-  task_code: string;
-  title: string;
-  desc?: string;
-  status?: string;
-  reward?: string;
-  claimed?: boolean;
-}
-
 export interface GrowthRunItem {
   account: string;
   region: string;
@@ -921,6 +942,104 @@ export function growthClaim(code: string): Promise<{ ok: boolean }> {
 
 export function growthRun(): Promise<{ accounts: GrowthRunItem[] }> {
   return call("growth_tasks_run");
+}
+
+export function growthTasksList(uid: string, region: Region): Promise<{ tasks: GrowthTask[] }> {
+  return call("growth_tasks_list", { uid, ...regionArg(region) });
+}
+
+export function growthTasksAccept(
+  uid: string,
+  taskCode: string,
+  region: Region,
+): Promise<{ ok: boolean }> {
+  return call("growth_tasks_accept", { uid, taskCode, ...regionArg(region) });
+}
+
+export function growthAcceptAll(uid: string, region: Region): Promise<{
+  accepted: number;
+  failed: string[];
+  message?: string;
+}> {
+  return call("growth_accept_all", { uid, ...regionArg(region) });
+}
+
+export function growthTaskClaim(
+  uid: string,
+  taskCode: string,
+  region: Region,
+): Promise<{ credit: number; energy: number; already_claimed: boolean }> {
+  return call("growth_task_claim", { uid, taskCode, ...regionArg(region) });
+}
+
+export function growthAutoTask(
+  uid: string,
+  taskCode: string,
+  region: Region,
+): Promise<{
+  ok: boolean;
+  skipped?: boolean;
+  message?: string;
+  progress_before?: string;
+  progress_after?: string;
+  claimable?: boolean;
+  claimed?: boolean;
+  credit?: number;
+  energy?: number;
+  claim_error?: string;
+}> {
+  return call("growth_auto_task", { uid, taskCode, ...regionArg(region) });
+}
+
+export function growthAutoAll(uid: string, region: Region): Promise<{ results: GrowthAutoAllItem[] }> {
+  return call("growth_auto_all", { uid, ...regionArg(region) });
+}
+
+export function growthTasksScanAll(region: Region): Promise<GrowthScanResult> {
+  return call("growth_tasks_scan_all", regionArg(region));
+}
+
+export function growthRunQueue(
+  region: Region,
+  concurrency?: number,
+): Promise<{ ok?: boolean; started: boolean; seq: number; message?: string; total?: number }> {
+  return call("growth_run_queue", { ...regionArg(region), concurrency });
+}
+
+export function growthQueueStatus(): Promise<GrowthQueueStatus> {
+  return call("growth_queue_status");
+}
+
+// ---- 豆包模块 ----
+
+export function doubaoAccountsList(): Promise<{ accounts: DoubaoAccount[] }> {
+  return call("doubao_accounts");
+}
+
+export function doubaoDetectUid(): Promise<DoubaoDetectResult> {
+  return call("doubao_detect_uid");
+}
+
+export function doubaoAccountSave(
+  userId: string,
+  name?: string,
+  note?: string,
+): Promise<DoubaoSaveResult> {
+  return call("doubao_account_save", { user_id: userId, name, note });
+}
+
+export function doubaoAccountRemove(userId: string, removeSnapshot: boolean): Promise<{ ok: boolean }> {
+  return call("doubao_account_remove", { user_id: userId, remove_snapshot: removeSnapshot });
+}
+
+export function doubaoKeepaliveRun(): Promise<DoubaoKeepaliveResult> {
+  return call("doubao_keepalive_run");
+}
+
+// ---- 通用导入 ----
+
+export function importAuthsDir(dir: string, region: Region): Promise<AuthsDirImportResult> {
+  return call("import_auths_dir", { dir, region });
 }
 
 /** 触发一轮活动：连登/活跃地图/抽奖。 */
@@ -1506,8 +1625,13 @@ export function getTraeGatewayStatus(variant?: TraeVariantId | null): Promise<un
 }
 
 /** 对外暴露的模型清单（OpenAI `/v1/models` 形状）。 */
-export function getTraeGatewayModels(): Promise<unknown> {
-  return call("get_trae_gateway_models");
+export function getTraeGatewayModels(variant?: string): Promise<unknown> {
+  return call("get_trae_gateway_models", variant ? { variant } : undefined);
+}
+
+/** 客户端（上游下发）的模型清单（从 state.vscdb 读取缓存）。 */
+export function getTraeClientModels(variant?: string): Promise<TraeClientModelList> {
+  return call("get_trae_client_models", variant ? { variant } : undefined);
 }
 
 /** 多 Key 列表（含归属产品线；不含 hash 与明文）。 */

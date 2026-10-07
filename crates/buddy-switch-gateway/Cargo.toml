@@ -17,6 +17,8 @@ uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 anyhow = "1"
 regex = "1"
+http-body-util = "0.1"
+tower = "0.5"
 
 [dev-dependencies]
 # `tower` 已在 Cargo.lock（axum 0.7 的传递依赖），仅用于路由级测试的 `oneshot` 驱动。

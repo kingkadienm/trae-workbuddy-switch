@@ -26,6 +26,8 @@ export const en = {
   "nav.credits": "Credits",
   "nav.apiService": "API service",
   "nav.modelCatalog": "Model catalog",
+  "nav.accountPool": "Account pool",
+  "nav.requestLogs": "Request logs",
   "nav.settings": "Settings",
 
   "sidebar.version": "Version",

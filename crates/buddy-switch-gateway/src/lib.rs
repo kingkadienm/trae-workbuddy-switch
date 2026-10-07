@@ -19,6 +19,8 @@
 
 pub mod account_strategy;
 pub mod apikey;
+pub mod autoclaw;
+pub mod autoclaw_proxy;
 pub mod credits_refresh;
 pub mod error;
 pub mod logging;
@@ -53,25 +55,42 @@ use std::net::{IpAddr, SocketAddr};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
+use crate::autoclaw_proxy::AutoclawProxyService;
+
 /// 组装网关对外路由（**不含 fallback**）。
 ///
 /// 挂载：`GET /healthz`、`GET /v1/models`、`GET /status`、
 /// `POST /v1/chat/completions`、`POST /v1/messages`。
 /// 鉴权在各自 handler 内完成（Key 绑定 region）；`/healthz` 免鉴权。
+///
+/// AutoClaw 桥接路由（`/autoclaw/`）：当 `state.autoclaw` 已缓存为健康时挂载，
+/// 将请求原样转发到 AutoClaw2api 服务（含 SSE 流式透传）。
 pub fn router(state: GatewayState) -> axum::Router {
     use axum::routing::{get, post};
     // 请求体上限：axum 的 `DefaultBodyLimit` **默认只有 2MB**，大上下文（长代码文件、
     // 长对话）会撞上一个裸 413。它在 **router 构建期**固化，因此改配置需重启网关
     // （见 `GatewayConfig::max_body_mb`）。
     let body_limit = state.body_limit_bytes;
-    axum::Router::new()
+
+    // AutoClaw 桥接路由：仅当缓存健康时挂载。
+    // is_active() 的检查在启动时完成（GatewayState::new 内），此处只检查缓存结果。
+    let autoclaw_active = state.autoclaw.cached_healthy();
+
+    let mut router = axum::Router::new()
         .route("/healthz", get(routes::health::handler))
         .route("/v1/models", get(routes::models::handler))
         .route("/status", get(routes::status::handler))
         .route("/v1/chat/completions", post(routes::chat::handler))
         .route("/v1/messages", post(routes::messages::handler))
         .layer(axum::extract::DefaultBodyLimit::max(body_limit))
-        .with_state(state)
+        .with_state(state.clone());
+
+    if autoclaw_active {
+        let svc = AutoclawProxyService::new(state.autoclaw.clone());
+        router = router.fallback_service(svc);
+    }
+
+    router
     // 注意：不设 fallback，避免与宿主 merge 时的 fallback 冲突
 }
 
@@ -159,9 +178,27 @@ pub async fn spawn_listener_with_state(state: GatewayState) -> anyhow::Result<Ga
     })?;
     let local = listener.local_addr().unwrap_or(addr);
 
+    // 保存 autoclaw 客户端引用，用于后台健康检查
+    let autoclaw_health = state.autoclaw.clone();
+    let autoclaw_active = config.autoclaw.is_active();
+
     let app = router(state);
 
-    let (tx, rx) = oneshot::channel::<()>();
+    let (tx, rx) = oneshot::channel::<()> ();
+
+    // 后台健康检查：每 30 秒检查一次 autoclaw 服务健康状态
+    if autoclaw_active {
+        let _health_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+            // 首次立即检查，之后每 30 秒一次
+            let _ = autoclaw_health.is_healthy().await;
+            loop {
+                interval.tick().await;
+                let _ = autoclaw_health.is_healthy().await;
+            }
+        });
+    }
+
     let join = tokio::spawn(async move {
         let _ = axum::serve(listener, app)
             .with_graceful_shutdown(async move {

@@ -21,6 +21,12 @@ use crate::modules::config::{authed_json_request_for, load_checkin_config, now_m
 use crate::modules::refresh::ensure_fresh_token_for;
 use crate::modules::region::{region_spec, Region};
 
+pub mod queue;
+pub mod tasks;
+pub mod autotasks;
+pub mod events;
+pub use queue::run_growth_queue_once;
+
 /// 账号之间的间隔（限速，避免批量请求触发风控）。
 pub const GROWTH_ACCOUNT_DELAY: Duration = Duration::from_millis(800);
 /// 同一账号内任务处理之间的间隔。
@@ -514,11 +520,14 @@ mod tests {
     }
 
     /// 桩 IO：任务列表可配置，accept/claim/trigger 返回预设响应。
+    /// 通过调用计数区分首次拉取与 refetch。
     struct StubIo {
         tasks_response: GrowthResponse,
+        tasks_refetch_response: Option<GrowthResponse>,
         accept_response: GrowthResponse,
         claim_response: GrowthResponse,
         trigger_response: GrowthResponse,
+        call_count: std::sync::atomic::AtomicUsize,
     }
 
     impl GrowthIo for StubIo {
@@ -530,19 +539,29 @@ mod tests {
             _body: Option<Value>,
             _account: &'a Value,
         ) -> Pin<Box<dyn Future<Output = GrowthResponse> + Send + 'a>> {
-            Box::pin(async move {
-                match (method, path) {
-                    (_, p) if p == TASKS_PATH => self.tasks_response.clone(),
-                    (_, p) if p.starts_with("/portal/activity/tasks/") && p.ends_with("/accept") => {
-                        self.accept_response.clone()
+            let count = self.call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let response = match (method, path) {
+                (_, p) if p == TASKS_PATH => {
+                    // 第 2 次及之后的 TASKS_PATH 调用返回 refetch 响应（如果提供）
+                    if count > 0 {
+                        self.tasks_refetch_response
+                            .as_ref()
+                            .unwrap_or(&self.tasks_response)
+                            .clone()
+                    } else {
+                        self.tasks_response.clone()
                     }
-                    (_, p) if p.starts_with("/portal/activity/tasks/") && p.ends_with("/claim") => {
-                        self.claim_response.clone()
-                    }
-                    (_, p) if p == REPORT_PATH => self.trigger_response.clone(),
-                    _ => (200, json!({"code": 0})),
                 }
-            })
+                (_, p) if p.starts_with("/portal/activity/tasks/") && p.ends_with("/accept") => {
+                    self.accept_response.clone()
+                }
+                (_, p) if p.starts_with("/portal/activity/tasks/") && p.ends_with("/claim") => {
+                    self.claim_response.clone()
+                }
+                (_, p) if p == REPORT_PATH => self.trigger_response.clone(),
+                _ => (200, json!({"code": 0})),
+            };
+            Box::pin(async move { response })
         }
     }
 
@@ -560,9 +579,11 @@ mod tests {
             tasks_response: (200, json!({"code": 0, "data": {"tasks": [
                 {"task_code": "chat_5", "status": "claimed", "target_count": 5},
             ]}})),
+            tasks_refetch_response: None,
             accept_response: (200, json!({"code": 0})),
             claim_response: (200, json!({"code": 0})),
             trigger_response: (200, json!({"code": 0})),
+            call_count: std::sync::atomic::AtomicUsize::new(0),
         };
         let out = run_growth_cycle_for_with(Region::Cn, one_account(), &io).await;
         assert_eq!(out["accounts"][0]["tasks"][0]["result"]["result"], "already");
@@ -574,9 +595,14 @@ mod tests {
             tasks_response: (200, json!({"code": 0, "data": {"tasks": [
                 {"task_code": "first_buddy", "status": "pending", "target_count": 1},
             ]}})),
+            // Refetch after trigger returns completed task (ready to claim)
+            tasks_refetch_response: Some((200, json!({"code": 0, "data": {"tasks": [
+                {"task_code": "first_buddy", "status": "completed", "target_count": 1, "progress": 1},
+            ]}}))),
             accept_response: (200, json!({"code": 0})),
             claim_response: (200, json!({"code": 0})),
             trigger_response: (200, json!({"code": 0})),
+            call_count: std::sync::atomic::AtomicUsize::new(0),
         };
         let out = run_growth_cycle_for_with(Region::Cn, one_account(), &io).await;
         let task_result = &out["accounts"][0]["tasks"][0]["result"];
@@ -589,9 +615,11 @@ mod tests {
             tasks_response: (200, json!({"code": 0, "data": {"tasks": [
                 {"task_code": "chat_5", "status": "pending", "target_count": 5},
             ]}})),
+            tasks_refetch_response: Some((500, json!({"code": -1, "msg": "server error"}))),
             accept_response: (200, json!({"code": 0})),
             claim_response: (200, json!({"code": 0})),
             trigger_response: (200, json!({"code": 0})),
+            call_count: std::sync::atomic::AtomicUsize::new(0),
         };
         // 用特殊路径让 refetch 失败（这里简化：直接验证 error 分支可通过桩覆盖）
         let out = run_growth_cycle_for_with(Region::Cn, one_account(), &io).await;

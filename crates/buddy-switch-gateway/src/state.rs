@@ -26,6 +26,7 @@ use buddy_switch_core::modules::upstream::UpstreamClient;
 
 use crate::account_strategy::{load_strategies, AccountStrategy};
 use crate::apikey::ApiKeyStore;
+use crate::autoclaw::AutoclawClient;
 use crate::logging::RequestLog;
 use crate::outbound::{DegradeGate, PromptSettings};
 use crate::pool::{Pool, PoolConfig};
@@ -91,6 +92,9 @@ pub struct GatewayConfig {
     /// （不能像其它配置那样热生效）。
     #[serde(alias = "maxBodyMb")]
     pub max_body_mb: usize,
+    /// AutoClaw 桥接配置。
+    #[serde(default)]
+    pub autoclaw: crate::autoclaw::AutoclawConfig,
 }
 
 impl Default for GatewayConfig {
@@ -111,6 +115,7 @@ impl Default for GatewayConfig {
             pool: PoolConfig::default(),
             allow_model_region_prefix: false,
             max_body_mb: DEFAULT_MAX_BODY_MB,
+            autoclaw: crate::autoclaw::AutoclawConfig::default(),
         }
     }
 }
@@ -175,6 +180,15 @@ pub struct GatewayStatusView {
     pub allow_non_loopback: bool,
     /// 应用版本号。
     pub version: String,
+    // ---- AutoClaw 桥接状态 ----
+    /// AutoClaw 桥接是否在配置中启用。
+    pub autoclaw_enabled: bool,
+    /// AutoClaw 桥接基址。
+    pub autoclaw_base_url: String,
+    /// AutoClaw 服务缓存健康状态。
+    pub autoclaw_healthy: bool,
+    /// 已知模型数量。
+    pub autoclaw_model_count: u64,
 }
 
 impl Default for GatewayStatusView {
@@ -188,6 +202,10 @@ impl Default for GatewayStatusView {
             port: 0,
             allow_non_loopback: false,
             version: String::new(),
+            autoclaw_enabled: false,
+            autoclaw_base_url: String::new(),
+            autoclaw_healthy: false,
+            autoclaw_model_count: 0,
         }
     }
 }
@@ -204,6 +222,10 @@ impl From<&GatewayConfig> for GatewayStatusView {
             port: config.port,
             allow_non_loopback: config.allow_non_loopback,
             version: String::new(),
+            autoclaw_enabled: config.autoclaw.is_active(),
+            autoclaw_base_url: config.autoclaw.base_url.clone(),
+            autoclaw_healthy: false,
+            autoclaw_model_count: 0,
         }
     }
 }
@@ -265,6 +287,8 @@ pub struct GatewayState {
     /// 之所以在构造时算一次而不是每次读配置：axum 的 `DefaultBodyLimit` 是 **layer**，
     /// 只在 router 构建期生效，因此本项天然是**启动期配置**。
     pub body_limit_bytes: usize,
+    /// AutoClaw 桥接客户端。
+    pub autoclaw: AutoclawClient,
 }
 
 impl GatewayState {
@@ -313,6 +337,8 @@ impl GatewayState {
             )),
         ));
 
+        let autoclaw = AutoclawClient::new(&config.autoclaw);
+
         Self {
             config: Arc::new(RwLock::new(config.clone())),
             keys,
@@ -328,6 +354,7 @@ impl GatewayState {
             sticky: Arc::new(RwLock::new(StickyTable::new(config.sticky_ttl_ms))),
             prompt_error,
             body_limit_bytes: body_limit_bytes(config.max_body_mb),
+            autoclaw,
         }
     }
 
@@ -415,6 +442,10 @@ mod tests {
             "port",
             "allow_non_loopback",
             "version",
+            "autoclaw_enabled",
+            "autoclaw_base_url",
+            "autoclaw_healthy",
+            "autoclaw_model_count",
         ]
         .into_iter()
         .collect();
@@ -477,6 +508,7 @@ mod tests {
             "pool",
             "allow_model_region_prefix",
             "max_body_mb",
+            "autoclaw",
         ]
         .into_iter()
         .collect();

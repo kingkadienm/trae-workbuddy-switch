@@ -18,6 +18,8 @@ export const zh = {
   "nav.credits": "积分统计",
   "nav.apiService": "API 服务",
   "nav.modelCatalog": "模型目录",
+  "nav.accountPool": "账号池",
+  "nav.requestLogs": "请求日志",
   "nav.settings": "设置",
 
   "sidebar.version": "版本",
