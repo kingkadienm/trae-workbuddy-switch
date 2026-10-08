@@ -279,6 +279,12 @@ function ProductSwitch({
    * 注意第二格的标签是 **`TraeWork`**（本分区管的产品线），而它内部的**区域**
    * （国内版 / 国际版）与**程序位**（TraeWork / TraeCode）都在页面里选，见
    * `useTraeVariant` 与账号页的状态条 —— 侧栏只表达「进哪个产品分区」。
+   *
+   * ## 为什么三列改竖排
+   *
+   * 侧栏固定 220px，横排即使压到 11px 字号仍然拥挤。
+   * 竖排每个 Tab 占一整行：图标在上、文字在下，220px 宽度绰绰有余，
+   * 视觉层次清晰，也不截断。
    */
   return (
     <Tabs
@@ -287,29 +293,30 @@ function ProductSwitch({
       className="mb-3 shrink-0"
     >
       <TabsList
-        className="grid h-9 w-full grid-cols-[auto_auto_auto] justify-center gap-y-0 gap-x-1 rounded-xl border border-sidebar-border bg-sidebar-accent/60 p-1"
+        className="grid w-full grid-cols-1 gap-1 rounded-xl border border-sidebar-border bg-sidebar-accent/60 p-1.5"
         aria-label={t("product.switchAria")}
       >
         <TabsTrigger
           value="workbuddy"
-          className="h-7 w-full min-w-0 gap-1 rounded-lg px-1 text-[11px] font-medium data-[state=active]:bg-primary/15 data-[state=active]:shadow-none"
+          className="flex h-11 w-full flex-col items-center gap-0.5 rounded-lg px-2 text-xs font-medium data-[state=active]:bg-primary/15 data-[state=active]:shadow-none"
         >
-          <WorkBuddyMark size={13} />
-          <span className="truncate">{t(PRODUCT_LABEL_KEY.workbuddy)}</span>
+          <WorkBuddyMark size={16} />
+          <span className="truncate text-[11px]">{t(PRODUCT_LABEL_KEY.workbuddy)}</span>
         </TabsTrigger>
         <TabsTrigger
           value="trae"
-          className="h-7 w-full min-w-0 gap-1 rounded-lg px-1 text-[11px] font-medium data-[state=active]:bg-primary/15 data-[state=active]:shadow-none"
+          className="flex h-11 w-full flex-col items-center gap-0.5 rounded-lg px-2 text-xs font-medium data-[state=active]:bg-primary/15 data-[state=active]:shadow-none"
         >
-          <TraeVariantMark variant="trae_work" size={13} />
-          <span className="truncate">{t(PRODUCT_LABEL_KEY.trae)}</span>
+          {/* Trae 分区用 TraeWork 的图标（这里不区分区域与程序位，都在页面内部选）。 */}
+          <TraeVariantMark variant="trae_work" size={16} />
+          <span className="truncate text-[11px]">{t(PRODUCT_LABEL_KEY.trae)}</span>
         </TabsTrigger>
         <TabsTrigger
           value="doubao"
-          className="h-7 w-full min-w-0 gap-1 rounded-lg px-1 text-[11px] font-medium data-[state=active]:bg-primary/15 data-[state=active]:shadow-none"
+          className="flex h-11 w-full flex-col items-center gap-0.5 rounded-lg px-2 text-xs font-medium data-[state=active]:bg-primary/15 data-[state=active]:shadow-none"
         >
-          <Bot className="size-3.5" />
-          <span className="truncate">{t(PRODUCT_LABEL_KEY.doubao)}</span>
+          <Bot className="size-4" />
+          <span className="truncate text-[11px]">{t(PRODUCT_LABEL_KEY.doubao)}</span>
         </TabsTrigger>
       </TabsList>
     </Tabs>
