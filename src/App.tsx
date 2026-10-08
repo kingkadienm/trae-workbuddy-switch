@@ -243,80 +243,46 @@ function ProductSwitch({
   const t = useT();
 
   /*
-   * 两个产品 Tab：**图标 + 文字**。
+   * 三个产品 Tab：**纯图标 + Tooltip**。
    *
-   * ## 为什么现在是两个而不是三个
+   * 侧栏固定 220px、可用高度有限，竖排三行会压占导航区域。
+   * 纯图标横排：每个 Tab 只有图标，鼠标悬停显示产品名 Tooltip，
+   * 高度固定 h-9，完全不占纵向空间。
    *
-   * 曾经这里是三个 Tab（WorkBuddy / Trae Work / Trae CN），因为两条 Trae 产品线
-   * 可以同机并存。但侧栏固定 220px、扣掉 `px-3` 后 tablist 只有 195px，
-   * 三等分每格约 60px，而 12px 字号下 `WorkBuddy` = 65px、`Trae Work` = 56px、
-   * `Trae CN` = 43px —— **三个全都放不下**。当时的妥协是压成纯图标 + Tooltip。
-   *
-   * 但纯图标本身就是一个更强的信号：**用户分不清两个几乎一样的 Trae 图标该点哪个**。
-   * 两条线共用全部页面与路由，拆成两个顶级入口本来就多一层无意义的二选一，
-   * 因此合并成一个 `Trae`。产品线的选择下沉到 Trae 页面内部（那里宽度充足，
-   * 可以完整展示 `Trae Work` / `Trae CN` 并带各自的运行状态）。
-   *
-   * ## 为什么两个 Tab 也**不能等分**（浏览器实测，别再改回 `grid-cols-2`）
-   *
-   * 合并成两个后，`grid-cols-2` 的等分**仍然放不下** `WorkBuddy`：
-   * tablist 外框 195px、扣 `p-1` 后内容区 187px、`gap-0.5` 占 2px ⇒ 每格 92px；
-   * 再减 `px-2`（16px）+ 图标 15px + `gap-1.5`（6px），**留给文字的只有 55px**，
-   * 而 12px/500 的 `WorkBuddy` 实测 `scrollWidth = 64px` —— 短 9px，被截成 `WorkBu…`。
-   *
-   * 因此改成**按内容自适应并居中**（`grid-cols-[auto_auto]` + `justify-center`）。
-   * **实测（2026-09-21，1333×900，`px-1.5`）**：`WorkBuddy` 格 97px、`TraeWork` 格 85px，
-   * 加 2px 间隙共 184px ≤ 内容区 193px，**余量 9px**；两个标签的
-   * `scrollWidth == clientWidth`（64/64、52/52）⇒ **均未被截断**。
-   *
-   * 刻意**不**用「缩字号 / 压 padding 硬塞进等分格」：要等分放下 `WorkBuddy`，
-   * `padX + gap` 只能有 13px（12px 字号）或 16px（11px 字号），余量仅 1~3px；
-   * 换 DPI / 字体回退时会再次截断，不可靠。按内容排布不依赖这点余量。
-   *
-   * label 上的 `truncate` 保留，作为将来产品名变长时的兜底（当前不触发）。
-   *
-   * 两个图标仍然如实反映「这是两个独立体系」——这正是 WorkBuddy 侧的做法。
-   * 注意第二格的标签是 **`TraeWork`**（本分区管的产品线），而它内部的**区域**
-   * （国内版 / 国际版）与**程序位**（TraeWork / TraeCode）都在页面里选，见
-   * `useTraeVariant` 与账号页的状态条 —— 侧栏只表达「进哪个产品分区」。
-   *
-   * ## 为什么三列改竖排
-   *
-   * 侧栏固定 220px，横排即使压到 11px 字号仍然拥挤。
-   * 竖排每个 Tab 占一整行：图标在上、文字在下，220px 宽度绰绰有余，
-   * 视觉层次清晰，也不截断。
+   * 三个产品共用同一组页面结构，切换靠 Tab 完成；产品内部维度（Trae 区域/程序位）
+   * 下沉到对应页面内部处理。
    */
   return (
     <Tabs
       value={product}
       onValueChange={(value) => onChange(value as Product)}
-      className="mb-3 shrink-0"
+      className="mb-2 shrink-0"
     >
       <TabsList
-        className="grid w-full grid-cols-1 gap-1 rounded-xl border border-sidebar-border bg-sidebar-accent/60 p-1.5"
+        className="grid h-9 w-full grid-cols-[auto_auto_auto] justify-center gap-0.5 rounded-xl border border-sidebar-border bg-sidebar-accent/60 p-1"
         aria-label={t("product.switchAria")}
       >
         <TabsTrigger
           value="workbuddy"
-          className="flex h-11 w-full flex-col items-center gap-0.5 rounded-lg px-2 text-xs font-medium data-[state=active]:bg-primary/15 data-[state=active]:shadow-none"
+          className="h-7 w-full min-w-0 rounded-lg px-1 text-xs font-medium data-[state=active]:bg-primary/15 data-[state=active]:shadow-none"
+          title={t(PRODUCT_LABEL_KEY.workbuddy)}
         >
           <WorkBuddyMark size={16} />
-          <span className="truncate text-[11px]">{t(PRODUCT_LABEL_KEY.workbuddy)}</span>
         </TabsTrigger>
         <TabsTrigger
           value="trae"
-          className="flex h-11 w-full flex-col items-center gap-0.5 rounded-lg px-2 text-xs font-medium data-[state=active]:bg-primary/15 data-[state=active]:shadow-none"
+          className="h-7 w-full min-w-0 rounded-lg px-1 text-xs font-medium data-[state=active]:bg-primary/15 data-[state=active]:shadow-none"
+          title={t(PRODUCT_LABEL_KEY.trae)}
         >
           {/* Trae 分区用 TraeWork 的图标（这里不区分区域与程序位，都在页面内部选）。 */}
           <TraeVariantMark variant="trae_work" size={16} />
-          <span className="truncate text-[11px]">{t(PRODUCT_LABEL_KEY.trae)}</span>
         </TabsTrigger>
         <TabsTrigger
           value="doubao"
-          className="flex h-11 w-full flex-col items-center gap-0.5 rounded-lg px-2 text-xs font-medium data-[state=active]:bg-primary/15 data-[state=active]:shadow-none"
+          className="h-7 w-full min-w-0 rounded-lg px-1 text-xs font-medium data-[state=active]:bg-primary/15 data-[state=active]:shadow-none"
+          title={t(PRODUCT_LABEL_KEY.doubao)}
         >
           <Bot className="size-4" />
-          <span className="truncate text-[11px]">{t(PRODUCT_LABEL_KEY.doubao)}</span>
         </TabsTrigger>
       </TabsList>
     </Tabs>
