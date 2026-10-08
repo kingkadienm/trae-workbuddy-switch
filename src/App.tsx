@@ -287,28 +287,26 @@ function ProductSwitch({
       className="mb-3 shrink-0"
     >
       <TabsList
-        className="grid h-9 w-full grid-cols-[auto_auto_auto] justify-center gap-0.5 rounded-xl border border-sidebar-border bg-sidebar-accent/60 p-1"
+        className="grid h-9 w-full grid-cols-[auto_auto_auto] justify-center gap-y-0 gap-x-1 rounded-xl border border-sidebar-border bg-sidebar-accent/60 p-1"
         aria-label={t("product.switchAria")}
       >
         <TabsTrigger
           value="workbuddy"
-          className="h-7 w-full min-w-0 gap-1.5 rounded-lg px-1.5 text-xs font-medium data-[state=active]:bg-primary/15 data-[state=active]:shadow-none"
+          className="h-7 w-full min-w-0 gap-1 rounded-lg px-1 text-[11px] font-medium data-[state=active]:bg-primary/15 data-[state=active]:shadow-none"
         >
-          <WorkBuddyMark size={15} />
+          <WorkBuddyMark size={13} />
           <span className="truncate">{t(PRODUCT_LABEL_KEY.workbuddy)}</span>
         </TabsTrigger>
         <TabsTrigger
           value="trae"
-          className="h-7 w-full min-w-0 gap-1.5 rounded-lg px-1.5 text-xs font-medium data-[state=active]:bg-primary/15 data-[state=active]:shadow-none"
+          className="h-7 w-full min-w-0 gap-1 rounded-lg px-1 text-[11px] font-medium data-[state=active]:bg-primary/15 data-[state=active]:shadow-none"
         >
-          {/* 两个产品的图标各自如实呈现；Trae 分区用 TraeWork 的图标
-              （这里不区分区域与程序位，都在页面内部选）。 */}
-          <TraeVariantMark variant="trae_work" size={15} />
+          <TraeVariantMark variant="trae_work" size={13} />
           <span className="truncate">{t(PRODUCT_LABEL_KEY.trae)}</span>
         </TabsTrigger>
         <TabsTrigger
           value="doubao"
-          className="h-7 w-full min-w-0 gap-1.5 rounded-lg px-1.5 text-xs font-medium data-[state=active]:bg-primary/15 data-[state=active]:shadow-none"
+          className="h-7 w-full min-w-0 gap-1 rounded-lg px-1 text-[11px] font-medium data-[state=active]:bg-primary/15 data-[state=active]:shadow-none"
         >
           <Bot className="size-3.5" />
           <span className="truncate">{t(PRODUCT_LABEL_KEY.doubao)}</span>
