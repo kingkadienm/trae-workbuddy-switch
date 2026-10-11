@@ -118,6 +118,7 @@ export const zh = {
   "wbAccounts.card.notCheckedIn": "未签到",
   "wbAccounts.card.needRelogin": "需重新登录",
   "wbAccounts.card.tokenExpired": "Token 已过期",
+  "wbAccounts.card.deactivated": "已停用",
   "wbAccounts.card.priorityAria": "建议优先",
   "wbAccounts.card.priorityTip": "建议优先使用",
   "wbAccounts.card.toolsInUse": "{n} 个工具正在使用",
@@ -126,6 +127,8 @@ export const zh = {
   "wbAccounts.card.refreshToken": "刷新 Token",
   "wbAccounts.card.manualCheckin": "手动签到",
   "wbAccounts.card.editRemark": "编辑备注",
+  "wbAccounts.card.deactivateAccount": "停用账号",
+  "wbAccounts.card.reactivateAccount": "启用账号",
   "wbAccounts.card.deleteAccount": "删除账号",
   "wbAccounts.card.setCurrentWorkbuddy": "设为 WorkBuddy 当前账号",
   "wbAccounts.card.setCurrentWorkbuddyRestart": "设为 WorkBuddy 当前账号（会重启 WorkBuddy）",
@@ -334,6 +337,10 @@ export const zh = {
   "wbAccounts.toast.remarkSaved": "备注已保存",
   "wbAccounts.toast.remarkCleared": "备注已清除",
   "wbAccounts.toast.remarkSaveFail": "备注保存失败",
+  "wbAccounts.toast.accountDeactivated": "账号已停用",
+  "wbAccounts.toast.accountReactivated": "账号已启用",
+  "wbAccounts.toast.deactivateFail": "停用失败",
+  "wbAccounts.toast.reactivateFail": "启用失败",
   "wbAccounts.page.loadingAccounts": "加载账号…",
   "wbAccounts.page.accounts": "账号",
 
@@ -371,6 +378,7 @@ export const zh = {
   "wbAccounts.growth.pendingCount": "{n} 项待办",
   "wbAccounts.growth.noPending": "全部账号没有待办任务",
   "wbAccounts.growth.runAll": "执行全部待办",
+  "wbAccounts.growth.autoAllDone": "已完成全部 {n} 个任务",
   "wbAccounts.growth.concurrency": "并发",
   "wbAccounts.growth.concLabel": "并发 {n}（每账号内串行）",
   "wbAccounts.growth.queueRunning": "执行中 {done}/{total}",
@@ -386,6 +394,7 @@ export const zh = {
   // 成长任务中心（独立页）
   "wbAccounts.growth.scanResult": "扫描结果",
   "wbAccounts.growth.tasks": "任务",
+  "wbAccounts.growth.queue": "队列",
   "wbAccounts.growth.logs": "执行日志",
   "wbAccounts.growth.noAccounts": "暂无账号",
   "wbAccounts.growth.scanFirst": "请先点击「扫描」加载任务",
@@ -394,4 +403,14 @@ export const zh = {
   "wbAccounts.growth.completed": "已完成",
   "wbAccounts.growth.actions.accept": "接受",
   "wbAccounts.growth.actions.claim": "领取",
+
+  // 账号池
+  "wbAccounts.pool.available": "可用",
+  "wbAccounts.pool.cooldown": "冷却中",
+  "wbAccounts.pool.disabled": "已停用",
+  "wbAccounts.pool.unknown": "未知",
+  "wbAccounts.pool.all": "全部",
+  "wbAccounts.pool.summary": "共 {total} 个账号 · 可用 {available} · 冷却中 {cooldown} · 已停用 {disabled} · 未知 {unknown}",
+  "wbAccounts.pool.searchPlaceholder": "搜索账号名称或 ID…",
+  "wbAccounts.pool.deactivated": "已停用",
 } as const;

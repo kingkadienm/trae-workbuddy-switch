@@ -174,6 +174,8 @@ pub fn run() {
             commands::copy_sessions,
             commands::migrate_account_data,
             commands::set_account_remark,
+            commands::deactivate_account,
+            commands::reactivate_account,
             commands::get_switch_config,
             commands::save_switch_config,
             commands::open_permission_settings,

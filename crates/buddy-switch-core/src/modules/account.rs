@@ -272,6 +272,8 @@ pub fn account_meta(acc: &Value) -> Value {
         // `reason` 下发）。同一件事只在**一处**编码，才不会两处漂移 ——
         // 账号级布尔要等请求才用得上，而请求本身就会带回原因。
         "remark": display_str(acc, "remark"),
+        // 账号是否已停用：停用的账号不会在网关池中被选中，但仍在账号库中保留。
+        "deactivated": acc.get("deactivated").and_then(|v| v.as_bool()) == Some(true),
     })
 }
 
@@ -1667,6 +1669,33 @@ fn set_remark_in_path(
     Ok(account_meta_for(region, &updated))
 }
 
+/// 通用字段设置：按 id 或 uid 定位账号，设置指定字段的值。
+/// 用于停用/启用等功能。
+fn set_field_in_path(
+    region: Region,
+    path: &Path,
+    account_id: &str,
+    field: &str,
+    value: Value,
+) -> Result<Value, String> {
+    let mut accounts = load_accounts_from_path(path);
+    let Some(index) = accounts.iter().position(|account| {
+        account.get("id").and_then(Value::as_str) == Some(account_id)
+            || account.get("uid").and_then(Value::as_str) == Some(account_id)
+    }) else {
+        return Err("账号不存在".to_string());
+    };
+
+    let record = accounts[index]
+        .as_object_mut()
+        .ok_or_else(|| "账号记录格式异常".to_string())?;
+    record.insert(field.to_string(), value);
+
+    let updated = accounts[index].clone();
+    save_accounts_to_path(path, &accounts).map_err(|error| error.to_string())?;
+    Ok(account_meta_for(region, &updated))
+}
+
 /// 按 region 设置账号备注（按 id 或 uid 定位）。
 pub fn set_account_remark_for(
     region: Region,
@@ -1674,6 +1703,17 @@ pub fn set_account_remark_for(
     remark: Option<&str>,
 ) -> Result<Value, String> {
     set_remark_in_path(region, &accounts_file_for(region), account_id, remark)
+}
+
+/// 按 region 停用账号（按 id 或 uid 定位）。
+/// 停用的账号仍保留在账号库中，但不会在网关池中被选中。
+pub fn deactivate_account_for(region: Region, account_id: &str) -> Result<Value, String> {
+    set_field_in_path(region, &accounts_file_for(region), account_id, "deactivated", Value::Bool(true))
+}
+
+/// 按 region 启用账号（按 id 或 uid 定位）。
+pub fn reactivate_account_for(region: Region, account_id: &str) -> Result<Value, String> {
+    set_field_in_path(region, &accounts_file_for(region), account_id, "deactivated", Value::Bool(false))
 }
 
 /// 设置 CN 账号备注。

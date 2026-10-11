@@ -14,6 +14,7 @@
 //! 非流式场景无差别（响应体在 handler 内被消费完毕）。
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -221,6 +222,13 @@ pub async fn relay(
                 // 账号已禁用 → 重试无意义。
                 if disabled {
                     break;
+                }
+
+                // 微小退避：换号重试前稍作停顿，避免对上游形成微型惊群。
+                // 50ms 远小于典型网络 RTT（通常 > 50ms），不会拖慢整体 latency；
+                // 但能把「同一瞬间扫射所有可用账号」的压力摊平。
+                if attempt + 1 < tries {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
 
                 // 会话失效标记：此处 `matches!` 仅用于文档化分支意图。

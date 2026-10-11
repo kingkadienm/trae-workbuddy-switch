@@ -109,6 +109,7 @@ export const en = {
   "wbAccounts.card.notCheckedIn": "Not checked in",
   "wbAccounts.card.needRelogin": "Needs re-login",
   "wbAccounts.card.tokenExpired": "Token expired",
+  "wbAccounts.card.deactivated": "Deactivated",
   "wbAccounts.card.priorityAria": "Priority",
   "wbAccounts.card.priorityTip": "Recommended priority",
   "wbAccounts.card.toolsInUse": "{n} tools in use",
@@ -116,6 +117,8 @@ export const en = {
   "wbAccounts.card.moreActions": "More account actions",
   "wbAccounts.card.refreshToken": "Refresh token",
   "wbAccounts.card.manualCheckin": "Manual check-in",
+  "wbAccounts.card.deactivateAccount": "Deactivate account",
+  "wbAccounts.card.reactivateAccount": "Reactivate account",
   "wbAccounts.card.editRemark": "Edit remark",
   "wbAccounts.card.deleteAccount": "Delete account",
   "wbAccounts.card.setCurrentWorkbuddy": "Set as WorkBuddy current account",
@@ -324,6 +327,10 @@ export const en = {
   "wbAccounts.toast.remarkSaved": "Remark saved",
   "wbAccounts.toast.remarkCleared": "Remark cleared",
   "wbAccounts.toast.remarkSaveFail": "Failed to save remark",
+  "wbAccounts.toast.accountDeactivated": "Account deactivated",
+  "wbAccounts.toast.accountReactivated": "Account reactivated",
+  "wbAccounts.toast.deactivateFail": "Failed to deactivate",
+  "wbAccounts.toast.reactivateFail": "Failed to reactivate",
   "wbAccounts.page.loadingAccounts": "Loading accounts…",
   "wbAccounts.page.accounts": "Accounts",
 
@@ -361,6 +368,7 @@ export const en = {
   "wbAccounts.growth.pendingCount": "{n} pending",
   "wbAccounts.growth.noPending": "No pending tasks on any account",
   "wbAccounts.growth.runAll": "Run all pending",
+  "wbAccounts.growth.autoAllDone": "Auto-completed {n} tasks",
   "wbAccounts.growth.concurrency": "Concurrency",
   "wbAccounts.growth.concLabel": "Concurrency {n} (serial within each account)",
   "wbAccounts.growth.queueRunning": "Running {done}/{total}",
@@ -376,6 +384,7 @@ export const en = {
   // Growth task center (standalone page)
   "wbAccounts.growth.scanResult": "Scan results",
   "wbAccounts.growth.tasks": "Tasks",
+  "wbAccounts.growth.queue": "Queue",
   "wbAccounts.growth.logs": "Run logs",
   "wbAccounts.growth.noAccounts": "No accounts found",
   "wbAccounts.growth.scanFirst": "Scan to load tasks",
@@ -384,4 +393,14 @@ export const en = {
   "wbAccounts.growth.completed": "completed",
   "wbAccounts.growth.actions.accept": "Accept",
   "wbAccounts.growth.actions.claim": "Claim",
+
+  // Account pool
+  "wbAccounts.pool.available": "Available",
+  "wbAccounts.pool.cooldown": "Cooldown",
+  "wbAccounts.pool.disabled": "Disabled",
+  "wbAccounts.pool.unknown": "Unknown",
+  "wbAccounts.pool.all": "All",
+  "wbAccounts.pool.summary": "{total} accounts · {available} available · {cooldown} cooldown · {disabled} disabled · {unknown} unknown",
+  "wbAccounts.pool.searchPlaceholder": "Search by name or ID…",
+  "wbAccounts.pool.deactivated": "Deactivated",
 };

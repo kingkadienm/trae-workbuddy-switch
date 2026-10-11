@@ -187,6 +187,14 @@ interface Props {
    * **保持编辑态**让用户能改完重试，而不是把半截输入丢掉。
    */
   onSaveRemark?: (a: AccountMeta, remark: string) => Promise<boolean>;
+  /**
+   * 停用账号。
+   */
+  onDeactivate?: (a: AccountMeta) => void;
+  /**
+   * 启用账号。
+   */
+  onReactivate?: (a: AccountMeta) => void;
   todayCheckedIn?: boolean;
   /** 今日旅行状态（undefined=查询中/未知，不渲染标签） */
   travelStatus?: TravelStatus;
@@ -258,7 +266,7 @@ function ProductCurrentState({ product, compact = false }: { product: "workbuddy
   );
 }
 
-export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch, onSaveRemark, todayCheckedIn, travelStatus, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, onAddPlaintextAccount, onGrowthTasks, featuresDisabled = true, compact = false }: Props) {
+export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch, onSaveRemark, onDeactivate, onReactivate, todayCheckedIn, travelStatus, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, onAddPlaintextAccount, onGrowthTasks, featuresDisabled = true, compact = false }: Props) {
   const t = useT();
   const [resourcesOpen, setResourcesOpen] = useState(false);
   const [remarkEditing, setRemarkEditing] = useState(false);
@@ -355,10 +363,13 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
 
   const statusChips = (
     <>
-      {todayCheckedIn !== undefined && (
+      {account.deactivated && (
+        <Badge variant="destructive" className={chipClass}>{t("wbAccounts.card.deactivated")}</Badge>
+      )}
+      {!account.deactivated && todayCheckedIn !== undefined && (
         <Badge variant={todayCheckedIn ? "success" : "secondary"} className={cn(chipClass, !todayCheckedIn && "text-muted-foreground")}><CircleCheck /> {todayCheckedIn ? t("wbAccounts.card.checkedIn") : t("wbAccounts.card.notCheckedIn")}</Badge>
       )}
-      {travelChip(travelStatus)}
+      {!account.deactivated && travelChip(travelStatus)}
       {(account.needsRelogin || expired) && <Badge variant="warning" className={chipClass}>{account.needsRelogin ? t("wbAccounts.card.needRelogin") : t("wbAccounts.card.tokenExpired")}</Badge>}
       {creditPriority && (
         <Tooltip>
@@ -448,6 +459,17 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
                 {onGrowthTasks && (
                   <DropdownMenuItem disabled={featuresDisabled} onSelect={() => onGrowthTasks(account)}>
                     <Gift />{t("wbAccounts.card.growthTasks")}
+                  </DropdownMenuItem>
+                )}
+                <DropdownMenuSeparator />
+                {!account.deactivated && onDeactivate && (
+                  <DropdownMenuItem disabled={featuresDisabled} onSelect={() => onDeactivate(account)}>
+                    <CircleCheck className="text-orange-600" />{t("wbAccounts.card.deactivateAccount")}
+                  </DropdownMenuItem>
+                )}
+                {account.deactivated && onReactivate && (
+                  <DropdownMenuItem disabled={featuresDisabled} onSelect={() => onReactivate(account)}>
+                    <RefreshCw className="text-emerald-600" />{t("wbAccounts.card.reactivateAccount")}
                   </DropdownMenuItem>
                 )}
                 <DropdownMenuSeparator />

@@ -314,10 +314,11 @@ pub fn classify_event(status: u16, body: &str) -> UpstreamEvent {
     if status == 402 {
         return UpstreamEvent::HardCredit;
     }
-    let lowered = body.to_lowercase();
+    // body 只转小写一次，之后所有 marker 共用同一个 lowered 副本。
+    let lowered = body.to_ascii_lowercase();
     if HARD_CREDIT_MARKERS
         .iter()
-        .any(|marker| lowered.contains(&marker.to_lowercase()))
+        .any(|marker| lowered.contains(&marker.to_ascii_lowercase()))
     {
         return UpstreamEvent::HardCredit;
     }
@@ -359,6 +360,7 @@ struct PersistedEntry {
     credits_expiring: i64,
     credits_refreshed_ms: i64,
     disabled: bool,
+    deactivated: bool,
     reason: String,
     until_ms: i64,
     cool_kind: Option<CoolKind>,
@@ -384,6 +386,7 @@ impl Default for PersistedEntry {
             credits_expiring: 0,
             credits_refreshed_ms: 0,
             disabled: false,
+            deactivated: false,
             reason: String::new(),
             until_ms: 0,
             cool_kind: None,
@@ -517,7 +520,14 @@ impl Pool {
                 .get("nickname")
                 .and_then(Value::as_str)
                 .unwrap_or("");
+            let deactivated = account
+                .get("deactivated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             self.upsert(uid, realm, nickname);
+            if let Some(entry) = self.entries.get_mut(uid) {
+                entry.deactivated = deactivated;
+            }
         }
     }
 
@@ -687,7 +697,7 @@ impl Pool {
         match event {
             UpstreamEvent::HardCredit => {
                 entry.cooldown_until_tomorrow_4am(now_ms, HARD_CREDIT_COOLDOWN_REASON);
-                true
+                false
             }
             UpstreamEvent::SoftRate {
                 reset_at_ms,
@@ -955,6 +965,7 @@ fn persist_of(entry: &PoolEntry) -> PersistedEntry {
         credits_expiring: entry.credits_expiring,
         credits_refreshed_ms: entry.credits_refreshed_ms,
         disabled: entry.disabled,
+        deactivated: entry.deactivated,
         reason: entry.reason.clone(),
         until_ms: entry.until_ms,
         cool_kind: entry.cool_kind,
@@ -989,6 +1000,7 @@ fn restore_entry(entry: &mut PoolEntry, persisted: PersistedEntry, now_ms: i64) 
     entry.credits_expiring = persisted.credits_expiring.clamp(0, entry.credits);
     entry.credits_refreshed_ms = persisted.credits_refreshed_ms;
     entry.disabled = persisted.disabled;
+    entry.deactivated = persisted.deactivated;
     entry.reason = persisted.reason;
     entry.until_ms = persisted.until_ms;
     entry.cool_kind = persisted.cool_kind;

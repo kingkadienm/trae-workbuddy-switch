@@ -616,6 +616,26 @@ function RegionPanel({ region }: { region: Region }) {
     setDeleteTarget(a);
   }
 
+  async function onDeactivate(a: AccountMeta) {
+    try {
+      await api.deactivateAccount(a.id, region);
+      toast.success(t("wbAccounts.toast.accountDeactivated"));
+      await reconcileAccounts(region);
+    } catch (e) {
+      toast.error(t("wbAccounts.toast.deactivateFail"), { description: api.asError(e) });
+    }
+  }
+
+  async function onReactivate(a: AccountMeta) {
+    try {
+      await api.reactivateAccount(a.id, region);
+      toast.success(t("wbAccounts.toast.accountReactivated"));
+      await reconcileAccounts(region);
+    } catch (e) {
+      toast.error(t("wbAccounts.toast.reactivateFail"), { description: api.asError(e) });
+    }
+  }
+
   async function confirmDelete() {
     if (!deleteTarget) return;
     const a = deleteTarget;
@@ -1205,6 +1225,8 @@ function RegionPanel({ region }: { region: Region }) {
                     account={a}
                     compact={compact}
                     onDelete={onDelete}
+                    onDeactivate={onDeactivate}
+                    onReactivate={onReactivate}
                     onSwitch={setSwitchAccount}
                     onSaveRemark={onSaveRemark}
                     onCheckin={onCheckin}

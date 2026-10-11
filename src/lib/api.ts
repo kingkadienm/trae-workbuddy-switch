@@ -158,6 +158,8 @@ const ROUTES: Record<string, Route> = {
   detect_codebuddy_cn_ide_account: { method: "POST", path: "/api/codebuddy-cn-ide/detect" },
   delete_account: { method: "POST", path: "/api/delete" },
   set_account_remark: { method: "POST", path: "/api/account/remark" },
+  deactivate_account: { method: "POST", path: "/api/account/deactivate" },
+  reactivate_account: { method: "POST", path: "/api/account/reactivate" },
   oauth_start: { method: "POST", path: "/api/oauth/start" },
   oauth_status: { method: "POST", path: "/api/oauth/status" },
   import_local: { method: "POST", path: "/api/import-local" },
@@ -525,6 +527,25 @@ export function setAccountRemark(
   region?: Region,
 ): Promise<AccountMeta> {
   return call<AccountMeta>("set_account_remark", { accountId, remark, ...regionArg(region) }).then(
+    normalizeAccountMeta,
+  );
+}
+
+/**
+ * 停用账号（deactivated = true）。
+ * 停用的账号仍保留在账号库中，但不会在网关池中被选中。
+ */
+export function deactivateAccount(accountId: string, region?: Region): Promise<AccountMeta> {
+  return call<AccountMeta>("deactivate_account", { accountId, ...regionArg(region) }).then(
+    normalizeAccountMeta,
+  );
+}
+
+/**
+ * 启用账号（deactivated = false）。
+ */
+export function reactivateAccount(accountId: string, region?: Region): Promise<AccountMeta> {
+  return call<AccountMeta>("reactivate_account", { accountId, ...regionArg(region) }).then(
     normalizeAccountMeta,
   );
 }

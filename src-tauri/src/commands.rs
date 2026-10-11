@@ -243,6 +243,28 @@ pub fn set_account_remark(
     account::set_account_remark_for(region, &account_id, remark.as_deref())
 }
 
+/// POST /api/account/deactivate —— 停用账号（按 region）。
+///
+/// 停用的账号仍保留在账号库中，但不会在网关池中被选中。
+#[tauri::command(rename_all = "camelCase")]
+pub fn deactivate_account(account_id: String, region: Option<String>) -> Result<Value, String> {
+    if account_id.trim().is_empty() {
+        return Err("缺少 accountId".to_string());
+    }
+    let region = parse_region(region.as_deref());
+    account::deactivate_account_for(region, &account_id)
+}
+
+/// POST /api/account/reactivate —— 启用账号（按 region）。
+#[tauri::command(rename_all = "camelCase")]
+pub fn reactivate_account(account_id: String, region: Option<String>) -> Result<Value, String> {
+    if account_id.trim().is_empty() {
+        return Err("缺少 accountId".to_string());
+    }
+    let region = parse_region(region.as_deref());
+    account::reactivate_account_for(region, &account_id)
+}
+
 /// POST /api/oauth/start —— 发起 OAuth 扫码登录（按 region）。
 #[tauri::command]
 pub async fn oauth_start(region: Option<String>) -> Result<Value, String> {
@@ -1331,20 +1353,72 @@ pub fn get_gateway_models(region: Option<String>) -> Value {
 }
 
 /// POST /api/gateway/models/refresh —— 手动刷新目录（按 region）。
+///
+/// 优先使用当前配置的策略选号；失败时依次回退到其他策略，最大化刷新成功率。
 #[tauri::command]
 pub async fn refresh_gateway_models(region: Option<String>) -> Result<Value, String> {
     let region = parse_region(region.as_deref());
     let state = gateway::shared_state();
-    let strategy = state.strategy_for(region).await;
+    let strategies = state.strategies.read().await;
+    let primary = strategies.get(&region).cloned().unwrap_or_default();
+    drop(strategies);
+
+    // 依次尝试策略：配置策略 → pinned(首个账号) → max_credits → current(本机)
+    let fallback_chain: Vec<buddy_switch_gateway::account_strategy::AccountStrategy> = vec![
+        primary.clone(),
+        first_pinned_strategy(region),
+        buddy_switch_gateway::account_strategy::AccountStrategy::MaxCredits,
+        buddy_switch_gateway::account_strategy::AccountStrategy::Current,
+    ];
+
+    let mut last_error = None;
+    for strategy in &fallback_chain {
+        match refresh_with_strategy(&state, region, strategy).await {
+            Ok(snapshot) => {
+                return Ok(serde_json::to_value(snapshot).unwrap_or(Value::Null));
+            }
+            Err(e) => {
+                last_error = Some(e);
+                continue;
+            }
+        }
+    }
+
+    // 全部策略都失败：返回缓存的或内置的
+    let snapshot = state.catalogs.current(region);
+    let mut result = serde_json::to_value(snapshot).unwrap_or(Value::Null);
+    if let Some(err) = last_error {
+        result["refreshError"] = serde_json::json!(err);
+    }
+    Ok(result)
+}
+
+/// 用指定策略选号并刷新目录。
+async fn refresh_with_strategy(
+    state: &buddy_switch_gateway::GatewayState,
+    region: Region,
+    strategy: &buddy_switch_gateway::account_strategy::AccountStrategy,
+) -> Result<buddy_switch_core::modules::catalog::CatalogSnapshot, String> {
     let account = buddy_switch_gateway::AccountSelector
-        .select(region, &strategy)
+        .select(region, strategy)
         .await
-        .map_err(|error| error.message())?;
-    let snapshot = state
+        .map_err(|e| e.message())?;
+    state
         .catalogs
-        .refresh(region, &state.upstream, &account)
-        .await;
-    Ok(serde_json::to_value(snapshot).unwrap_or(Value::Null))
+        .try_refresh(region, &state.upstream, &account)
+        .await
+}
+
+/// 取该 region 账号库中第一个账号 id（用于回退策略）。
+fn first_pinned_strategy(region: Region) -> buddy_switch_gateway::account_strategy::AccountStrategy {
+    let accounts = buddy_switch_core::modules::account::load_accounts_for(region);
+    if let Some(id) = accounts.into_iter().find_map(|acc| {
+        acc.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string)
+    }) {
+        buddy_switch_gateway::account_strategy::AccountStrategy::Pinned { account_id: id }
+    } else {
+        buddy_switch_gateway::account_strategy::AccountStrategy::Current
+    }
 }
 
 /// GET /api/gateway/strategy —— 各 region 账号策略。

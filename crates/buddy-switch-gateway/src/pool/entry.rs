@@ -122,6 +122,9 @@ pub struct PoolEntry {
 
     /// 是否已禁用（终态，需人工/刷新成功复活）。
     pub disabled: bool,
+    /// 是否已停用（账号库中的 `deactivated` 字段，持久化）。
+    /// 停用的账号不会在网关池中被选中，但仍在账号库中保留。
+    pub deactivated: bool,
     /// 连续会话失效计数（12153 三振）。
     pub session_dead_fails: i32,
 
@@ -165,6 +168,7 @@ impl PoolEntry {
             soft_streak: 0,
             model_cooldowns: HashMap::new(),
             disabled: false,
+            deactivated: false,
             session_dead_fails: 0,
             breaker_until_ms: 0,
             fails: 0,

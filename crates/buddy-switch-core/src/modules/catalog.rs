@@ -212,6 +212,25 @@ impl CatalogStore {
         client: &UpstreamClient,
         acc: &Value,
     ) -> CatalogSnapshot {
+        self.try_refresh(region, client, acc).await.unwrap_or_else(|_| {
+            if let Some(mut cached) = self.load_cached(region) {
+                cached.note = Some(DEGRADE_NOTE.to_string());
+                return cached;
+            }
+            Self::builtin_snapshot(region, Some(DEGRADE_NOTE.to_string()))
+        })
+    }
+
+    /// 实时刷新：仅成功时返回 Ok；失败返回 Err（不降级）。
+    ///
+    /// 供需要**知道是否真正从上游拉到新数据**的场景使用（如模型目录刷新
+    /// 的多策略回退：成功即返回，失败才试下一条策略）。
+    pub async fn try_refresh(
+        &self,
+        region: Region,
+        client: &UpstreamClient,
+        acc: &Value,
+    ) -> Result<CatalogSnapshot, String> {
         match client.fetch_models(region, acc).await {
             Ok(models) if !models.is_empty() => {
                 let snapshot = CatalogSnapshot {
@@ -227,15 +246,10 @@ impl CatalogStore {
                     .live
                     .insert(region, snapshot.clone());
                 self.save_cached(&snapshot);
-                snapshot
+                Ok(snapshot)
             }
-            _ => {
-                if let Some(mut cached) = self.load_cached(region) {
-                    cached.note = Some(DEGRADE_NOTE.to_string());
-                    return cached;
-                }
-                Self::builtin_snapshot(region, Some(DEGRADE_NOTE.to_string()))
-            }
+            Ok(_) => Err("上游返回空目录".to_string()),
+            Err(e) => Err(e.message),
         }
     }
 

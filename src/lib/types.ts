@@ -29,6 +29,8 @@ export interface AccountMeta {
   remark?: string | null;
   /** 该账号所属版本（后端 region 化后返回；缺省视为 "cn"）。 */
   region?: Region;
+  /** 账号是否已停用（停用的账号不会在网关池中被选中）。 */
+  deactivated?: boolean;
 }
 
 /** 认证文件 domain 与目标 region 不符时的结构化信息（安全红线 F）。 */
@@ -831,6 +833,8 @@ export interface CatalogSnapshot {
   models: CatalogModel[];
   /** 降级说明（如「上游接口可能已变更」）。 */
   note?: string | null;
+  /** 刷新部分失败时的错误描述；成功时为空。 */
+  refreshError?: string | null;
 }
 
 /** 账号选择策略（按 region 各自独立配置）。 */

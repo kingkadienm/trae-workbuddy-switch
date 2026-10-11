@@ -112,7 +112,7 @@ fn idle_weight(last_used_ms: i64, now_ms: i64, policy: &PickPolicy) -> f64 {
 /// （症状：**明明有别的号可用却一直失败**）。两处判据一旦分家，这种缺陷不会报错、
 /// 只会表现成「偶发失败」。抽成一个函数是唯一可靠的做法。
 fn entry_usable(entry: &PoolEntry, policy: &PickPolicy, now_ms: i64, model: &str) -> bool {
-    entry.healthy_for_request(now_ms, model) && !in_flight_full(entry, policy)
+    !entry.deactivated && entry.healthy_for_request(now_ms, model) && !in_flight_full(entry, policy)
 }
 
 /// 指定 uid 此刻是否可用于该请求（**与 [`pick`] 同一套判据**，见 [`entry_usable`]）。
