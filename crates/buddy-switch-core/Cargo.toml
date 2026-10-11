@@ -13,6 +13,9 @@ uuid = { version = "1", features = ["v4"] }
 dirs = "5"
 chrono = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
+totp-rs = { version = "6", features = ["otpauth", "gen_secret"] }
+base32 = "0.5"
+rand = "0.10"
 
 # Trae OAuth 登录：本地回调监听（`127.0.0.1:<port>/authorize`）。
 # 版本与 buddy-switch-gateway 一致，复用 Cargo.lock 里已有的 0.7.9，不引入新解析。

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ArrowUpCircle, ExternalLink, Loader2, RefreshCw, Save, Settings2 } from "lucide-react";
+import { ArrowUpCircle, ExternalLink, Loader2, RefreshCw, Save, Settings2, Shield } from "lucide-react";
 
 import { DemoAction } from "@/components/demo-action";
 import { SettingsFieldRow, SettingsGroup } from "@/components/settings-primitives";
@@ -18,6 +18,7 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { UpdateInstallDialog } from "@/components/update-install-dialog";
+import { TotpSetupDialog } from "@/components/totp-setup-dialog";
 import * as api from "@/lib/api";
 import { isLocale, setLocale, useLocale, useT } from "@/lib/i18n";
 import { getThemePreference, setThemePreference, type ThemePreference } from "@/lib/theme";
@@ -426,12 +427,68 @@ function LanguageCard() {
  *
  * 顺序把**语言放在最前**：它改的是其余所有文案的语言，用户在找「设置」时最可能先要它。
  */
+
+/**
+ * TOTP 两步验证测试卡片（仅桌面端）。
+ *
+ * 在通用设置里提供 TOTP 设置入口，方便桌面端快速测试。
+ */
+function TotpCard() {
+  const [setupOpen, setSetupOpen] = useState(false);
+  const [enabled, setEnabled] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void api.totpStatus().then((s) => {
+      if (!cancelled) setEnabled(s.enabled);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
+  return (
+    <SettingsGroup
+      id="settings-totp"
+      title="两步验证（测试）"
+    >
+      <CardContent className="space-y-0 p-0">
+        <SettingsFieldRow
+          className="border-b-0"
+          label="状态"
+          description={enabled === null
+            ? "检查中..."
+            : enabled
+              ? "已启用"
+              : "未启用"}
+          htmlFor="totp-setup"
+          operational
+        >
+          <DemoAction><Button
+            id="totp-setup"
+            size="sm"
+            variant={enabled ? "outline" : "default"}
+            onClick={() => setSetupOpen(true)}
+          >
+            <Shield className="mr-1.5 size-3.5" />
+            {enabled ? "重新设置" : "启用两步验证"}
+          </Button></DemoAction>
+        </SettingsFieldRow>
+      </CardContent>
+      <TotpSetupDialog
+        open={setupOpen}
+        onOpenChange={setSetupOpen}
+        onSuccess={() => setEnabled(true)}
+      />
+    </SettingsGroup>
+  );
+}
+
 export function AppSettingsGroups() {
   return (
     <>
       <LanguageCard />
       <AppearanceCard />
       {api.isDesktop() || api.isDemoMode() ? <StartupCard /> : null}
+      {api.isDesktop() ? <TotpCard /> : null}
       {api.isWebui() && !api.isDemoMode() ? null : <UpdateCard />}
     </>
   );

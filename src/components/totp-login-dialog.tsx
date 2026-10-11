@@ -28,21 +28,28 @@ export function TotpLoginDialog({ open, onOpenChange, onSuccess }: Props) {
 
     function handleSubmit(e: React.FormEvent) {
         e.preventDefault();
+        console.log("[TotpLoginDialog] handleSubmit called, code length:", code.length, "busy:", busy);
         if (busy || code.length !== 6) return;
         setBusy(true);
         setError("");
+        console.log("[TotpLoginDialog] calling api.totpValidate...");
         api
             .totpValidate(code)
             .then((res) => {
+                console.log("[TotpLoginDialog] totpValidate success:", res);
                 sessionStorage.setItem("totp_session", res.sessionToken);
                 setCode("");
                 onSuccess();
                 onOpenChange(false);
             })
             .catch((err) => {
+                console.log("[TotpLoginDialog] totpValidate error:", err);
                 setError(api.asError(err));
             })
-            .finally(() => setBusy(false));
+            .finally(() => {
+                console.log("[TotpLoginDialog] totpValidate done");
+                setBusy(false);
+            });
     }
 
     return (

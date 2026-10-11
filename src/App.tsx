@@ -15,8 +15,7 @@ import { Button } from "@/components/ui/button";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Toaster } from "@/components/ui/sonner";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { TotpLoginDialog } from "@/components/totp-login-dialog";
-import { TotpSetupDialog } from "@/components/totp-setup-dialog";
+import { TotpAuthPage } from "@/components/totp-auth-page";
 import { demoModeEnabled, pagesDemoHostingEnabled } from "@/lib/demo-mode";
 import { useT } from "@/lib/i18n";
 import type { TranslationKey } from "@/locales/zh";
@@ -392,8 +391,6 @@ function Layout() {
   // ---- TOTP 两步验证状态 ----
   const [totpEnabled, setTotpEnabled] = useState(false);
   const [authenticated, setAuthenticated] = useState(false);
-  const [showLogin, setShowLogin] = useState(false);
-  const [showSetup, setShowSetup] = useState(false);
   const [checkingAuth, setCheckingAuth] = useState(true);
 
   // 初始化：检查 TOTP 状态 + session 有效性
@@ -401,7 +398,6 @@ function Layout() {
     api.setUnauthorizedHandler(() => {
       setAuthenticated(false);
       sessionStorage.removeItem("totp_session");
-      setShowLogin(true);
     });
 
     api
@@ -413,12 +409,9 @@ function Layout() {
           if (session) {
             // 有 session token，乐观标记为已认证；首个 API 调用会验证 token 有效性
             setAuthenticated(true);
-          } else {
-            setShowLogin(true);
           }
         } else {
           // TOTP 未启用，显示首次设置引导
-          setShowSetup(true);
         }
       })
       .catch(() => {
@@ -431,12 +424,11 @@ function Layout() {
 
   function handleLoginSuccess() {
     setAuthenticated(true);
-    setShowLogin(false);
   }
 
   function handleSetupSuccess() {
     setTotpEnabled(true);
-    setShowLogin(true);
+    setAuthenticated(true);
   }
 
   // 认证中：在 Layout 内显示加载态（不提前 return，保持 hooks 顺序稳定）
@@ -570,14 +562,12 @@ function Layout() {
           <Outlet />
         </Suspense>
       </main>
-      {/* TOTP 弹框始终挂载，由状态控制可见性，保持 hooks 顺序稳定 */}
-      {/* 未认证且加载完成：TOTP 未启用时显示首次设置，已启用时显示登录 */}
+      {/* TOTP 认证全屏页面：不可关闭，必须完成验证才能进入应用 */}
       {!authenticated && !checkingAuth && (
-        totpEnabled ? (
-          <TotpLoginDialog open={showLogin} onOpenChange={setShowLogin} onSuccess={handleLoginSuccess} />
-        ) : (
-          <TotpSetupDialog open={showSetup || true} onOpenChange={setShowSetup} onSuccess={handleSetupSuccess} />
-        )
+        <TotpAuthPage
+          mode={totpEnabled ? "login" : "setup"}
+          onSuccess={totpEnabled ? handleLoginSuccess : handleSetupSuccess}
+        />
       )}
     </div>
   );

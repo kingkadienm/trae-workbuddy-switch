@@ -2209,6 +2209,48 @@ pub fn clear_trae_gateway_logs() -> Value {
     json!({ "ok": true })
 }
 
+// ---------------------------------------------------------------------------
+// TOTP 两步验证（桌面端 IPC 命令）
+// ---------------------------------------------------------------------------
+
+use buddy_switch_core::modules::totp_auth;
+
+/// 获取 TOTP 状态。
+#[tauri::command]
+pub fn totp_status() -> Value {
+    json!({
+        "enabled": totp_auth::is_enabled(),
+        "session_duration_minutes": totp_auth::session_duration(),
+    })
+}
+
+/// 生成 TOTP 密钥（首次设置）。
+#[tauri::command]
+pub fn totp_setup() -> Result<Value, String> {
+    let secret = totp_auth::setup()?;
+    let otpauth_uri = totp_auth::get_otpauth_uri().unwrap_or_default();
+    Ok(json!({ "secret": secret, "otpauthUri": otpauth_uri }))
+}
+
+/// 验证首次设置的动态口令。
+#[tauri::command]
+pub fn totp_verify(code: String) -> Result<Value, String> {
+    totp_auth::verify_setup(&code).map(|()| json!({ "ok": true }))
+}
+
+/// 登录验证：校验动态口令，返回 session token。
+#[tauri::command]
+pub fn totp_validate(code: String) -> Result<Value, String> {
+    let token = totp_auth::validate(&code)?;
+    Ok(json!({ "ok": true, "sessionToken": token }))
+}
+
+/// 禁用 TOTP。
+#[tauri::command]
+pub fn totp_disable(code: String) -> Result<Value, String> {
+    totp_auth::disable(&code).map(|()| json!({ "ok": true }))
+}
+
 /// 护栏：**慢 IO / 起子进程**的命令必须 `async`（否则阻塞 Tauri 主线程）。
 ///
 /// ## 判据来自本文件自己的约定

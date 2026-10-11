@@ -10,7 +10,6 @@
 mod api;
 mod gateway_host;
 mod trae_gateway_host;
-mod totp_auth;
 
 use serde_json::json;
 

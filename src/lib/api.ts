@@ -319,15 +319,25 @@ async function httpCall<T>(cmd: string, args?: Record<string, unknown>): Promise
       route.method === "GET"
         ? `${API_BASE}${route.path}${queryString(args)}`
         : `${API_BASE}${route.path}`;
-    res = await fetch(url, {
-      method: route.method,
-      headers: {
-        "Content-Type": "application/json",
-        "X-Session-Token": sessionStorage.getItem("totp_session") || "",
-      },
-      body: route.method === "POST" ? JSON.stringify(args ?? {}) : undefined,
-    });
-  } catch {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10_000);
+    try {
+      res = await fetch(url, {
+        method: route.method,
+        headers: {
+          "Content-Type": "application/json",
+          "X-Session-Token": sessionStorage.getItem("totp_session") || "",
+        },
+        body: route.method === "POST" ? JSON.stringify(args ?? {}) : undefined,
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new Error("请求超时，请检查服务是否正常");
+    }
     throw new Error(t("shared.api.unreachable", { base: API_BASE }));
   }
   const data = await res.json().catch(() => ({}));
@@ -355,7 +365,23 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
     if (!DEMO_READ_COMMANDS.has(cmd)) throw new Error(demoUnavailableMessage());
     return localizeCodedStrings(screenshotDemoResponse(cmd, args)) as T;
   }
-  if (!isWebui()) return localizeCodedStrings(await invoke<T>(cmd, args)) as T;
+  if (!isWebui()) {
+    // Tauri IPC：加超时保护，避免命令挂起无响应
+    const timeoutMs = 15_000;
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("操作超时，请重试")), timeoutMs)
+    );
+    try {
+      const result = await Promise.race([
+        invoke<T>(cmd, args),
+        timeoutPromise,
+      ]);
+      return localizeCodedStrings(result) as T;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`[${cmd}] ${msg}`);
+    }
+  }
   return httpCall<T>(cmd, args);
 }
 

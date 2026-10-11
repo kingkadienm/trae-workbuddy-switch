@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { Loader2, Copy, Check } from "lucide-react";
+import QRCode from "qrcode";
 
 import {
     Dialog,
@@ -23,11 +24,12 @@ interface Props {
 
 type Step = "secret" | "verify";
 
-/** 两步验证首次设置弹框：展示密钥 → 用户录入验证码 → 启用。 */
+/** 两步验证首次设置弹框：展示密钥 + 二维码 → 用户录入验证码 → 启用。 */
 export function TotpSetupDialog({ open, onOpenChange, onSuccess }: Props) {
     const [step, setStep] = useState<Step>("secret");
     const [secret, setSecret] = useState("");
     const [otpauthUri, setOtpauthUri] = useState("");
+    const [qrDataUrl, setQrDataUrl] = useState("");
     const [code, setCode] = useState("");
     const [busy, setBusy] = useState(false);
     const [error, setError] = useState("");
@@ -37,6 +39,7 @@ export function TotpSetupDialog({ open, onOpenChange, onSuccess }: Props) {
         setStep("secret");
         setSecret("");
         setOtpauthUri("");
+        setQrDataUrl("");
         setCode("");
         setError("");
         setBusy(false);
@@ -53,6 +56,12 @@ export function TotpSetupDialog({ open, onOpenChange, onSuccess }: Props) {
                 .then((res) => {
                     setSecret(res.secret);
                     setOtpauthUri(res.otpauthUri || "");
+                    // 生成二维码 data URL
+                    if (res.otpauthUri) {
+                        QRCode.toDataURL(res.otpauthUri, { width: 200, margin: 1 })
+                            .then(setQrDataUrl)
+                            .catch(() => setQrDataUrl(""));
+                    }
                 })
                 .catch((err) => {
                     setError(api.asError(err));
@@ -71,18 +80,25 @@ export function TotpSetupDialog({ open, onOpenChange, onSuccess }: Props) {
 
     function handleVerify(e: React.FormEvent) {
         e.preventDefault();
+        console.log("[TotpSetupDialog] handleVerify called, code length:", code.length, "busy:", busy);
         if (busy || code.length !== 6) return;
         setBusy(true);
         setError("");
+        console.log("[TotpSetupDialog] calling api.totpVerify...");
         api.totpVerify(code)
-            .then(() => {
+            .then((res) => {
+                console.log("[TotpSetupDialog] totpVerify success:", res);
                 onSuccess();
                 onOpenChange(false);
             })
             .catch((err) => {
+                console.log("[TotpSetupDialog] totpVerify error:", err);
                 setError(api.asError(err));
             })
-            .finally(() => setBusy(false));
+            .finally(() => {
+                console.log("[TotpSetupDialog] totpVerify done");
+                setBusy(false);
+            });
     }
 
     return (
@@ -101,6 +117,11 @@ export function TotpSetupDialog({ open, onOpenChange, onSuccess }: Props) {
                     </div>
                 ) : step === "secret" ? (
                     <div className="space-y-4">
+                        {qrDataUrl && (
+                            <div className="flex justify-center">
+                                <img src={qrDataUrl} alt="TOTP QR Code" className="rounded-lg border" />
+                            </div>
+                        )}
                         <Alert>
                             <AlertTitle>密钥</AlertTitle>
                             <AlertDescription className="flex items-center gap-2">

@@ -3,9 +3,11 @@
 //! 路由设计对应 Python 版 server.py 与桌面端 commands.rs。仅绑定 127.0.0.1，
 //! token 不出本机。
 
+use buddy_switch_core::modules::totp_auth;
+
 /// 初始化 TOTP 模块（从磁盘加载配置）。启动时调用一次。
 pub fn init_totp() {
-    crate::totp_auth::init();
+    totp_auth::init();
 }
 
 use std::sync::Mutex;
@@ -96,7 +98,7 @@ async fn totp_middleware(
     }
 
     // TOTP 未启用 → 不拦截
-    if !crate::totp_auth::is_enabled() {
+    if !totp_auth::is_enabled() {
         return Ok(next.run(req).await);
     }
 
@@ -106,7 +108,7 @@ async fn totp_middleware(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    if crate::totp_auth::check_session(token) {
+    if totp_auth::check_session(token) {
         Ok(next.run(req).await)
     } else {
         Err(StatusCode::UNAUTHORIZED)
@@ -2296,8 +2298,8 @@ async fn api_trae_clear_gateway_logs() -> Response {
 /// GET /api/auth/totp/status —— 返回当前 TOTP 是否启用及 session 有效期。
 async fn api_totp_status() -> Response {
     json_ok(json!({
-        "enabled": crate::totp_auth::is_enabled(),
-        "session_duration_minutes": crate::totp_auth::session_duration(),
+        "enabled": totp_auth::is_enabled(),
+        "session_duration_minutes": totp_auth::session_duration(),
     }))
 }
 
@@ -2305,9 +2307,9 @@ async fn api_totp_status() -> Response {
 ///
 /// 返回 base32 密钥 + otpauth URI（前端用于展示二维码）。
 async fn api_totp_setup() -> Response {
-    match crate::totp_auth::setup() {
+    match totp_auth::setup() {
         Ok(secret) => {
-            let otpauth_uri = crate::totp_auth::get_otpauth_uri().unwrap_or_default();
+            let otpauth_uri = totp_auth::get_otpauth_uri().unwrap_or_default();
             json_ok(json!({ "secret": secret, "otpauthUri": otpauth_uri }))
         }
         Err(e) => json_err(e, StatusCode::BAD_REQUEST),
@@ -2320,7 +2322,7 @@ async fn api_totp_verify(Json(body): Json<Value>) -> Response {
     if code.trim().is_empty() {
         return json_err("请输入验证码".to_string(), StatusCode::BAD_REQUEST);
     }
-    match crate::totp_auth::verify_setup(code.trim()) {
+    match totp_auth::verify_setup(code.trim()) {
         Ok(()) => json_ok(json!({ "ok": true })),
         Err(e) => json_err(e, StatusCode::BAD_REQUEST),
     }
@@ -2332,7 +2334,7 @@ async fn api_totp_validate(Json(body): Json<Value>) -> Response {
     if code.trim().is_empty() {
         return json_err("请输入验证码".to_string(), StatusCode::BAD_REQUEST);
     }
-    match crate::totp_auth::validate(code.trim()) {
+    match totp_auth::validate(code.trim()) {
         Ok(token) => json_ok(json!({ "ok": true, "sessionToken": token })),
         Err(e) => json_err(e, StatusCode::UNAUTHORIZED),
     }
@@ -2344,7 +2346,7 @@ async fn api_totp_disable(Json(body): Json<Value>) -> Response {
     if code.trim().is_empty() {
         return json_err("请输入验证码".to_string(), StatusCode::BAD_REQUEST);
     }
-    match crate::totp_auth::disable(code.trim()) {
+    match totp_auth::disable(code.trim()) {
         Ok(()) => json_ok(json!({ "ok": true })),
         Err(e) => json_err(e, StatusCode::BAD_REQUEST),
     }

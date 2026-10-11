@@ -124,6 +124,8 @@ pub fn run() {
             app.manage(gateway::GatewayRuntime::new());
             // Trae 网关运行时句柄（与上面那份**互不相干**：配置 / Key / 日志全独立）。
             app.manage(trae_gateway::TraeGatewayRuntime::new());
+            // TOTP 模块初始化（从磁盘加载配置）。
+            buddy_switch_core::modules::totp_auth::init();
             // README 截图模式只渲染前端虚构数据，禁止读取账号后执行签到、轮换或保活。
             if !is_screenshot_demo() {
                 spawn_background_loops();
@@ -302,6 +304,12 @@ pub fn run() {
             commands::doubao_renew_task_register,
             commands::doubao_renew_task_status,
             commands::doubao_renew_task_unregister,
+            // ---- TOTP 两步验证 ----
+            commands::totp_status,
+            commands::totp_setup,
+            commands::totp_verify,
+            commands::totp_validate,
+            commands::totp_disable,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

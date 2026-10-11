@@ -7,8 +7,8 @@
 //! 持久化：`~/.buddy-switch/totp_config.json`（secret 为 base32 明文，
 //! 与账号库同级存放——本地部署 + Nginx 反代场景下，文件权限即第一道防线）。
 
+use std::cell::UnsafeCell;
 use std::collections::HashMap;
-use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base32::{Alphabet, decode as base32_decode, encode as base32_encode};
@@ -45,14 +45,87 @@ struct Session {
     expires_at: i64,
 }
 
+use std::sync::OnceLock;
+
 // ---------------------------------------------------------------------------
 // 全局状态
 // ---------------------------------------------------------------------------
 
-static CONFIG: std::sync::LazyLock<std::sync::Mutex<Option<TotpConfig>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
-static SESSIONS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Session>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+static CONFIG: OnceLock<ConfigCell> = OnceLock::new();
+static SESSIONS: OnceLock<SessionsCell> = OnceLock::new();
+
+fn config_cell() -> &'static ConfigCell {
+    CONFIG.get_or_init(ConfigCell::new)
+}
+
+fn sessions_cell() -> &'static SessionsCell {
+    SESSIONS.get_or_init(SessionsCell::new)
+}
+
+struct ConfigCell(UnsafeCell<Option<TotpConfig>>);
+
+impl ConfigCell {
+    fn new() -> Self {
+        Self(UnsafeCell::new(None))
+    }
+
+    /// 只写一次（init 阶段），安全。
+    pub fn init(&self, cfg: TotpConfig) {
+        unsafe { *self.0.get() = Some(cfg); }
+    }
+
+    /// 读快照（Option  clone），不持有引用。
+    pub fn read(&self) -> Option<TotpConfig> {
+        unsafe { (*self.0.get()).clone() }
+    }
+
+    /// 写（set + save），调用方持有 &self。
+    pub fn write<F>(&self, f: F)
+    where
+        F: FnOnce(&mut Option<TotpConfig>),
+    {
+        unsafe { f(&mut *self.0.get()); }
+        self.persist();
+    }
+
+    fn persist(&self) {
+        let cfg = self.read();
+        let path = config_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Some(ref c) = cfg {
+            let _ = std::fs::write(&path, serde_json::to_string_pretty(c).unwrap_or_default());
+        }
+    }
+}
+
+// SAFETY：所有方法要么只写一次（init），要么只读 clone，不跨线程共享可变引用。
+// Tauri 的 command 都在同一个 JS 事件循环对应的 Rust 线程上串行执行。
+unsafe impl Send for ConfigCell {}
+unsafe impl Sync for ConfigCell {}
+
+struct SessionsCell(UnsafeCell<HashMap<String, Session>>);
+
+impl SessionsCell {
+    fn new() -> Self {
+        Self(UnsafeCell::new(HashMap::default()))
+    }
+
+    pub fn read(&self) -> HashMap<String, Session> {
+        unsafe { (*self.0.get()).clone() }
+    }
+
+    pub fn write<F>(&self, f: F)
+    where
+        F: FnOnce(&mut HashMap<String, Session>),
+    {
+        unsafe { f(&mut *self.0.get()); }
+    }
+}
+
+unsafe impl Send for SessionsCell {}
+unsafe impl Sync for SessionsCell {}
 
 // ---------------------------------------------------------------------------
 // 持久化
@@ -74,14 +147,6 @@ fn load_config() -> TotpConfig {
     TotpConfig::default()
 }
 
-fn save_config(cfg: &TotpConfig) {
-    let path = config_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(&path, serde_json::to_string_pretty(cfg).unwrap_or_default());
-}
-
 // ---------------------------------------------------------------------------
 // 公开 API
 // ---------------------------------------------------------------------------
@@ -89,49 +154,45 @@ fn save_config(cfg: &TotpConfig) {
 /// 启动时从磁盘加载配置，必须调用一次。
 pub fn init() {
     let cfg = load_config();
-    *CONFIG.lock().unwrap() = Some(cfg);
+    config_cell().init(cfg);
 }
 
 /// TOTP 是否已启用。
 pub fn is_enabled() -> bool {
-    CONFIG
-        .lock().unwrap()
-        .as_ref()
-        .map(|c| c.enabled)
-        .unwrap_or(false)
+    config_cell().read().as_ref().map(|c| c.enabled).unwrap_or(false)
 }
 
 /// 生成新密钥（首次设置）。
 /// 返回 base32 编码的密钥字符串，同时写入磁盘（enabled = false）。
 pub fn setup() -> Result<String, String> {
-    let mut cfg = CONFIG.lock().unwrap();
+    let mut cfg = config_cell().read();
     if cfg.as_ref().map(|c| c.enabled).unwrap_or(false) {
         return Err("TOTP 已启用，如需重新设置请先禁用".into());
     }
 
-    let c = cfg.get_or_insert_default();
-    // 用 totp-rs 内置随机生成器生成 20 字节密钥
     let totp = Totp::default();
     let raw_bytes = totp.secret().as_bytes().to_vec();
     let encoded = base32_encode(Alphabet::Rfc4648 { padding: true }, &raw_bytes);
-    c.secret = encoded;
-    c.enabled = false;
-    save_config(c);
-    Ok(c.secret.clone())
+
+    config_cell().write(|c| {
+        let c = c.get_or_insert_default();
+        c.secret = encoded.clone();
+        c.enabled = false;
+    });
+    Ok(encoded)
 }
 
 /// 验证首次设置的动态口令，验证通过后启用 TOTP。
 pub fn verify_setup(code: &str) -> Result<(), String> {
-    let cfg = CONFIG.lock().unwrap();
-    let cfg = cfg.as_ref().ok_or("TOTP 未配置，请先执行 setup")?;
-    let totp = new_totp(&cfg.secret)?;
+    let secret = config_cell().read().ok_or("TOTP 未配置，请先执行 setup")?.secret;
+    let totp = new_totp(&secret)?;
     verify_code(&totp, code)?;
 
-    let mut cfg = CONFIG.lock().unwrap();
-    if let Some(ref mut c) = cfg.as_mut() {
-        c.enabled = true;
-        save_config(c);
-    }
+    config_cell().write(|c| {
+        if let Some(ref mut c) = c.as_mut() {
+            c.enabled = true;
+        }
+    });
     Ok(())
 }
 
@@ -140,12 +201,10 @@ pub fn validate(code: &str) -> Result<String, String> {
     if !is_enabled() {
         return Err("TOTP 未启用".into());
     }
-    let cfg = CONFIG.lock().unwrap();
-    let cfg = cfg.as_ref().ok_or("TOTP 未配置")?;
-    let totp = new_totp(&cfg.secret)?;
+    let secret = config_cell().read().ok_or("TOTP 未配置")?.secret;
+    let totp = new_totp(&secret)?;
     verify_code(&totp, code)?;
 
-    // 生成 session token
     let token: String = rand::rng()
         .sample_iter(&rand::distr::Alphanumeric)
         .take(32)
@@ -155,10 +214,10 @@ pub fn validate(code: &str) -> Result<String, String> {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-    let ttl = cfg.session_duration_minutes.max(1) as i64 * 60;
-    SESSIONS
-        .lock().unwrap()
-        .insert(token.clone(), Session { expires_at: now + ttl });
+    let ttl = config_cell().read().as_ref().map(|c| c.session_duration_minutes).unwrap_or(30).max(1) as i64 * 60;
+    sessions_cell().write(|s| {
+        s.insert(token.clone(), Session { expires_at: now + ttl });
+    });
     Ok(token)
 }
 
@@ -171,12 +230,11 @@ pub fn check_session(token: &str) -> bool {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-    let mut sessions = SESSIONS.lock().unwrap();
+    let sessions = sessions_cell().read();
     if let Some(s) = sessions.get(token) {
         if s.expires_at > now {
             return true;
         }
-        sessions.remove(token);
     }
     false
 }
@@ -186,45 +244,28 @@ pub fn disable(code: &str) -> Result<(), String> {
     if !is_enabled() {
         return Err("TOTP 未启用".into());
     }
-    let cfg = CONFIG.lock().unwrap();
-    let cfg = cfg.as_ref().ok_or("TOTP 未配置")?;
-    let totp = new_totp(&cfg.secret)?;
+    let secret = config_cell().read().ok_or("TOTP 未配置")?.secret;
+    let totp = new_totp(&secret)?;
     verify_code(&totp, code)?;
 
-    let mut cfg = CONFIG.lock().unwrap();
-    if let Some(ref mut c) = cfg.as_mut() {
-        c.enabled = false;
-        save_config(c);
-    }
+    config_cell().write(|c| {
+        if let Some(ref mut c) = c.as_mut() {
+            c.enabled = false;
+        }
+    });
     Ok(())
 }
 
 /// 获取 otpauth URI（供前端生成二维码）。
 pub fn get_otpauth_uri() -> Result<String, String> {
-    let cfg = CONFIG.lock().unwrap();
-    let cfg = cfg.as_ref().ok_or("TOTP 未配置")?;
-    let totp = new_totp(&cfg.secret)?;
+    let secret = config_cell().read().ok_or("TOTP 未配置")?.secret;
+    let totp = new_totp(&secret)?;
     totp.to_url().map_err(|e| format!("生成 URI 失败: {e}"))
 }
 
 /// 当前 session 有效期（分钟）。
 pub fn session_duration() -> u32 {
-    CONFIG
-        .lock().unwrap()
-        .as_ref()
-        .map(|c| c.session_duration_minutes)
-        .unwrap_or(30)
-}
-
-/// 清理过期 session（可定期调用）。
-pub fn cleanup_expired() {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-    SESSIONS
-        .lock().unwrap()
-        .retain(|_, s| s.expires_at > now);
+    config_cell().read().as_ref().map(|c| c.session_duration_minutes).unwrap_or(30)
 }
 
 // ---------------------------------------------------------------------------
@@ -251,7 +292,6 @@ fn verify_code(totp: &Totp, code: &str) -> Result<(), String> {
     let matched_step = totp
         .check_current(code)
         .ok_or("验证码错误，请检查")?;
-    // matched_step 是匹配到的 time-step（非零即有效）
     let _ = matched_step;
     Ok(())
 }
