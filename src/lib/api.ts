@@ -291,6 +291,12 @@ const ROUTES: Record<string, Route> = {
   trae_launch_client: { method: "POST", path: "/api/trae/launch-client" },
   get_trae_gateway_logs: { method: "GET", path: "/api/trae/gateway/logs" },
   clear_trae_gateway_logs: { method: "POST", path: "/api/trae/gateway/logs/clear" },
+  // ---- TOTP 两步验证 ----
+  totp_status: { method: "GET", path: "/api/auth/totp/status" },
+  totp_setup: { method: "POST", path: "/api/auth/totp/setup" },
+  totp_verify: { method: "POST", path: "/api/auth/totp/verify" },
+  totp_validate: { method: "POST", path: "/api/auth/totp/validate" },
+  totp_disable: { method: "POST", path: "/api/auth/totp/disable" },
 };
 
 function queryString(args?: Record<string, unknown>): string {
@@ -315,7 +321,10 @@ async function httpCall<T>(cmd: string, args?: Record<string, unknown>): Promise
         : `${API_BASE}${route.path}`;
     res = await fetch(url, {
       method: route.method,
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "X-Session-Token": sessionStorage.getItem("totp_session") || "",
+      },
       body: route.method === "POST" ? JSON.stringify(args ?? {}) : undefined,
     });
   } catch {
@@ -323,11 +332,19 @@ async function httpCall<T>(cmd: string, args?: Record<string, unknown>): Promise
   }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
+    if (res.status === 401) {
+      sessionStorage.removeItem("totp_session");
+      unauthorizedHandler?.();
+    }
     throw new Error(data.message || data.error || t("shared.api.requestFailed", { status: res.status }));
   }
-  // 数据带上来的错误（`error` / `warning` 这类字段）在**这里**统一本地化，
-  // 而不是靠每个渲染点自己记得剥结构尾 —— 见 `error-code.ts` 的说明。
   return localizeCodedStrings(data) as T;
+}
+
+let unauthorizedHandler: (() => void) | null = null;
+
+export function setUnauthorizedHandler(handler: () => void) {
+  unauthorizedHandler = handler;
 }
 
 async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -1712,6 +1729,35 @@ export function getTraeGatewayLogs(): Promise<unknown> {
 /** 清空网关请求日志。 */
 export function clearTraeGatewayLogs(): Promise<{ ok: boolean }> {
   return call("clear_trae_gateway_logs");
+}
+
+// ---------------------------------------------------------------------------
+// TOTP 两步验证
+// ---------------------------------------------------------------------------
+
+/** 检查 TOTP 是否启用。 */
+export function totpStatus(): Promise<{ enabled: boolean; sessionDurationMinutes: number }> {
+  return call("totp_status");
+}
+
+/** 生成新密钥（首次设置）。返回 base32 密钥 + otpauth URI。 */
+export function totpSetup(): Promise<{ secret: string; otpauthUri: string }> {
+  return call("totp_setup");
+}
+
+/** 验证首次设置的动态口令（setup 流程第二步）。 */
+export function totpVerify(code: string): Promise<{ ok: boolean }> {
+  return call("totp_verify", { code });
+}
+
+/** 登录验证：校验动态口令，成功返回 sessionToken。 */
+export function totpValidate(code: string): Promise<{ ok: boolean; sessionToken: string }> {
+  return call("totp_validate", { code });
+}
+
+/** 禁用 TOTP（需提供有效验证码）。 */
+export function totpDisable(code: string): Promise<{ ok: boolean }> {
+  return call("totp_disable", { code });
 }
 
 export type { TraeGatewayLogEntry, TraeGatewayStatus };

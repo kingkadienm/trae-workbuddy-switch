@@ -10,6 +10,7 @@
 mod api;
 mod gateway_host;
 mod trae_gateway_host;
+mod totp_auth;
 
 use serde_json::json;
 
@@ -237,6 +238,7 @@ async fn serve(args: &[String]) {
     }
 
     let app = api::router();
+    api::init_totp();
     let addr = format!("127.0.0.1:{port}");
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(l) => l,

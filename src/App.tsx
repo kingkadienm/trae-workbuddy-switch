@@ -1,6 +1,6 @@
 import { Suspense, lazy, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import { BrowserRouter, HashRouter, Navigate, NavLink, Outlet, Route, Routes, useLocation, useNavigate } from "react-router-dom";
-import { ArrowUp, Bot, MessagesSquare, Server, Settings, Sparkles, User } from "lucide-react";
+import { ArrowUp, Bot, Loader2, MessagesSquare, Server, Settings, Sparkles, User } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
@@ -15,6 +15,8 @@ import { Button } from "@/components/ui/button";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Toaster } from "@/components/ui/sonner";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { TotpLoginDialog } from "@/components/totp-login-dialog";
+import { TotpSetupDialog } from "@/components/totp-setup-dialog";
 import { demoModeEnabled, pagesDemoHostingEnabled } from "@/lib/demo-mode";
 import { useT } from "@/lib/i18n";
 import type { TranslationKey } from "@/locales/zh";
@@ -387,6 +389,86 @@ function Layout() {
   const location = useLocation();
   const navigate = useNavigate();
 
+  // ---- TOTP 两步验证状态 ----
+  const [totpEnabled, setTotpEnabled] = useState(false);
+  const [authenticated, setAuthenticated] = useState(false);
+  const [showLogin, setShowLogin] = useState(false);
+  const [showSetup, setShowSetup] = useState(false);
+  const [checkingAuth, setCheckingAuth] = useState(true);
+
+  // 初始化：检查 TOTP 状态 + session 有效性
+  useEffect(() => {
+    api.setUnauthorizedHandler(() => {
+      setAuthenticated(false);
+      sessionStorage.removeItem("totp_session");
+      setShowLogin(true);
+    });
+
+    api
+      .totpStatus()
+      .then((status) => {
+        setTotpEnabled(status.enabled);
+        if (status.enabled) {
+          const session = sessionStorage.getItem("totp_session");
+          if (session) {
+            // 有 session token，乐观标记为已认证；首个 API 调用会验证 token 有效性
+            setAuthenticated(true);
+          } else {
+            setShowLogin(true);
+          }
+        } else {
+          // TOTP 未启用，直接放行
+          setAuthenticated(true);
+        }
+      })
+      .catch(() => {
+        // 获取状态失败（如 TOTP 服务未启动），降级为无 TOTP
+        setTotpEnabled(false);
+        setAuthenticated(true);
+      })
+      .finally(() => setCheckingAuth(false));
+  }, []);
+
+  function handleLoginSuccess() {
+    setAuthenticated(true);
+    setShowLogin(false);
+  }
+
+  function handleSetupSuccess() {
+    setTotpEnabled(true);
+    setShowLogin(true);
+  }
+
+  // 认证中：显示加载态
+  if (checkingAuth) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-background">
+        <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
+
+  // TOTP 已启用但未认证：显示登录框
+  if (totpEnabled && !authenticated) {
+    return (
+      <>
+        <TotpLoginDialog open={showLogin} onOpenChange={setShowLogin} onSuccess={handleLoginSuccess} />
+        <TotpSetupDialog open={showSetup} onOpenChange={setShowSetup} onSuccess={handleSetupSuccess} />
+      </>
+    );
+  }
+
+  // TOTP 未启用且未认证：显示首次设置引导
+  if (!totpEnabled && !authenticated) {
+    return (
+      <>
+        <TotpSetupDialog open={showSetup || !checkingAuth} onOpenChange={setShowSetup} onSuccess={handleSetupSuccess} />
+      </>
+    );
+  }
+
+  // ---- 以下为原有的 Layout 组件内容 ----
+
   /** 每个产品各自记住上次停留的页面，来回切换不会丢上下文。 */
   const lastPathRef = useRef<Record<Product, string>>({ ...PRODUCT_HOME });
 
@@ -508,6 +590,9 @@ function Layout() {
           <Outlet />
         </Suspense>
       </main>
+      {/* TOTP 弹框（登录 / 首次设置）挂载在 Layout 层，确保始终可访问 */}
+      <TotpLoginDialog open={showLogin} onOpenChange={setShowLogin} onSuccess={handleLoginSuccess} />
+      <TotpSetupDialog open={showSetup} onOpenChange={setShowSetup} onSuccess={handleSetupSuccess} />
     </div>
   );
 }
