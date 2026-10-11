@@ -439,14 +439,8 @@ function Layout() {
     setShowLogin(true);
   }
 
-  // 认证中：显示加载态
-  if (checkingAuth) {
-    return (
-      <div className="flex h-screen items-center justify-center bg-background">
-        <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
-      </div>
-    );
-  }
+  // 认证中：在 Layout 内显示加载态（不提前 return，保持 hooks 顺序稳定）
+  const showLoadingOverlay = checkingAuth;
 
   // ---- 以下为原有的 Layout 组件内容 ----
 
@@ -496,6 +490,11 @@ function Layout() {
 
   return (
     <div className="flex h-screen min-h-0 overflow-hidden bg-background">
+      {showLoadingOverlay && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-background/80">
+          <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+        </div>
+      )}
       {hasUnifiedTitleBar ? (
         <div
           data-tauri-drag-region
