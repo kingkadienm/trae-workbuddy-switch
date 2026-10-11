@@ -417,8 +417,8 @@ function Layout() {
             setShowLogin(true);
           }
         } else {
-          // TOTP 未启用，直接放行
-          setAuthenticated(true);
+          // TOTP 未启用，显示首次设置引导
+          setShowSetup(true);
         }
       })
       .catch(() => {
@@ -570,16 +570,14 @@ function Layout() {
           <Outlet />
         </Suspense>
       </main>
-      {/* TOTP 弹框（登录 / 首次设置）挂载在 Layout 层，始终渲染以保持 hooks 顺序稳定 */}
-      {/* 可见性由 open 状态控制：未认证时显示登录框；未启用时显示设置引导 */}
+      {/* TOTP 弹框始终挂载，由状态控制可见性，保持 hooks 顺序稳定 */}
+      {/* 未认证且加载完成：TOTP 未启用时显示首次设置，已启用时显示登录 */}
       {!authenticated && !checkingAuth && (
-        <>
-          {totpEnabled ? (
-            <TotpLoginDialog open={showLogin} onOpenChange={setShowLogin} onSuccess={handleLoginSuccess} />
-          ) : (
-            <TotpSetupDialog open={showSetup || true} onOpenChange={setShowSetup} onSuccess={handleSetupSuccess} />
-          )}
-        </>
+        totpEnabled ? (
+          <TotpLoginDialog open={showLogin} onOpenChange={setShowLogin} onSuccess={handleLoginSuccess} />
+        ) : (
+          <TotpSetupDialog open={showSetup || true} onOpenChange={setShowSetup} onSuccess={handleSetupSuccess} />
+        )
       )}
     </div>
   );
