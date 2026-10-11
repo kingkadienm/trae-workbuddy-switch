@@ -448,25 +448,6 @@ function Layout() {
     );
   }
 
-  // TOTP 已启用但未认证：显示登录框
-  if (totpEnabled && !authenticated) {
-    return (
-      <>
-        <TotpLoginDialog open={showLogin} onOpenChange={setShowLogin} onSuccess={handleLoginSuccess} />
-        <TotpSetupDialog open={showSetup} onOpenChange={setShowSetup} onSuccess={handleSetupSuccess} />
-      </>
-    );
-  }
-
-  // TOTP 未启用且未认证：显示首次设置引导
-  if (!totpEnabled && !authenticated) {
-    return (
-      <>
-        <TotpSetupDialog open={showSetup || !checkingAuth} onOpenChange={setShowSetup} onSuccess={handleSetupSuccess} />
-      </>
-    );
-  }
-
   // ---- 以下为原有的 Layout 组件内容 ----
 
   /** 每个产品各自记住上次停留的页面，来回切换不会丢上下文。 */
@@ -590,9 +571,17 @@ function Layout() {
           <Outlet />
         </Suspense>
       </main>
-      {/* TOTP 弹框（登录 / 首次设置）挂载在 Layout 层，确保始终可访问 */}
-      <TotpLoginDialog open={showLogin} onOpenChange={setShowLogin} onSuccess={handleLoginSuccess} />
-      <TotpSetupDialog open={showSetup} onOpenChange={setShowSetup} onSuccess={handleSetupSuccess} />
+      {/* TOTP 弹框（登录 / 首次设置）挂载在 Layout 层，始终渲染以保持 hooks 顺序稳定 */}
+      {/* 可见性由 open 状态控制：未认证时显示登录框；未启用时显示设置引导 */}
+      {!authenticated && !checkingAuth && (
+        <>
+          {totpEnabled ? (
+            <TotpLoginDialog open={showLogin} onOpenChange={setShowLogin} onSuccess={handleLoginSuccess} />
+          ) : (
+            <TotpSetupDialog open={showSetup || true} onOpenChange={setShowSetup} onSuccess={handleSetupSuccess} />
+          )}
+        </>
+      )}
     </div>
   );
 }
