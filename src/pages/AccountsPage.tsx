@@ -1010,7 +1010,7 @@ function RegionPanel({ region }: { region: Region }) {
                   </Button>
                 </DemoAction>
                 <DemoAction>
-                  <Button className="h-10 px-4" onClick={onImport} disabled={importing} variant="outline">
+                  <Button className="h-10 px-4" onClick={onImport} disabled={importing || api.isWebui()} variant="outline">
                     {importing ? <Loader2 className="animate-spin" /> : <Download />}{t("wbAccounts.page.importLocal")}
                   </Button>
                 </DemoAction>
@@ -1027,6 +1027,7 @@ function RegionPanel({ region }: { region: Region }) {
                     size="sm"
                     className="h-9 px-2.5"
                     onClick={() => setPanelAuthsOpen(true)}
+                    disabled={api.isWebui()}
                     title={t("wbAccounts.page.importPanelAuthsDesc")}
                   >
                     <FolderOpen />{t("wbAccounts.page.importPanelAuths")}
