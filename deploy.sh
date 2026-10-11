@@ -1,7 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-APP_DIR="/root/trae-workbuddy-switch"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+APP_DIR="$SCRIPT_DIR"
 BIN="$APP_DIR/target/release/buddy-switch"
 PORT=57890
 LOG="$APP_DIR/buddy-switch.log"
