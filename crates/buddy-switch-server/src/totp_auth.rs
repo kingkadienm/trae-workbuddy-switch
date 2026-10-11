@@ -12,7 +12,6 @@ use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base32::{Alphabet, decode as base32_decode, encode as base32_encode};
-use rand::Rng;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use totp_rs::{Algorithm, Builder, Secret, Totp};
@@ -50,10 +49,10 @@ struct Session {
 // 全局状态
 // ---------------------------------------------------------------------------
 
-static CONFIG: LazyLock<tokio::sync::Mutex<Option<TotpConfig>>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(None));
-static SESSIONS: LazyLock<tokio::sync::Mutex<HashMap<String, Session>>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
+static CONFIG: std::sync::LazyLock<std::sync::Mutex<Option<TotpConfig>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+static SESSIONS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Session>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 // ---------------------------------------------------------------------------
 // 持久化
@@ -90,13 +89,13 @@ fn save_config(cfg: &TotpConfig) {
 /// 启动时从磁盘加载配置，必须调用一次。
 pub fn init() {
     let cfg = load_config();
-    *CONFIG.blocking_lock() = Some(cfg);
+    *CONFIG.lock().unwrap() = Some(cfg);
 }
 
 /// TOTP 是否已启用。
 pub fn is_enabled() -> bool {
     CONFIG
-        .blocking_lock()
+        .lock().unwrap()
         .as_ref()
         .map(|c| c.enabled)
         .unwrap_or(false)
@@ -105,7 +104,7 @@ pub fn is_enabled() -> bool {
 /// 生成新密钥（首次设置）。
 /// 返回 base32 编码的密钥字符串，同时写入磁盘（enabled = false）。
 pub fn setup() -> Result<String, String> {
-    let mut cfg = CONFIG.blocking_lock();
+    let mut cfg = CONFIG.lock().unwrap();
     if cfg.as_ref().map(|c| c.enabled).unwrap_or(false) {
         return Err("TOTP 已启用，如需重新设置请先禁用".into());
     }
@@ -123,13 +122,12 @@ pub fn setup() -> Result<String, String> {
 
 /// 验证首次设置的动态口令，验证通过后启用 TOTP。
 pub fn verify_setup(code: &str) -> Result<(), String> {
-    let cfg = CONFIG.blocking_lock();
+    let cfg = CONFIG.lock().unwrap();
     let cfg = cfg.as_ref().ok_or("TOTP 未配置，请先执行 setup")?;
     let totp = new_totp(&cfg.secret)?;
     verify_code(&totp, code)?;
-    drop(cfg);
 
-    let mut cfg = CONFIG.blocking_lock();
+    let mut cfg = CONFIG.lock().unwrap();
     if let Some(ref mut c) = cfg.as_mut() {
         c.enabled = true;
         save_config(c);
@@ -142,7 +140,7 @@ pub fn validate(code: &str) -> Result<String, String> {
     if !is_enabled() {
         return Err("TOTP 未启用".into());
     }
-    let cfg = CONFIG.blocking_lock();
+    let cfg = CONFIG.lock().unwrap();
     let cfg = cfg.as_ref().ok_or("TOTP 未配置")?;
     let totp = new_totp(&cfg.secret)?;
     verify_code(&totp, code)?;
@@ -159,7 +157,7 @@ pub fn validate(code: &str) -> Result<String, String> {
         .as_secs() as i64;
     let ttl = cfg.session_duration_minutes.max(1) as i64 * 60;
     SESSIONS
-        .blocking_lock()
+        .lock().unwrap()
         .insert(token.clone(), Session { expires_at: now + ttl });
     Ok(token)
 }
@@ -173,7 +171,7 @@ pub fn check_session(token: &str) -> bool {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-    let mut sessions = SESSIONS.blocking_lock();
+    let mut sessions = SESSIONS.lock().unwrap();
     if let Some(s) = sessions.get(token) {
         if s.expires_at > now {
             return true;
@@ -188,13 +186,12 @@ pub fn disable(code: &str) -> Result<(), String> {
     if !is_enabled() {
         return Err("TOTP 未启用".into());
     }
-    let cfg = CONFIG.blocking_lock();
+    let cfg = CONFIG.lock().unwrap();
     let cfg = cfg.as_ref().ok_or("TOTP 未配置")?;
     let totp = new_totp(&cfg.secret)?;
     verify_code(&totp, code)?;
-    drop(cfg);
 
-    let mut cfg = CONFIG.blocking_lock();
+    let mut cfg = CONFIG.lock().unwrap();
     if let Some(ref mut c) = cfg.as_mut() {
         c.enabled = false;
         save_config(c);
@@ -204,7 +201,7 @@ pub fn disable(code: &str) -> Result<(), String> {
 
 /// 获取 otpauth URI（供前端生成二维码）。
 pub fn get_otpauth_uri() -> Result<String, String> {
-    let cfg = CONFIG.blocking_lock();
+    let cfg = CONFIG.lock().unwrap();
     let cfg = cfg.as_ref().ok_or("TOTP 未配置")?;
     let totp = new_totp(&cfg.secret)?;
     totp.to_url().map_err(|e| format!("生成 URI 失败: {e}"))
@@ -213,7 +210,7 @@ pub fn get_otpauth_uri() -> Result<String, String> {
 /// 当前 session 有效期（分钟）。
 pub fn session_duration() -> u32 {
     CONFIG
-        .blocking_lock()
+        .lock().unwrap()
         .as_ref()
         .map(|c| c.session_duration_minutes)
         .unwrap_or(30)
@@ -226,7 +223,7 @@ pub fn cleanup_expired() {
         .unwrap()
         .as_secs() as i64;
     SESSIONS
-        .blocking_lock()
+        .lock().unwrap()
         .retain(|_, s| s.expires_at > now);
 }
 
