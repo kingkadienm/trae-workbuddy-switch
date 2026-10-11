@@ -92,9 +92,9 @@ import type {
 /**
  * 双通道适配层：
  * - 桌面 App（Tauri）：`invoke` 调用 Rust commands
- * - webui（浏览器）：HTTP fetch 调用本地 buddy-switch 服务（127.0.0.1）
+ * - webui（浏览器）：HTTP fetch 走同源（Nginx 反代），API_BASE 为相对路径
  */
-const API_BASE = "http://127.0.0.1:57890";
+const API_BASE = "/";
 
 const DEMO_READ_COMMANDS = new Set([
   "get_status", "get_accounts", "get_codebuddy_cli_status", "get_codebuddy_cn_ide_status", "get_checkin_status",
