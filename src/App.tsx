@@ -481,7 +481,7 @@ function Layout() {
   }
 
   return (
-    <div className="flex h-screen min-h-0 overflow-hidden bg-background">
+    <div className="relative flex h-screen min-h-0 overflow-hidden bg-background">
       {showLoadingOverlay && (
         <div className="absolute inset-0 z-50 flex items-center justify-center bg-background/80">
           <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
@@ -562,12 +562,14 @@ function Layout() {
           <Outlet />
         </Suspense>
       </main>
-      {/* TOTP 认证全屏页面：不可关闭，必须完成验证才能进入应用 */}
+      {/* TOTP 认证全屏页面：绝对定位覆盖整个布局，不可关闭 */}
       {!authenticated && !checkingAuth && (
-        <TotpAuthPage
-          mode={totpEnabled ? "login" : "setup"}
-          onSuccess={totpEnabled ? handleLoginSuccess : handleSetupSuccess}
-        />
+        <div className="absolute inset-0 z-50">
+          <TotpAuthPage
+            mode={totpEnabled ? "login" : "setup"}
+            onSuccess={totpEnabled ? handleLoginSuccess : handleSetupSuccess}
+          />
+        </div>
       )}
     </div>
   );
