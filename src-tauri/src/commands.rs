@@ -944,6 +944,13 @@ pub async fn growth_run_queue(
         .await
 }
 
+/// POST /api/growth/tasks/run —— 启动成长任务队列（CN 全账号，默认并发 1）。
+#[tauri::command]
+pub async fn growth_tasks_run(concurrency: Option<u32>) -> Value {
+    buddy_switch_core::modules::growth::queue::start_growth_queue(Region::Cn, concurrency.unwrap_or(1))
+        .await
+}
+
 /// GET /api/growth/queue/status —— 队列状态快照（前端 3s 轮询）。
 #[tauri::command]
 pub async fn growth_queue_status() -> Value {

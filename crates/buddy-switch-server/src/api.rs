@@ -85,6 +85,8 @@ fn api_routes() -> Router {
         .route("/api/codebuddy-cn-ide/detect", post(api_codebuddy_cn_ide_detect))
         .route("/api/delete", post(api_delete))
         .route("/api/account/remark", post(api_set_account_remark))
+        .route("/api/account/deactivate", post(api_deactivate_account))
+        .route("/api/account/reactivate", post(api_reactivate_account))
         .route(
             "/api/switch/config",
             get(api_switch_config).post(api_save_switch_config),
@@ -132,9 +134,12 @@ fn api_routes() -> Router {
         .route("/api/schedule/run", post(api_run_schedule_task))
         // —— 成长任务中心（与 Tauri 的 9 个 growth 命令同契约；CN 专有，Global 返回结构化提示）——
         .route("/api/growth/tasks", get(api_growth_tasks_list))
+        .route("/api/growth/tasks/list", get(api_growth_tasks_list))
+        .route("/api/growth/tasks/run", post(api_growth_tasks_run))
         .route("/api/growth/tasks/accept", post(api_growth_tasks_accept))
         .route("/api/growth/tasks/accept-all", post(api_growth_accept_all))
         .route("/api/growth/tasks/claim", post(api_growth_task_claim))
+        .route("/api/growth/tasks/run", post(api_growth_tasks_run))
         .route("/api/growth/auto-task", post(api_growth_auto_task))
         .route("/api/growth/auto-all", post(api_growth_auto_all))
         .route("/api/growth/scan-all", get(api_growth_tasks_scan_all))
@@ -1125,6 +1130,34 @@ async fn api_run_schedule_task(Json(body): Json<Value>) -> Response {
 }
 
 // ---------------------------------------------------------------------------
+// 账号停用 / 启用
+// ---------------------------------------------------------------------------
+
+async fn api_deactivate_account(Json(body): Json<Value>) -> Response {
+    let account_id = body.get("accountId").and_then(Value::as_str).unwrap_or("");
+    if account_id.is_empty() {
+        return json_err("缺少 accountId".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let region = parse_region(body.get("region").and_then(Value::as_str));
+    match account::deactivate_account_for(region, account_id) {
+        Ok(v) => json_ok(v),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_reactivate_account(Json(body): Json<Value>) -> Response {
+    let account_id = body.get("accountId").and_then(Value::as_str).unwrap_or("");
+    if account_id.is_empty() {
+        return json_err("缺少 accountId".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let region = parse_region(body.get("region").and_then(Value::as_str));
+    match account::reactivate_account_for(region, account_id) {
+        Ok(v) => json_ok(v),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 成长任务中心（panel 移植；CN 专有，Global 返回结构化提示）
 // ---------------------------------------------------------------------------
 
@@ -1230,6 +1263,11 @@ async fn api_growth_run_queue(Json(body): Json<Value>) -> Response {
 
 async fn api_growth_queue_status() -> Response {
     json_ok(queue::queue_status().await)
+}
+
+async fn api_growth_tasks_run(Json(body): Json<Value>) -> Response {
+    let conc = body.get("concurrency").and_then(Value::as_u64).unwrap_or(1) as u32;
+    json_ok(queue::start_growth_queue(Region::Cn, conc).await)
 }
 
 // ---------------------------------------------------------------------------

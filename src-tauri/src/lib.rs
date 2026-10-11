@@ -205,6 +205,7 @@ pub fn run() {
             commands::growth_auto_task,
             commands::growth_auto_all,
             commands::growth_tasks_scan_all,
+            commands::growth_tasks_run,
             commands::growth_run_queue,
             commands::growth_queue_status,
             commands::refresh_account_token,
