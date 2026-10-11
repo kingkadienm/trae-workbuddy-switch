@@ -139,7 +139,6 @@ fn api_routes() -> Router {
         .route("/api/growth/tasks/accept", post(api_growth_tasks_accept))
         .route("/api/growth/tasks/accept-all", post(api_growth_accept_all))
         .route("/api/growth/tasks/claim", post(api_growth_task_claim))
-        .route("/api/growth/tasks/run", post(api_growth_tasks_run))
         .route("/api/growth/auto-task", post(api_growth_auto_task))
         .route("/api/growth/auto-all", post(api_growth_auto_all))
         .route("/api/growth/scan-all", get(api_growth_tasks_scan_all))
