@@ -808,6 +808,12 @@ pub async fn run_schedule_task(task: String) -> Result<Value, String> {
     Ok(crate::modules::scheduler::run_scheduled_task(task).await)
 }
 
+/// POST /api/activity/run —— 立即触发活动任务（活跃地图 / 连登 / 抽奖）。
+#[tauri::command]
+pub async fn api_activity_run() -> Result<Value, String> {
+    Ok(crate::modules::scheduler::run_scheduled_task(crate::modules::schedule::ScheduleTask::Activity).await)
+}
+
 // ---------------------------------------------------------------------------
 // 成长任务中心（panel 移植：任务列表 / 接受 / 领奖 / 一键完成 / 全账号队列）
 // ---------------------------------------------------------------------------

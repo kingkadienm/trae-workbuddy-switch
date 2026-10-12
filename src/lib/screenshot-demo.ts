@@ -1377,12 +1377,11 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "get_account_strategy": return demoStrategyMap();
     case "get_gateway_logs": return { logs: demoGatewayLogs() };
     // ---- 成长任务（只读；写操作不进这里，由 DemoAction 统一拦截）----
-    case "growth_tasks": return { tasks: demoGrowthTasks() };
     case "growth_tasks_list": return { tasks: demoGrowthTasks() };
     case "growth_tasks_scan_all": return demoTasksScanAll();
     case "growth_queue_status": return demoQueueStatus();
     // ---- 豆包模块（只读；写操作不进这里，由 DemoAction 统一拦截）----
-    case "doubao_accounts": return demoDoubaoAccounts();
+    case "doubao_accounts_list": return demoDoubaoAccounts();
     case "doubao_detect_uid": return { uid: "demo-doubao-user" };
     // ---- Trae 分区（只读；写操作不进这里，由 DemoAction 统一拦截）----
     case "get_trae_env": return demoTraeEnv();

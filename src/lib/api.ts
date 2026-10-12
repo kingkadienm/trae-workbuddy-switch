@@ -105,9 +105,9 @@ const DEMO_READ_COMMANDS = new Set([
   "get_travel_status", "get_auto_travel_config", "get_schedule_config",
   "get_switch_config",
   // 成长任务只读命令（演示站需返回虚构数据，否则 build:demo 报错）。
-  "growth_tasks", "growth_tasks_list", "growth_tasks_scan_all", "growth_queue_status",
+  "growth_tasks_list", "growth_tasks_scan_all", "growth_queue_status",
   // 豆包只读命令
-  "doubao_accounts", "doubao_detect_uid",
+  "doubao_accounts_list", "doubao_detect_uid",
   // API 网关只读命令（演示站需返回虚构数据，否则 build:demo 报错）
   "get_gateway_config", "gateway_status", "list_api_keys", "get_gateway_models",
   "get_account_strategy", "get_gateway_logs",
@@ -191,8 +191,7 @@ const ROUTES: Record<string, Route> = {
   get_schedule_config: { method: "GET", path: "/api/schedule/config" },
   save_schedule_config: { method: "POST", path: "/api/schedule/config" },
   run_schedule_task: { method: "POST", path: "/api/schedule/run" },
-  growth_tasks: { method: "GET", path: "/api/growth/tasks" },
-  growth_tasks_list: { method: "GET", path: "/api/growth/tasks/list" },
+  growth_tasks_list: { method: "GET", path: "/api/growth/tasks" },
   growth_tasks_accept: { method: "POST", path: "/api/growth/tasks/accept" },
   growth_accept_all: { method: "POST", path: "/api/growth/tasks/accept-all" },
   growth_task_claim: { method: "POST", path: "/api/growth/tasks/claim" },
@@ -203,7 +202,7 @@ const ROUTES: Record<string, Route> = {
   growth_queue_status: { method: "GET", path: "/api/growth/queue/status" },
   growth_tasks_run: { method: "POST", path: "/api/growth/tasks/run" },
   // ---- 豆包模块 ----
-  doubao_accounts: { method: "GET", path: "/api/doubao/accounts" },
+  doubao_accounts_list: { method: "GET", path: "/api/doubao/accounts" },
   doubao_detect_uid: { method: "GET", path: "/api/doubao/detect-uid" },
   doubao_account_save: { method: "POST", path: "/api/doubao/accounts/save" },
   doubao_account_remove: { method: "POST", path: "/api/doubao/accounts/delete" },
@@ -297,6 +296,7 @@ const ROUTES: Record<string, Route> = {
   totp_verify: { method: "POST", path: "/api/auth/totp/verify" },
   totp_validate: { method: "POST", path: "/api/auth/totp/validate" },
   totp_disable: { method: "POST", path: "/api/auth/totp/disable" },
+  api_activity_run: { method: "POST", path: "/api/activity/run" },
 };
 
 function queryString(args?: Record<string, unknown>): string {
@@ -965,18 +965,6 @@ export interface GrowthRunItem {
   detail?: string;
 }
 
-export function activityReport(): Promise<{ status: string; accounts: unknown[] }> {
-  return call("activity_report");
-}
-
-export function activityStreak(): Promise<{ status: string; accounts: unknown[] }> {
-  return call("activity_streak");
-}
-
-export function activityLottery(): Promise<{ status: string; accounts: unknown[] }> {
-  return call("activity_lottery");
-}
-
 export function getScheduleConfig(): Promise<ScheduleConfig> {
   return call("get_schedule_config");
 }
@@ -992,16 +980,8 @@ export function runScheduleTask(task: string): Promise<ScheduleRunResult> {
   return call("run_schedule_task", { task });
 }
 
-export function growthTasks(): Promise<{ tasks: GrowthTask[] }> {
-  return call("growth_tasks");
-}
-
 export function growthAccept(args: { code: string }): Promise<{ ok: boolean }> {
   return call("growth_tasks_accept", args);
-}
-
-export function growthClaim(code: string): Promise<{ ok: boolean }> {
-  return call("growth_tasks_claim", { code });
 }
 
 export function growthRun(): Promise<{ accounts: GrowthRunItem[] }> {
@@ -1077,7 +1057,7 @@ export function growthQueueStatus(): Promise<GrowthQueueStatus> {
 // ---- 豆包模块 ----
 
 export function doubaoAccountsList(): Promise<{ accounts: DoubaoAccount[] }> {
-  return call("doubao_accounts");
+  return call("doubao_accounts_list");
 }
 
 export function doubaoDetectUid(): Promise<DoubaoDetectResult> {

@@ -196,6 +196,7 @@ fn api_routes() -> Router {
             get(api_schedule_config).post(api_save_schedule_config),
         )
         .route("/api/schedule/run", post(api_run_schedule_task))
+        .route("/api/activity/run", post(api_activity_run))
         // —— 成长任务中心（与 Tauri 的 9 个 growth 命令同契约；CN 专有，Global 返回结构化提示）——
         .route("/api/growth/tasks", get(api_growth_tasks_list))
         .route("/api/growth/tasks/list", get(api_growth_tasks_list))
@@ -1218,6 +1219,11 @@ async fn api_run_schedule_task(Json(body): Json<Value>) -> Response {
         Some(task) => json_ok(scheduler::run_scheduled_task(task).await),
         None => json_err(format!("未知定时任务: {task}"), StatusCode::BAD_REQUEST),
     }
+}
+
+/// POST /api/activity/run —— 立即触发活动任务（活跃地图 / 连登 / 抽奖）。
+async fn api_activity_run() -> Response {
+    json_ok(scheduler::run_scheduled_task(schedule::ScheduleTask::Activity).await)
 }
 
 // ---------------------------------------------------------------------------

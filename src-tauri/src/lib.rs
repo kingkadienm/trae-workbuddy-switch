@@ -199,6 +199,7 @@ pub fn run() {
             commands::get_schedule_config,
             commands::save_schedule_config,
             commands::run_schedule_task,
+            commands::api_activity_run,
             // ---- 成长任务中心（与 server 的 /api/growth/* 路由一一对应）----
             commands::growth_tasks_list,
             commands::growth_tasks_accept,
