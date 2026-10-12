@@ -19,6 +19,7 @@ use crate::modules::config::{
     workbuddy_api_base,
 };
 use crate::modules::refresh::{ensure_fresh_token, refresh_account_token};
+use crate::modules::region::{region_spec, Region};
 
 static TRAVEL_RUNNING: AtomicBool = AtomicBool::new(false);
 static TRAVEL_CLAIM_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -366,6 +367,37 @@ fn classify_depart_error(_code: i64, message: &str) -> DepartClass {
     }
 }
 
+/// 尝试领养第一只 Buddy：同意协议 → 领取。
+/// 返回 `true` 表示领养成功，`false` 表示门槛未过（正常态，不重试）。
+async fn adopt_buddy(account: &Value) -> bool {
+    let base = region_spec(Region::Cn).chat_base;
+    let headers = build_auth_headers(account);
+
+    // 1. 同意 Buddy 协议
+    let agreement_url = format!("{base}/activity/growth/buddy/agreement");
+    let resp = http_request(&agreement_url, "POST", Some(json!({"agree": true})), Some(&headers)).await;
+    let code = resp.get("code").and_then(Value::as_i64).unwrap_or(-1);
+    if code != 0 && code != 200 {
+        return false;
+    }
+
+    // 2. 领取第一只 Buddy
+    let first_url = format!("{base}/activity/growth/buddy/first");
+    let resp = http_request(&first_url, "POST", Some(json!({})), Some(&headers)).await;
+    let status_code = resp.get("code").and_then(Value::as_i64).unwrap_or(-1);
+    if status_code == 0 || status_code == 200 {
+        return true;
+    }
+
+    // 400 + first_buddy 关键词 = 门槛未过（活跃度不足），正常态不重试
+    let text = format!("{status_code} {}", resp.to_string());
+    if status_code == 400 && text.to_lowercase().contains("first_buddy") {
+        return false;
+    }
+
+    false
+}
+
 /// 对单个账号执行派猫猫旅行：依次尝试地点列表，报错分类处理。
 pub async fn depart_travel_for_account(account: &Value) -> Value {
     let cfg = load_checkin_config();
@@ -462,6 +494,34 @@ pub async fn depart_travel_for_account(account: &Value) -> Value {
                 return result;
             }
             DepartClass::NoBuddy => {
+                // 尝试自动领养 Buddy，成功后重新尝试 depart。
+                if adopt_buddy(&acc).await {
+                    let location_id = location.get("id").cloned().unwrap_or(Value::Null);
+                    let retry = depart_travel(&acc, &location_id).await;
+                    if retry.get("ok").and_then(Value::as_bool) == Some(true) {
+                        let mut result = depart_result(
+                            &acc,
+                            uid_ref,
+                            true,
+                            false,
+                            None,
+                            Some(
+                                retry.get("state")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("traveling"),
+                            ),
+                            "",
+                        );
+                        if let Some(name) = nonempty_str(location.get("name").unwrap_or(&Value::Null)) {
+                            result["locationName"] = json!(name);
+                        }
+                        let status = fetch_travel_status(&acc).await;
+                        if status.get("ok").and_then(Value::as_bool) == Some(true) {
+                            apply_status_record(&mut result, &status);
+                        }
+                        return result;
+                    }
+                }
                 return depart_result(
                     &acc,
                     uid_ref,
@@ -550,6 +610,18 @@ fn in_flight_due(entry: &Value, now: i64) -> bool {
     let arrive_at = entry.get("arriveAt").and_then(Value::as_i64).unwrap_or(0);
     let arrive_secs = arrive_at_secs(arrive_at);
     arrive_secs <= 0 || arrive_secs <= now
+}
+
+/// 超过 10 分钟的 status-error / no-buddy 等可重试错误，视为过期需要重试。
+/// 避免 relay 配置变更、token 刷新等 transient 错误导致缓存永久卡死。
+fn stale_retryable_error(entry: &Value, now: i64) -> bool {
+    let skip = entry.get("skip").and_then(Value::as_str);
+    if !is_retryable_skip(skip) {
+        return false;
+    }
+    let at = entry.get("at").and_then(Value::as_i64).unwrap_or(0);
+    let elapsed_ms = now * 1000 - at;
+    elapsed_ms > 10 * 60 * 1000 // 10 分钟
 }
 
 /// 官网 idle + daily_limit_reached：当日已完成，保留地点/积分只改完结标记。
@@ -963,7 +1035,7 @@ pub async fn reconcile_due_travel(account_id: Option<&str>) {
                     return false;
                 }
             }
-            in_flight_due(entry, now)
+            in_flight_due(entry, now) || stale_retryable_error(entry, now)
         })
         .map(|(id, _)| id.clone())
         .collect();
