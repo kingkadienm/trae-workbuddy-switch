@@ -84,6 +84,7 @@ pub fn router() -> Router {
 /// TOTP 认证中间件。
 ///
 /// - `/api/auth/totp/*` 始终放行（用于 setup / verify / login / disable）。
+/// - `/api/public-config` 始终放行（前端启动时需无认证读取域名配置）。
 /// - TOTP 未启用时放行全部（向后兼容）。
 /// - 其余路由需携带有效 `X-Session-Token` 请求头。
 async fn totp_middleware(
@@ -94,6 +95,11 @@ async fn totp_middleware(
 
     // TOTP 管理路由始终公开
     if path.starts_with("/api/auth/totp") {
+        return Ok(next.run(req).await);
+    }
+
+    // 公开配置路由无需认证（前端启动时读取 base URL）
+    if path == "/api/public-config" {
         return Ok(next.run(req).await);
     }
 
