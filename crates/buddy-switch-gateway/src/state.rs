@@ -303,6 +303,16 @@ impl GatewayState {
         ));
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(600))
+            .proxy(reqwest::Proxy::custom(|target_url| {
+                let env_proxy = std::env::var("HTTPS_PROXY")
+                    .or_else(|_| std::env::var("https_proxy"))
+                    .ok()?;
+                if target_url.scheme() == "https" {
+                    url::Url::parse(&env_proxy).ok()
+                } else {
+                    None
+                }
+            }))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         let upstream = Arc::new(UpstreamClient::new(http));
