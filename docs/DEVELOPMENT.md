@@ -109,6 +109,11 @@ src/                 # 前端：components/pages/lib（api.ts 双通道：Tauri 
 npm/                 # npm 包：package.json + bin + scripts/install.js
 ```
 
+## 新增/修改 API 的契约校验
+
+前后端 API 命令名是纯字符串匹配，`npm run build` 会跑 `check:api` 做一致性校验。
+新增端点前必读：[docs/API_CONTRACT.md](./API_CONTRACT.md)。
+
 ## 隐私注意事项
 
 - 仓库不提交本地数据（accounts.json、认证文件、密钥、token 由 `.gitignore` 排除）
