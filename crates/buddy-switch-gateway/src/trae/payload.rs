@@ -26,44 +26,94 @@ use super::{TRAE_APP_ID, TRAE_FUNCTION, TRAE_IDE_VERSION, TRAE_IDE_VERSION_CODE}
 ///
 /// 两个名字都要发给上游，且**大小写敏感**：`config_name` 用展示名，
 /// `model_name` 是上游内部名（多为小写下划线 + `__dev` 后缀）。
-/// 未知模型回落到默认模型而不是报错——客户端传错名字时，给一个能用的模型
-/// 比直接 400 更有用。
-pub fn model_config(model: &str) -> (&'static str, &'static str) {
-    match model.trim().to_lowercase().as_str() {
-        "deepseek-v4-flash" => ("DeepSeek-V4-Flash", "deepseek_v4_flash__dev"),
-        "deepseek-v4-flash-official" => (
-            "DeepSeek-V4-Flash-Official",
-            "DeepSeek-V4-Flash-Official__dev",
-        ),
-        "deepseek-v4-pro" => ("DeepSeek-V4-Pro", "deepseek_v4_pro__dev"),
-        "glm-5.2" => ("glm-5.2", "glm-5.2__dev"),
-        "glm-5.3" => ("glm-5.3", "glm-5.3__dev"),
+///
+/// 匹配优先级：
+/// 1. 精确映射表（模型内部名不符合常规推导规律、或有别名共用同一内部名时
+///    手工维护）；
+/// 2. 推导规则：`config_name` 保持原样（trim），`model_name` = 全小写 + 非字母数字
+///    替换为下划线 + `__dev` 后缀（覆盖大部分新增模型）；
+/// 3. 最终兜底：原样回传 model id（上游会拒绝不认识的模型，比静默跳到
+///    另一个模型更利于排障）。
+///
+/// ⚠️ 别名模型（如 `seed-code-pro-0430` → `doubao-seed-2.1-pro`）必须在映射表
+/// 里声明，推导 fallback 无法识别别名关系。
+pub fn model_config(model: &str) -> (String, String) {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return (
+            "DeepSeek-V4-Flash".to_string(),
+            "deepseek_v4_flash__dev".to_string(),
+        );
+    }
+    // 1. 精确映射表（含别名 → canonical 的转换）。
+    let (config, internal_static): (_, &str) = match trimmed {
+        // 别名：seed-code-pro-0430 与 doubao-seed-2.1-pro 共用同一个上游内部名
         "doubao-seed-2.1-pro" | "seed-code-pro-0430" => {
             ("Doubao-Seed-2.1-Pro", "Doubao-Seed-2.1-Pro__dev")
         }
+        "deepseek-v4-flash" | "DeepSeek-V4-Flash" => ("DeepSeek-V4-Flash", "deepseek_v4_flash__dev"),
+        "deepseek-v4-flash-official" | "DeepSeek-V4-Flash-Official" => {
+            ("DeepSeek-V4-Flash-Official", "DeepSeek-V4-Flash-Official__dev")
+        }
+        "deepseek-v4-pro" | "DeepSeek-V4-Pro" => ("DeepSeek-V4-Pro", "deepseek_v4_pro__dev"),
         "doubao-seed-2.1-turbo" => ("Doubao-Seed-2.1-Turbo", "Doubao-Seed-2.1-Turbo__dev"),
+        "glm-5.2" | "GLM-5.2" => ("glm-5.2", "glm-5.2__dev"),
+        "glm-5.3" | "GLM-5.3" => ("glm-5.3", "glm-5.3__dev"),
         "kimi-k2.7-code" => ("kimi-k2.7-code", "kimi-k2.7-code__dev"),
-        "minimax-m3" => ("minimax-m3", "minimax-m3__dev"),
-        _ => ("DeepSeek-V4-Flash", "deepseek_v4_flash__dev"),
+        // 2. 未知模型：推导内部名而非静默跳到另一个模型。
+        _ => return (trimmed.to_string(), derive_internal_model_name(trimmed)),
+    };
+    (config.to_string(), internal_static.to_string())
+}
+
+/// 将模型 id 推导为上游内部名：全小写，`-` 替换为 `_`，其他字符（含 `.`）保留，
+/// 末尾加 `__dev`。
+///
+/// 例: `"step-5-preview"` → `"step_5_preview__dev"`,
+///     `"deepseek-v4.1-flash"` → `"deepseek_v4.1_flash__dev"`（保留 `.`），
+///     `"Space-Bunny"` → `"space_bunny__dev"`.
+fn derive_internal_model_name(model: &str) -> String {
+    let mut result = String::new();
+    let mut prev_underscore = false;
+    for c in model.chars().flat_map(|c| {
+        if c.is_ascii_alphanumeric() {
+            Some(c.to_ascii_lowercase())
+        } else if c == '-' {
+            Some('_')
+        } else if c == '_' {
+            Some('_')
+        } else {
+            // 保留其他字符（如 `.`），避免破坏上游内部名格式
+            Some(c)
+        }
+    }) {
+        if c == '_' {
+            if !prev_underscore {
+                result.push(c);
+                prev_underscore = true;
+            }
+        } else {
+            result.push(c);
+            prev_underscore = false;
+        }
     }
+    result.trim_end_matches('_').to_string() + "__dev"
 }
 
 /// 网关对外暴露的模型清单（**静态兜底**，`/v1/models` 读不到客户端清单时才用）。
 ///
-/// ⚠️ **内容已滞后**（本机实测：客户端里早已是 `deepseek-v4.1-flash`、
-/// `Doubao-Seed-Evolving`、`step-5-preview`、`qwen3.8-max` 等，而这里的
-/// `sagitta` / `aquila` 在客户端里**根本不存在**）。它现在只保证「客户端没启动过 /
-/// 没登录时，`/v1/models` 不至于返回空表」。
+/// `model_config()` 对未知模型有推导 fallback，所以新增模型即使不在此列表也能
+/// 正常代理；但此列表决定 `/v1/models` 返回什么，过时条目会让客户端显示已下架的
+/// 模型，漏记条目则客户端不会展示该模型。
 ///
-/// ⚠️ 改这里的名字**必须同时看 [`model_config`]** —— 那张映射表是按这里的名字
-/// 写的（例如 `deepseek-v4-flash` → `DeepSeek-V4-Flash`），改名会让映射落到默认分支。
-/// 而映射正确与否**只能靠实测上游认哪个名字**，不能照抄客户端清单的显示名。
+/// ⚠️ 增删模型**必须同步看 [`model_config`]** —— 映射表按模型 id 推导内部名。
 pub const MODEL_NAMES: &[&str] = &[
     "doubao-seed-2.1-pro",
     "doubao-seed-2.1-turbo",
     "doubao-seed-2.0-code",
     "deepseek-v4-flash",
     "deepseek-v4-pro",
+    "deepseek-v4.1-flash",
     "glm-5.2",
     "glm-5.3",
     "glm-5-turbo",
@@ -73,8 +123,8 @@ pub const MODEL_NAMES: &[&str] = &[
     "kimi-k2.6",
     "minimax-m3",
     "qwen-3.7-plus",
-    "sagitta",
-    "aquila",
+    "step-5-preview",
+    "space-bunny",
 ];
 
 /// 静态兜底清单的上下文窗口（客户端清单里取不到时沿用，保持既有形状不变）。
@@ -99,8 +149,7 @@ pub fn models_response() -> Value {
 /// Trae 的模型清单由服务端下发，客户端拉取后落在 `state.vscdb`
 /// （见 `buddy_switch_core::modules::trae::model_list`）。网关对外暴露的清单
 /// **必须与客户端里那份一致** —— 否则用户照着 `/v1/models` 列出的名字去调用，
-/// 很可能传的是上游根本不认的旧名（本仓实测：静态清单里的 `deepseek-v4-flash`
-/// 在客户端里早已是 `deepseek-v4.1-flash`，而 `sagitta` / `aquila` **根本不存在**）。
+/// 很可能传的是上游根本不认的旧名。
 ///
 /// ## 为什么读不到要**回落**而不是报错
 ///
@@ -368,12 +417,18 @@ mod tests {
 
     #[test]
     fn model_config_is_case_insensitive_and_falls_back() {
-        assert_eq!(model_config("DeepSeek-V4-Flash"), ("DeepSeek-V4-Flash", "deepseek_v4_flash__dev"));
-        assert_eq!(model_config("  GLM-5.3 "), ("glm-5.3", "glm-5.3__dev"));
-        assert_eq!(model_config("seed-code-pro-0430"), ("Doubao-Seed-2.1-Pro", "Doubao-Seed-2.1-Pro__dev"));
-        // 未知模型回落默认，而不是报错。
-        assert_eq!(model_config("no-such-model"), ("DeepSeek-V4-Flash", "deepseek_v4_flash__dev"));
-        assert_eq!(model_config(""), ("DeepSeek-V4-Flash", "deepseek_v4_flash__dev"));
+        // 精确映射
+        assert_eq!(model_config("DeepSeek-V4-Flash"), ("DeepSeek-V4-Flash".into(), "deepseek_v4_flash__dev".into()));
+        assert_eq!(model_config("  GLM-5.3 "), ("glm-5.3".into(), "glm-5.3__dev".into()));
+        // 别名共用同一内部名
+        assert_eq!(model_config("seed-code-pro-0430"), ("Doubao-Seed-2.1-Pro".into(), "Doubao-Seed-2.1-Pro__dev".into()));
+        // 空字符串回退到默认模型（非静默跳到另一个模型）。
+        assert_eq!(model_config(""), ("DeepSeek-V4-Flash".into(), "deepseek_v4_flash__dev".into()));
+        // 未知模型：推导内部名而非静默跳到 deepseek-v4-flash。
+        assert_eq!(model_config("step-5-preview"), ("step-5-preview".into(), "step_5_preview__dev".into()));
+        assert_eq!(model_config("space-bunny"), ("space-bunny".into(), "space_bunny__dev".into()));
+        assert_eq!(model_config("deepseek-v4.1-flash"), ("deepseek-v4.1-flash".into(), "deepseek_v4.1_flash__dev".into()));
+        assert_eq!(model_config("kimi-k2.8-preview"), ("kimi-k2.8-preview".into(), "kimi_k2.8_preview__dev".into()));
     }
 
     #[test]

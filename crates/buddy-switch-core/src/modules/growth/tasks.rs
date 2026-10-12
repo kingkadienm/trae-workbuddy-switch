@@ -16,6 +16,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use crate::modules::config::authed_json_request_for;
+use crate::modules::identity;
 use crate::modules::region::{region_spec, Region};
 
 use super::events::{
@@ -300,7 +301,10 @@ async fn real_sse_chat(
 
     let sse_headers = |account: &Value, conversation_id: &str, now_ms: i64| {
         let mut headers = build_auth_headers(account);
-        headers.insert("User-Agent".into(), "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1".into());
+        let chat_id = identity::resolve_chat_identity(region);
+        let ua = identity::chat_user_agent(region, &chat_id.client_version, chat_id.cli_version.as_deref())
+            .unwrap_or_else(|_| format!("WorkBuddy/{} WorkBuddy/{}", region_spec(region).fallback_app_version, region_spec(region).fallback_app_version));
+        headers.insert("User-Agent".into(), ua);
         headers.insert("X-Domain".into(), region_spec(region).chat_base.to_string());
         headers.insert("X-Product".into(), "SaaS".into());
         headers.insert("Accept".into(), "text/event-stream".into());

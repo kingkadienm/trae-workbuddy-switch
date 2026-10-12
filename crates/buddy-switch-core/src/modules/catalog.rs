@@ -84,6 +84,8 @@ pub static FALLBACK_CN_MODELS: LazyLock<Vec<CatalogModel>> = LazyLock::new(|| {
         CatalogModel { id: "auto".into(), name: "Auto".into(), context_window: 168_000, max_tokens: 32_000, supports_images: true, credits: None, badges: Vec::new(), free: false },
         CatalogModel { id: "hy4-preview".into(), name: "Hy4 preview".into(), context_window: 1_000_000, max_tokens: 64_000, supports_images: true, credits: None, badges: Vec::new(), free: false },
         CatalogModel { id: "hy3".into(), name: "Hy3".into(), context_window: 192_000, max_tokens: 64_000, supports_images: true, credits: None, badges: Vec::new(), free: false },
+        CatalogModel { id: "step-5-preview".into(), name: "Step-5-Preview".into(), context_window: 1_000_000, max_tokens: 64_000, supports_images: true, credits: None, badges: vec!["独家限免".into()], free: false },
+        CatalogModel { id: "space-bunny".into(), name: "Space-Bunny".into(), context_window: 1_000_000, max_tokens: 128_000, supports_images: true, credits: Some("x0.08 credits".into()), badges: Vec::new(), free: false },
         CatalogModel { id: "hy3-x".into(), name: "Hy3".into(), context_window: 192_000, max_tokens: 64_000, supports_images: true, credits: Some("x0.05".into()), badges: Vec::new(), free: false },
         CatalogModel { id: "deepseek-v4.1-flash".into(), name: "Deepseek-V4.1-Flash".into(), context_window: 1_000_000, max_tokens: 128_000, supports_images: true, credits: Some("x0.03 credits".into()), badges: vec!["独家优惠".into()], free: false },
         CatalogModel { id: "glm-5.3".into(), name: "GLM-5.3".into(), context_window: 1_000_000, max_tokens: 48_000, supports_images: true, credits: Some("x0.79".into()), badges: Vec::new(), free: false },
@@ -191,6 +193,17 @@ impl CatalogStore {
             return snapshot;
         }
         Self::builtin_snapshot(region, None)
+    }
+
+    /// 尝试从上游拉取最新目录；成功则写入 live + 缓存并返回 Live 快照，
+    /// 失败则静默降级到 cached → builtin（与 [`refresh`] 行为一致但不返回错误）。
+    pub async fn current_or_refresh(
+        &self,
+        region: Region,
+        client: &UpstreamClient,
+        acc: &Value,
+    ) -> CatalogSnapshot {
+        self.refresh(region, client, acc).await
     }
 
     /// 手动写入实时快照（供网关手动刷新 / 单测种子）。
@@ -345,10 +358,12 @@ mod tests {
     /// `FALLBACK_WORKBUDDY_AI_MODELS` 为准做字面量校验。
     #[test]
     fn fallback_catalog_matches_hardcoded_contract() {
-        const CN_IDS: [&str; 16] = [
+        const CN_IDS: [&str; 18] = [
             "auto",
             "hy4-preview",
             "hy3",
+            "step-5-preview",
+            "space-bunny",
             "hy3-x",
             "deepseek-v4.1-flash",
             "glm-5.3",
@@ -389,7 +404,7 @@ mod tests {
         let cn = CatalogStore::fallback_models(Region::Cn);
         let global = CatalogStore::fallback_models(Region::Global);
 
-        assert_eq!(FALLBACK_CN_MODELS.len(), 16);
+        assert_eq!(FALLBACK_CN_MODELS.len(), 18);
         assert_eq!(FALLBACK_GLOBAL_MODELS.len(), 20);
         assert_eq!(cn[0].id, "auto");
         assert_eq!(global[0].id, "default-model");
@@ -417,7 +432,7 @@ mod tests {
         let builtin = store.current(Region::Cn);
         assert_eq!(builtin.source, CatalogSource::Builtin);
         // 硬编码 16：与兜底数据源比较会两端同源，失去回归价值。
-        assert_eq!(builtin.models.len(), 16);
+        assert_eq!(builtin.models.len(), 18);
 
         // 2) 写入缓存文件后 → Cached（新 store 无 live）。
         let cached_models = vec![CatalogModel {

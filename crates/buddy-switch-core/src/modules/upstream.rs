@@ -18,9 +18,12 @@ use crate::modules::catalog::CatalogModel;
 use crate::modules::identity;
 use crate::modules::net;
 use crate::modules::region::{region_spec, CatalogUa, Region};
+use crate::modules::update::APP_VERSION;
 
-/// 共享 CLI 形态 UA（刷新 / CN 目录使用）。
-pub const CLIENT_UA: &str = "CLI/2.63.2 CodeBuddy/2.63.2";
+/// 共享 CLI 形态 UA（刷新 / CN 目录使用），版本随 Cargo.toml 自动更新。
+pub fn client_ua() -> String {
+    format!("CLI/{} CodeBuddy/{}", APP_VERSION, APP_VERSION)
+}
 
 /// 错误响应体读取上限（字节）。
 const ERROR_BODY_LIMIT: usize = 4096;
@@ -60,8 +63,14 @@ impl UpstreamErrorKind {
     }
 }
 
-/// 硬性积分不足标记（ASCII 小写 + 原样中文）。
+/// 硬性积分不足标记（ASCII 小写匹配 + 原样中文匹配）。
+///
+/// `classify_upstream_error` 对每条 marker 做两路检测：
+/// - ASCII：统一 `.to_lowercase()` 后做 `contains`（大小写不敏感）；
+/// - 非 ASCII（中文）：原样 `contains`。
+/// 上游新增措辞时只需在此追加，无需改动判定逻辑。
 const HARD_CREDIT_MARKERS: &[&str] = &[
+    // 英文（小写匹配）
     "insufficient credit",
     "no credit",
     "credit exhausted",
@@ -72,16 +81,34 @@ const HARD_CREDIT_MARKERS: &[&str] = &[
     "payment required",
     "credit not enough",
     "not enough credit",
+    "credit balance is zero",
+    "rate limit exceeded",
+    "daily rate limit",
+    "plan limit reached",
+    "usage limit reached",
+    // JSON error code 形态
+    "insufficient_quota",
+    "rate_limit_exceeded",
+    // 中文（原样匹配）
     "积分不足",
     "额度不足",
     "余额不足",
     "积分用完",
     "额度用尽",
     "没有积分",
+    "今日次数已用完",
+    "触发限流",
 ];
 
-/// 会话失效标记。
-const SESSION_DEAD_MARKERS: &[&str] = &["Offline user session not found", "12153"];
+/// 会话失效标记（原样匹配）。
+const SESSION_DEAD_MARKERS: &[&str] = &[
+    "Offline user session not found",
+    "12153",
+    "session expired",
+    "token expired",
+    "user session not found",
+    "登录已过期",
+];
 
 /// 上游失败分类（严格按参考实现的判定顺序）。
 pub fn classify_upstream_error(status: u16, body: &str) -> UpstreamErrorKind {
@@ -89,14 +116,28 @@ pub fn classify_upstream_error(status: u16, body: &str) -> UpstreamErrorKind {
         return UpstreamErrorKind::HardCredit;
     }
     let lower = body.to_lowercase();
-    for marker in HARD_CREDIT_MARKERS {
+    // 会话失效优先于积分不足
+    const SESSION_MARKERS: &[&str] = &[
+        // 精确短语
+        "12153",
+        "offline user session not found",
+        "user session not found",
+        "登录已过期",
+        // 变体（上游可能用 "has expired" 而非 "expired"）
+        "session has expired",
+        "session was expired",
+        "session expired",
+        "token expired",
+        "access token expired",
+    ];
+    for &marker in SESSION_MARKERS {
         if lower.contains(&marker.to_lowercase()) || body.contains(marker) {
-            return UpstreamErrorKind::HardCredit;
+            return UpstreamErrorKind::SessionDead;
         }
     }
-    for marker in SESSION_DEAD_MARKERS {
-        if body.contains(marker) {
-            return UpstreamErrorKind::SessionDead;
+    for &marker in HARD_CREDIT_MARKERS {
+        if lower.contains(&marker.to_lowercase()) || body.contains(marker) {
+            return UpstreamErrorKind::HardCredit;
         }
     }
     if status == 429 {
@@ -528,9 +569,9 @@ impl UpstreamClient {
         let url = format!("{}{}", spec.chat_base, spec.models_path);
         let user_agent = if international {
             let info = identity::resolve_app_version(region);
-            identity::app_user_agent(&info.version).unwrap_or_else(|_| CLIENT_UA.to_string())
+            identity::app_user_agent(&info.version).unwrap_or_else(|_| client_ua())
         } else {
-            CLIENT_UA.to_string()
+            client_ua()
         };
 
         let mut headers = HashMap::new();
@@ -757,7 +798,7 @@ fn common_headers(region: Region) -> HashMap<String, String> {
     headers.insert("X-Requested-With".to_string(), "XMLHttpRequest".to_string());
     headers.insert("Origin".to_string(), origin.to_string());
     headers.insert("Referer".to_string(), format!("{origin}/"));
-    headers.insert("User-Agent".to_string(), CLIENT_UA.to_string());
+    headers.insert("User-Agent".to_string(), client_ua());
     headers
 }
 
@@ -1021,6 +1062,33 @@ mod tests {
         assert_eq!(
             classify_upstream_error(402, "Offline user session not found"),
             UpstreamErrorKind::HardCredit
+        );
+    }
+
+    #[test]
+    fn classify_new_markers_are_recognized() {
+        // 新增英文积分标记
+        assert_eq!(
+            classify_upstream_error(200, "Credit balance is zero, please top up"),
+            UpstreamErrorKind::HardCredit
+        );
+        assert_eq!(
+            classify_upstream_error(200, "Rate limit exceeded for your plan"),
+            UpstreamErrorKind::HardCredit
+        );
+        // 新增中文积分标记
+        assert_eq!(
+            classify_upstream_error(200, "今日次数已用完，请明天再试"),
+            UpstreamErrorKind::HardCredit
+        );
+        // 新增会话失效标记
+        assert_eq!(
+            classify_upstream_error(200, "Your session has expired"),
+            UpstreamErrorKind::SessionDead
+        );
+        assert_eq!(
+            classify_upstream_error(200, "登录已过期，请重新登录"),
+            UpstreamErrorKind::SessionDead
         );
     }
 

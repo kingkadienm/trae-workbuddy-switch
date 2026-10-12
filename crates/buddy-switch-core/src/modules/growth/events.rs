@@ -9,6 +9,7 @@
 //! - **mp 指纹**（`workbuddy-mp`）：`www.codebuddy.cn/v2/report` 数组上报（小程序口径任务）
 //! - **chat_request_send**：billing 域 `/v2/report` 单元素数组（`userId` 必填）
 
+use crate::modules::update::APP_VERSION;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
@@ -40,11 +41,11 @@ pub fn desktop_fingerprint(uid: &str, nickname: &str, now_ms: i64) -> HashMap<St
     m.insert("commit".into(), json!("5f9692923c93033111c51ad7b003eb80204a9b75"));
     m.insert("ideName".into(), json!("WorkBuddy"));
     m.insert("ideType".into(), json!("WorkBuddy"));
-    m.insert("ideVersion".into(), json!("5.5.6"));
+    m.insert("ideVersion".into(), json!(APP_VERSION));
     m.insert("machineId".into(), json!(derive_id(uid, "machine")));
     m.insert("sessionId".into(), json!(derive_id(uid, "session")));
     m.insert("extName".into(), json!("workbuddy-desktop"));
-    m.insert("extVersion".into(), json!("5.5.6"));
+    m.insert("extVersion".into(), json!(APP_VERSION));
     m.insert("os".into(), json!("win32"));
     m.insert("arch".into(), json!("x64"));
     m.insert("osVersion".into(), json!("10.0.26220"));

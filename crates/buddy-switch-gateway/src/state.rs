@@ -373,6 +373,23 @@ impl GatewayState {
             .unwrap_or_default()
     }
 
+    /// 按策略选一个可用账号并刷新模型目录；无可用账号时返回 `None`（调用方降级）。
+    pub async fn refresh_catalog(
+        &self,
+        region: Region,
+    ) -> Option<buddy_switch_core::modules::catalog::CatalogSnapshot> {
+        let strategy = self.strategy_for(region).await;
+        let account = crate::AccountSelector
+            .select(region, &strategy)
+            .await
+            .ok()?;
+        Some(
+            self.catalogs
+                .current_or_refresh(region, &self.upstream, &account)
+                .await,
+        )
+    }
+
     /// 当前是否处于内容拦截降级期。
     pub async fn degrade_active(&self, now_ms: i64) -> bool {
         self.degrade.read().await.active(now_ms)

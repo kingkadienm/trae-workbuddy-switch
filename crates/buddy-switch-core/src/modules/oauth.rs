@@ -13,6 +13,7 @@ use crate::modules::checkin;
 use crate::modules::config::{
     http_request, norm_ts, now_ms, now_secs, OAUTH_TIMEOUT_SECONDS, WORKBUDDY_API_PREFIX,
 };
+use crate::modules::update::APP_VERSION;
 use crate::modules::credits;
 use crate::modules::region::{region_spec, Region};
 use crate::modules::wb_register;
@@ -38,7 +39,7 @@ fn oauth_states() -> &'static Mutex<HashMap<String, OAuthInfo>> {
 /// 覆盖默认桌面 UA，因此无需另建 client。
 fn web_login_headers(base: &str) -> HashMap<String, String> {
     let mut headers = HashMap::new();
-    headers.insert("User-Agent".to_string(), "CLI/2.63.2 CodeBuddy/2.63.2".to_string());
+    headers.insert("User-Agent".to_string(), format!("CLI/{} CodeBuddy/{}", APP_VERSION, APP_VERSION));
     headers.insert("X-Requested-With".to_string(), "XMLHttpRequest".to_string());
     headers.insert("Origin".to_string(), base.to_string());
     headers.insert("Referer".to_string(), format!("{base}/"));
@@ -426,7 +427,7 @@ mod tests {
     #[test]
     fn web_login_headers_match_panel_cli_profile() {
         let headers = web_login_headers("https://www.workbuddy.ai");
-        assert_eq!(headers.get("User-Agent").unwrap(), "CLI/2.63.2 CodeBuddy/2.63.2");
+        assert_eq!(headers.get("User-Agent").unwrap(), &format!("CLI/{} CodeBuddy/{}", APP_VERSION, APP_VERSION));
         assert_eq!(headers.get("X-Requested-With").unwrap(), "XMLHttpRequest");
         assert_eq!(headers.get("Origin").unwrap(), "https://www.workbuddy.ai");
         assert_eq!(headers.get("Referer").unwrap(), "https://www.workbuddy.ai/");
