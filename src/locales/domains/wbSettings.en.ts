@@ -192,4 +192,25 @@ export const en = {
   "wbSettings.donate.alipay": "Alipay",
   "wbSettings.donate.qrAlt": "{name} QR code",
   "wbSettings.donate.repoHome": "Project home",
-};
+
+  // ---- Two-Factor Authentication (TOTP) ----
+  "wbSettings.totp.groupTitle": "Two-Factor Authentication",
+  "wbSettings.totp.enableDesc": "When enabled, you will need to enter a Google Authenticator code to log in.",
+  "wbSettings.totp.disableDesc": "When disabled, you will no longer need a verification code to log in.",
+  "wbSettings.totp.enabledLabel": "Enabled",
+  "wbSettings.totp.disabledLabel": "Disabled",
+  "wbSettings.totp.setupTitle": "Set Up Two-Factor Authentication",
+  "wbSettings.totp.setupDesc": "Scan the QR code with Google Authenticator or enter the secret manually.",
+  "wbSettings.totp.verifyTitle": "Verify First Code",
+  "wbSettings.totp.verifyPlaceholder": "000000",
+  "wbSettings.totp.verifyBtn": "Verify and Enable",
+  "wbSettings.totp.disableTitle": "Disable Two-Factor Authentication",
+  "wbSettings.totp.disableConfirmDesc": "Enter your current verification code to confirm disabling.",
+  "wbSettings.totp.disableBtn": "Disable",
+  "wbSettings.totp.copied": "Copied",
+  "wbSettings.totp.copiedToast": "Secret copied to clipboard",
+  "wbSettings.totp.backToSecret": "Back to secret",
+  "wbSettings.totp.addedNext": "Added, next step",
+  "wbSettings.totp.secretLabel": "Secret",
+  "wbSettings.totp.scanHint": "Open Google Authenticator, tap \"Scan QR code\" or \"Enter setup key\", then enter the verification code below.",
+} as const;

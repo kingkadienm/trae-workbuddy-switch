@@ -1,22 +1,33 @@
 import { useEffect, useState } from "react";
 import {
   CircleCheck,
+  Copy,
   FolderOpen,
   Loader2,
   Play,
   RefreshCw,
   Save,
+  Shield,
 } from "lucide-react";
+import QRCode from "qrcode";
 import { toast } from "sonner";
 
-import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { CardContent } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { SettingsFieldRow, SettingsGroup, SettingsRow } from "@/components/settings-primitives";
 // 小时表编辑器与 Trae 设置页**共用同一份实现**（校验规则属于规则，不属于版式）。
 import { HoursEditor } from "@/components/schedule-hours-editor";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import * as api from "@/lib/api";
@@ -551,6 +562,249 @@ function AutoRotateCard() {
           )}
         </div>
       </CardContent>
+    </SettingsGroup>
+  );
+}
+
+/** 两步验证（TOTP）设置卡片。 */
+function TotpSettingsCard() {
+  const t = useT();
+  const [enabled, setEnabled] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+
+  // 设置流程状态
+  const [setupOpen, setSetupOpen] = useState(false);
+  const [setupStep, setSetupStep] = useState<"secret" | "verify">("secret");
+  const [secret, setSecret] = useState("");
+  const [qrDataUrl, setQrDataUrl] = useState("");
+  const [verifyCode, setVerifyCode] = useState("");
+  const [setupError, setSetupError] = useState("");
+
+  // 禁用流程状态
+  const [disableOpen, setDisableOpen] = useState(false);
+  const [disableCode, setDisableCode] = useState("");
+  const [disableError, setDisableError] = useState("");
+
+  // 加载当前状态
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .totpStatus()
+      .then((res) => {
+        if (!cancelled) setEnabled(res.enabled);
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // 开启：生成密钥
+  async function startSetup() {
+    setSetupError("");
+    setSetupStep("secret");
+    setVerifyCode("");
+    try {
+      const res = await api.totpSetup();
+      setSecret(res.secret);
+      const uri = res.otpauthUri || "";
+      if (uri) {
+        try {
+          const url = await QRCode.toDataURL(uri, { width: 200, margin: 2 });
+          setQrDataUrl(url);
+        } catch {
+          setQrDataUrl("");
+        }
+      }
+      setSetupOpen(true);
+    } catch (e) {
+      toast.error(t("wbSettings.common.saveFailed"), { description: api.asError(e) });
+    }
+  }
+
+  // 开启：验证首次口令
+  async function confirmSetup(e: React.FormEvent) {
+    e.preventDefault();
+    if (verifyCode.length !== 6 || saving) return;
+    setSaving(true);
+    setSetupError("");
+    try {
+      await api.totpVerify(verifyCode);
+      setEnabled(true);
+      setSetupOpen(false);
+      toast.success(t("wbSettings.common.saved"));
+    } catch (err) {
+      setSetupError(api.asError(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  // 关闭：验证当前口令后禁用
+  async function confirmDisable(e: React.FormEvent) {
+    e.preventDefault();
+    if (disableCode.length !== 6 || saving) return;
+    setSaving(true);
+    setDisableError("");
+    try {
+      await api.totpDisable(disableCode);
+      setEnabled(false);
+      setDisableOpen(false);
+      setDisableCode("");
+      toast.success(t("wbSettings.common.saved"));
+    } catch (err) {
+      setDisableError(api.asError(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  // Switch 点击：根据目标状态打开对应对话框
+  function handleToggle(checked: boolean) {
+    if (checked) {
+      startSetup();
+    } else {
+      setDisableError("");
+      setDisableCode("");
+      setDisableOpen(true);
+    }
+  }
+
+  return (
+    <SettingsGroup id="settings-totp" title={t("wbSettings.totp.groupTitle")}>
+      <CardContent className="space-y-0 p-0">
+        <SettingsFieldRow
+          label={enabled ? t("wbSettings.totp.enabledLabel") : t("wbSettings.totp.disabledLabel")}
+          description={enabled ? t("wbSettings.totp.enableDesc") : t("wbSettings.totp.disableDesc")}
+          htmlFor="totp-switch"
+          operational
+        >
+          <Switch
+            id="totp-switch"
+            checked={enabled}
+            onCheckedChange={handleToggle}
+            disabled={loading}
+            aria-label={t("wbSettings.totp.groupTitle")}
+          />
+        </SettingsFieldRow>
+      </CardContent>
+
+      {/* 开启对话框：显示密钥 + 二维码 + 验证码输入 */}
+      <Dialog open={setupOpen} onOpenChange={setSetupOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t("wbSettings.totp.setupTitle")}</DialogTitle>
+            <DialogDescription>{t("wbSettings.totp.setupDesc")}</DialogDescription>
+          </DialogHeader>
+
+          {setupStep === "secret" && (
+            <div className="space-y-4">
+              {qrDataUrl && (
+                <div className="flex justify-center">
+                  <img src={qrDataUrl} alt="TOTP QR Code" className="rounded-lg border" />
+                </div>
+              )}
+              <Alert>
+                <Shield className="h-4 w-4" />
+                <AlertTitle>{t("wbSettings.totp.secretLabel")}</AlertTitle>
+                <AlertDescription className="flex items-center gap-2">
+                  <code className="flex-1 break-all font-mono text-xs">{secret}</code>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={() => void copyText(secret, t("wbSettings.totp.copiedToast"))}
+                  >
+                    <Copy className="h-4 w-4" />
+                  </Button>
+                </AlertDescription>
+              </Alert>
+              <p className="text-xs text-muted-foreground">{t("wbSettings.totp.scanHint")}</p>
+              <Button
+                variant="outline"
+                className="w-full"
+                onClick={() => setSetupStep("verify")}
+              >
+                {t("wbSettings.totp.addedNext")}
+              </Button>
+            </div>
+          )}
+
+          {setupStep === "verify" && (
+            <form onSubmit={confirmSetup}>
+              <div className="space-y-4">
+                <div className="space-y-2">
+                  <Label htmlFor="totp-setup-code">{t("wbSettings.totp.verifyTitle")}</Label>
+                  <Input
+                    id="totp-setup-code"
+                    value={verifyCode}
+                    onChange={(e) => setVerifyCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                    placeholder={t("wbSettings.totp.verifyPlaceholder")}
+                    maxLength={6}
+                    autoFocus
+                    disabled={saving}
+                    className="text-center text-2xl tracking-widest"
+                  />
+                </div>
+                {setupError && <p className="text-sm text-red-500">{setupError}</p>}
+                <Button
+                  type="button"
+                  variant="ghost"
+                  className="w-full"
+                  onClick={() => setSetupStep("secret")}
+                  disabled={saving}
+                >
+                  {t("wbSettings.totp.backToSecret")}
+                </Button>
+              </div>
+              <Button type="submit" className="w-full mt-4" disabled={saving || verifyCode.length !== 6}>
+                {saving && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                {t("wbSettings.totp.verifyBtn")}
+              </Button>
+            </form>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* 关闭对话框：输入当前验证码确认禁用 */}
+      <Dialog open={disableOpen} onOpenChange={setDisableOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t("wbSettings.totp.disableTitle")}</DialogTitle>
+            <DialogDescription>{t("wbSettings.totp.disableConfirmDesc")}</DialogDescription>
+          </DialogHeader>
+          <form onSubmit={confirmDisable}>
+            <div className="space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="totp-disable-code">{t("wbSettings.totp.verifyTitle")}</Label>
+                <Input
+                  id="totp-disable-code"
+                  value={disableCode}
+                  onChange={(e) => setDisableCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                  placeholder={t("wbSettings.totp.verifyPlaceholder")}
+                  maxLength={6}
+                  autoFocus
+                  disabled={saving}
+                  className="text-center text-2xl tracking-widest"
+                />
+              </div>
+              {disableError && <p className="text-sm text-red-500">{disableError}</p>}
+            </div>
+            <DialogFooter className="mt-4">
+              <Button type="button" variant="outline" onClick={() => setDisableOpen(false)} disabled={saving}>
+                {t("wbSettings.common.close")}
+              </Button>
+              <Button type="submit" variant="destructive" disabled={saving || disableCode.length !== 6}>
+                {saving && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                {t("wbSettings.totp.disableBtn")}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
     </SettingsGroup>
   );
 }
@@ -1222,6 +1476,7 @@ export default function SettingsPage() {
 
       <div className="min-w-0 space-y-12">
         <VersionAccountsCard />
+        <TotpSettingsCard />
         <SwitchBehaviorCard />
         <PermissionCheckCard />
         <GatewaySettingsCard />
