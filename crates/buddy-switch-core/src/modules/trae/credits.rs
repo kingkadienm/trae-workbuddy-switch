@@ -24,6 +24,7 @@ use crate::modules::trae::store;
 use crate::modules::trae::{TRAE_APP_VERSION, TRAE_ENTITLEMENT_PATH, TRAE_ENTITLEMENT_PATH_GLOBAL};
 use crate::modules::trae::region::TraeRegion;
 use crate::modules::trae::variant::TraeVariant;
+use crate::modules::trae::account_base_for;
 
 // ---------------------------------------------------------------------------
 // HTTP
@@ -237,7 +238,7 @@ pub async fn post_json_for(
     jwt_value: &str,
     device: &DeviceEntry,
 ) -> (u16, String) {
-    let base = super::endpoints_for(variant).account_base;
+    let base = account_base_for(variant);
     let url = format!("{base}{path}");
     let mut request = trae_http_client().post(&url).body("{}");
     for (key, value) in build_headers(jwt_value, device) {

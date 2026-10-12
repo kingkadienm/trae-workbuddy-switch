@@ -27,6 +27,7 @@ use crate::modules::trae::{
     device, TRAE_EXCHANGE_TOKEN_LEGACY_PATH, TRAE_EXCHANGE_TOKEN_PATH, TRAE_OAUTH_APP_ID,
     TRAE_PAGE_PLATFORM_CODE,
 };
+use crate::modules::trae::{account_base_for, icube_base_for};
 
 /// 账号库中的一条账号记录（持久化形态，键名与参考实现一致）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1006,7 +1007,7 @@ fn build_refresh_variants(
     refresh_token: &str,
     credential: Option<&DeviceCredential>,
 ) -> Vec<RefreshVariant> {
-    let icube_base = crate::modules::trae::endpoints_for_region(variant).icube_base;
+    let icube_base = icube_base_for(variant);
     let new_url = format!("{icube_base}{TRAE_EXCHANGE_TOKEN_PATH}");
     let legacy_url = format!("{icube_base}{TRAE_EXCHANGE_TOKEN_LEGACY_PATH}");
 
@@ -1643,8 +1644,8 @@ pub fn checkin_url() -> String {
 }
 
 /// 按变体派生的 [`checkin_url`]。
-pub fn checkin_url_for(variant: TraeVariant) -> String {
-    let base = crate::modules::trae::endpoints_for(variant).account_base;
+pub fn checkin_url_for(_variant: TraeVariant) -> String {
+    let base = account_base_for(_variant);
     format!("{base}{}", crate::modules::trae::TRAE_CHECKIN_PATH)
 }
 

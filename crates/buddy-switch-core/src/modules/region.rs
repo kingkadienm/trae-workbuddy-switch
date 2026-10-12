@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 
 use crate::modules::config::{home_dir, official_usage_cache_file, store_dir};
+use crate::modules::update::APP_VERSION;
 
 /// 目标版本。CN 为既有默认，Global 为国际版。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -182,7 +183,7 @@ const CN_SPEC: RegionSpec = RegionSpec {
     billing_base: "https://www.codebuddy.cn",
     models_path: "/console/enterprises/personal/models",
     catalog_ua: CatalogUa::Cli,
-    fallback_app_version: "5.5.6",
+    fallback_app_version: APP_VERSION,
     platform: "workbuddy",
 };
 
@@ -199,7 +200,7 @@ const GLOBAL_SPEC: RegionSpec = RegionSpec {
     billing_base: "https://www.workbuddy.ai",
     models_path: "/v3/config",
     catalog_ua: CatalogUa::App,
-    fallback_app_version: "5.5.2",
+    fallback_app_version: APP_VERSION,
     platform: "workbuddy",
 };
 
@@ -361,7 +362,7 @@ mod tests {
         assert_eq!(spec.accounts_filename, "accounts.json");
         assert_eq!(spec.models_path, "/console/enterprises/personal/models");
         assert_eq!(spec.catalog_ua, CatalogUa::Cli);
-        assert_eq!(spec.fallback_app_version, "5.5.6");
+        assert_eq!(spec.fallback_app_version, APP_VERSION);
     }
 
     #[test]
@@ -373,7 +374,7 @@ mod tests {
         assert_eq!(spec.accounts_filename, "accounts.global.json");
         assert_eq!(spec.models_path, "/v3/config");
         assert_eq!(spec.catalog_ua, CatalogUa::App);
-        assert_eq!(spec.fallback_app_version, "5.5.2");
+        assert_eq!(spec.fallback_app_version, APP_VERSION);
     }
 
     #[test]

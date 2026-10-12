@@ -144,6 +144,10 @@ fn api_routes() -> Router {
             "/api/switch/config",
             get(api_switch_config).post(api_save_switch_config),
         )
+        .route(
+            "/api/relay/config",
+            get(api_relay_config).post(api_save_relay_config),
+        )
         .route("/api/oauth/start", post(api_oauth_start))
         .route("/api/oauth/status", post(api_oauth_status))
         .route("/api/import-local", post(api_import_local))
@@ -584,6 +588,20 @@ async fn api_save_switch_config(Json(body): Json<Value>) -> Response {
     let submitted = body.get("config").unwrap_or(&body);
     match config::save_switch_config(submitted) {
         Ok(()) => json_ok(config::load_switch_config()),
+        Err(e) => json_err(e.to_string(), StatusCode::BAD_REQUEST),
+    }
+}
+
+/// GET /api/relay/config —— 接入代理配置。
+async fn api_relay_config() -> Response {
+    json_ok(config::load_relay_config())
+}
+
+/// POST /api/relay/config —— 保存接入代理配置。
+async fn api_save_relay_config(Json(body): Json<Value>) -> Response {
+    let submitted = body.get("config").unwrap_or(&body);
+    match config::save_relay_config(submitted) {
+        Ok(()) => json_ok(config::load_relay_config()),
         Err(e) => json_err(e.to_string(), StatusCode::BAD_REQUEST),
     }
 }
@@ -1432,25 +1450,22 @@ async fn api_gateway_delete_key(Json(body): Json<Value>) -> Response {
 async fn api_gateway_models(RawQuery(query): RawQuery) -> Response {
     let region = parse_region(query_value(query.as_deref(), "region").as_deref());
     let state = crate::gateway_host::shared_state();
-    let snapshot = state.catalogs.current(region);
+
+    // 优先尝试从上游拉取最新目录，失败则静默降级到缓存 / 内置兜底。
+    let snapshot = state
+        .refresh_catalog(region)
+        .await
+        .unwrap_or_else(|| state.catalogs.current(region));
     json_ok(serde_json::to_value(snapshot).unwrap_or(Value::Null))
 }
 
 async fn api_gateway_refresh_models(Json(body): Json<Value>) -> Response {
     let region = parse_region(body.get("region").and_then(Value::as_str));
     let state = crate::gateway_host::shared_state();
-    let strategy = state.strategy_for(region).await;
-    let account = match buddy_switch_gateway::AccountSelector
-        .select(region, &strategy)
-        .await
-    {
-        Ok(account) => account,
-        Err(error) => return json_err(error.message(), StatusCode::BAD_REQUEST),
+    let snapshot = match state.refresh_catalog(region).await {
+        Some(snapshot) => snapshot,
+        None => return json_err("no available account".to_string(), StatusCode::BAD_REQUEST),
     };
-    let snapshot = state
-        .catalogs
-        .refresh(region, &state.upstream, &account)
-        .await;
     json_ok(serde_json::to_value(snapshot).unwrap_or(Value::Null))
 }
 

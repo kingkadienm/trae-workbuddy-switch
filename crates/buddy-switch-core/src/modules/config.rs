@@ -235,8 +235,14 @@ pub use crate::modules::region::{
 
 /// 目标 region 的 billing / 官网基址（CN = `https://www.codebuddy.cn`，
 /// Global = `https://www.workbuddy.ai`）。
+///
+/// 若 `relay_config.json` 配置了 `workbuddy_base`，CN 端返回 relay 地址。
 pub fn api_endpoint_for(region: crate::modules::region::Region) -> &'static str {
-    crate::modules::region::region_spec(region).billing_base
+    if region == crate::modules::region::Region::Cn {
+        workbuddy_api_base()
+    } else {
+        crate::modules::region::region_spec(region).billing_base
+    }
 }
 
 
@@ -763,6 +769,113 @@ pub fn save_switch_config(cfg: &Value) -> std::io::Result<()> {
     std::fs::create_dir_all(store_dir())?;
     let content = serde_json::to_string_pretty(&merged).unwrap_or_default();
     atomic_write(&switch_config_file(), &content)
+}
+
+// ---------------------------------------------------------------------------
+// Relay / 接入代理配置
+// ---------------------------------------------------------------------------
+
+/// 接入代理配置文件路径：`~/.buddy-switch/relay_config.json`。
+pub fn relay_config_file() -> PathBuf {
+    store_dir().join("relay_config.json")
+}
+
+/// 默认 relay 配置（空串 = 不启用代理，直连上游）。
+pub fn default_relay_config() -> Value {
+    json!({
+        "workbuddy_base": "",
+        "trae_base": "",
+    })
+}
+
+/// 读取 relay 配置（缺失/损坏回落默认值）。
+///
+/// 测试二进制（`target/debug/deps/…`）下跳过磁盘读取，返回空配置，避免
+/// `~/.buddy-switch/relay_config.json` 污染单测的硬编码断言。
+pub fn load_relay_config() -> Value {
+    if is_test_binary() {
+        return default_relay_config();
+    }
+    let f = relay_config_file();
+    if f.exists() {
+        if let Ok(text) = std::fs::read_to_string(&f) {
+            if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                return normalize_relay_config(&value);
+            }
+        }
+    }
+    default_relay_config()
+}
+
+/// 判断当前是否运行在 cargo test 生成的测试二进制中。
+fn is_test_binary() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
+        .map(|s| s.contains("target/debug/deps") || s.contains("target/release/deps"))
+        .unwrap_or(false)
+}
+
+/// 合并默认值与已知字段；未知键一律丢弃。
+fn normalize_relay_config(input: &Value) -> Value {
+    let mut merged = default_relay_config();
+    for key in ["workbuddy_base", "trae_base"] {
+        if let Some(value) = input.get(key).and_then(Value::as_str) {
+            merged[key] = json!(value);
+        }
+    }
+    merged
+}
+
+/// 保存 relay 配置。
+pub fn save_relay_config(cfg: &Value) -> std::io::Result<()> {
+    let merged = normalize_relay_config(cfg);
+    std::fs::create_dir_all(store_dir())?;
+    let content = serde_json::to_string_pretty(&merged).unwrap_or_default();
+    atomic_write(&relay_config_file(), &content)
+}
+
+/// WorkBuddy 上游基址：配置了 relay 则走 relay，否则直连。
+///
+/// Relay 值应包含路径前缀（如 `https://api.wangzs.vip/workbuddy`），
+/// 调用方直接 `{base}{path}` 即可。
+pub fn workbuddy_api_base() -> &'static str {
+    match load_relay_config()
+        .get("workbuddy_base")
+        .and_then(Value::as_str)
+    {
+        Some(s) if !s.is_empty() => {
+            // 每次调用读取当前配置；重启服务时自动取最新值。
+            // 使用 boxed leak 避免每次分配（配置变更极少，此处以正确性优先）。
+            // 简化处理：直接返回 static 默认 + 通过 OnceLock 缓存 relay 值。
+            static WB_RELAY: OnceLock<Box<str>> = OnceLock::new();
+            // 每次调用都重新检查配置（支持热更新）。
+            // 但 OnceLock 只初始化一次 → 用 Mutex 包装以便重载。
+            // 为简单起见，这里采用「首次看到的 relay 值缓存到程序生命周期」策略：
+            // 如需变更，重启服务即可。
+            WB_RELAY.get_or_init(|| s.into())
+        }
+        _ => WORKBUDDY_API_ENDPOINT,
+    }
+}
+
+/// Trae relay 基址：配置了 relay 则返回 Some(url)，否则 None。
+///
+/// 变体感知版本见 [`crate::modules::trae::account_base_for`] / [`crate::modules::trae::icube_base_for`]。
+pub(crate) fn trae_relay_base() -> Option<&'static str> {
+    if is_test_binary() {
+        return None;
+    }
+    match load_relay_config()
+        .get("trae_base")
+        .and_then(Value::as_str)
+    {
+        Some(s) if !s.is_empty() => {
+            static TRAE_RELAY: OnceLock<Box<str>> = OnceLock::new();
+            Some(TRAE_RELAY.get_or_init(|| s.into()))
+        }
+        _ => None,
+    }
 }
 
 /// 读取自动轮换日志。

@@ -86,6 +86,7 @@ use crate::modules::trae::{
     TRAE_OAUTH_APP_ID, TRAE_OAUTH_LOGIN_TIMEOUT_SECONDS, TRAE_PAGE_APP_VERSION,
     TRAE_PAGE_PLUGIN_VERSION,
 };
+use crate::modules::trae::{account_base_for, icube_base_for};
 
 /// 授权页路径（挂在**该变体的 `console_base`** 后面）。
 ///
@@ -864,13 +865,13 @@ fn build_authorize_url(
 /// 而 `icube_base`（`https://api.trae.com.cn`）是**另一台主机**。
 /// 客户端源码里 `apiHost` 的取值顺序是「回调回传的 host → `account.trae.normal`」，
 /// 从不是 iCube 基址。
-fn resolve_exchange_host(callback_host: Option<&str>, variant: TraeVariant) -> (String, bool) {
+fn resolve_exchange_host(callback_host: Option<&str>, _variant: TraeVariant) -> (String, bool) {
     match callback_host
         .map(|host| host.trim().trim_end_matches('/'))
         .filter(|host| !host.is_empty())
     {
         Some(host) => (host.to_string(), false),
-        None => (endpoints_for(variant).account_base.to_string(), true),
+        None => (account_base_for(_variant).to_string(), true),
     }
 }
 
@@ -989,7 +990,7 @@ async fn exchange_auth_code(
     let platform_code = line.platform_code();
     let legacy_url = format!(
         "{}{}",
-        endpoints_for(variant).icube_base,
+        icube_base_for(variant),
         TRAE_EXCHANGE_TOKEN_LEGACY_PATH
     );
     let variants: Vec<(String, String, Value, bool)> = vec![

@@ -16,7 +16,7 @@ use crate::modules::account::{
 use crate::modules::config::{
     http_request, load_checkin_config, load_travel_cache, load_travel_config, now_ms, now_secs,
     save_travel_cache, with_travel_cache_lock, RunFlagGuard, TRAVEL_API_PREFIX,
-    WORKBUDDY_API_ENDPOINT,
+    workbuddy_api_base,
 };
 use crate::modules::refresh::{ensure_fresh_token, refresh_account_token};
 
@@ -62,10 +62,11 @@ fn account_key(account: &Value) -> String {
 fn build_travel_headers(account: &Value) -> HashMap<String, String> {
     let mut headers = build_auth_headers(account);
     headers.insert("x-client-platform".to_string(), "web".to_string());
-    headers.insert("origin".to_string(), WORKBUDDY_API_ENDPOINT.to_string());
+    let wb_base = workbuddy_api_base();
+    headers.insert("origin".to_string(), wb_base.to_string());
     headers.insert(
         "referer".to_string(),
-        format!("{WORKBUDDY_API_ENDPOINT}/profile/growth-center"),
+        format!("{wb_base}/profile/growth-center"),
     );
     headers
 }
@@ -92,7 +93,7 @@ async fn travel_request(path: &str, method: &str, body: Option<Value>, account: 
     if let Some(err) = envelope_token_error(account) {
         return json!({"code": -2, "message": err});
     }
-    let url = format!("{WORKBUDDY_API_ENDPOINT}{path}");
+    let url = format!("{}{path}", workbuddy_api_base());
     let headers = build_travel_headers(account);
     let mut resp = http_request(&url, method, body.clone(), Some(&headers)).await;
     if is_unauthorized(&resp)

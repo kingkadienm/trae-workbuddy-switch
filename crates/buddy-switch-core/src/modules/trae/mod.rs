@@ -158,6 +158,26 @@ pub fn endpoints_for_region(variant: variant::TraeVariant) -> &'static variant::
     }
 }
 
+// ---------------------------------------------------------------------------
+// Relay 感知端点（覆盖 variant 表）
+// ---------------------------------------------------------------------------
+
+/// Trae 账号中心基址：relay 配置优先，否则走变体所属区域的 `account_base`。
+pub fn account_base_for(variant: variant::TraeVariant) -> &'static str {
+    match crate::modules::config::trae_relay_base() {
+        Some(relay) => relay,
+        None => endpoints_for_region(variant).account_base,
+    }
+}
+
+/// Trae iCube 基址：relay 配置优先，否则走变体所属区域的 `icube_base`。
+pub fn icube_base_for(variant: variant::TraeVariant) -> &'static str {
+    match crate::modules::config::trae_relay_base() {
+        Some(relay) => relay,
+        None => endpoints_for_region(variant).icube_base,
+    }
+}
+
 /// 签到接口路径。
 pub const TRAE_CHECKIN_PATH: &str = "/trae/api/v2/ug/checkin_credits/claim";
 

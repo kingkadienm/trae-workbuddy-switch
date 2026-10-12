@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use crate::modules::account::{
     account_display_name, build_auth_headers, envelope_token_error,
 };
-use crate::modules::config::{http_request, load_checkin_config, now_ms, WORKBUDDY_API_ENDPOINT};
+use crate::modules::config::{http_request, load_checkin_config, now_ms, workbuddy_api_base};
 use crate::modules::credit_usage;
 use crate::modules::refresh::{ensure_fresh_token_for, refresh_account_token_for};
 use crate::modules::region::{region_spec, Region};
@@ -399,7 +399,7 @@ fn request_origin(url: &str) -> &'static str {
     if url.starts_with(WORKBUDDY_WEB_ENDPOINT) {
         WORKBUDDY_WEB_ENDPOINT
     } else {
-        WORKBUDDY_API_ENDPOINT
+        workbuddy_api_base()
     }
 }
 
@@ -463,7 +463,7 @@ fn new_resource_endpoint(account: &Value) -> &'static str {
         .as_deref()
     {
         Some("workbuddy.cn") | Some("www.workbuddy.cn") => WORKBUDDY_WEB_ENDPOINT,
-        _ => WORKBUDDY_API_ENDPOINT,
+        _ => workbuddy_api_base(),
     }
 }
 
@@ -919,7 +919,7 @@ mod tests {
         );
         assert_eq!(
             new_resource_endpoint_for(Region::Cn, &cn_domain),
-            WORKBUDDY_API_ENDPOINT
+            workbuddy_api_base()
         );
 
         // 两版端点必须不同（Global 不得复用 CN 的域判定）。
@@ -1258,7 +1258,7 @@ mod tests {
         );
         assert_eq!(
             request_origin("https://www.codebuddy.cn/v2/billing/meter/get-user-resource"),
-            WORKBUDDY_API_ENDPOINT
+            workbuddy_api_base()
         );
     }
 
