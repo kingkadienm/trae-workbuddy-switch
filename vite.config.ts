@@ -50,5 +50,16 @@ export default defineConfig(async () => ({
       // 3. tell Vite to ignore watching `src-tauri`
       ignored: ["**/src-tauri/**"],
     },
+    // 本地开发代理：将 API 和网关请求转发到 Rust 后端（默认 57890）
+    proxy: {
+      "/api": {
+        target: "http://127.0.0.1:57890",
+        changeOrigin: true,
+      },
+      "/v1": {
+        target: "http://127.0.0.1:57890",
+        changeOrigin: true,
+      },
+    },
   },
 }));
