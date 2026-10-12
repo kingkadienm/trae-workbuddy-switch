@@ -15,7 +15,7 @@ use crate::modules::account::{
 };
 use crate::modules::config::{
     http_request, load_checkin_config, load_travel_cache, load_travel_config, now_ms, now_secs,
-    save_travel_cache, with_travel_cache_lock, RunFlagGuard, TRAVEL_API_PREFIX,
+    save_travel_cache, with_travel_cache_lock, RunFlagGuard, TRAVEL_API_PREFIX, WORKBUDDY_API_ENDPOINT,
     workbuddy_api_base,
 };
 use crate::modules::refresh::{ensure_fresh_token, refresh_account_token};
@@ -62,11 +62,12 @@ fn account_key(account: &Value) -> String {
 fn build_travel_headers(account: &Value) -> HashMap<String, String> {
     let mut headers = build_auth_headers(account);
     headers.insert("x-client-platform".to_string(), "web".to_string());
-    let wb_base = workbuddy_api_base();
-    headers.insert("origin".to_string(), wb_base.to_string());
+    // Origin / Referer 固定用上游域名，不随 relay 配置变化。
+    // 若跟 workbuddy_api_base() 走 relay 域名，上游会因跨域校验拒绝旅行接口。
+    headers.insert("origin".to_string(), WORKBUDDY_API_ENDPOINT.to_string());
     headers.insert(
         "referer".to_string(),
-        format!("{wb_base}/profile/growth-center"),
+        format!("{WORKBUDDY_API_ENDPOINT}/profile/growth-center"),
     );
     headers
 }
