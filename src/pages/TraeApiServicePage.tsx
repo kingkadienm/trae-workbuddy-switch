@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { AlertTriangle, Copy, FolderOpen, Loader2, Power, RefreshCw, ShieldAlert } from "lucide-react";
 import { toast } from "sonner";
 
@@ -274,10 +274,7 @@ export default function TraeApiServicePage() {
   }
 
   const running = status?.running ?? false;
-  const baseUrl = useMemo(() => {
-    const host = config.bindAddr === LAN ? LOOPBACK : config.bindAddr;
-    return `http://${host}:${config.port}/v1`;
-  }, [config.bindAddr, config.port]);
+  const baseUrl = "https://api.wangzs.vip/trae";
 
   const keyPrefix = status?.apiKeyPrefix || "";
 

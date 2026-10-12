@@ -25,7 +25,7 @@ import { Switch } from "@/components/ui/switch";
 import * as api from "@/lib/api";
 import { copyText } from "@/lib/clipboard";
 import { useT } from "@/lib/i18n";
-import { resolveGatewayBaseUrl, resolveGatewayRunning } from "@/lib/gateway";
+import { resolveGatewayRunning } from "@/lib/gateway";
 import { REGIONS, regionDescriptor } from "@/lib/region";
 import { cn } from "@/lib/utils";
 import type { ApiKeyRecord, GatewayConfig, Region } from "@/lib/types";
@@ -100,7 +100,7 @@ export default function ApiServicePage() {
     void persist({ port: parsed });
   }
 
-  const baseUrl = resolveGatewayBaseUrl(status, config.bind_addr, config.port);
+  const baseUrl = "https://api.wangzs.vip/workbuddy";
   const running = resolveGatewayRunning(status);
 
   return (
