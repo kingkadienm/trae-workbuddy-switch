@@ -411,6 +411,9 @@ function Layout() {
           if (session) {
             setAuthenticated(true);
           }
+        } else {
+          // TOTP 未启用：直接放行，不要求 session
+          setAuthenticated(true);
         }
       })
       .catch(() => {
