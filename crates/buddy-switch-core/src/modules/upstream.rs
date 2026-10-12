@@ -100,16 +100,6 @@ const HARD_CREDIT_MARKERS: &[&str] = &[
     "触发限流",
 ];
 
-/// 会话失效标记（原样匹配）。
-const SESSION_DEAD_MARKERS: &[&str] = &[
-    "Offline user session not found",
-    "12153",
-    "session expired",
-    "token expired",
-    "user session not found",
-    "登录已过期",
-];
-
 /// 上游失败分类（严格按参考实现的判定顺序）。
 pub fn classify_upstream_error(status: u16, body: &str) -> UpstreamErrorKind {
     if status == 402 {

@@ -165,7 +165,7 @@ pub fn is_enabled() -> bool {
 /// 生成新密钥（首次设置）。
 /// 返回 base32 编码的密钥字符串，同时写入磁盘（enabled = false）。
 pub fn setup() -> Result<String, String> {
-    let mut cfg = config_cell().read();
+    let cfg = config_cell().read();
     if cfg.as_ref().map(|c| c.enabled).unwrap_or(false) {
         return Err("TOTP 已启用，如需重新设置请先禁用".into());
     }
