@@ -21,6 +21,7 @@ import { useT } from "@/lib/i18n";
 import type { TranslationKey } from "@/locales/zh";
 import { TRAE_VARIANTS_KEY, loadTraeVariantStatuses } from "@/lib/trae-variant-status";
 import type { TraeVariantStatus } from "@/lib/trae-types";
+import { fetchPublicConfig } from "@/hooks/use-public-config";
 
 // ---------------------------------------------------------------------------
 // 路由级懒加载（P0-2）
@@ -393,33 +394,35 @@ function Layout() {
   const [authenticated, setAuthenticated] = useState(false);
   const [checkingAuth, setCheckingAuth] = useState(true);
 
-  // 初始化：检查 TOTP 状态 + session 有效性
+  // 初始化：检查 TOTP 状态 + session 有效性 + 公开配置
   useEffect(() => {
     api.setUnauthorizedHandler(() => {
       setAuthenticated(false);
       sessionStorage.removeItem("totp_session");
     });
 
-    api
+    // 并行拉取：auth 检查与 public-config 互不阻塞
+    const authPromise = api
       .totpStatus()
       .then((status) => {
         setTotpEnabled(status.enabled);
         if (status.enabled) {
           const session = sessionStorage.getItem("totp_session");
           if (session) {
-            // 有 session token，乐观标记为已认证；首个 API 调用会验证 token 有效性
             setAuthenticated(true);
           }
-        } else {
-          // TOTP 未启用，显示首次设置引导
         }
       })
       .catch(() => {
-        // 获取状态失败（如 TOTP 服务未启动），降级为无 TOTP
         setTotpEnabled(false);
         setAuthenticated(true);
-      })
-      .finally(() => setCheckingAuth(false));
+      });
+
+    const configPromise = fetchPublicConfig().catch(() => {
+      // 降级：fetchPublicConfig 内部已写入默认值，此处静默
+    });
+
+    Promise.all([authPromise, configPromise]).finally(() => setCheckingAuth(false));
   }, []);
 
   function handleLoginSuccess() {

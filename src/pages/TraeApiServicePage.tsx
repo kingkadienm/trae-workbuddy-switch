@@ -27,6 +27,7 @@ import { Switch } from "@/components/ui/switch";
 import * as api from "@/lib/api";
 import { useT } from "@/lib/i18n";
 import { copyText } from "@/lib/clipboard";
+import { fetchPublicConfig } from "@/hooks/use-public-config";
 import {
   DEFAULT_TRAE_GATEWAY_CONFIG,
   normalizeTraeGatewayConfig,
@@ -274,7 +275,10 @@ export default function TraeApiServicePage() {
   }
 
   const running = status?.running ?? false;
-  const baseUrl = "https://api.wangzs.vip/trae";
+  const [baseUrl, setBaseUrl] = useState("https://api.wangzs.vip/trae");
+  useEffect(() => {
+    void fetchPublicConfig().then((cfg) => setBaseUrl(cfg.traeBase));
+  }, []);
 
   const keyPrefix = status?.apiKeyPrefix || "";
 

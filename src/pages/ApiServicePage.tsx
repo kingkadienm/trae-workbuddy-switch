@@ -27,6 +27,7 @@ import { copyText } from "@/lib/clipboard";
 import { useT } from "@/lib/i18n";
 import { resolveGatewayRunning } from "@/lib/gateway";
 import { REGIONS, regionDescriptor } from "@/lib/region";
+import { fetchPublicConfig } from "@/hooks/use-public-config";
 import { cn } from "@/lib/utils";
 import type { ApiKeyRecord, GatewayConfig, Region } from "@/lib/types";
 import { useGatewayStore } from "@/stores/gateway";
@@ -100,7 +101,10 @@ export default function ApiServicePage() {
     void persist({ port: parsed });
   }
 
-  const baseUrl = "https://api.wangzs.vip/workbuddy";
+  const [baseUrl, setBaseUrl] = useState("https://api.wangzs.vip/workbuddy");
+  useEffect(() => {
+    void fetchPublicConfig().then((cfg) => setBaseUrl(cfg.workbuddyBase));
+  }, []);
   const running = resolveGatewayRunning(status);
 
   return (

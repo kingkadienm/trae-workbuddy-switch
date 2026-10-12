@@ -148,6 +148,7 @@ fn api_routes() -> Router {
             "/api/relay/config",
             get(api_relay_config).post(api_save_relay_config),
         )
+        .route("/api/public-config", get(api_public_config))
         .route("/api/oauth/start", post(api_oauth_start))
         .route("/api/oauth/status", post(api_oauth_status))
         .route("/api/import-local", post(api_import_local))
@@ -595,6 +596,20 @@ async fn api_save_switch_config(Json(body): Json<Value>) -> Response {
 /// GET /api/relay/config —— 接入代理配置。
 async fn api_relay_config() -> Response {
     json_ok(config::load_relay_config())
+}
+
+/// GET /api/public-config —— 前端所需的公开配置（base URL 等）。
+async fn api_public_config() -> Response {
+    let relay = config::load_relay_config();
+    let wb = relay
+        .get("workbuddy_base")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let trae = relay
+        .get("trae_base")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    json_ok(json!({ "workbuddyBase": wb, "traeBase": trae }))
 }
 
 /// POST /api/relay/config —— 保存接入代理配置。
