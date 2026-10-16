@@ -66,6 +66,28 @@ function expiringSoonAmount(credit?: CreditExpiry): number {
   return credit?.ok ? credit.expiringSoonRemaining ?? 0 : 0;
 }
 
+/** 汇总所有账号「近期到期」的积分总量与涉及的账号数，用于账号列表头部的统计徽标。 */
+function summarizeExpiringCredits(
+  accountIds: string[],
+  creditMap: Record<string, CreditExpiry | undefined>,
+): { total: number; accounts: number } {
+  let total = 0;
+  let accounts = 0;
+  for (const id of accountIds) {
+    const amount = expiringSoonAmount(creditMap[id]);
+    if (amount > 0) {
+      total += amount;
+      accounts += 1;
+    }
+  }
+  return { total, accounts };
+}
+
+function formatCredits(value: number): string {
+  if (!Number.isFinite(value)) return "—";
+  return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(value);
+}
+
 function hasExpiringSoonCredits(credit?: CreditExpiry): boolean {
   return credit?.ok === true && expiringSoonAmount(credit) > 0;
 }
@@ -1149,6 +1171,20 @@ function RegionPanel({ region }: { region: Region }) {
                 >
                   {accounts.length}
                 </Badge>
+                {(() => {
+                  const expiring = summarizeExpiringCredits(accounts.map((a) => a.id), creditMap);
+                  if (expiring.total <= 0) return null;
+                  return (
+                    <Badge
+                      variant="secondary"
+                      className="h-6 rounded-full border-0 px-2 text-[11px] tabular-nums text-orange-600 shadow-none"
+                      title={t("wbAccounts.page.expiringSummaryAria", { amount: formatCredits(expiring.total), accounts: expiring.accounts })}
+                      aria-label={t("wbAccounts.page.expiringSummaryAria", { amount: formatCredits(expiring.total), accounts: expiring.accounts })}
+                    >
+                      {t("wbAccounts.page.expiringSummary", { amount: formatCredits(expiring.total), accounts: expiring.accounts })}
+                    </Badge>
+                  );
+                })()}
               </div>
               <TooltipProvider delayDuration={400}>
                 <div className="ml-auto flex items-center gap-1">

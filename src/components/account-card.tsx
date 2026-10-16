@@ -675,7 +675,18 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
               </div>
             </div>
 
-            <div className={cn("text-[11px] font-medium text-muted-foreground", compact ? "mt-3" : "mt-4")}>{t("wbAccounts.card.expiringSoonTitle")}</div>
+            <div className={cn("flex items-center text-[11px] font-medium text-muted-foreground", compact ? "mt-3" : "mt-4")}>
+              <span>{t("wbAccounts.card.expiringSoonTitle")}</span>
+              {expiringAmount > 0 && (
+                <span
+                  className="ml-auto whitespace-nowrap tabular-nums font-semibold text-orange-600"
+                  title={t("wbAccounts.card.expiringTotalAria", { amount: formatCredits(expiringAmount) })}
+                  aria-label={t("wbAccounts.card.expiringTotalAria", { amount: formatCredits(expiringAmount) })}
+                >
+                  {t("wbAccounts.card.expiringTotal", { amount: formatCredits(expiringAmount) })}
+                </span>
+              )}
+            </div>
             <div className={cn(compact ? "mt-1.5 space-y-2" : "mt-2 space-y-2.5")}>
               {visibleResources.length > 0 ? visibleResources.map((resource, index) => {
                 const resourceName = resource.packageName || resource.packageCode || t("wbAccounts.card.creditPackFallback");
