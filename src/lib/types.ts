@@ -841,7 +841,8 @@ export interface CatalogSnapshot {
 export type AccountStrategy =
   | { kind: "current" }
   | { kind: "pinned"; account_id: string }
-  | { kind: "max_credits" };
+  | { kind: "max_credits" }
+  | { kind: "earliest_expiry" };
 
 /** 某 region 的策略 + 当前选用账号（selected 与 AccountMeta 同构）。 */
 export interface AccountStrategyView {

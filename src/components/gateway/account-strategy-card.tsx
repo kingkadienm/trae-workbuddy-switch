@@ -18,6 +18,7 @@ const STRATEGY_OPTIONS: { value: string; labelKey: TranslationKey }[] = [
   { value: "current", labelKey: "wbStats.gateway.strategyCurrent" },
   { value: "pinned", labelKey: "wbStats.gateway.strategyPinned" },
   { value: "max_credits", labelKey: "wbStats.gateway.strategyMaxCredits" },
+  { value: "earliest_expiry", labelKey: "wbStats.gateway.strategyEarliestExpiry" },
 ];
 
 function accountLabel(account: AccountMeta): string {
@@ -42,6 +43,7 @@ export function AccountStrategyCard({ className }: { className?: string }) {
         <p>{t("wbStats.gateway.strategyHint1")}</p>
         <p>{t("wbStats.gateway.strategyHint2")}</p>
         <p>{t("wbStats.gateway.strategyHint3")}</p>
+        <p>{t("wbStats.gateway.strategyHint4")}</p>
       </div>
     </Card>
   );
@@ -80,8 +82,8 @@ function RegionStrategyRow({ region }: { region: Region }) {
       void persist({ kind: "pinned", account_id: pinnedId });
       return;
     }
-    if (next === "max_credits") {
-      void persist({ kind: "max_credits" });
+    if (next === "max_credits" || next === "earliest_expiry") {
+      void persist({ kind: next });
       return;
     }
     void persist({ kind: "current" });

@@ -1,4 +1,4 @@
-//! 账号选择策略（`current` / `pinned` / `max_credits`；P0-8）。
+//! 账号选择策略（`current` / `pinned` / `max_credits` / `earliest_expiry`；P0-8）。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -24,6 +24,9 @@ pub enum AccountStrategy {
     Pinned { account_id: String },
     /// 积分最多：在账号库中选剩余积分最高者。
     MaxCredits,
+    /// 积分最先到期：在账号库中选「有效积分到期时间最早」者，
+    /// 优先把快过期的积分用掉，减少浪费。
+    EarliestExpiry,
 }
 
 impl Default for AccountStrategy {
@@ -48,6 +51,37 @@ where
         }
     }
     best.map(|(_, account)| account)
+}
+
+/// 选「有效积分到期最早」的账号。
+///
+/// 排序键 `(soonest_expire_at, total_remaining)`：
+/// - 只考虑 `totalRemaining > 0` 且能拿到 `soonestExpireAt` 的账号；
+/// - 到期时间早者优先（严格小于），并列时**剩余多者优先**——同样是快过期，
+///   先消耗存量最大的一笔，减少浪费；
+/// - 仍并列时保留先出现者，与 `max_credits` 的并列语义一致。
+fn select_earliest_expiry_candidate<I>(candidates: I) -> Option<Value>
+where
+    I: IntoIterator<Item = (Option<i64>, f64, Value)>,
+{
+    let mut best: Option<(i64, f64, Value)> = None;
+    for (expire_at, remaining, account) in candidates {
+        let Some(expire_at) = expire_at else { continue };
+        if remaining <= 0.0 {
+            continue;
+        }
+        let better = match &best {
+            Some((current_expire, current_remaining, _)) => {
+                expire_at < *current_expire
+                    || (expire_at == *current_expire && remaining > *current_remaining)
+            }
+            None => true,
+        };
+        if better {
+            best = Some((expire_at, remaining, account));
+        }
+    }
+    best.map(|(_, _, account)| account)
 }
 
 /// 账号选择器。
@@ -99,6 +133,28 @@ impl AccountSelector {
                 ensure_region(&account, region)?;
                 Ok(account)
             }
+            AccountStrategy::EarliestExpiry => {
+                let accounts = account::load_accounts_for(region);
+                if accounts.is_empty() {
+                    return Err(GatewayError::NoCredential { region });
+                }
+                let mut candidates = Vec::with_capacity(accounts.len());
+                for account in accounts {
+                    let credits_value = credits::get_credit_expiry(&account).await;
+                    let remaining = credits_value
+                        .get("totalRemaining")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0);
+                    let expire_at = credits_value
+                        .get("soonestExpireAt")
+                        .and_then(Value::as_i64);
+                    candidates.push((expire_at, remaining, account));
+                }
+                let account = select_earliest_expiry_candidate(candidates.into_iter())
+                    .ok_or(GatewayError::NoCredential { region })?;
+                ensure_region(&account, region)?;
+                Ok(account)
+            }
         }?;
 
         // 加密信封凭据不得送进网关：`build_chat_headers` 会把信封折成**空 `Bearer`**，
@@ -132,6 +188,11 @@ pub async fn describe_strategy(region: Region, strategy: &AccountStrategy) -> Va
         AccountStrategy::MaxCredits => {
             described["note"] =
                 serde_json::json!("max_credits 在每次请求时按实时积分择优，此处不预取（避免 N 次网络请求）");
+        }
+        AccountStrategy::EarliestExpiry => {
+            described["note"] = serde_json::json!(
+                "earliest_expiry 在每次请求时按实时积分到期时间择优，此处不预取（避免 N 次网络请求）"
+            );
         }
         _ => match AccountSelector.select(region, strategy).await {
             Ok(account) => {
@@ -214,6 +275,29 @@ mod tests {
     }
 
     #[test]
+    fn earliest_expiry_selection_prefers_soonest_then_largest_remaining() {
+        let candidates = vec![
+            (Some(200), 5.0, json!({"id": "later"})),
+            (Some(100), 3.0, json!({"id": "sooner-small"})),
+            (Some(100), 8.0, json!({"id": "sooner-large"})),
+            (Some(50), 0.0, json!({"id": "no-remaining"})),
+            (None, 9.0, json!({"id": "no-expiry"})),
+        ];
+        let selected = select_earliest_expiry_candidate(candidates.into_iter()).unwrap();
+        assert_eq!(selected["id"], "sooner-large");
+
+        // 全部无效（无到期时间或无剩余）→ None（调用方回落 NoCredential）。
+        let all_invalid = vec![
+            (None, 9.0, json!({"id": "a"})),
+            (Some(50), 0.0, json!({"id": "b"})),
+        ];
+        assert!(select_earliest_expiry_candidate(all_invalid.into_iter()).is_none());
+
+        let empty: Vec<(Option<i64>, f64, Value)> = Vec::new();
+        assert!(select_earliest_expiry_candidate(empty.into_iter()).is_none());
+    }
+
+    #[test]
     fn strategy_serde_roundtrip() {
         assert_eq!(
             serde_json::to_value(AccountStrategy::Current).unwrap(),
@@ -229,6 +313,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(AccountStrategy::MaxCredits).unwrap(),
             json!({"kind": "max_credits"})
+        );
+        assert_eq!(
+            serde_json::to_value(AccountStrategy::EarliestExpiry).unwrap(),
+            json!({"kind": "earliest_expiry"})
         );
 
         let parsed: AccountStrategy = serde_json::from_value(json!({"kind": "pinned", "account_id": "x"})).unwrap();
