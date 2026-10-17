@@ -423,10 +423,16 @@ async fn select_account(
             let uid = account::get_str(&account_value, "uid").unwrap_or_default();
             // 池已试过的账号不再重复选择（否则会立刻二次失败）。
             if !uid.is_empty() && tried.contains(&uid) {
-                None
-            } else {
-                Some(account_value)
+                return None;
             }
+            // 池里已对该账号记录了生效中的冷却（账号级或**本模型的模型级 6004**）时，
+            // 策略不得越过冷却强行选它。否则 `max_credits` 在「积分最多的号恰好
+            // 被限流」的场面下会每个请求都重选同一个号、每次都吃同一个 429
+            // （2026-10-17 实测：kimi-k3-1 全池限流后连续十余次 429 全落同一号）。
+            if !uid.is_empty() && !state.pool.read().await.is_usable_for(&uid, now_ms, model) {
+                return None;
+            }
+            Some(account_value)
         }
         Err(_) => None,
     }

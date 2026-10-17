@@ -170,7 +170,7 @@ pub fn pick(
         .collect();
 
     if candidate_uids.is_empty() {
-        return pick_earliest_expiry(entries, policy, now_ms, realm, tried);
+        return pick_earliest_expiry(entries, policy, now_ms, realm, model, tried);
     }
 
     // 归一化基准：分层过滤**之前**的候选集最大值。
@@ -300,14 +300,22 @@ fn draw_weighted<'a>(items: &[&'a Candidate], rng: &mut Pcg32) -> Option<&'a Can
 
 /// 全冷却兜底：池内无健康候选时，挑「最早解冻」的账号强试一次。
 ///
-/// 约束：非 `tried`、realm 匹配、非禁用、**排除仍在有效硬冷却中的账号**
-/// （硬冷却意味着余额不足，强试必然再失败且浪费一次上游调用）。
+/// 约束：非 `tried`、realm 匹配、非禁用、**排除仍在有效冷却中的账号**。
+/// 排除范围包括：
+/// - 硬冷却（余额不足）：强试必然再失败且浪费一次上游调用；
+/// - 账号级软冷却（无重置时刻的 429 退避）：同上；
+/// - **该模型的模型级冷却（6004）**：兜底不查模型冷却会把「全池恰好都因同一模型
+///   被限流」的场面变成「每个请求都强试最早解冻的号、每次都吃同一个 429」——
+///   2026-10-17 实测：max_credits 策略下 kimi-k3-1 全池限流，兜底连续十余次
+///   重选同一限流号，用户侧表现为持续 429 而非换到其它模型可用号。
+///
 /// 不推进 `used_seq`（它只是「试一下」，不应影响 LRU 语义）。
 fn pick_earliest_expiry(
     entries: &mut BTreeMap<String, PoolEntry>,
     policy: &PickPolicy,
     now_ms: i64,
     realm: Option<RealmTag>,
+    model: &str,
     tried: &HashSet<String>,
 ) -> Option<String> {
     let candidate = entries
@@ -324,9 +332,16 @@ fn pick_earliest_expiry(
             if in_flight_full(entry, policy) {
                 return false;
             }
-            // 硬冷却期间余额不足，强试无意义。
-            if entry.cool_kind == Some(crate::pool::entry::CoolKind::Hard) && now_ms < entry.until_ms {
+            // 仍在生效的冷却（硬 / 账号级软 / 本模型的模型级）一律排除：强试无意义。
+            // 注意 `cool_kind == None` 表示从未冷却或已被清，`until_ms` 可能残留旧值，
+            // 因此以 `CoolKind` 是否存在为准。
+            if entry.cool_kind.is_some() && now_ms < entry.until_ms {
                 return false;
+            }
+            if let Some(cooldown) = entry.model_cooldowns.get(model) {
+                if now_ms < cooldown.until_ms {
+                    return false;
+                }
             }
             entry.expiry_ms() > 0
         })
@@ -611,18 +626,30 @@ mod tests {
         assert_eq!(pick(&mut pool, &mut seq, &policy(), NOW, None, "", &HashSet::new(), 1), None);
     }
 
+    /// 全冷却 ⇒ 兜底**不再强试**（2026-10-17 语义修正）。
+    ///
+    /// 旧语义「挑最早解冻的强试一次」会让每个新请求都重撞同一堵限流墙：
+    /// 实测 max_credits 策略下 kimi-k3-1 全池限流，兜底连续十余次重选同一号，
+    /// 用户侧表现为持续 429。修正后全池冷却时诚实返回 `None`，由上层回 429。
     #[test]
-    fn all_cooling_falls_back_to_earliest_expiry() {
+    fn all_cooling_falls_back_to_none_instead_of_probing() {
         let mut soon = base_entry("soon");
         soon.cooldown_fixed(NOW, 1000, "404");
         let mut late = base_entry("late");
-        late.cooldown_fixed(NOW, 60_000, "429");
+        late.cooldown_soft_until(NOW, NOW + 7_200_000, 7_200_000, "429 rate limit");
         let mut pool = pool_of(vec![soon, late]);
         let mut seq = 0;
         assert_eq!(
             pick(&mut pool, &mut seq, &policy(), NOW, None, "", &HashSet::new(), 1),
+            None,
+            "全池冷却时不得强试任何号，应诚实无号可给"
+        );
+        // 冷却解冻后恢复正常选号。
+        let later = NOW + 61_000;
+        assert_eq!(
+            pick(&mut pool, &mut seq, &policy(), later, None, "", &HashSet::new(), 1),
             Some("soon".to_string()),
-            "全冷却时选最早解冻者"
+            "解冻后应恢复可选"
         );
     }
 
@@ -663,6 +690,45 @@ mod tests {
             pick(&mut pool, &mut seq, &policy(), NOW, None, "deepseek-v4-flash", &HashSet::new(), 1),
             Some("a".to_string()),
             "其它模型应立即可用"
+        );
+    }
+
+    /// 回归（2026-10-17）：全池都对同一模型处于模型级限流（6004）时，
+    /// 「最早解冻」兜底**不得**强试任何仍在模型冷却中的账号——否则每个请求
+    /// 都重选同一限流号、每次都吃同一个 429。全池冷却 ⇒ `None`。
+    #[test]
+    fn earliest_expiry_fallback_respects_model_cooldown() {
+        let mut a = base_entry("a");
+        a.cooldown_model(NOW, "kimi-k3-1", NOW + 60_000, 7_200_000, "6004");
+        let mut b = base_entry("b");
+        b.cooldown_model(NOW, "kimi-k3-1", NOW + 120_000, 7_200_000, "6004");
+        let mut pool = pool_of(vec![a, b]);
+        let mut seq = 0;
+        assert_eq!(
+            pick(&mut pool, &mut seq, &policy(), NOW, None, "kimi-k3-1", &HashSet::new(), 1),
+            None,
+            "全池模型级限流时不得强试任何号"
+        );
+        // 冷却到期的号在兜底里恢复可选（60s 号已解冻、120s 号仍在冷却）。
+        let later = NOW + 61_000;
+        assert_eq!(
+            pick(&mut pool, &mut seq, &policy(), later, None, "kimi-k3-1", &HashSet::new(), 1),
+            Some("a".to_string()),
+            "到期号应按解冻先后恢复"
+        );
+    }
+
+    /// 回归（2026-10-17）：兜底同样不得强试**账号级软冷却**（429 无墙钟退避）中的账号。
+    #[test]
+    fn earliest_expiry_fallback_respects_account_soft_cooldown() {
+        let mut a = base_entry("a");
+        a.cooldown_soft_backoff(NOW, 600_000, 7_200_000, "429 rate limit");
+        let mut pool = pool_of(vec![a]);
+        let mut seq = 0;
+        assert_eq!(
+            pick(&mut pool, &mut seq, &policy(), NOW, None, "", &HashSet::new(), 1),
+            None,
+            "账号级软冷却期间不得强试"
         );
     }
 
