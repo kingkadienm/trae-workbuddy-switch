@@ -35,6 +35,10 @@ export const en = {
   "sidebar.running": "{product} running",
   "sidebar.notRunning": "{product} not running",
   "sidebar.update": "Update",
+  "sidebar.update.check": "Check for updates",
+  "sidebar.update.found": "New version v{latest} available",
+  "sidebar.update.upToDate": "You're up to date (v{current})",
+  "sidebar.update.checkFailed": "Update check failed",
 
   // ---- General settings (app-level settings dialog) ----
   "appSettings.title": "General settings",

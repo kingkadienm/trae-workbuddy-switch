@@ -1,6 +1,7 @@
 import { Suspense, lazy, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import { BrowserRouter, HashRouter, Navigate, NavLink, Outlet, Route, Routes, useLocation, useNavigate } from "react-router-dom";
-import { ArrowUp, Bot, Loader2, MessagesSquare, Server, Settings, Sparkles, User } from "lucide-react";
+import { ArrowUp, Bot, Loader2, MessagesSquare, RefreshCw, Server, Settings, Sparkles, User } from "lucide-react";
+import { toast } from "sonner";
 
 import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
@@ -314,6 +315,7 @@ function AppFooter({
   const t = useT();
   const [info, setInfo] = useState<UpdateInfo | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
+  const [checking, setChecking] = useState(false);
 
   useEffect(() => {
     let disposed = false;
@@ -334,6 +336,29 @@ function AppFooter({
       window.clearInterval(timer);
     };
   }, []);
+
+  // 手动检查：force=true 绕过缓存；结果用 toast 反馈（侧栏底部空间放不下 Alert）。
+  async function checkNow() {
+    if (checking) return;
+    setChecking(true);
+    try {
+      const result = await api.checkUpdate(undefined, true);
+      if (result.ok) {
+        setInfo(result);
+        if (result.hasUpdate) {
+          toast.success(t("sidebar.update.found", { latest: result.latest ?? "?" }));
+        } else {
+          toast.message(t("sidebar.update.upToDate", { current: result.current ?? "?" }));
+        }
+      } else {
+        toast.error(result.message || result.error || t("sidebar.update.checkFailed"));
+      }
+    } catch (error) {
+      toast.error(api.asError(error));
+    } finally {
+      setChecking(false);
+    }
+  }
 
   const hasUpdate = Boolean(info?.ok && info.hasUpdate && info.latest);
   const productLabel = t(PRODUCT_LABEL_KEY[product]);
@@ -357,6 +382,25 @@ function AppFooter({
               重复一遍反而挤占了版本号的位置。版本号用更小字号并保持 tabular-nums，
               让数字在版本号变化时纵向对齐、不跳动。 */}
           <span className="shrink-0 text-[11px] tabular-nums text-sidebar-foreground/50">v{version || "?"}</span>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                size="icon"
+                className="size-5 rounded-full p-0 text-sidebar-foreground/50 hover:text-sidebar-foreground"
+                aria-label={t("sidebar.update.check")}
+                onClick={() => void checkNow()}
+                disabled={checking}
+              >
+                <RefreshCw
+                  className={cn("size-3", checking && "animate-spin")}
+                  strokeWidth={2.5}
+                  aria-hidden="true"
+                />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="top">{t("sidebar.update.check")}</TooltipContent>
+          </Tooltip>
           {hasUpdate && (
             <Tooltip>
               <TooltipTrigger asChild>

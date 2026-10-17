@@ -27,6 +27,10 @@ export const zh = {
   "sidebar.running": "{product} 运行中",
   "sidebar.notRunning": "{product} 未运行",
   "sidebar.update": "更新",
+  "sidebar.update.check": "检查更新",
+  "sidebar.update.found": "发现新版本 v{latest}",
+  "sidebar.update.upToDate": "已是最新版本（v{current}）",
+  "sidebar.update.checkFailed": "检查更新失败",
 
   // ---- 通用设置（应用级设置弹层）----
   "appSettings.title": "通用设置",
