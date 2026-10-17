@@ -84,6 +84,18 @@ where
     best.map(|(_, _, account)| account)
 }
 
+/// 账号是否已在账号库中被标记停用（`deactivated: true`）。
+///
+/// 策略的自动择优（`max_credits` / `earliest_expiry`）必须跳过停用账号——
+/// 停用通常是会话失效（上游恒回 401），选它只会浪费一次上游往返。
+/// 2026-10-17 实测：已停用的 `王正帅` 在 max_credits 下被反复选中，持续 401。
+fn is_deactivated(account: &Value) -> bool {
+    account
+        .get("deactivated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// 账号选择器。
 pub struct AccountSelector;
 
@@ -121,6 +133,9 @@ impl AccountSelector {
                 }
                 let mut candidates = Vec::with_capacity(accounts.len());
                 for account in accounts {
+                    if is_deactivated(&account) {
+                        continue;
+                    }
                     let credits_value = credits::get_credit_expiry(&account).await;
                     let remaining = credits_value
                         .get("totalRemaining")
@@ -128,8 +143,10 @@ impl AccountSelector {
                         .unwrap_or(0.0);
                     candidates.push((remaining, account));
                 }
-                let account = select_max_credit_candidate(candidates.into_iter())
-                    .expect("accounts is non-empty");
+                // 过滤停用账号后可能为空（全库停用），不得 `expect` 直接 panic。
+                let account =
+                    select_max_credit_candidate(candidates.into_iter())
+                        .ok_or(GatewayError::NoCredential { region })?;
                 ensure_region(&account, region)?;
                 Ok(account)
             }
@@ -140,6 +157,9 @@ impl AccountSelector {
                 }
                 let mut candidates = Vec::with_capacity(accounts.len());
                 for account in accounts {
+                    if is_deactivated(&account) {
+                        continue;
+                    }
                     let credits_value = credits::get_credit_expiry(&account).await;
                     let remaining = credits_value
                         .get("totalRemaining")
@@ -295,6 +315,15 @@ mod tests {
 
         let empty: Vec<(Option<i64>, f64, Value)> = Vec::new();
         assert!(select_earliest_expiry_candidate(empty.into_iter()).is_none());
+    }
+
+    #[test]
+    fn is_deactivated_only_flags_explicit_true() {
+        // 缺字段 / false / 非布尔都不是停用——只有显式 true 才是。
+        assert!(!is_deactivated(&json!({})));
+        assert!(!is_deactivated(&json!({"deactivated": false})));
+        assert!(!is_deactivated(&json!({"deactivated": null})));
+        assert!(is_deactivated(&json!({"deactivated": true})));
     }
 
     #[test]
