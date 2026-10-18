@@ -95,6 +95,11 @@ pub struct PoolEntry {
     /// 由后台余额刷新循环维护（见 [`crate::credits_refresh`]）：`0` 表示从未取过，
     /// 必须刷新；否则超过 `credits_refresh_interval_ms` 才刷新。
     pub credits_refreshed_ms: i64,
+    /// 快过期积分的到期时刻（毫秒；`None` = 无到期时间 / 未知）。
+    ///
+    /// 与 [`Self::credits_refreshed_ms`] 同批写入（`crate::credits_refresh` 刷新循环），
+    /// 供 `earliest_expiry` 策略在池缓存新鲜时**零网络**择优（`crate::account_strategy`）。
+    pub credits_expire_at_ms: Option<i64>,
 
     /// 终身成功次数（展示用）。
     pub success_count: i64,
@@ -156,6 +161,7 @@ impl PoolEntry {
             credits: 0,
             credits_expiring: 0,
             credits_refreshed_ms: 0,
+            credits_expire_at_ms: None,
             success_count: 0,
             err_total: 0,
             success_ema: 0.0,

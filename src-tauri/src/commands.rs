@@ -220,10 +220,25 @@ pub async fn detect_codebuddy_cn_ide_account() -> Result<Value, String> {
 
 
 /// POST /api/delete —— 删除账号（按 region）。
+///
+/// 删除即清池：账号库是账号存亡的唯一权威，网关侧池条目与粘性绑定必须**立即**移除，
+/// 否则残留的已删 uid 会被选号路径拿着死凭据打上游（401）。取 uid 必须在**删除前**
+/// 做（`find_account_for` 删后查无此号）。
 #[tauri::command(rename_all = "camelCase")]
-pub fn delete_account(account_id: String, region: Option<String>) -> Result<Value, String> {
+pub async fn delete_account(account_id: String, region: Option<String>) -> Result<Value, String> {
     let region = parse_region(region.as_deref());
+    // 删除前先取 uid（网关池键）；无 uid 记录（异常数据）不阻断删除。
+    let uid = account::find_account_for(region, &account_id)
+        .map(|record| account::get_str(&record, "uid").unwrap_or_default())
+        .filter(|uid| !uid.is_empty());
     account::delete_account_for(region, &account_id)?;
+    if let Some(uid) = uid {
+        let state = gateway::shared_state();
+        state.pool.write().await.remove(&uid);
+        state.sticky.write().await.remove_uid(&uid);
+        // 桌面端没有 30s 后台持久化循环，必须显式落盘，避免重启后残留复活。
+        state.persist_pool().await;
+    }
     Ok(json!({ "ok": true }))
 }
 

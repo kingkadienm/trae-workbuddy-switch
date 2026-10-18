@@ -1,4 +1,10 @@
 //! 账号选择策略（`current` / `pinned` / `max_credits` / `earliest_expiry`；P0-8）。
+//!
+//! 中继热路径（`routes::relay` 把策略放在**首选**位）用 [`AccountSelector::select_with_pool`]：
+//! `max_credits` / `earliest_expiry` 的候选优先读**池缓存**（后台刷新循环写入的
+//! `credits` / `credits_expire_at_ms`，新鲜度 = `credits_refresh_interval_ms`，默认 30 分钟），
+//! 零网络；条目过期或从未取过才按账号实时查（每号一次 `get_credit_expiry_for`）。
+//! `current` / `pinned` 恒为纯本地解析。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -13,6 +19,8 @@ use buddy_switch_core::modules::credits;
 use buddy_switch_core::modules::region::{self, Region, RegionMismatch};
 
 use crate::error::GatewayError;
+use crate::pool::{Pool, PoolEntry};
+use crate::timeutil;
 
 /// 账号选择策略（按 region 各自独立配置）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,14 +110,32 @@ pub struct AccountSelector;
 impl AccountSelector {
     /// 返回该 region 选中的账号（含 `access_token` / `domain` / `uid`）。
     ///
-    /// 选中的账号会做**安全红线 F** 校验：`region_of(domain)` 必须等于目标
-    /// region，否则返回 [`GatewayError::RegionMismatch`]（含修复指引）。
+    /// 无池缓存（管理页 / 目录刷新等低频路径）：`max_credits` / `earliest_expiry`
+    /// 按账号库全量实时查。池缓存可用时走 [`Self::select_with_pool`]。
     pub async fn select(
         &self,
         region: Region,
         strategy: &AccountStrategy,
     ) -> Result<Value, GatewayError> {
-        let account = match strategy {
+        self.select_with_pool(None, region, strategy).await
+    }
+
+    /// 池缓存版的选号（中继热路径用，见模块头）。
+    ///
+    /// `pool` 为 `None` 时等价于 [`Self::select`]。`max_credits` / `earliest_expiry`
+    /// 的候选取自**池条目**（跳过 `disabled` / `deactivated`，与池选号同一套治理状态）：
+    /// 条目缓存新鲜（`credits_refreshed_ms > 0` 且距 `now` 小于
+    /// `credits_refresh_interval_ms`）直接用池里的 `credits`（+`credits_expire_at_ms`），
+    /// **零网络**；否则对该 uid 取账号记录并实时查（每号一次，串行）。
+    ///
+    /// 安全红线与 [`Self::select`] 相同：选中的账号过 [`ensure_region`] + 信封凭据拦截。
+    pub async fn select_with_pool(
+        &self,
+        pool: Option<&Pool>,
+        region: Region,
+        strategy: &AccountStrategy,
+    ) -> Result<Value, GatewayError> {
+                let account = match strategy {
             AccountStrategy::Current => {
                 // 安全红线 F：先用 core 的校验读取（region 不符 → RegionMismatch，
                 // 且不发起任何上游请求），再导入账号并二次防御校验。
@@ -118,64 +144,17 @@ impl AccountSelector {
                 let account = auth_file::import_from_auth_file_for(region)
                     .ok_or(GatewayError::NoCredential { region })?;
                 ensure_region(&account, region)?;
-                Ok(account)
+                account
             }
             AccountStrategy::Pinned { account_id } => {
                 let account = account::find_account_for(region, account_id)
                     .ok_or(GatewayError::NoCredential { region })?;
                 ensure_region(&account, region)?;
-                Ok(account)
+                account
             }
-            AccountStrategy::MaxCredits => {
-                let accounts = account::load_accounts_for(region);
-                if accounts.is_empty() {
-                    return Err(GatewayError::NoCredential { region });
-                }
-                let mut candidates = Vec::with_capacity(accounts.len());
-                for account in accounts {
-                    if is_deactivated(&account) {
-                        continue;
-                    }
-                    let credits_value = credits::get_credit_expiry(&account).await;
-                    let remaining = credits_value
-                        .get("totalRemaining")
-                        .and_then(Value::as_f64)
-                        .unwrap_or(0.0);
-                    candidates.push((remaining, account));
-                }
-                // 过滤停用账号后可能为空（全库停用），不得 `expect` 直接 panic。
-                let account =
-                    select_max_credit_candidate(candidates.into_iter())
-                        .ok_or(GatewayError::NoCredential { region })?;
-                ensure_region(&account, region)?;
-                Ok(account)
-            }
-            AccountStrategy::EarliestExpiry => {
-                let accounts = account::load_accounts_for(region);
-                if accounts.is_empty() {
-                    return Err(GatewayError::NoCredential { region });
-                }
-                let mut candidates = Vec::with_capacity(accounts.len());
-                for account in accounts {
-                    if is_deactivated(&account) {
-                        continue;
-                    }
-                    let credits_value = credits::get_credit_expiry(&account).await;
-                    let remaining = credits_value
-                        .get("totalRemaining")
-                        .and_then(Value::as_f64)
-                        .unwrap_or(0.0);
-                    let expire_at = credits_value
-                        .get("soonestExpireAt")
-                        .and_then(Value::as_i64);
-                    candidates.push((expire_at, remaining, account));
-                }
-                let account = select_earliest_expiry_candidate(candidates.into_iter())
-                    .ok_or(GatewayError::NoCredential { region })?;
-                ensure_region(&account, region)?;
-                Ok(account)
-            }
-        }?;
+            AccountStrategy::MaxCredits => select_max_credits(pool, region).await?,
+            AccountStrategy::EarliestExpiry => select_earliest_expiry(pool, region).await?,
+        };
 
         // 加密信封凭据不得送进网关：`build_chat_headers` 会把信封折成**空 `Bearer`**，
         // 上游只会回 401，而用户看到的是网关的 HTML 错误页。
@@ -183,13 +162,147 @@ impl AccountSelector {
         // ★ 这条是「本机导入接受信封」（core `imported_account_from_root` 的
         //   `plain_text_or_envelope` 改造）的**必要配套**：改造之前 `Current` 策略会因
         //   导入失败而报 `NoCredential`（响亮、可行动），改造之后就会静默发出空 Bearer。
-        //   三种策略都可能选出信封账号（`Pinned` / `MaxCredits` 走账号库，而库里在
-        //   明文过期后也会被信封接管），故拦在 match 之后而不是各分支里。
+        //   各策略都可能选出信封账号（`Pinned` / 择优走账号库，而库里在明文过期后
+        //   也会被信封接管），故拦在 match 之后而不是各分支里。
         if account::is_envelope(&account, "access_token") {
             return Err(GatewayError::EncryptedCredential { region });
         }
+        ensure_region(&account, region)?;
         Ok(account)
     }
+}
+
+/// 池缓存新鲜度判据：从未取过（`0`）或超出刷新间隔一律视为过期。
+///
+/// 与后台刷新循环（`crate::credits_refresh::needs_refresh`）**同一套口径**——
+/// 缓存不新鲜时本策略实时查，新鲜时直接用池读数，后台循环负责把缓存养新鲜。
+fn is_credit_cache_fresh(entry: &PoolEntry, now_ms: i64, interval_ms: i64) -> bool {
+    entry.credits_refreshed_ms > 0
+        && now_ms.saturating_sub(entry.credits_refreshed_ms) < interval_ms
+}
+
+/// 池条目 → 账号记录（池是权威：已删 uid 在库里查无此号时直接跳过，
+/// 等待下一次请求的 `sync_accounts` 裁剪掉它）。
+fn pool_account(pool: &Pool, uid: &str, region: Region) -> Option<Value> {
+    pool.get(uid)
+        .and_then(|_| account::find_account_for(region, uid))
+}
+
+/// `max_credits`：池缓存优先，过期条目才实时查（每号一次，串行）。
+///
+/// 池为 `None`（管理页 / 目录刷新等低频路径）时退化为账号库全量实时查——
+/// 与改造前行为一致（展示层「每次请求时实时择优」的既有语义）。
+async fn select_max_credits(pool: Option<&Pool>, region: Region) -> Result<Value, GatewayError> {
+    let now_ms = timeutil::now_ms();
+    let mut candidates: Vec<(f64, Value)> = Vec::new();
+
+    match pool {
+        Some(pool) => {
+            let interval = pool.config().credits_refresh_interval_ms.max(0);
+            for entry in pool.entries() {
+                if entry.disabled || entry.deactivated {
+                    continue;
+                }
+                let Some(account) = pool_account(pool, &entry.uid, region) else {
+                    continue;
+                };
+                if is_deactivated(&account) {
+                    continue;
+                }
+                if is_credit_cache_fresh(entry, now_ms, interval) {
+                    // 池缓存直接可用：零网络。
+                    candidates.push((entry.credits.max(0) as f64, account));
+                    continue;
+                }
+                // 缓存过期 → 实时查（region 修正：旧实现 Global 号误查 CN 端点）。
+                let credits_value = credits::get_credit_expiry_for(region, &account).await;
+                let remaining = credits_value
+                    .get("totalRemaining")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                candidates.push((remaining, account));
+            }
+        }
+        None => {
+            let accounts = account::load_accounts_for(region);
+            for account in accounts {
+                if is_deactivated(&account) {
+                    continue;
+                }
+                let credits_value = credits::get_credit_expiry_for(region, &account).await;
+                let remaining = credits_value
+                    .get("totalRemaining")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                candidates.push((remaining, account));
+            }
+        }
+    }
+
+    // 过滤禁用/停用/已删后可能为空（全库停用），不得 `expect` 直接 panic。
+    select_max_credit_candidate(candidates.into_iter())
+        .ok_or(GatewayError::NoCredential { region })
+}
+
+/// `earliest_expiry`：池缓存优先（含 `credits_expire_at_ms` 到期时刻），
+/// 过期条目才实时查。池为 `None` 时同 [`select_max_credits`] 走全库实时查。
+async fn select_earliest_expiry(pool: Option<&Pool>, region: Region) -> Result<Value, GatewayError> {
+    let now_ms = timeutil::now_ms();
+    let mut candidates: Vec<(Option<i64>, f64, Value)> = Vec::new();
+
+    match pool {
+        Some(pool) => {
+            let interval = pool.config().credits_refresh_interval_ms.max(0);
+            for entry in pool.entries() {
+                if entry.disabled || entry.deactivated {
+                    continue;
+                }
+                let Some(account) = pool_account(pool, &entry.uid, region) else {
+                    continue;
+                };
+                if is_deactivated(&account) {
+                    continue;
+                }
+                if is_credit_cache_fresh(entry, now_ms, interval) {
+                    candidates.push((
+                        entry.credits_expire_at_ms,
+                        entry.credits.max(0) as f64,
+                        account,
+                    ));
+                    continue;
+                }
+                let credits_value = credits::get_credit_expiry_for(region, &account).await;
+                let remaining = credits_value
+                    .get("totalRemaining")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                let expire_at = credits_value
+                    .get("soonestExpireAt")
+                    .and_then(Value::as_i64);
+                candidates.push((expire_at, remaining, account));
+            }
+        }
+        None => {
+            let accounts = account::load_accounts_for(region);
+            for account in accounts {
+                if is_deactivated(&account) {
+                    continue;
+                }
+                let credits_value = credits::get_credit_expiry_for(region, &account).await;
+                let remaining = credits_value
+                    .get("totalRemaining")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                let expire_at = credits_value
+                    .get("soonestExpireAt")
+                    .and_then(Value::as_i64);
+                candidates.push((expire_at, remaining, account));
+            }
+        }
+    }
+
+    select_earliest_expiry_candidate(candidates.into_iter())
+        .ok_or(GatewayError::NoCredential { region })
 }
 
 /// 构造某 region 的策略展示对象：`{ region, strategy, selected, error?, note? }`。
@@ -207,11 +320,11 @@ pub async fn describe_strategy(region: Region, strategy: &AccountStrategy) -> Va
     match strategy {
         AccountStrategy::MaxCredits => {
             described["note"] =
-                serde_json::json!("max_credits 在每次请求时按实时积分择优，此处不预取（避免 N 次网络请求）");
+                serde_json::json!("max_credits 在每次请求时择优（池缓存新鲜时零网络，过期才实时查），此处不预取");
         }
         AccountStrategy::EarliestExpiry => {
             described["note"] = serde_json::json!(
-                "earliest_expiry 在每次请求时按实时积分到期时间择优，此处不预取（避免 N 次网络请求）"
+                "earliest_expiry 在每次请求时按积分到期时间择优（池缓存新鲜时零网络，过期才实时查），此处不预取"
             );
         }
         _ => match AccountSelector.select(region, strategy).await {
@@ -279,6 +392,18 @@ pub fn save_strategies(map: &HashMap<Region, AccountStrategy>) -> Result<(), Str
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn is_credit_cache_fresh_requires_read_value_and_within_interval() {
+        let now = 1_700_000_000_000i64;
+        let mut entry = crate::pool::PoolEntry::new("u1");
+        entry.credits_refreshed_ms = 0;
+        assert!(!is_credit_cache_fresh(&entry, now, 60_000), "从未取过（0）不新鲜");
+        entry.credits_refreshed_ms = now - 30_000;
+        assert!(is_credit_cache_fresh(&entry, now, 60_000), "间隔内新鲜");
+        entry.credits_refreshed_ms = now - 60_000;
+        assert!(!is_credit_cache_fresh(&entry, now, 60_000), "恰达阈值即过期");
+    }
 
     #[test]
     fn max_credits_selection_keeps_first_tie_and_uses_zero_for_missing_values() {

@@ -3,6 +3,9 @@
 //! 这是「把一个请求可靠地送到上游」的唯一实现，OpenAI（`/v1/chat/completions`）
 //! 与 Anthropic（`/v1/messages`）两条路由共用它，避免两套轮换逻辑各自演化。
 //!
+//! 选号语义（**策略首选**，2026-10-18 起）：策略（current / pinned /
+//! max_credits / earliest_expiry）→ 会话粘性 → 池加权随机，逐层不可用才换下一层
+//! （见 [`select_account`]）。
 //! 轮换语义（对照参考实现 `handler.go` 的轮转循环）：
 //! - 单轮最多尝试 `max_rotate` 次，`tried` 集合保证**同一账号不试第二次**；
 //! - 每次失败按事件类型写入池的冷却/熔断状态，下一次选号自然避开；
@@ -372,6 +375,21 @@ fn sticky_choice(
     usable(uid).then(|| uid.to_string())
 }
 
+/// 选号（**策略首选** → 会话粘性 → 池加权随机）。
+///
+/// 顺序与语义（2026-10-18 起）：
+/// 1. **策略**（`current` / `pinned` / `max_credits` / `earliest_expiry`）：用户显式
+///    配置的选号意图必须优先满足。择优类策略走
+///    [`AccountSelector::select_with_pool`] 的池缓存路径（新鲜零网络，过期才实时查）。
+///    选中的账号若本轮已试过（`tried`）或池判定此刻不可用（冷却 / 占满在途 / 熔断），
+///    **不得**强行打它（会立刻二次失败）——落到下一步换号。
+/// 2. **会话粘性**：复用上次成功绑定的账号，只在池判定它此刻可用时；已删 uid 查无
+///    库中凭据 ⇒ 放弃。
+/// 3. **池加权随机**：`pick_account` 四因子加权 + 短名单抽签。选出的 uid 若已不在
+///    账号库（等待下一次请求的 `sync_accounts` 裁剪掉残留条目）⇒ 放弃。
+///
+/// 三者都给不出账号时返回 `None`（调用方按既有失败路径处理；全池冷却后的
+/// `NoCredential` 空账号 401 是**诊断态**，不是「用错号」）。
 async fn select_account(
     state: &GatewayState,
     region: Region,
@@ -382,7 +400,63 @@ async fn select_account(
     attempt: usize,
     preferred_uid: Option<&str>,
 ) -> Option<Value> {
-    // ★ 会话粘性：优先复用上次成功的账号，**但只在它此刻确实可用时**（见 [`sticky_choice`]）。
+    // ① 策略首选。策略**失败**（如无可用凭据）不阻断整个请求——落到 ②/③ 换号；
+    // 策略成功但账号此刻不可用（冷却 / 占用 / 已试）同样落下去。
+    let strategy = state.strategy_for(region).await;
+    let strategy_result = {
+        let pool = state.pool.read().await;
+        AccountSelector.select_with_pool(Some(&*pool), region, &strategy)
+            .await
+    };
+    let strategy_account = match strategy_result {
+        Ok(account_value) => account_value,
+        // 策略给不出账号（如全库停用 / 无凭据）⇒ 走 ②/③，不吞掉整个请求。
+        Err(_) => {
+            return strategy_fallback(state, region, model, realm, tried, now_ms, attempt, preferred_uid)
+                .await;
+        }
+    };
+    let strategy_uid = account::get_str(&strategy_account, "uid").unwrap_or_default();
+    if !strategy_uid.is_empty() {
+        // 池已试过的账号不再重复选择（否则会立刻二次失败）。
+        let usable = {
+            let pool = state.pool.read().await;
+            pool.is_usable_for(&strategy_uid, now_ms, model)
+        };
+        // 池里已对该账号记录了生效中的冷却（账号级或**本模型的模型级 6004**）时，
+        // 策略不得越过冷却强行选它。否则 `max_credits` 在「积分最多的号恰好
+        // 被限流」的场面下会每个请求都重选同一个号、每次都吃同一个 429
+        // （2026-10-17 实测：kimi-k3-1 全池限流后连续十余次 429 全落同一号）。
+        // 此刻落到 ②/③ 换号，而不是把请求钉死在这堵墙上。
+        if !tried.contains(&strategy_uid) && usable {
+            return Some(strategy_account);
+        }
+    } else {
+        // `current` / `pinned` 选中但 uid 缺失：没有池治理可查（uid 为空时池层
+        // 全部 bypass，见 `relay` 主循环），直接采用；凭据缺陷（如加密信封）
+        // 已由 `select_with_pool` 内部拦截，不会带错凭据走到这里。
+        return Some(strategy_account);
+    }
+
+    // 策略账号此刻不可用（冷却 / 占用 / 已试）⇒ 落到 ②/③ 换号。
+    strategy_fallback(state, region, model, realm, tried, now_ms, attempt, preferred_uid).await
+}
+
+/// 策略未命中时的换号路径：**会话粘性 → 池加权随机**（见 [`select_account`] 的 ②/③）。
+///
+/// 抽成独立函数：策略与它各自的「不可用 ⇒ 换下一层」判定互不干扰，两处守卫
+/// （粘性可用性、池 uid 库内复核）也只在这一个地方出现。
+async fn strategy_fallback(
+    state: &GatewayState,
+    region: Region,
+    model: &str,
+    realm: RealmTag,
+    tried: &HashSet<String>,
+    now_ms: i64,
+    attempt: usize,
+    preferred_uid: Option<&str>,
+) -> Option<Value> {
+    // ② 会话粘性：优先复用上次成功的账号，**但只在它此刻确实可用时**（见 [`sticky_choice`]）。
     let sticky_uid = match preferred_uid {
         Some(_) => {
             let pool = state.pool.read().await;
@@ -393,12 +467,13 @@ async fn select_account(
         None => None,
     };
     if let Some(uid) = sticky_uid.as_deref() {
-        // 池里有但账号库已删除 ⇒ 该 uid 无凭据可用，落回策略选择。
+        // 池里有但账号库已删除 ⇒ 该 uid 无凭据可用，落回池加权随机。
         if let Some(account_value) = account::find_account_for(region, uid) {
             return Some(account_value);
         }
     }
 
+    // ③ 池加权随机。
     let picked_uid = {
         let mut pool = state.pool.write().await;
         if pool.is_empty() {
@@ -413,33 +488,13 @@ async fn select_account(
     };
 
     if let Some(uid) = picked_uid {
-        // 池里存在但账号库已删除 → 该 uid 无凭据可用，落回策略选择。
+        // 池里存在但账号库已删除 → 该 uid 无凭据可用（下一次请求即被裁剪）。
         if let Some(account_value) = account::find_account_for(region, &uid) {
             return Some(account_value);
         }
     }
 
-    // 回落：策略模块（current / pinned / max_credits）。
-    let strategy = state.strategy_for(region).await;
-    let selector = AccountSelector;
-    match selector.select(region, &strategy).await {
-        Ok(account_value) => {
-            let uid = account::get_str(&account_value, "uid").unwrap_or_default();
-            // 池已试过的账号不再重复选择（否则会立刻二次失败）。
-            if !uid.is_empty() && tried.contains(&uid) {
-                return None;
-            }
-            // 池里已对该账号记录了生效中的冷却（账号级或**本模型的模型级 6004**）时，
-            // 策略不得越过冷却强行选它。否则 `max_credits` 在「积分最多的号恰好
-            // 被限流」的场面下会每个请求都重选同一个号、每次都吃同一个 429
-            // （2026-10-17 实测：kimi-k3-1 全池限流后连续十余次 429 全落同一号）。
-            if !uid.is_empty() && !state.pool.read().await.is_usable_for(&uid, now_ms, model) {
-                return None;
-            }
-            Some(account_value)
-        }
-        Err(_) => None,
-    }
+    None
 }
 
 /// 把 `Region` 映射为池的域标记。

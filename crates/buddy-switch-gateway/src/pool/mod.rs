@@ -3,7 +3,8 @@
 //! 移植自参考实现 `internal/pool/`。与既有 [`crate::account_strategy`] 的关系：
 //! 策略模块解决「**用哪个账号**」（current / pinned / max_credits 这类单点决策），
 //! 本模块解决「**多账号如何协同**」——失败换号、冷却熔断、在途限流、状态落盘。
-//! 二者互补：策略先给出首选账号，池负责在其不可用时接管。
+//! 二者互补：**策略为首选**，粘性 / 池加权随机在其不可用（冷却 / 占用 / 已试）时
+//! 依次接管（见 [`crate::routes::relay::select_account`]）。
 //!
 //! 治理语义（优先级从高到低）：
 //! 1. **禁用**（终态，需刷新成功或人工复活）；
@@ -359,6 +360,7 @@ struct PersistedEntry {
     credits: i64,
     credits_expiring: i64,
     credits_refreshed_ms: i64,
+    credits_expire_at_ms: Option<i64>,
     disabled: bool,
     deactivated: bool,
     reason: String,
@@ -385,6 +387,7 @@ impl Default for PersistedEntry {
             credits: 0,
             credits_expiring: 0,
             credits_refreshed_ms: 0,
+            credits_expire_at_ms: None,
             disabled: false,
             deactivated: false,
             reason: String::new(),
@@ -505,9 +508,36 @@ impl Pool {
         }
     }
 
-    /// 用账号库快照对齐池：新增缺失账号，**不删除**已有账号
-    /// （删除会让冷却/熔断历史丢失，重登同一账号即「洗白」）。
+    /// 按 uid 移除条目（账号库已删除该号 ⇒ 治理历史随之作废，**立即**清池）。
+    ///
+    /// 产品语义：删除即失效——已删账号的冷却/熔断状态没有保留价值（凭据已死，
+    /// 重登会拿到**新 uid**）。返回被移除的条目（调用方可做审计/日志）；无此
+    /// uid 返回 `None`。置 `dirty`，由 `flush_if_dirty` / 后台持久化循环落盘。
+    pub fn remove(&mut self, uid: &str) -> Option<PoolEntry> {
+        let removed = self.entries.remove(uid);
+        if removed.is_some() {
+            self.dirty = true;
+        }
+        removed
+    }
+
+    /// 用账号库快照对齐池：新增缺失账号、**移除已删账号**（保留库内账号的治理状态）。
+    ///
+    /// 裁剪是产品语义（2026-10-18 用户要求「删除就立马清除」）：账号库是账号
+    /// 存亡的**唯一权威**，残留条目会把已删 uid 送入选号路径 → 拿死凭据打上游。
+    /// 本方法在每个 relay 请求前被调用（[`crate::routes::relay`]），因此跨进程
+    /// （桌面 App 与 webui server 双开）删除的号最迟在下一个请求即被自愈。
     pub fn sync_accounts(&mut self, accounts: &[Value], realm: Option<RealmTag>) {
+        // 存活 uid 集合（账号库快照）：缺失 / 空 uid 的记录不参与（与新增规则一致）。
+        let live: std::collections::HashSet<&str> = accounts
+            .iter()
+            .filter_map(|account| {
+                account
+                    .get("uid")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+            })
+            .collect();
         for account in accounts {
             let Some(uid) = account
                 .get("uid")
@@ -529,6 +559,26 @@ impl Pool {
                 entry.deactivated = deactivated;
             }
         }
+        // 裁剪：移除已不在账号库里的 uid（删除即失效）。库内账号的
+        // 冷却/熔断治理状态原样保留。
+        //
+        // ★ 裁剪必须**限定本 realm 的条目**：relay 每次只拿**一个 region** 的
+        // 账号库快照进来，若不加 realm 过滤，一次 CN 请求会把池里**所有 Global
+        // 条目**当「已删除」清掉（库文件是分家互不含对方的）。`realm == None`
+        // 的遗留条目（旧 state.json 恢复）不裁剪——无从判定归属，误删代价
+        // 高于残留（残留最迟在下一次对应 region 请求时被 `find_account_for`
+        // 查无此号自然弃用）。
+        let before = self.entries.len();
+        self.entries.retain(|_, entry| {
+            if realm.map(|wanted| entry.realm == Some(wanted)).unwrap_or(false) {
+                live.iter().any(|uid| *uid == entry.uid.as_str())
+            } else {
+                true
+            }
+        });
+        if self.entries.len() < before {
+            self.dirty = true;
+        }
     }
 
     /// 写入积分明细（`credits` 与「快过期」子集）。
@@ -538,6 +588,21 @@ impl Pool {
         };
         entry.credits = credits.max(0);
         entry.credits_expiring = expiring.clamp(0, entry.credits);
+        self.dirty = true;
+    }
+
+    /// 记录快过期积分的到期时刻（`None` = 上游未给出；只覆盖、不清除旧值）。
+    ///
+    /// 与 [`Self::set_credits`] / [`Self::mark_credits_refreshed`] 同批调用
+    /// （后台余额刷新循环），供 `earliest_expiry` 策略在池缓存新鲜时零网络择优。
+    pub fn set_credits_expire_at(&mut self, uid: &str, soonest_expire_at: Option<i64>) {
+        if soonest_expire_at.is_none() {
+            return;
+        }
+        let Some(entry) = self.entries.get_mut(uid) else {
+            return;
+        };
+        entry.credits_expire_at_ms = soonest_expire_at;
         self.dirty = true;
     }
 
@@ -964,6 +1029,7 @@ fn persist_of(entry: &PoolEntry) -> PersistedEntry {
         credits: entry.credits,
         credits_expiring: entry.credits_expiring,
         credits_refreshed_ms: entry.credits_refreshed_ms,
+        credits_expire_at_ms: entry.credits_expire_at_ms,
         disabled: entry.disabled,
         deactivated: entry.deactivated,
         reason: entry.reason.clone(),
@@ -999,6 +1065,7 @@ fn restore_entry(entry: &mut PoolEntry, persisted: PersistedEntry, now_ms: i64) 
     entry.credits = persisted.credits.max(0);
     entry.credits_expiring = persisted.credits_expiring.clamp(0, entry.credits);
     entry.credits_refreshed_ms = persisted.credits_refreshed_ms;
+    entry.credits_expire_at_ms = persisted.credits_expire_at_ms;
     entry.disabled = persisted.disabled;
     entry.deactivated = persisted.deactivated;
     entry.reason = persisted.reason;
@@ -1227,16 +1294,36 @@ mod tests {
     }
 
     #[test]
-    fn sync_accounts_never_removes_existing_entries() {
+    fn sync_accounts_prunes_deleted_accounts_and_keeps_governance() {
         let mut pool = Pool::new(PoolConfig::default());
+        pool.upsert("gone", Some(RealmTag::Cn), "已删");
         pool.upsert("keep", Some(RealmTag::Cn), "保留");
         pool.sync_accounts(
-            &vec![json!({"uid": "new", "nickname": "新号"})],
+            &vec![json!({"uid": "keep", "nickname": "保留"}), json!({"uid": "new", "nickname": "新号"})],
             Some(RealmTag::Cn),
         );
-        assert_eq!(pool.len(), 2, "对齐是增量，不得删除既有账号");
-        assert!(pool.get("keep").is_some());
+        assert!(pool.get("gone").is_none(), "已删账号必须被裁剪（删除即清池）");
+        assert!(pool.get("keep").is_some(), "库内账号原样保留");
         assert!(pool.get("new").is_some());
+        assert_eq!(pool.len(), 2);
+
+        // 裁剪按 realm 隔离：CN 快照不得误删 Global 条目（库文件分家互不含对方）。
+        let mut pool = Pool::new(PoolConfig::default());
+        pool.upsert("cn", Some(RealmTag::Cn), "国内");
+        pool.upsert("glob", Some(RealmTag::Global), "国际");
+        pool.sync_accounts(&vec![json!({"uid": "cn"})], Some(RealmTag::Cn));
+        assert!(pool.get("cn").is_some());
+        assert!(pool.get("glob").is_some(), "Global 条目不受 CN 快照影响");
+
+        // 删除置 dirty（可落盘）：先 save 清脏，再裁剪。
+        let path = temp_path("sync-dirty");
+        let mut pool = Pool::new(PoolConfig::default());
+        pool.upsert("a", Some(RealmTag::Cn), "");
+        pool.save(&path).expect("save");
+        assert!(!pool.is_dirty(), "save 后清脏");
+        pool.sync_accounts(&[], Some(RealmTag::Cn));
+        assert!(pool.is_dirty(), "裁剪掉条目必须置脏");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -1262,6 +1349,34 @@ mod tests {
         let entry = pool.get("u1").unwrap();
         assert_eq!(entry.credits, 0);
         assert_eq!(entry.credits_expiring, 0);
+    }
+
+    #[test]
+    fn set_credits_expire_at_only_overrides_with_some() {
+        let mut pool = Pool::new(PoolConfig::default());
+        pool.upsert("u1", None, "");
+        pool.set_credits_expire_at("u1", Some(1_000));
+        assert_eq!(pool.get("u1").unwrap().credits_expire_at_ms, Some(1_000));
+        // `None`（上游未给到期时间）不覆盖旧值，保留最后一次已知读数。
+        pool.set_credits_expire_at("u1", None);
+        assert_eq!(pool.get("u1").unwrap().credits_expire_at_ms, Some(1_000));
+        pool.set_credits_expire_at("u1", Some(2_000));
+        assert_eq!(pool.get("u1").unwrap().credits_expire_at_ms, Some(2_000));
+    }
+
+    #[test]
+    fn remove_drops_entry_and_marks_dirty() {
+        let path = temp_path("pool-remove");
+        let mut pool = Pool::new(PoolConfig::default());
+        pool.upsert("gone", Some(RealmTag::Cn), "已删");
+        pool.save(&path).expect("save");
+        assert!(!pool.is_dirty());
+        let removed = pool.remove("gone").expect("应取回被删条目");
+        assert_eq!(removed.uid, "gone");
+        assert!(pool.get("gone").is_none());
+        assert!(pool.is_dirty(), "删除必须置脏以便落盘");
+        assert!(pool.remove("never-there").is_none(), "不存在的 uid 返回 None");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

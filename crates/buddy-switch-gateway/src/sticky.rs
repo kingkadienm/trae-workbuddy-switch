@@ -108,6 +108,20 @@ impl StickyTable {
         self.bindings.remove(key);
     }
 
+    /// 按 uid 解绑（账号被**删除**时调用；下次请求重新绑定）。
+    ///
+    /// 与 [`Self::unbind`] 的区别：`unbind` 只知道**会话键**，删除只知道
+    /// **账号 uid**——而一个 uid 可能被多个会话同时钉住，故必须按 uid 全量清理。
+    /// 产品语义「删除就立马清除」：残留绑定会把已删账号的 uid 继续送进
+    /// 选号路径（池侧同步裁剪掉该条目后 `is_usable_for` 自会挡掉，粘性此处
+    /// 提前清掉只是省一次无谓查库）。返回被移除的绑定数。
+    pub fn remove_uid(&mut self, uid: &str) -> usize {
+        let before = self.bindings.len();
+        self.bindings
+            .retain(|_, binding| binding.uid != uid);
+        before - self.bindings.len()
+    }
+
     /// 清理过期条目，返回清理数量。
     pub fn gc(&mut self, now_ms: i64) -> usize {
         let ttl = self.ttl_ms;
@@ -185,6 +199,20 @@ mod tests {
         table.unbind("k");
         assert_eq!(table.get("k", NOW), None);
         assert!(table.is_empty());
+    }
+
+    #[test]
+    fn remove_uid_drops_every_session_pinned_to_that_account() {
+        let mut table = StickyTable::new(1000);
+        table.bind("s1", "u1", NOW);
+        table.bind("s2", "u1", NOW + 10);
+        table.bind("s3", "u2", NOW);
+        assert_eq!(table.remove_uid("u1"), 2, "同一 uid 的多个会话绑定全清");
+        assert_eq!(table.get("s1", NOW + 100), None);
+        assert_eq!(table.get("s2", NOW + 100), None);
+        assert_eq!(table.get("s3", NOW + 100), Some("u2"), "其它 uid 的绑定不受影响");
+        assert_eq!(table.remove_uid("never-bound"), 0);
+        assert_eq!(table.remove_uid(""), 0, "空 uid 不应清掉任何绑定");
     }
 
     #[test]

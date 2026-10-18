@@ -555,10 +555,21 @@ async fn api_codebuddy_cn_ide_detect() -> Response {
 async fn api_delete(Json(body): Json<Value>) -> Response {
     let region = parse_region(body.get("region").and_then(Value::as_str));
     let id = body.get("accountId").and_then(|v| v.as_str()).unwrap_or("");
-    match account::delete_account_for(region, id) {
-        Ok(()) => json_ok(json!({ "ok": true })),
-        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    // 删除即清池（与 Tauri 端 `delete_account` 同一语义）：池条目与粘性绑定必须
+    // 随账号库移除**立即**失效，取 uid 要在删除前做。
+    let uid = account::find_account_for(region, id)
+        .map(|record| account::get_str(&record, "uid").unwrap_or_default())
+        .filter(|uid| !uid.is_empty());
+    if let Err(e) = account::delete_account_for(region, id) {
+        return json_err(e, StatusCode::BAD_REQUEST);
     }
+    if let Some(uid) = uid {
+        let state = crate::gateway_host::shared_state();
+        state.pool.write().await.remove(&uid);
+        state.sticky.write().await.remove_uid(&uid);
+        state.persist_pool().await;
+    }
+    json_ok(json!({ "ok": true }))
 }
 
 async fn api_import_local(Json(body): Json<Value>) -> Response {
@@ -4099,6 +4110,60 @@ mod tests {
             account_ids(&emptied).is_empty(),
             "删除后 Global 库应为空：{emptied}"
         );
+    }
+
+    /// 删除即清池：`/api/delete` 成功后，网关池条目与粘性绑定**立即**移除，
+    /// 已删 uid 不得再被选号路径拿着死凭据打上游（401）。
+    #[tokio::test]
+    async fn delete_prunes_pool_entry_and_sticky_binding() {
+        let _guard = test_guard();
+        let home = isolated_home();
+
+        seed_accounts(
+            Region::Cn,
+            json!(
+              [
+                {"id": "del-me", "uid": "pool-uid-del", "email": "d@example.com"},
+                {"id": "keep-me", "uid": "pool-uid-keep", "email": "k@example.com"}
+              ]
+            ),
+        );
+
+        // 把两个 uid 放进共享网关池 + 粘性表（模拟此前服务过这两个账号）。
+        {
+            let state = crate::gateway_host::shared_state();
+            let mut pool = state.pool.write().await;
+            pool.upsert("pool-uid-del", Some(buddy_switch_gateway::pool::RealmTag::Cn), "已删");
+            pool.upsert("pool-uid-keep", Some(buddy_switch_gateway::pool::RealmTag::Cn), "保留");
+            pool.save(&home.join("state.json")).expect("save pool");
+            let mut sticky = state.sticky.write().await;
+            sticky.bind("cn|glm-5.3|conv-1", "pool-uid-del", buddy_switch_core::modules::config::now_ms());
+            drop(sticky);
+            assert_eq!(pool.len(), 2, "前置：池里应有两个 uid");
+        }
+
+        let (status, body) = call_api(
+            Method::POST,
+            "/api/delete",
+            Some(json!({"accountId": "del-me", "region": "cn"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "删除必须成功：{body}");
+
+        {
+            let state = crate::gateway_host::shared_state();
+            let pool = state.pool.read().await;
+            assert!(pool.get("pool-uid-del").is_none(), "已删账号的池条目必须立即移除");
+            assert!(pool.get("pool-uid-keep").is_some(), "其它账号的池条目不受影响");
+            let sticky = state.sticky.read().await;
+            assert!(
+                sticky.get("cn|glm-5.3|conv-1", buddy_switch_core::modules::config::now_ms()).is_none(),
+                "指向已删 uid 的粘性绑定必须立即清除"
+            );
+        }
+
+        clear_accounts(Region::Cn);
+        clear_accounts(Region::Global);
     }
 }
 

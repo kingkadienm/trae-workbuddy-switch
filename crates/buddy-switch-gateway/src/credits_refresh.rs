@@ -121,11 +121,18 @@ pub async fn refresh_pool<F: CreditFetcher>(
     for (uid, region) in targets {
         let result = fetcher.fetch(region, &uid).await;
         // 未知（失败/回退）→ 绝不写 0，也绝不标记已刷新（下一轮重试）。
-        let Some((credits, expiring)) = parse_credits(&result) else {
+        let Some((credits, expiring, soonest_expire_at)) = parse_credits(&result) else {
             continue;
         };
         // ③ 短暂写锁：只做内存写回。
-        apply_refresh(&mut *pool.write().await, &uid, credits, expiring, now_ms);
+        apply_refresh(
+            &mut *pool.write().await,
+            &uid,
+            credits,
+            expiring,
+            soonest_expire_at,
+            now_ms,
+        );
         refreshed += 1;
     }
     refreshed
@@ -141,8 +148,9 @@ fn refresh_targets(pool: &Pool, now_ms: i64, interval_ms: i64) -> Vec<(String, R
 }
 
 /// 把一次**有效**读数写回池（只碰内存，不做 IO）。
-fn apply_refresh(pool: &mut Pool, uid: &str, credits: i64, expiring: i64, now_ms: i64) {
+fn apply_refresh(pool: &mut Pool, uid: &str, credits: i64, expiring: i64, soonest_expire_at: Option<i64>, now_ms: i64) {
     pool.set_credits(uid, credits, expiring);
+    pool.set_credits_expire_at(uid, soonest_expire_at);
     pool.mark_credits_refreshed(uid, now_ms);
     // 余额恢复后自动解冻「因余额不足」的硬冷却账号（内部有 0 余额/未知/其它原因三重反面约束）。
     pool.thaw_hard_credit_if_recovered(uid, credits);
@@ -172,10 +180,10 @@ pub async fn refresh_with<F: CreditFetcher>(
     for (uid, region) in targets {
         let result = fetcher.fetch(region, &uid).await;
         // 未知（失败/回退）→ 绝不写 0，也绝不标记已刷新（下一轮重试）。
-        let Some((credits, expiring)) = parse_credits(&result) else {
+        let Some((credits, expiring, soonest_expire_at)) = parse_credits(&result) else {
             continue;
         };
-        apply_refresh(pool, &uid, credits, expiring, now_ms);
+        apply_refresh(pool, &uid, credits, expiring, soonest_expire_at, now_ms);
         refreshed += 1;
     }
     refreshed
@@ -209,9 +217,11 @@ fn region_of(realm: RealmTag) -> Region {
 /// - 剩余总额取返回对象的 `totalRemaining`；
 /// - 快过期子集**自行聚合**：`resources[]` 中所有 `expiringSoon == true` 的资源的
 ///   `remaining` 之和。⚠️ `expiringSoon` 是**布尔标记**而非额度，把它当数量求和是错的；
+/// - 快过期积分的到期时刻直接取返回体的 `soonestExpireAt`（`core::credit_result`
+///   已算好：所有 `remaining > 0` 资源的最小 `expireAt`；无此类资源为缺省）；
 /// - 只有当 `ok == true`、`totalRemaining` 与 `resources` 数组**同时存在**时才认为读数有效，
 ///   否则返回 `None`（调用方据此**不写**，避免把失败回退写成 0）。
-fn parse_credits(result: &Value) -> Option<(i64, i64)> {
+fn parse_credits(result: &Value) -> Option<(i64, i64, Option<i64>)> {
     if result.get("ok").and_then(Value::as_bool) != Some(true) {
         return None;
     }
@@ -227,7 +237,8 @@ fn parse_credits(result: &Value) -> Option<(i64, i64)> {
         })
         .filter_map(|resource| resource.get("remaining").and_then(Value::as_f64))
         .sum();
-    Some((to_credits(total), to_credits(expiring_soon)))
+    let soonest_expire_at = result.get("soonestExpireAt").and_then(Value::as_i64);
+    Some((to_credits(total), to_credits(expiring_soon), soonest_expire_at))
 }
 
 /// f64 额度 → i64（四舍五入，非有限 / 负值钳 0）。
@@ -473,7 +484,20 @@ mod tests {
         );
         assert_eq!(
             parse_credits(&json!({"ok": true, "totalRemaining": 5.0, "resources": []})),
-            Some((5, 0))
+            Some((5, 0, None)),
+            "无到期时间键 → None（保留池里旧读数）"
+        );
+        assert_eq!(
+            parse_credits(
+                &json!({
+                    "ok": true,
+                    "totalRemaining": 5.0,
+                    "soonestExpireAt": 1_700_000_500_000i64,
+                    "resources": []
+                })
+            ),
+            Some((5, 0, Some(1_700_000_500_000i64))),
+            "soonestExpireAt 原样透传"
         );
     }
 
