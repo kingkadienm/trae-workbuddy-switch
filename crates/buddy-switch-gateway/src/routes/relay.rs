@@ -132,7 +132,11 @@ pub async fn relay(
         };
 
         let uid = account::get_str(&account_value, "uid").unwrap_or_default();
-        let account_name = account::account_display_name(&account_value);
+        // 日志/前端请求列表专用名：昵称 + uid 尾号。同库可能存在同名账号
+        // （2026-10-18 现场：两个「王正帅」，一停用一正常），只记昵称无法区分，
+        // 用户会误判「删除的账号还在被请求」。uid 尾号取 UUID 第一段的末 4 位，
+        // 同名账号几乎必不同，正常唯一账号也可借尾号对回账号库。
+        let account_name = log_display_name(&account_value);
 
         // 在途租约：占满则标记为已试并换号。
         if !uid.is_empty() {
@@ -446,6 +450,26 @@ pub fn realm_of(region: Region) -> RealmTag {
     }
 }
 
+/// 请求日志/前端列表用的账号名：`昵称(uid尾4位)`。
+///
+/// [`account::account_display_name`] 只回昵称——同库同名账号（2026-10-18 现场：
+/// 两个「王正帅」）在日志里无法区分，用户会误判「删除/停用的账号还在被请求」。
+/// 这里追加 uid 第一段的末 4 位（UUID 第一段含时间戳低位，同名账号几乎必不同）。
+/// 尾号只用于人眼比对，不做任何查找键。
+fn log_display_name(account: &Value) -> String {
+    let base = account::account_display_name(account);
+    let Some(uid) = account::get_str(account, "uid") else {
+        return base;
+    };
+    // UUID 形如 `b5a1ecc6-7040-…`，取第一段末 4 位；非 UUID（短 id）取整体末 4 位。
+    let first_segment = uid.split('-').next().unwrap_or(&uid);
+    let tail: String = first_segment.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+    if tail.is_empty() || tail.len() >= base.chars().count() + uid.len() {
+        return base;
+    }
+    format!("{base}({tail})")
+}
+
 /// 回填实测用量到账本（拿到 `usage` 之后调用）。
 ///
 /// 账本是「免费/便宜的账号优先」的依据，只在拿到真实 token 数时才写入——
@@ -551,6 +575,31 @@ mod tests {
     fn realm_mapping_covers_both_regions() {
         assert_eq!(realm_of(Region::Cn), RealmTag::Cn);
         assert_eq!(realm_of(Region::Global), RealmTag::Global);
+    }
+
+    /// 回归（2026-10-18）：同名账号必须在日志名里可区分。
+    /// 现场两个「王正帅」（uid 7c4ab311… 停用 / b5a1ecc6… 正常）只记昵称时
+    /// 用户误判「删除的账号还在被请求」。
+    #[test]
+    fn log_display_name_appends_uid_tail_to_disambiguate_same_name() {
+        let a = json!({"nickname": "王正帅", "uid": "7c4ab311-d6be-4971-9e3e-d05bb982a7a5"});
+        let b = json!({"nickname": "王正帅", "uid": "b5a1ecc6-7040-4fa1-a6e8-241aad77f1fd"});
+        let name_a = log_display_name(&a);
+        let name_b = log_display_name(&b);
+        assert_eq!(name_a, "王正帅(b311)");
+        assert_eq!(name_b, "王正帅(ecc6)");
+        assert_ne!(name_a, name_b, "同名账号的日志名必须不同");
+
+        // 无 uid / 超短 uid：回落裸昵称，不产生 "名()" 这种空尾号。
+        let no_uid = json!({"nickname": "独一号"});
+        assert_eq!(log_display_name(&no_uid), "独一号");
+        // 超短 uid（2 位）：尾号完整保留，仍可与同名区分。
+        let short_uid = json!({"nickname": "ab", "uid": "12"});
+        assert_eq!(log_display_name(&short_uid), "ab(12)");
+
+        // email 优先的展示名同样带尾号。
+        let email = json!({"email": "u@x.c", "uid": "686e1bcf-fb93-433f-91e6-8e2d1a2b3c4d"});
+        assert_eq!(log_display_name(&email), "u@x.c(1bcf)");
     }
 
     #[test]
