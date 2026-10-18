@@ -321,15 +321,39 @@ pub async fn run_checkin_cycle_for(region: Region, _mode: CheckinCycleMode) -> V
         return json!({"status": "no_accounts"});
     }
     let mut summary = json!({"status": "ok", "accounts": []});
-    for acc in accounts {
-        let result = checkin_account_for(region, &acc).await;
+    for (index, acc) in accounts.iter().enumerate() {
+        // 账号间随机间隔（2026-10-18 防风控）：与 Trae 侧 `human_pause_secs` 同款，
+        // 消除「返回即发下一发」的机器节奏。最后一个账号之后不停顿。
+        if index > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(human_pause_secs())).await;
+        }
+        let result = checkin_account_for(region, acc).await;
         summary["accounts"].as_array_mut().unwrap().push(json!({
-            "email": account_display_name(&acc),
+            "email": account_display_name(acc),
             "result": result.get("result").cloned().unwrap_or(Value::Null),
             "error": result.get("error").cloned().unwrap_or(Value::Null),
         }));
     }
     summary
+}
+
+/// 账号间拟人停顿秒数：3s + 指数分布（均值约 10s，上限 60s）。
+///
+/// 2026-10-18 防风控：批量签到的零间隔串行是机器人签名。与 Trae 侧
+/// `trae::checkin::human_pause_secs` 刻意**两份实现**而非共享——签到两条产品线
+/// 的模块边界不允许 core::checkin 反向依赖 core::trae；逻辑逐字一致，测试两边各钉。
+fn human_pause_secs() -> u64 {
+    let entropy = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64 ^ d.as_secs())
+        .unwrap_or(0x9E37_79B9_7F4A_7C15);
+    let mut state = entropy | 1;
+    state ^= state >> 12;
+    state ^= state << 25;
+    state ^= state >> 27;
+    let unit = (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64;
+    let exponential = -unit.max(1e-12).ln();
+    3 + (exponential.min(57.0) as u64)
 }
 
 /// True when every stored account has a today's log of `success` or `already`（CN）。
@@ -400,6 +424,19 @@ pub async fn run_checkin_all_for(region: Region) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 拟人停顿（与 Trae 侧 `human_pause_secs` 同款双实现，测试两边各钉一份）：
+    /// 3–60s 区间内，且连续采样不完全相同。
+    #[test]
+    fn human_pause_secs_is_bounded_and_varies() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..50 {
+            let pause = human_pause_secs();
+            assert!((3..=60).contains(&pause), "停顿越界: {pause}");
+            seen.insert(pause);
+        }
+        assert!(seen.len() > 1, "50 次采样全同值 ⇒ 停顿退化成常量");
+    }
 
     /// 回归上游 issue #94：信封凭据的签到请求应在入口短路并返回可读错误，
     /// 不发出空 `Bearer`（此前会被网关 401 后把整页 HTML 回显到界面）。

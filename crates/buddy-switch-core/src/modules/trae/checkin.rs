@@ -256,6 +256,27 @@ fn snippet(body: &str) -> String {
     body.chars().take(200).collect()
 }
 
+/// 账号间拟人停顿秒数：3s + 指数分布（均值约 10s，偶发 30s+ 长停顿）。
+///
+/// 2026-10-18 防风控：批量签到的「返回即发下一发」是机器人签名；真人逐个账号
+/// 操作时存在自然间隔。用 xoshiro 风格的时钟熵而非固定种子——**这里要的就是
+/// 每轮不同**（与 `next_fire` 抖动的确定性要求相反），上游无法从间隔序列预测。
+fn human_pause_secs() -> u64 {
+    let entropy = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64 ^ d.as_secs())
+        .unwrap_or(0x9E37_79B9_7F4A_7C15);
+    // xorshift64*：一步熵放大，避免纳秒低位聚集。
+    let mut state = entropy | 1; // 恒非零（xorshift 零吸收）。
+    state ^= state >> 12;
+    state ^= state << 25;
+    state ^= state >> 27;
+    let unit = (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64;
+    // 指数分布（单位均值）+ 3s 起步，上限 60s 防极端拖长轮次。
+    let exponential = -unit.max(1e-12).ln();
+    3 + (exponential.min(57.0) as u64)
+}
+
 /// 组装本次要处理的账号列表（范围过滤 → 跳过条件 → 冷却过滤 → 紧迫度排序）。
 ///
 /// **本函数不做任何 IO**：账号列表、账号视图、冷却状态、剩余积分缓存全部由调用方注入。
@@ -326,6 +347,20 @@ pub fn plan(
         .collect();
 
     // 积分过期紧迫度排序：最早过期优先；同到期时间按剩余积分降序；无到期信息排最后。
+    //
+    // 末位并列键是**日期种子轮换**（2026-10-18 防风控）：紧迫度完全相同的账号
+    // 若每天以固定次序被签，账号顺序本身就成了指纹。以「今天日期 + uid」散列出
+    // 每个账号当日专属的伪随机名次作并列打破键——同一天内稳定（重跑同轮不漂移），
+    // 每天换一次。**只影响并列组内部次序**，紧迫度优先（快过期的先签）不动摇。
+    let today_seed = chrono::Local::now().format("%Y%m%d").to_string();
+    let daily_rank = |uid: &str| -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in today_seed.bytes().chain(uid.bytes()) {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x1000_0000_01b3);
+        }
+        hash
+    };
     planned.sort_by(|(uid_a, _), (uid_b, _)| {
         let expire_a = remaining.expire_times.get(uid_a).copied();
         let expire_b = remaining.expire_times.get(uid_b).copied();
@@ -334,16 +369,22 @@ pub fn plan(
                 if a == b {
                     let credits_a = remaining.credits.get(uid_a).copied().unwrap_or(0.0);
                     let credits_b = remaining.credits.get(uid_b).copied().unwrap_or(0.0);
-                    credits_b
+                    match credits_b
                         .partial_cmp(&credits_a)
                         .unwrap_or(std::cmp::Ordering::Equal)
+                    {
+                        std::cmp::Ordering::Equal => {
+                            daily_rank(uid_a).cmp(&daily_rank(uid_b))
+                        }
+                        other => other,
+                    }
                 } else {
                     a.cmp(&b)
                 }
             }
             (Some(_), None) => std::cmp::Ordering::Less,
             (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
+            (None, None) => daily_rank(uid_a).cmp(&daily_rank(uid_b)),
         }
     });
     planned
@@ -411,6 +452,14 @@ where
     }
 
     for (index, (uid, raw)) in planned.iter().enumerate() {
+        // 账号间随机间隔（2026-10-18 防风控）：上一账号返回即发下一账号是机器节奏的
+        // 明确签名；真人会在多个账号间自然停顿。指数分布：短间隔为主、偶发长停顿
+        // （更像「人切去看了眼别的再回来」）。3s 起步保证轮次总时长可控
+        // （10 账号期望约 1.5 分钟）。最后一个账号之后无需停顿。
+        if index > 0 {
+            let pause = human_pause_secs();
+            tokio::time::sleep(std::time::Duration::from_secs(pause)).await;
+        }
         let info = jwt::parse(&raw.jwt);
 
         // JWT 临期/过期告警（不阻断：临期账号仍可尝试签到）。
@@ -628,6 +677,18 @@ mod tests {
     use super::*;
     use crate::modules::trae::account::RawAccount;
 
+    /// 拟人停顿：3–60s 区间内，且连续采样不完全相同（确认非恒定值）。
+    #[test]
+    fn human_pause_secs_is_bounded_and_varies() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..50 {
+            let pause = human_pause_secs();
+            assert!((3..=60).contains(&pause), "停顿越界: {pause}");
+            seen.insert(pause);
+        }
+        assert!(seen.len() > 1, "50 次采样全同值 ⇒ 停顿退化成常量");
+    }
+
     /// 造一个「可解析且 30 小时后过期」的 JWT，使 jwtStatus = ok。
     fn valid_jwt(uid: &str) -> String {
         use base64::Engine;
@@ -844,6 +905,54 @@ mod tests {
             vec!["same-time-richer", "early", "late", "no-expire"],
             "排序应为：最早过期优先 → 同到期按剩余积分降序 → 无到期信息最后"
         );
+    }
+
+    #[test]
+    fn plan_breaks_full_ties_input_independently_and_deterministically() {
+        // 日期种子轮换（daily_rank）是纯函数：同一账号集合的并列组次序
+        // 不得依赖输入顺序（否则账号库文件顺序就成了指纹），
+        // 且同日重算必须得到同一结果（否则重复触发会漂移）。
+        let ids = ["tie-a", "tie-b"];
+        let build = |order: &[&str]| -> (Vec<(String, account::RawAccount)>, Vec<Value>) {
+            let accounts = order
+                .iter()
+                .map(|uid| ((*uid).to_string(), raw(uid, &valid_jwt(uid))))
+                .collect();
+            let views = order
+                .iter()
+                .map(|uid| view_for(uid, &valid_jwt(uid), false))
+                .collect();
+            (accounts, views)
+        };
+        let cooldowns = credits::CooldownsFile::default();
+        let mut remaining = credits::RemainingCreditsFile::default();
+        remaining.expire_times.insert("tie-a".into(), 1_000);
+        remaining.expire_times.insert("tie-b".into(), 1_000);
+
+        let (forward_accounts, forward_views) = build(&ids);
+        let (reversed_accounts, reversed_views) = build(&[ids[1], ids[0]]);
+
+        let forward = plan(
+            forward_accounts,
+            &forward_views,
+            &cooldowns,
+            &remaining,
+            &CheckinOptions::default(),
+        );
+        let reversed = plan(
+            reversed_accounts,
+            &reversed_views,
+            &cooldowns,
+            &remaining,
+            &CheckinOptions::default(),
+        );
+        assert_eq!(
+            forward.iter().map(|(uid, _)| uid.as_str()).collect::<Vec<_>>(),
+            reversed.iter().map(|(uid, _)| uid.as_str()).collect::<Vec<_>>(),
+            "并列组次序必须与输入顺序无关"
+        );
+        let order: Vec<&str> = forward.iter().map(|(uid, _)| uid.as_str()).collect();
+        assert_eq!(order.len(), 2, "两个账号都必须出现在队列中");
     }
 
     #[test]

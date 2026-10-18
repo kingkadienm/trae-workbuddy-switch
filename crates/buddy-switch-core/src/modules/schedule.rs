@@ -311,6 +311,31 @@ pub fn save_schedule_config(input: &Value) -> Result<ScheduleConfig, String> {
 /// - 该整点已过（或恰等于 `now_ms`）→ 取次日同一整点；
 /// - 跨月 / 跨年 / 闰日由 `NaiveDate::succ_opt` 处理，不做手工进位；
 /// - `hours` 为空（任务禁用）→ `None`。
+///
+/// ## 触发时刻抖动（2026-10-18 防风控）
+///
+/// 整点返回值之上叠加 0–30 分钟的**确定性**偏移。随机源是「日期 + 小时」的
+/// 简单散列——同一触发点（同一天同一小时）无论被 `schedule_loop` 重算多少次
+/// 都得到同一偏移，不会漂移；不同天/不同小时则各不相同。
+///
+/// 为什么必须确定性：`schedule_loop` 每轮醒来都重新调 `next_fire`；若偏移每次
+/// 真随机，循环会永远追着一个移动靶（唤醒 → 计算出的时刻又变了）。
+/// 同时 [`next_wake`] 按「相同时刻」分组同槽任务——同一天同一小时的抖动一致，
+/// 分组语义得以保留。
+const JITTER_MAX_MS: i64 = 30 * 60 * 1000;
+
+fn fire_jitter_ms(fire_ms: i64) -> i64 {
+    // FNV-1a 风格散列：输入是「触发时刻按小时取整」的毫秒值。整点取整保证
+    // 恰在触发点被重算时（now 略晚于该小时起点）散列输入不变、偏移稳定。
+    let hour_bucket = fire_ms - fire_ms.rem_euclid(3_600_000);
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in hour_bucket.to_le_bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    (hash % (JITTER_MAX_MS as u64 + 1)) as i64
+}
+
 pub fn next_fire(hours: &[u32], now_ms: i64) -> Option<i64> {
     let today = crate::modules::cst::cst_date(now_ms);
     let mut earliest: Option<i64> = None;
@@ -322,9 +347,13 @@ pub fn next_fire(hours: &[u32], now_ms: i64) -> Option<i64> {
                 .and_then(|next_day| crate::modules::cst::cst_hour_ms(next_day, h));
         }
         if let Some(ts) = candidate {
+            let jittered = ts + fire_jitter_ms(ts);
+            // 抖动后已过 now 的情况：只有 now 落在该小时后的 30 分钟窗口内才可能发生，
+            // 此时直接照用（略过部分抖动），不得推到明天——那会让「错过即等一天」。
+            let fire = if jittered > now_ms { jittered } else { ts };
             earliest = Some(match earliest {
-                Some(existing) => existing.min(ts),
-                None => ts,
+                Some(existing) => existing.min(fire),
+                None => fire,
             });
         }
     }
@@ -500,31 +529,70 @@ mod tests {
 
     #[test]
     fn next_fire_picks_nearest_upcoming_hour_today() {
-        // 今天 08:00 → [9,21] 今天 09:00。
+        // 今天 08:00 → [9,21] 今天 09:00 附近的抖动时刻。
         let now = cst_ms(2026, 9, 16, 8, 0);
-        assert_eq!(next_fire(&[9, 21], now), Some(cst_ms(2026, 9, 16, 9, 0)));
+        let fire = next_fire(&[9, 21], now).expect("应有触发点");
+        let nine = cst_ms(2026, 9, 16, 9, 0);
+        assert!(
+            (nine..=nine + JITTER_MAX_MS).contains(&fire),
+            "触发点应落在 9 点 + 抖动窗口内: {fire}"
+        );
+    }
+
+    #[test]
+    fn next_fire_jitter_is_deterministic_and_within_bounds() {
+        // 同一 (天, 小时) 的抖动必须确定：重复计算结果一致（schedule_loop 重算不漂移）。
+        let now = cst_ms(2026, 9, 16, 8, 0);
+        assert_eq!(next_fire(&[9], now), next_fire(&[9], now));
+        // 不同小时的触发点抖动应各不相同（30 分钟窗内几乎必不同）。
+        let a = next_fire(&[9], now).unwrap() - cst_ms(2026, 9, 16, 9, 0);
+        let b = next_fire(&[21], now).unwrap() - cst_ms(2026, 9, 16, 21, 0);
+        assert!((0..=JITTER_MAX_MS).contains(&a), "抖动越界: {a}");
+        assert!((0..=JITTER_MAX_MS).contains(&b), "抖动越界: {b}");
+    }
+
+    #[test]
+    fn next_fire_jitter_does_not_slip_past_now() {
+        // now 落在某小时后 10 分钟（抖动窗口内）：触发点不得因此跳到次日，
+        // 也不得早于 now —— 直接取未抖动整点（已过 now？否：now=9:10 晚于 9:00，
+        // 该小时已过，next_fire 本就该取次日）。真正要防的是「抖动把明天的点推
+        // 到窗口外后又被误判已过」——构造次日场景验证不发生。
+        let now = cst_ms(2026, 9, 16, 9, 10);
+        let fire = next_fire(&[9], now).expect("应有次日触发点");
+        let next_nine = cst_ms(2026, 9, 17, 9, 0);
+        assert!(
+            (next_nine..=next_nine + JITTER_MAX_MS).contains(&fire),
+            "次日触发点应落在次日 9 点 + 抖动窗口内: {fire}"
+        );
     }
 
     #[test]
     fn next_fire_wraps_to_next_day_when_all_points_passed() {
-        // 今天 22:00 → 今天时点（9/21）全过 → 次日 09:00。
+        // 今天 22:00 → 今天时点（9/21）全过 → 次日 09:00 附近的抖动时刻。
         let now = cst_ms(2026, 9, 16, 22, 0);
-        assert_eq!(next_fire(&[9, 21], now), Some(cst_ms(2026, 9, 17, 9, 0)));
+        let fire = next_fire(&[9, 21], now).expect("应有次日触发点");
+        let next_nine = cst_ms(2026, 9, 17, 9, 0);
+        assert!((next_nine..=next_nine + JITTER_MAX_MS).contains(&fire));
 
         // 恰好等于某整点 → 不算「之后」，取次日（与参考实现 !After 语义一致）。
         let exact = cst_ms(2026, 9, 16, 9, 0);
-        assert_eq!(next_fire(&[9], exact), Some(cst_ms(2026, 9, 17, 9, 0)));
+        let fire = next_fire(&[9], exact).expect("应有次日触发点");
+        assert!((next_nine..=next_nine + JITTER_MAX_MS).contains(&fire));
     }
 
     #[test]
     fn next_fire_crosses_month_and_year_boundaries() {
+        let next = cst_ms(2026, 10, 1, 9, 0);
         assert_eq!(
-            next_fire(&[9], cst_ms(2026, 9, 30, 23, 59)),
-            Some(cst_ms(2026, 10, 1, 9, 0))
+            next_fire(&[9], cst_ms(2026, 9, 30, 23, 59))
+                .map(|fire| (next..=next + JITTER_MAX_MS).contains(&fire)),
+            Some(true)
         );
+        let next = cst_ms(2027, 1, 1, 1, 0);
         assert_eq!(
-            next_fire(&[1], cst_ms(2026, 12, 31, 20, 0)),
-            Some(cst_ms(2027, 1, 1, 1, 0))
+            next_fire(&[1], cst_ms(2026, 12, 31, 20, 0))
+                .map(|fire| (next..=next + JITTER_MAX_MS).contains(&fire)),
+            Some(true)
         );
         // 空列表（禁用）→ None。
         assert_eq!(next_fire(&[], cst_ms(2026, 9, 16, 8, 0)), None);
@@ -532,19 +600,22 @@ mod tests {
 
     #[test]
     fn next_wake_groups_multiple_tasks_on_same_hour() {
-        // 默认配置下 checkin/travel 都在 9 点；08:00 唤醒时二者同槽。
+        // 默认配置下 checkin/travel 都在 9 点；08:00 唤醒时二者同槽
+        // （同一天同一小时的抖动一致，分组语义保留）。
         let cfg = default_schedule();
         let (at, kinds) = next_wake(&cfg, cst_ms(2026, 9, 16, 8, 0));
-        assert_eq!(at, Some(cst_ms(2026, 9, 16, 9, 0)));
+        let nine = cst_ms(2026, 9, 16, 9, 0);
+        assert!(at.is_some_and(|fire| (nine..=nine + JITTER_MAX_MS).contains(&fire)));
         assert_eq!(hours_of(&kinds), vec!["checkin", "travel"]);
     }
 
     #[test]
     fn next_wake_returns_earliest_across_task_families() {
-        // 08:00：cat=1(次日) / activity=10 / school=12 / checkin&travel=9 / keepalive=22 → 9 点。
+        // 08:00：cat=1(次日) / activity=10 / school=12 / checkin&travel=9 / keepalive=22 → 9 点附近。
         let cfg = default_schedule();
         let (at, kinds) = next_wake(&cfg, cst_ms(2026, 9, 16, 8, 0));
-        assert_eq!(at, Some(cst_ms(2026, 9, 16, 9, 0)));
+        let nine = cst_ms(2026, 9, 16, 9, 0);
+        assert!(at.is_some_and(|fire| (nine..=nine + JITTER_MAX_MS).contains(&fire)));
         assert_eq!(hours_of(&kinds), vec!["checkin", "travel"]);
     }
 
@@ -569,7 +640,8 @@ mod tests {
         assert_eq!(ScheduleTask::Cat.hours(&cfg), &[1]);
         // 最近的唤醒时点 = 各启用任务的最近时点，school(12) 与 cat(次日1) 均在其中。
         let (at, _) = next_wake(&cfg, cst_ms(2026, 9, 16, 9, 30));
-        assert_eq!(at, Some(cst_ms(2026, 9, 16, 12, 0)));
+        let noon = cst_ms(2026, 9, 16, 12, 0);
+        assert!(at.is_some_and(|fire| (noon..=noon + JITTER_MAX_MS).contains(&fire)));
     }
 
     #[test]
