@@ -75,7 +75,9 @@ export default defineConfig(async () => ({
     proxy: {
       "/api": {
         target: "http://127.0.0.1:57890",
-        changeOrigin: true,
+        // 管理面 api_guard 要求 Origin 与 Host 一致；保留浏览器的回环 Host。
+        // 回归：node scripts/check-vite-api-proxy.mjs
+        changeOrigin: false,
       },
       "/v1": {
         target: "http://127.0.0.1:57890",

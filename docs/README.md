@@ -117,6 +117,7 @@
 
 | 文档 | 为什么在历史区 |
 |:--|:--|
+| [`upstream-sync-review-2026-11-14.md`](history/upstream-sync-review-2026-11-14.md) | 本次独立审查发现的开发API代理同源回归、真实Rust判定验证及反向代理升级配置提示 |
 | [`upstream-sync-2026-11-14.md`](history/upstream-sync-2026-11-14.md) | 2026-11-14 fork同步上游：96个冲突的逐项比较、兼容取舍和本地验证边界 |
 | [`overview.md`](history/overview.md) | 2026-10-09 的多区域 + 网关改造总览，已被 README 与 `specs/` 取代 |
 | [`ia-redesign-proposal.md`](history/ia-redesign-proposal.md) | v1 信息架构方案，被 `specs/PLAN.md`（v2）取代 |
