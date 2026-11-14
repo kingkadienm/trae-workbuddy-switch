@@ -15,10 +15,10 @@ use crate::modules::account::{
 };
 use crate::modules::config::{
     http_request, load_checkin_config, load_travel_cache, load_travel_config, now_ms, now_secs,
-    save_travel_cache, with_travel_cache_lock, RunFlagGuard, TRAVEL_API_PREFIX, WORKBUDDY_API_ENDPOINT,
-    workbuddy_api_base,
+    save_travel_cache, with_travel_cache_lock, workbuddy_api_base, RunFlagGuard, TRAVEL_API_PREFIX,
+    WORKBUDDY_API_ENDPOINT,
 };
-use crate::modules::refresh::{ensure_fresh_token, refresh_account_token};
+use crate::modules::refresh::ensure_fresh_token;
 use crate::modules::region::{region_spec, Region};
 
 static TRAVEL_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -73,22 +73,6 @@ fn build_travel_headers(account: &Value) -> HashMap<String, String> {
     headers
 }
 
-fn is_unauthorized(resp: &Value) -> bool {
-    let code = resp.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
-    if code == 401 || code == 403 {
-        return true;
-    }
-    let msg = resp
-        .get("message")
-        .or_else(|| resp.get("msg"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_lowercase();
-    ["unauthorized", "401", "登录", "失效", "过期", "token"]
-        .iter()
-        .any(|k| msg.contains(k))
-}
-
 /// 发旅行接口请求；遇到未授权且存在 refresh token 时刷新一次并重试。
 async fn travel_request(path: &str, method: &str, body: Option<Value>, account: &Value) -> Value {
     // 加密信封凭据短路：不发空 Bearer，直接给出可读错误（上游 PR #95 的同款处理）。
@@ -97,18 +81,27 @@ async fn travel_request(path: &str, method: &str, body: Option<Value>, account: 
     }
     let url = format!("{}{path}", workbuddy_api_base());
     let headers = build_travel_headers(account);
-    let mut resp = http_request(&url, method, body.clone(), Some(&headers)).await;
-    if is_unauthorized(&resp)
-        && !account
-            .get("refresh_token")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .is_empty()
-    {
-        let refreshed = refresh_account_token(account.clone()).await;
-        let headers = build_travel_headers(&refreshed);
-        resp = http_request(&url, method, body, Some(&headers)).await;
-    }
+    let uid = account.get("uid").and_then(Value::as_str).unwrap_or("");
+    let _risk_permit =
+        match crate::modules::risk_control::admit_platform_request("workbuddy", "cn", uid).await {
+            Ok(permit) => permit,
+            Err(error) => return json!({"code": -3, "message": format!("风控准入拦截：{error}")}),
+        };
+    let resp = http_request(&url, method, body, Some(&headers)).await;
+    let code = resp.get("code").and_then(Value::as_i64).unwrap_or(-1);
+    let reason = resp
+        .get("message")
+        .or_else(|| resp.get("msg"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let _ = crate::modules::risk_control::record_platform_response(
+        "workbuddy",
+        "cn",
+        uid,
+        code,
+        reason,
+    );
     resp
 }
 
@@ -375,7 +368,13 @@ async fn adopt_buddy(account: &Value) -> bool {
 
     // 1. 同意 Buddy 协议
     let agreement_url = format!("{base}/activity/growth/buddy/agreement");
-    let resp = http_request(&agreement_url, "POST", Some(json!({"agree": true})), Some(&headers)).await;
+    let resp = http_request(
+        &agreement_url,
+        "POST",
+        Some(json!({"agree": true})),
+        Some(&headers),
+    )
+    .await;
     let code = resp.get("code").and_then(Value::as_i64).unwrap_or(-1);
     if code != 0 && code != 200 {
         return false;
@@ -506,13 +505,16 @@ pub async fn depart_travel_for_account(account: &Value) -> Value {
                             false,
                             None,
                             Some(
-                                retry.get("state")
+                                retry
+                                    .get("state")
                                     .and_then(Value::as_str)
                                     .unwrap_or("traveling"),
                             ),
                             "",
                         );
-                        if let Some(name) = nonempty_str(location.get("name").unwrap_or(&Value::Null)) {
+                        if let Some(name) =
+                            nonempty_str(location.get("name").unwrap_or(&Value::Null))
+                        {
                             result["locationName"] = json!(name);
                         }
                         let status = fetch_travel_status(&acc).await;
@@ -652,14 +654,18 @@ fn merge_claim_state(prior: &Value, new: &Value) -> Value {
         if result_in_flight(prior)
             && nonzero_credit(merged.get("rewardCredit").unwrap_or(&Value::Null)).is_none()
         {
-            if let Some(credit) = nonzero_credit(prior.get("rewardCredit").unwrap_or(&Value::Null)) {
+            if let Some(credit) = nonzero_credit(prior.get("rewardCredit").unwrap_or(&Value::Null))
+            {
                 merged["rewardCredit"] = credit;
             }
         }
         if result_in_flight(prior)
             && merged.get("arriveAt").and_then(Value::as_i64).unwrap_or(0) <= 0
         {
-            if let Some(arrive_at) = prior.get("arriveAt").and_then(Value::as_i64).filter(|v| *v > 0)
+            if let Some(arrive_at) = prior
+                .get("arriveAt")
+                .and_then(Value::as_i64)
+                .filter(|v| *v > 0)
             {
                 merged["arriveAt"] = json!(arrive_at);
             }
@@ -669,7 +675,8 @@ fn merge_claim_state(prior: &Value, new: &Value) -> Value {
     if !result_claimed(prior) {
         return merged;
     }
-    let new_has_credit = nonzero_credit(merged.get("rewardCredit").unwrap_or(&Value::Null)).is_some();
+    let new_has_credit =
+        nonzero_credit(merged.get("rewardCredit").unwrap_or(&Value::Null)).is_some();
     merged["claimed"] = json!(true);
     if !new_has_credit {
         merged["rewardCredit"] = prior.get("rewardCredit").cloned().unwrap_or(Value::Null);
@@ -1216,10 +1223,7 @@ mod tests {
 
     #[test]
     fn official_status_decides_whether_to_depart() {
-        assert_eq!(
-            decide_travel_action("idle", false),
-            TravelAction::Depart
-        );
+        assert_eq!(decide_travel_action("idle", false), TravelAction::Depart);
         assert_eq!(
             decide_travel_action("idle", true),
             TravelAction::SkipDailyLimit
@@ -1228,10 +1232,7 @@ mod tests {
             decide_travel_action("traveling", true),
             TravelAction::WaitTraveling
         );
-        assert_eq!(
-            decide_travel_action("arrived", true),
-            TravelAction::Claim
-        );
+        assert_eq!(decide_travel_action("arrived", true), TravelAction::Claim);
     }
 
     #[test]
@@ -1280,10 +1281,7 @@ mod tests {
         assert!(in_flight_due(&traveling, 100));
         assert!(in_flight_due(&traveling, 101));
         assert!(!in_flight_due(&traveling, 99));
-        assert!(in_flight_due(
-            &json!({ "ok": true, "claimed": false }),
-            1
-        ));
+        assert!(in_flight_due(&json!({ "ok": true, "claimed": false }), 1));
         assert!(!in_flight_due(
             &json!({ "ok": true, "claimed": true, "arriveAt": 1 }),
             100

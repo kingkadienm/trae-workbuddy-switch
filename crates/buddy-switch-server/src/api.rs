@@ -25,13 +25,38 @@ use axum::{Json, Router};
 use rust_embed::RustEmbed;
 use serde_json::{json, Value};
 
-use buddy_switch_core::modules::{
-    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, config, credit_usage, credits, doubao, export_import,
-    migrate, oauth, process, refresh, region::Region, region::RegionFilter, rotate, schedule, scheduler,
-    session, switch, token_stats, trae, travel, update,
-};
 use buddy_switch_core::modules::growth::{autotasks, queue, tasks};
+use buddy_switch_core::modules::{
+    account, auth_file, backup, checkin, client_limits, client_settings, codebuddy_cli,
+    codebuddy_memory, config, credit_usage, credits, diagnostics, doubao, export_import,
+    gateway_ledger, migrate, oauth, process, programs, qoder, refresh, region::Region,
+    region::RegionFilter, rotate, schedule, scheduler, session, session_bundle, skill, switch,
+    token_daily, token_stats, trae, travel, update, vscode_session,
+};
+use buddy_switch_gateway::unified::UnifiedGatewayConfig;
+use buddy_switch_gateway::GatewayProduct;
 use buddy_switch_gateway::{GatewayConfig, GatewayStatusView};
+
+// P9 · 悬浮窗**只读**数据模型 + provider（core）；两宿主同源。
+use buddy_switch_core::modules::companion as companion_state;
+// P15 · 外部 Agent 会话监听（客户端 hook 驱动）—— 悬浮窗的**第二个数据源**。
+use buddy_switch_core::modules::agent_watch;
+// P15 · hook 安装面（写上游客户端配置）+ 「宿主也要读」的应用偏好。
+use buddy_switch_core::modules::agent_hook_install;
+use buddy_switch_core::modules::app_prefs;
+use buddy_switch_core::modules::proxy;
+// 运行日志（本工具自身，排查问题用）：读 / 清 / 开目录三件。桌面端有同名命令。
+use buddy_switch_core::modules::runtime_log;
+
+// P5 §2.5 第 (2) 条：capability **默认拒绝**。表数据只在 core（`product_spec`），本文件只查表。
+// ⚠️ 本文件在 `src-tauri/src/commands.rs` 有**同款**接线（刻意不去重，见共享知识）。
+use buddy_switch_core::modules::capability;
+use buddy_switch_core::modules::product::{
+    require_capability, require_qoder_region, require_trae_region, require_wb_region,
+    resolve_scope_param, Product,
+};
+use buddy_switch_core::modules::qoder::region::QoderRegion;
+use buddy_switch_core::modules::trae::region::TraeRegion;
 
 /// WorkBuddy 运行状态缓存：Windows 上检测要跑 tasklist（慢），缓存几秒避免
 /// 前端切 tab 频繁触发命令行导致卡顿/闪窗。缓存按 region 分别记录，避免两版串台。
@@ -64,6 +89,8 @@ struct Assets;
 /// 切换进度缓存：webui 通过 GET /api/switch/progress 轮询。
 static SWITCH_PROGRESS: Mutex<Option<String>> = Mutex::new(None);
 static SWITCH_RUNNING: Mutex<bool> = Mutex::new(false);
+/// 进行中的切换操作所属 region —— 供悬浮窗只读快照推导用（与 Tauri 宿主同款）。
+static SWITCH_REGION: Mutex<Option<Region>> = Mutex::new(None);
 
 /// webui 对外路由。
 ///
@@ -75,9 +102,19 @@ static SWITCH_RUNNING: Mutex<bool> = Mutex::new(false);
 /// 启用后除 `/api/auth/totp/*` 外均需有效 session。
 pub fn router() -> Router {
     let gateway_state = crate::gateway_host::shared_state();
+    // ★ 安全审计 P0-1：**管理面必须有来源校验**。
+    //
+    // 这里 `.layer(...)` 的位置很关键：它在 `merge` **之前**，所以只作用于
+    // `api_routes()`（`/api/*`）；网关那棵树有自己的 Bearer 鉴权与独立端口，
+    // 不该被 webui 的 Host 策略牵连。
+    //
+    // 也不能挂在最外层：那会把 `static_handler`（SPA 静态资源）一起拦掉，
+    // 而静态资源是公开的、且它的 GET 请求不带 `Content-Type`。
     let protected = api_routes()
-        .merge(buddy_switch_gateway::router(gateway_state))
-        .layer(middleware::from_fn(totp_middleware));
+        .layer(axum::middleware::from_fn(crate::api_guard::guard))
+        // TOTP 保护管理面；模型协议端点保留自己的 Bearer Key 鉴权。
+        .layer(middleware::from_fn(totp_middleware))
+        .merge(buddy_switch_gateway::router(gateway_state));
     protected.fallback(static_handler)
 }
 
@@ -87,10 +124,7 @@ pub fn router() -> Router {
 /// - `/api/public-config` 始终放行（前端启动时需无认证读取域名配置）。
 /// - TOTP 未启用时放行全部（向后兼容）。
 /// - 其余路由需携带有效 `X-Session-Token` 请求头。
-async fn totp_middleware(
-    req: Request<Body>,
-    next: Next,
-) -> Result<Response, StatusCode> {
+async fn totp_middleware(req: Request<Body>, next: Next) -> Result<Response, StatusCode> {
     let path = req.uri().path().to_string();
 
     // TOTP 管理路由始终公开
@@ -126,6 +160,49 @@ fn api_routes() -> Router {
     Router::new()
         .route("/api/status", get(api_status))
         .route("/api/accounts", get(api_accounts))
+        // P5 T03 · 参数化命令（`scope` 决定平台与区域）。旧路由（/api/accounts、/api/account/remark、
+        // /api/delete）保留为别名，故这里用**新路径**，避免与旧路由同路径冲突。
+        .route("/api/accounts/list", get(api_accounts_list))
+        .route("/api/accounts/remark", post(api_account_remark))
+        .route("/api/accounts/delete", post(api_account_delete))
+        // P5 §2.7 · 回收站 4 命令（**全新命令**，非参数化、无别名）。`scope` 决定平台与区域，
+        // 从而决定读/写哪个 `*.trash.<region>.json`；非法 scope ⇒ 4xx 且**不落盘**（fail-closed）。
+        .route("/api/accounts/trash", get(api_account_trash_list))
+        .route("/api/accounts/trash/restore", post(api_account_restore))
+        .route("/api/accounts/trash/purge", post(api_account_purge))
+        .route("/api/accounts/trash/clear", post(api_account_trash_clear))
+        .route("/api/accounts/export", post(api_accounts_export))
+        .route(
+            "/api/accounts/export-to-path",
+            post(api_accounts_export_to_path),
+        )
+        .route("/api/accounts/import", post(api_accounts_import))
+        // P5 T03 · 参数化「从本机客户端导入账号」（`scope` 决定平台与区域）。旧路由
+        // `/api/import-local`（WB）与 `/api/trae/accounts/import-local`（Trae）保留为别名，
+        // 故这里用**新路径**（与 `accounts_*` 家族同族）。
+        .route(
+            "/api/accounts/import-local",
+            post(api_accounts_import_local),
+        )
+        // 粘贴授权凭据（issue #62）：无客户端时与「浏览器授权」并列的第二条路。
+        .route(
+            "/api/accounts/paste-credential",
+            post(api_accounts_paste_credential),
+        )
+        // P5 T03 · 参数化「打开客户端数据目录」（`scope` 决定平台与区域）。旧路由
+        // `/api/gateway/open-data-dir`（WB）与 `/api/trae/open-data-dir`（Trae）保留为别名。
+        .route("/api/data-dir/open", post(api_open_data_dir))
+        // 缓存清理（「清除缓存」）：`scan` 只读量体积，`clear` 按类别删（不可逆）。
+        // 无 scope 参数 —— `~/.buddy-switch` 是全局单目录（见 core `config::store_dir`）。
+        .route("/api/cache/scan", get(api_cache_scan))
+        .route("/api/cache/clear", post(api_cache_clear))
+        // P5 T03 · 参数化积分命令（`scope` 决定平台与区域）。旧路由 `/api/credits`（WB）与
+        // `/api/trae/credits`（Trae）保留为别名，故这里用**新路径**，避免与旧路由同路径冲突。
+        .route("/api/credits/query", post(api_credits_query))
+        // P5 T03 · 参数化签到状态命令（`scope` 决定平台与区域）。旧路由 `GET /api/checkin/status`
+        // （WB，**批量整端点**）与 `GET /api/trae/checkin/status`（Trae）保留为别名，故这里用
+        // **新路径 + POST**，既避开同路径冲突，也避开与旧 GET 的 method 冲突。
+        .route("/api/checkin/status/query", post(api_checkin_status_query))
         .route("/api/accounts/open-dir", post(api_open_accounts_dir))
         .route("/api/codebuddy-cli/status", get(api_codebuddy_cli_status))
         .route(
@@ -133,9 +210,52 @@ fn api_routes() -> Router {
             post(api_codebuddy_cli_install_helper),
         )
         .route("/api/codebuddy-cli/switch", post(api_codebuddy_cli_switch))
-        .route("/api/codebuddy-cn-ide/status", get(api_codebuddy_cn_ide_status))
-        .route("/api/codebuddy-cn-ide/switch", post(api_codebuddy_cn_ide_switch))
-        .route("/api/codebuddy-cn-ide/detect", post(api_codebuddy_cn_ide_detect))
+        // issue #109 §PR-2：一键把 CLI 切到本机网关（建 Key + 写 settings + 关轮换）。
+        .route(
+            "/api/codebuddy-cli/enable-gateway",
+            post(api_codebuddy_cli_enable_gateway),
+        )
+        // issue #109：切回直连（清网关键 + 重建上游凭据）。没有它，用户切过去就回不来。
+        .route(
+            "/api/codebuddy-cli/disable-gateway",
+            post(api_codebuddy_cli_disable_gateway),
+        )
+        .route(
+            "/api/codebuddy-cn-ide/status",
+            get(api_codebuddy_cn_ide_status),
+        )
+        .route(
+            "/api/codebuddy-cn-ide/switch",
+            post(api_codebuddy_cn_ide_switch),
+        )
+        .route(
+            "/api/codebuddy-cn-ide/detect",
+            post(api_codebuddy_cn_ide_detect),
+        )
+        .route(
+            "/api/vscode-codebuddy-plugin/status",
+            get(api_vscode_codebuddy_plugin_status),
+        )
+        .route(
+            "/api/vscode-codebuddy-plugin/switch",
+            post(api_vscode_codebuddy_plugin_switch),
+        )
+        .route(
+            "/api/vscode-codebuddy-plugin/detect",
+            post(api_vscode_codebuddy_plugin_detect),
+        )
+        .route(
+            "/api/jetbrains-codebuddy-plugin/status",
+            get(api_jetbrains_codebuddy_plugin_status),
+        )
+        .route(
+            "/api/jetbrains-codebuddy-plugin/switch",
+            post(api_jetbrains_codebuddy_plugin_switch),
+        )
+        .route(
+            "/api/jetbrains-codebuddy-plugin/detect",
+            post(api_jetbrains_codebuddy_plugin_detect),
+        )
         .route("/api/delete", post(api_delete))
         .route("/api/account/remark", post(api_set_account_remark))
         .route("/api/account/deactivate", post(api_deactivate_account))
@@ -146,6 +266,11 @@ fn api_routes() -> Router {
         .route("/api/auth/totp/verify", post(api_totp_verify))
         .route("/api/auth/totp/validate", post(api_totp_validate))
         .route("/api/auth/totp/disable", post(api_totp_disable))
+        .route("/api/account/group", post(api_set_account_group))
+        .route("/api/account/token-today", get(api_account_token_today))
+        .route("/api/account/token-trend", get(api_gateway_token_trend))
+        .route("/api/account/usage-dim", get(api_gateway_usage_dim))
+        .route("/api/account/usage-reconcile", get(api_usage_reconcile))
         .route(
             "/api/switch/config",
             get(api_switch_config).post(api_save_switch_config),
@@ -166,10 +291,87 @@ fn api_routes() -> Router {
         .route("/api/import/preview", post(api_preview_import))
         .route("/api/import", post(api_import))
         .route("/api/import/auths-dir", post(api_import_auths_dir))
+        // P7 T01 · 全局备份导出（跨 4 作用域；凭据按 CREDENTIAL_KEYS 剥离）。
+        .route("/api/backup/export", post(api_export_backup))
+        // P7 T02 · 全局备份导入（预览 / 导入 / 自动备份 / 恢复 / 配置）。
+        .route(
+            "/api/backup/import/preview",
+            post(api_preview_import_backup),
+        )
+        .route("/api/backup/import", post(api_import_backup))
+        .route("/api/backup/auto/list", get(api_list_auto_backups))
+        .route("/api/backup/auto/restore", post(api_restore_auto_backup))
+        .route(
+            "/api/backup/auto/config",
+            get(api_get_auto_backup_config).post(api_save_auto_backup_config),
+        )
         .route("/api/switch", post(api_switch))
+        // Q1 · 诊断包导出（只读；凭据闸门在 core 内，命中即拒绝发出）。
+        .route("/api/diagnostics/export", post(api_export_diagnostic))
+        // 运行日志（本工具自身，排查问题用）：读 / 清 / 开目录。
+        // ⚠️ 与 `src-tauri/src/commands.rs` 的三条同名命令**一一对应**（刻意不去重）。
+        .route("/api/logs/runtime", get(api_runtime_logs))
+        .route("/api/logs/runtime/clear", post(api_clear_runtime_logs))
+        .route("/api/logs/runtime/slow-call", post(api_report_slow_call))
+        .route("/api/logs/open-dir", post(api_open_logs_dir))
         .route("/api/switch/progress", get(api_switch_progress))
         .route("/api/sessions", get(api_sessions))
+        .route("/api/sessions/replicas", get(api_session_replicas))
+        .route(
+            "/api/sessions/replicas/prune",
+            post(api_prune_session_replicas),
+        )
+        // P8 · 安全同步（增量追加）—— **写操作**：只往目标 jsonl 追加，绝不改写已有内容。
+        .route("/api/sessions/sync", post(api_session_sync))
+        .route("/api/sessions/unify", post(api_session_unify))
         .route("/api/sessions/copy", post(api_copy_sessions))
+        // issue #87 · 会话导出 / 导入（单文件 JSON 包；导入是加法写）。
+        .route("/api/sessions/export", post(api_export_sessions_bundle))
+        .route(
+            "/api/sessions/import/preview",
+            get(api_preview_sessions_bundle),
+        )
+        .route("/api/sessions/import", post(api_import_sessions_bundle))
+        // P14 S4a · VS Code 插件 / CodeBuddy IDE 的会话仓（只读枚举 + 加法复制）。
+        .route("/api/vscode-sessions", get(api_vscode_sessions))
+        .route("/api/vscode-sessions/copy", post(api_copy_vscode_sessions))
+        // issue #86 · CodeBuddy IDE 长期记忆合并（加法；结构认不出时拒绝并列出键名）。
+        .route(
+            "/api/codebuddy-ide/memory/merge",
+            post(api_merge_codebuddy_ide_memory),
+        )
+        // P14 S4b · 记录级 diff（只读）+ 增量追加。
+        .route("/api/vscode-sessions/diff", get(api_diff_vscode_sessions))
+        .route("/api/vscode-sessions/sync", post(api_sync_vscode_sessions))
+        // 客户端限流可视化（**只读**）：账号 × 模型 × 恢复时刻。
+        .route("/api/client/limits", get(api_client_limits))
+        // Skill 管理（cc-switch 式）：清单 + 启停 + 跨区搬迁 + 本地导入。
+        // `region` 决定读 / 写哪个 `{data_dir}/skills`（`skill::*` 两宿主同源）。
+        .route("/api/skills", get(api_list_skills))
+        .route("/api/skills/enabled", post(api_set_skill_enabled))
+        .route("/api/skills/copy-cross", post(api_copy_skills_cross))
+        .route("/api/skills/import", post(api_import_skill))
+        .route("/api/skills/open-dir", post(api_open_skills_dir))
+        // 上游客户端 settings.json 统一托管（读 · 编辑 · 备份 · 恢复 · 差异比对）。
+        // ⚠️ 与 `src-tauri/src/commands.rs` 的 6 个同名命令**同契约**（两宿主同步）。两侧都调
+        // 同一个 core `client_settings::*` 函数并原样返回其结果，本层**不自己拼 JSON 形状**。
+        // ⚠️ 无 capability 门控：本模块跨 WorkBuddy / Trae 两个产品线托管**各自客户端**的本地
+        // 设置文件，平台能力表（`capability.rs`）里没有与之对应的能力项，故不套用任何平台能力。
+        .route("/api/client-settings/slots", get(api_client_settings_slots))
+        .route("/api/client-settings/read", get(api_client_settings_read))
+        .route(
+            "/api/client-settings/patch",
+            post(api_client_settings_patch),
+        )
+        .route(
+            "/api/client-settings/backups",
+            get(api_client_settings_backups),
+        )
+        .route(
+            "/api/client-settings/restore",
+            post(api_client_settings_restore),
+        )
+        .route("/api/client-settings/diff", post(api_client_settings_diff))
         .route("/api/migrate/account", post(api_migrate_account))
         .route("/api/checkin/status", get(api_checkin_status))
         .route("/api/credits", post(api_credits))
@@ -223,12 +425,39 @@ fn api_routes() -> Router {
             "/api/gateway/config",
             get(api_gateway_config).post(api_save_gateway_config),
         )
+        .route(
+            "/api/settings/risk-controls",
+            get(api_risk_control_settings).post(api_save_risk_control_settings),
+        )
+        .route("/api/proxy/status", get(api_proxy_status))
+        .route("/api/proxy/enable", post(api_proxy_enable))
+        .route("/api/proxy/disable", post(api_proxy_disable))
         .route("/api/gateway/status", get(api_gateway_status))
+        // 账号池：人工解除某账号的禁用（禁用是终态且落盘，此前**没有任何出口**）。
+        .route("/api/gateway/pool/revive", post(api_gateway_revive_account))
+        .route("/api/gateway/risk/recover", post(api_gateway_risk_recover))
+        .route(
+            "/api/gateway/pool/exclusions",
+            get(api_gateway_pool_exclusions).post(api_gateway_set_pool_exclusion),
+        )
+        // 打开 WorkBuddy 客户端数据目录（非 Windows 返回结构化 Unsupported）。
+        .route(
+            "/api/gateway/open-data-dir",
+            post(api_gateway_open_data_dir),
+        )
         .route(
             "/api/gateway/keys",
             get(api_gateway_list_keys).post(api_gateway_create_key),
         )
         .route("/api/gateway/keys/revoke", post(api_gateway_revoke_key))
+        // ★ 2026-11-04：创建时明文不落盘，用户点「保存到本软件」才写。
+        .route(
+            "/api/gateway/keys/plaintext",
+            post(api_gateway_save_key_plaintext),
+        )
+        .route("/api/gateway/keys/policy", post(api_gateway_set_key_policy))
+        .route("/api/gateway/keys/usage", get(api_gateway_key_usage))
+        .route("/api/gateway/keys/restore", post(api_gateway_restore_key))
         .route("/api/gateway/keys/delete", post(api_gateway_delete_key))
         .route("/api/gateway/models", get(api_gateway_models))
         .route(
@@ -239,8 +468,88 @@ fn api_routes() -> Router {
             "/api/gateway/strategy",
             get(api_gateway_strategy).post(api_gateway_save_strategy),
         )
+        // 模型禁用偏好（P11）：GET 列表 / POST 置位·清位，同一路径两种方法（与 Tauri 命令一一对应）。
+        .route(
+            "/api/gateway/disabled-models",
+            get(api_gateway_disabled_models).post(api_gateway_set_model_disabled),
+        )
+        // 图片能力声明 / 覆盖（issue #101）：同一路径两种方法，与 Tauri 命令一一对应。
+        .route(
+            "/api/gateway/model-image-caps",
+            get(api_gateway_model_image_caps).post(api_gateway_set_model_image_cap),
+        )
+        // 模型降级链（P13）：读 / 存 / 预演，与三个 Tauri 命令一一对应。
+        .route(
+            "/api/gateway/model-fallback",
+            get(api_gateway_model_fallback).post(api_save_gateway_model_fallback),
+        )
+        .route(
+            "/api/gateway/model-fallback/preview",
+            post(api_preview_gateway_model_fallback),
+        )
+        // 降级统计：读**落盘账本**（不是环形缓冲），「近 N 天」才成立。
+        .route(
+            "/api/gateway/fallback-stats",
+            get(api_gateway_fallback_stats),
+        )
         .route("/api/gateway/logs", get(api_gateway_logs))
         .route("/api/gateway/logs/clear", post(api_gateway_clear_logs))
+        // 限流探测（账号 × 模型矩阵 · 一次性作业 + 轮询）：start 异步作业 / status 快照 / cancel。
+        // 与 `src-tauri/src/commands.rs` 的 `probe_*` 命令、`src/lib/api.ts` 的 ROUTES 三方一致。
+        .route("/api/gateway/probe/start", post(api_probe_start))
+        .route("/api/gateway/probe/status", get(api_probe_status))
+        .route("/api/gateway/probe/cancel", post(api_probe_cancel))
+        .route("/api/gateway/probe/ledger", get(api_probe_ledger))
+        // ---- 统一网关（第三个产品线 · 跨作用域）----
+        // ⚠️ 前缀 `/api/unified-gateway/…` 与两条既有线路（`/api/gateway/…`、`/api/trae/…`）平行；
+        //   命令与其在 `src-tauri/commands.rs` 的实现一一对应（门禁 `check:api` 两侧夹）。
+        .route(
+            "/api/unified-gateway/config",
+            get(api_unified_gateway_config).post(api_save_unified_gateway_config),
+        )
+        .route(
+            "/api/unified-gateway/models",
+            get(api_unified_gateway_models),
+        )
+        .route(
+            "/api/unified-gateway/pool-overview",
+            get(api_unified_gateway_pool_overview),
+        )
+        .route(
+            "/api/unified-gateway/keys",
+            get(api_unified_gateway_list_keys).post(api_unified_gateway_create_key),
+        )
+        .route(
+            "/api/unified-gateway/keys/revoke",
+            post(api_unified_gateway_revoke_key),
+        )
+        // ★ 2026-11-04：创建时明文不落盘，用户点「保存到本软件」才写。
+        .route(
+            "/api/unified-gateway/keys/plaintext",
+            post(api_unified_gateway_save_key_plaintext),
+        )
+        // ★ issue #76：策略更新 + 按密钥用量（与另三条产品线同形）。
+        .route(
+            "/api/unified-gateway/keys/policy",
+            post(api_unified_gateway_set_key_policy),
+        )
+        .route(
+            "/api/unified-gateway/keys/usage",
+            get(api_unified_gateway_key_usage),
+        )
+        // ★ issue #76：**批量**用量（密钥表每行一列，避免 N 次往返）。
+        .route(
+            "/api/unified-gateway/keys/usage-all",
+            get(api_unified_gateway_key_usage_all),
+        )
+        .route(
+            "/api/unified-gateway/keys/restore",
+            post(api_unified_gateway_restore_key),
+        )
+        .route(
+            "/api/unified-gateway/keys/delete",
+            post(api_unified_gateway_delete_key),
+        )
         // ---- Trae 模块（与 src-tauri commands.rs 的 trae 命令一一对应）----
         .route("/api/trae/env", get(api_trae_env))
         .route("/api/trae/variants", get(api_trae_variants))
@@ -248,11 +557,23 @@ fn api_routes() -> Router {
         .route("/api/trae/accounts", get(api_trae_accounts))
         .route("/api/trae/accounts/add", post(api_trae_add_account))
         .route("/api/trae/accounts/update", post(api_trae_update_account))
+        .route(
+            "/api/trae/accounts/remark",
+            post(api_trae_set_account_remark),
+        )
         .route("/api/trae/accounts/delete", post(api_trae_delete_account))
         // ---- 账号迁移（与 WorkBuddy 的 /api/import-local、/api/export-accounts* 同构）----
-        .route("/api/trae/accounts/import-local", post(api_trae_import_local))
+        .route(
+            "/api/trae/accounts/import-local",
+            post(api_trae_import_local),
+        )
         // ---- Trae OAuth 登录（对齐 WorkBuddy 的 /api/oauth/*）----
         .route("/api/trae/oauth/start", post(api_trae_oauth_start))
+        // 手工提交回调链接（issue #62）：远程部署时浏览器在另一台机器，回调打不回 127.0.0.1。
+        .route(
+            "/api/trae/oauth/submit-callback",
+            post(api_trae_oauth_submit_callback),
+        )
         .route("/api/trae/oauth/status", post(api_trae_oauth_status))
         .route("/api/trae/oauth/cancel", post(api_trae_oauth_cancel))
         .route("/api/trae/accounts/export", post(api_trae_export_accounts))
@@ -260,13 +581,41 @@ fn api_routes() -> Router {
             "/api/trae/accounts/export-to-path",
             post(api_trae_export_accounts_to_path),
         )
-        .route("/api/trae/accounts/import/preview", post(api_trae_preview_import))
+        .route(
+            "/api/trae/accounts/import/preview",
+            post(api_trae_preview_import),
+        )
         .route("/api/trae/accounts/import", post(api_trae_import_accounts))
         .route("/api/trae/groups", post(api_trae_group_op))
         .route("/api/trae/checkin/status", get(api_trae_checkin_status))
+        // issue #47：逐账号「今日」只读重取（与 WB 的同名命令同构）。
+        .route(
+            "/api/trae/checkin/status-map",
+            get(api_trae_checkin_status_map),
+        )
+        .route(
+            "/api/trae/account/token-today",
+            get(api_trae_account_token_today),
+        )
         .route("/api/trae/checkin", post(api_trae_checkin))
         .route("/api/trae/credits", get(api_trae_credits))
         .route("/api/trae/token-stats", get(api_trae_token_statistics))
+        // Trae 客户端账本（导入用户自己导出的明文库；不内置解密）。
+        .route("/api/trae/client-import/probe", get(api_trae_client_probe))
+        .route(
+            "/api/trae/client-import/config",
+            get(api_trae_client_config),
+        )
+        .route(
+            "/api/trae/client-import/path",
+            post(api_trae_save_client_path),
+        )
+        // 内置解密：口令由用户输入，工具内部完成「加密库 → 明文副本」。
+        .route(
+            "/api/trae/client-import/unlock",
+            post(api_trae_unlock_client_db),
+        )
+        .route("/api/trae/client-usage", get(api_trae_client_usage))
         .route("/api/trae/logs", get(api_trae_logs))
         .route("/api/trae/credits/refresh", post(api_trae_refresh_credits))
         .route("/api/trae/refresh-jwt", post(api_trae_refresh_jwt))
@@ -278,39 +627,227 @@ fn api_routes() -> Router {
         .route("/api/trae/profiles/restore", post(api_trae_restore_profile))
         .route("/api/trae/profiles/delete", post(api_trae_delete_profile))
         .route("/api/trae/switch", post(api_trae_switch))
+        // ---- Qoder（第三个平台）----
+        // ⚠️ path + method 必须与 `src/lib/api.ts` 的 ROUTES、以及
+        // `src-tauri/src/lib.rs` 的 invoke_handler 三方一致（门禁 check-api-contract.cjs）。
+        .route("/api/qoder/accounts", get(api_qoder_accounts))
+        .route("/api/qoder/local-sources", get(api_qoder_local_sources))
+        .route(
+            "/api/qoder/accounts/import-local",
+            post(api_qoder_import_local),
+        )
+        .route("/api/qoder/accounts/import-pat", post(api_qoder_import_pat))
+        .route(
+            "/api/qoder/accounts/remark",
+            post(api_qoder_set_account_remark),
+        )
+        .route("/api/qoder/accounts/delete", post(api_qoder_delete_account))
+        .route(
+            "/api/qoder/accounts/refresh",
+            post(api_qoder_refresh_account),
+        )
+        .route("/api/qoder/checkin/status", get(api_qoder_checkin_status))
+        // issue #47：逐账号「今日」只读重取（与 WB 的同名命令同构）。
+        .route(
+            "/api/qoder/checkin/status-map",
+            get(api_qoder_checkin_status_map),
+        )
+        .route("/api/qoder/checkin/claim", post(api_qoder_checkin_claim))
+        // 自动签到台账（只读；回答「后台那几轮到底做了什么」）。
+        .route("/api/qoder/checkin/logs", get(api_qoder_checkin_logs))
+        // 一次性 Pro 升级包（+1800）：资格查询（只读）/ 领取（幂等）。
+        .route("/api/qoder/pro-pack/status", get(api_qoder_pro_pack_status))
+        .route("/api/qoder/pro-pack/claim", post(api_qoder_pro_pack_claim))
+        .route("/api/qoder/credits", get(api_qoder_credits))
+        // OAuth 设备授权（PKCE S256）：发起 + 轮询。与 WB 的 `/api/oauth/*` 同形，
+        // 但**按 scope 分家**（Qoder 的双区域各有自己的授权页与 client_id）。
+        .route("/api/qoder/oauth/start", post(api_qoder_oauth_start))
+        .route("/api/qoder/oauth/status", post(api_qoder_oauth_status))
+        // 程序位 / 切换 / 昵称 / 分组 / 用量（2026-10-15 补齐）
+        .route("/api/qoder/programs", get(api_qoder_program_status))
+        .route("/api/qoder/accounts/switch", post(api_qoder_switch_account))
+        .route(
+            "/api/qoder/accounts/group",
+            post(api_qoder_set_account_group),
+        )
+        .route("/api/qoder/usage", get(api_qoder_usage))
+        // ---- Qoder 网页端逐资源包明细（issue #111）----
+        // ★ 三条都**只对桌面端成立**：逐包数据在网页端私有接口，只认浏览器登录后的
+        //   会话 Cookie，而只有 Tauri 的 `Webview::cookies()` 能读到它。本进程是
+        //   headless 服务端（Docker / npm CLI / 裸二进制），没有 `Webview` ⇒ 原理上做不到。
+        //   ⇒ 结构化拒绝，**不返回空包列表**（那会被读成「该账号没有资源包」，与事实相反）。
+        .route(
+            "/api/qoder/web/login-open",
+            post(api_qoder_web_desktop_only),
+        )
+        .route(
+            "/api/qoder/web/login-close",
+            post(api_qoder_web_desktop_only),
+        )
+        .route(
+            "/api/qoder/web/credit-packs/probe",
+            post(api_qoder_web_desktop_only),
+        )
+        .route(
+            "/api/qoder/web/credit-packs",
+            get(api_qoder_web_desktop_only),
+        )
+        .route(
+            "/api/qoder/web/session/status",
+            get(api_qoder_web_desktop_only),
+        )
+        .route(
+            "/api/qoder/web/session/window-cookies",
+            get(api_qoder_web_desktop_only),
+        )
+        .route(
+            "/api/qoder/web/session/logout",
+            post(api_qoder_web_desktop_only),
+        )
+        // ---- 内嵌授权窗（公共设置 `auth_in_app`）----
+        // ★ 仅桌面端：它就是一个 webview 窗口。headless 形态没有 `Webview`，但**不是缺陷**
+        //   —— 授权页本来就能在系统浏览器里完成（令牌由后端轮询取回），
+        //   所以这里只拒绝「在应用内开窗」这一动作，登录流程在浏览器里照常可用。
+        .route(
+            "/api/auth/webview/open",
+            post(api_auth_webview_desktop_only),
+        )
+        .route(
+            "/api/auth/webview/close",
+            post(api_auth_webview_desktop_only),
+        )
+        // ---- Qoder 逐包出站代理（issue #111 收尾）----
+        // ★ 这是**纯配置**，不是「仅桌面端可用」：headless 服务端只要有会话文件同样要取
+        //   逐包，代理通道（国际版按 IP 判地区）对它是同等需要的能力 ⇒ 真实读写。
+        .route(
+            "/api/qoder/web/proxy",
+            get(api_qoder_web_proxy_get).post(api_qoder_web_proxy_set),
+        )
+        // ---- Qoder API 网关（管理面；网关本体走独立端口 57895，**不** merge 进本 Router）----
+        // ⚠️ 一个监听、两个区域：区域由请求所用 API Key 的归属决定（`QoderKeyRegion`），
+        //   状态 / 模型两条按 `scope` 看对应的那本账号库（fail-closed）。
+        .route(
+            "/api/qoder/gateway/config",
+            get(api_qoder_gateway_config).post(api_save_qoder_gateway_config),
+        )
+        .route("/api/qoder/gateway/status", get(api_qoder_gateway_status))
+        // 限额护栏：逐账号当日用量 / 拦截原因 / 余额快照（只读）。
+        .route("/api/qoder/gateway/quota", get(api_qoder_gateway_quota))
+        .route(
+            "/api/qoder/gateway/pool/exclusions",
+            post(api_set_qoder_pool_exclusion),
+        )
+        .route("/api/qoder/gateway/models", get(api_qoder_gateway_models))
+        // 多 Key 管理（含归属区域）：GET 列表 / POST 创建，同一路径两种方法。
+        .route(
+            "/api/qoder/gateway/keys",
+            get(api_qoder_list_api_keys).post(api_qoder_create_api_key),
+        )
+        .route(
+            "/api/qoder/gateway/keys/revoke",
+            post(api_qoder_revoke_api_key),
+        )
+        // ★ 2026-11-04：创建时明文不落盘，用户点「保存到本软件」才写。
+        .route(
+            "/api/qoder/gateway/keys/plaintext",
+            post(api_qoder_save_api_key_plaintext),
+        )
+        // ★ issue #76：策略更新 + 按密钥用量（与 WB / Trae 侧同形）。
+        .route(
+            "/api/qoder/gateway/keys/policy",
+            post(api_qoder_set_key_policy),
+        )
+        .route("/api/qoder/gateway/keys/usage", get(api_qoder_key_usage))
+        .route(
+            "/api/qoder/gateway/keys/restore",
+            post(api_qoder_restore_api_key),
+        )
+        .route(
+            "/api/qoder/gateway/keys/delete",
+            post(api_qoder_delete_api_key),
+        )
+        .route("/api/qoder/gateway/logs", get(api_qoder_gateway_logs))
+        .route(
+            "/api/qoder/gateway/logs/clear",
+            post(api_qoder_clear_gateway_logs),
+        )
+        // 网关账本（用量页「账本」视图，issue #63 的平台补齐）。
+        .route(
+            "/api/qoder/gateway/usage-dim",
+            get(api_qoder_gateway_usage_dim),
+        )
         .route("/api/trae/device/reset", post(api_trae_reset_device))
-        .route("/api/trae/settings", get(api_trae_settings).post(api_trae_save_settings))
+        .route(
+            "/api/trae/settings",
+            get(api_trae_settings).post(api_trae_save_settings),
+        )
         // ---- 豆包模块 ----
         .route("/api/doubao/accounts", get(api_doubao_accounts))
         .route("/api/doubao/detect-uid", get(api_doubao_detect_uid))
         .route("/api/doubao/accounts/save", post(api_doubao_account_save))
-        .route("/api/doubao/accounts/delete", post(api_doubao_account_remove))
+        .route(
+            "/api/doubao/accounts/delete",
+            post(api_doubao_account_remove),
+        )
         .route("/api/doubao/keepalive", post(api_doubao_keepalive))
         .route("/api/doubao/history", get(api_doubao_history))
-        .route("/api/doubao/chatdata/backup", post(api_doubao_chatdata_backup))
-        .route("/api/doubao/chatdata/restore", post(api_doubao_chatdata_restore))
+        .route(
+            "/api/doubao/chatdata/backup",
+            post(api_doubao_chatdata_backup),
+        )
+        .route(
+            "/api/doubao/chatdata/restore",
+            post(api_doubao_chatdata_restore),
+        )
         .route("/api/doubao/chatdata/info", post(api_doubao_chatdata_info))
         .route("/api/doubao/export-chats", post(api_doubao_export_chats))
         .route("/api/doubao/quota", post(api_doubao_quota))
-        .route("/api/doubao/quota/task", post(api_doubao_quota_task_register))
-        .route("/api/doubao/quota/task/status", get(api_doubao_quota_task_status))
-        .route("/api/doubao/quota/task/delete", post(api_doubao_quota_task_unregister))
+        .route(
+            "/api/doubao/quota/task",
+            post(api_doubao_quota_task_register),
+        )
+        .route(
+            "/api/doubao/quota/task/status",
+            get(api_doubao_quota_task_status),
+        )
+        .route(
+            "/api/doubao/quota/task/delete",
+            post(api_doubao_quota_task_unregister),
+        )
         .route("/api/doubao/renew", post(api_doubao_renew))
-        .route("/api/doubao/renew/task", post(api_doubao_renew_task_register))
-        .route("/api/doubao/renew/task/status", get(api_doubao_renew_task_status))
-        .route("/api/doubao/renew/task/delete", post(api_doubao_renew_task_unregister))
+        .route(
+            "/api/doubao/renew/task",
+            post(api_doubao_renew_task_register),
+        )
+        .route(
+            "/api/doubao/renew/task/status",
+            get(api_doubao_renew_task_status),
+        )
+        .route(
+            "/api/doubao/renew/task/delete",
+            post(api_doubao_renew_task_unregister),
+        )
         // ---- Trae API 网关（管理面；网关本体走独立端口 7864，**不** merge 进本 Router）----
         .route(
             "/api/trae/gateway/config",
             get(api_trae_gateway_config).post(api_save_trae_gateway_config),
         )
         .route("/api/trae/gateway/status", get(api_trae_gateway_status))
+        .route(
+            "/api/trae/gateway/pool/exclusions",
+            post(api_set_trae_pool_exclusion),
+        )
         .route("/api/trae/gateway/models", get(api_trae_gateway_models))
         // 客户端（上游下发）的模型清单：与上面那条静态清单不同，它读客户端
         // `state.vscdb` 的缓存，因此随客户端刷新而变（issue #4）。
         .route(
             "/api/trae/gateway/client-models",
             get(api_trae_client_models),
+        )
+        // ★ issue #173 opt-in：用账号池凭据直连上游抓一次清单（**用户点击**才走这里）。
+        .route(
+            "/api/trae/gateway/client-models/refresh",
+            post(api_trae_refresh_client_models),
         )
         // 多 Key 管理（含归属产品线）：GET 列表 / POST 创建，同一路径两种方法。
         .route(
@@ -320,6 +857,26 @@ fn api_routes() -> Router {
         .route(
             "/api/trae/gateway/keys/revoke",
             post(api_trae_revoke_api_key),
+        )
+        // ★ 2026-11-04：创建时明文不落盘，用户点「保存到本软件」才写。
+        .route(
+            "/api/trae/gateway/keys/plaintext",
+            post(api_trae_save_api_key_plaintext),
+        )
+        // ★ issue #76：策略更新 + 按密钥用量（与 WB 侧同形）。
+        .route(
+            "/api/trae/gateway/keys/policy",
+            post(api_trae_set_key_policy),
+        )
+        .route("/api/trae/gateway/keys/usage", get(api_trae_key_usage))
+        // 网关账本（用量页「账本」视图，issue #63 的平台补齐）。
+        .route(
+            "/api/trae/gateway/usage-dim",
+            get(api_trae_gateway_usage_dim),
+        )
+        .route(
+            "/api/trae/gateway/keys/restore",
+            post(api_trae_restore_api_key),
         )
         .route(
             "/api/trae/gateway/keys/delete",
@@ -333,6 +890,21 @@ fn api_routes() -> Router {
             "/api/trae/gateway/logs/clear",
             post(api_trae_clear_gateway_logs),
         )
+        // ---- 桌面悬浮窗（P9 · 只读数据层）----
+        // 与 `src-tauri/src/commands.rs` 的 `companion_*` 一一对应（两宿主同步）。
+        // 悬浮窗本体是**桌面端**的独立窗口；webui 无此窗口 ⇒ 显隐 / 聚焦返回结构化
+        // 「仅桌面端可用」，而只读快照两宿主同源。
+        .route("/api/companion/status", get(api_companion_status))
+        .route("/api/companion/visibility", post(api_companion_set_visible))
+        .route("/api/companion/toggle", post(api_companion_toggle))
+        .route("/api/companion/jump", post(api_companion_jump))
+        // ---- 外部 Agent 会话监听（P15 · hook 安装面）----
+        // 与 `src-tauri/src/commands.rs` 的 `get_agent_hook_status` / `set_agent_hook_enabled`
+        // 一一对应（两宿主同步）。webui 的二进制**也有** `hook` 子命令
+        //（见 `crates/buddy-switch-server/src/main.rs` 的 `"hook"` 分支）⇒ 它同样是合法的
+        // hook 目标，装出来的命令指向 `buddy-switch` 而不是桌面 exe。
+        .route("/api/agent-hooks/status", get(api_agent_hook_status))
+        .route("/api/agent-hooks/enabled", post(api_agent_hook_set_enabled))
 }
 
 fn json_ok(v: Value) -> Response {
@@ -348,16 +920,93 @@ fn json_err(e: String, code: StatusCode) -> Response {
 // ---------------------------------------------------------------------------
 
 /// 从 query 中读取一个参数值（URL 解码为最简实现，仅处理 `%` 之外的常规字符）。
+/// 解析 GET 查询串里某个键的值（**做过 percent-decode**）。
+///
+/// ## 为什么必须解码（2026-10-28 修）
+///
+/// 前端用 `URLSearchParams` 拼 query，它会把 Windows 路径编码成
+/// `D%3A%5Ctrae-plain%5Cdatabase.db`、把空格编码成 `+`。旧实现直接
+/// `value.to_string()` 取原始片段 ⇒ 服务端拿到的是一条**没解码**的串，
+/// 路径必然打不开，而桌面端（走 IPC，参数不经 URL）完全正常 ——
+/// 这是典型的「两个通道语义分叉」。
+///
+/// 这个缺陷以前看不出来：既有 GET 参数全是 `region` / `days` / `scope` / 逗号 id
+/// 这类枚举值，没有任何需要编码的字符。一传**文件路径**就暴露。
+///
+/// 解码规则与 `application/x-www-form-urlencoded` 一致：`%XX` → 字节、`+` → 空格。
+/// 非法的 `%` 序列**原样保留**（宁可让路径打不开并报错，也不要静默丢字符）。
 fn query_value(query: Option<&str>, name: &str) -> Option<String> {
     query.unwrap_or("").split('&').find_map(|pair| {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        (key == name).then(|| value.to_string())
+        (decode_query_component(key) == name).then(|| decode_query_component(value))
     })
+}
+
+/// `%XX` 与 `+` 的解码（[`query_value`] 的唯一实现）。
+fn decode_query_component(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok();
+                match hex.and_then(|digits| u8::from_str_radix(digits, 16).ok()) {
+                    Some(byte) => {
+                        out.push(byte);
+                        index += 3;
+                    }
+                    // 非法转义：原样收下 `%`，继续往后走（不吞字符）。
+                    None => {
+                        out.push(bytes[index]);
+                        index += 1;
+                    }
+                }
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 解析**逗号分隔**的账号 id 列表（`accountIds=a,b,c`；缺失 / 空串 ⇒ 空数组）。
+///
+/// ## 为什么是逗号串而不是重复键 / JSON 数组
+///
+/// 这两条「按账号」的读命令是 **GET**（只读、可缓存、可重试）。而 `httpCall` 的
+/// `queryString` 对数组只会产出 `String(["a","b"])` = `"a,b"`，桌面端则天然拿到
+/// `Vec<String>` —— 若两端各用一套形状，就会出现「浏览器好用、桌面端拿不到 id」的
+/// 分叉（本仓已因同类漂移踩过 `trae_switch_account`）。
+/// 因此**两个通道统一收一个逗号串**，前端只需 `ids.join(",")`。
+///
+/// 逐项 `trim` 并丢弃空项：`"a, ,b,"` 与 `"a,b"` 等价。
+fn parse_id_list(raw: Option<String>) -> Vec<String> {
+    raw.unwrap_or_default()
+        .split(',')
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect()
 }
 
 /// 解析 region 参数，缺省为 `cn`（保证旧行为）。
 fn parse_region(value: Option<&str>) -> Region {
     value.and_then(Region::parse).unwrap_or(Region::Cn)
+}
+
+/// 读取可选的自定义密钥。前端发 camelCase，手工调 API 可能发 snake_case ⇒ 两种都收。
+/// `None` / 空串都表示「按原规则自动生成」（后端 `resolve_key_plaintext` 会再兜一层）。
+fn custom_key_from_body(body: &Value) -> Option<String> {
+    body.get("customKey")
+        .or_else(|| body.get("custom_key"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// 解析 Trae 产品线变体参数，缺省为 [`trae::variant::TraeVariant::default`]（保证旧行为）。
@@ -366,14 +1015,13 @@ fn parse_region(value: Option<&str>) -> Region {
 /// 老版本前端不带该参数、或从探测结果里回传目录名（如 `TRAE SOLO CN`）都应被接受；
 /// 无法解析时等价于未传。
 ///
-/// ⚠️ **本函数在 `src-tauri/src/commands.rs` 有一份同款实现，两处必须保持一致**
-/// （同样的「缺失/未知 → `default()`」语义）。不要为了去重跨 crate 抽公共函数——
-/// server 与 tauri 是两个独立 crate，为这 4 行引入共享依赖不值得。
-/// 两处各自带 `parse_trae_variant_*` 单测（含未知值回落护栏）钉住行为。
+/// ★ 实际映射规则在 core 的 `trae::handlers::parse_variant_id`：
+/// **区域标识（`cn` / `global`）必须落到本区域的合并版变体**，否则国际版登录会打开
+/// TraeWork（SOLO 线）的授权页，用户看到「TraeWork 在所在地区不可用」。
+/// 本函数只保留「可选参数 + 缺省回落」这层形态，规则**不在两条通道各写一份**
+/// （``src-tauri/src/commands.rs`` 的同名录事）。
 fn parse_trae_variant(value: Option<&str>) -> trae::variant::TraeVariant {
-    value
-        .and_then(trae::variant::TraeVariant::parse)
-        .unwrap_or_default()
+    trae::handlers::parse_variant_id(value)
 }
 
 /// 解析统计查询范围参数，缺省为 `cn`（保证旧行为）；额外支持 `"all"` 合并视图。
@@ -406,6 +1054,8 @@ fn mismatch_json(mismatch: &auth_file::RegionMismatch) -> Value {
     })
 }
 
+#[allow(clippy::bind_instead_of_map)]
+// 闭包末尾构造 `Some(...)`，与 tauri 侧同构；改成 `map` 会让两边 diff 变大。
 async fn api_status(RawQuery(query): RawQuery) -> Response {
     let region = parse_region(query_value(query.as_deref(), "region").as_deref());
     // 安全红线 F：读取后校验凭据域归属；不匹配即拒绝使用该凭据（current 置空），
@@ -442,9 +1092,34 @@ async fn api_status(RawQuery(query): RawQuery) -> Response {
     }))
 }
 
-async fn api_accounts(RawQuery(query): RawQuery) -> Response {
-    let region = parse_region(query_value(query.as_deref(), "region").as_deref());
-    json_ok(json!({
+/// ★ 参数化命令的 Trae 分支：把**区域**映射到该区域的**主程序**变体。
+///
+/// 与 `src-tauri/src/commands.rs` 的同名函数**同款实现**（刻意不去重，见共享知识）。
+/// 只对**区域纯**的命令（账号列表 / 备注 / 删除）使用 —— 理由见那边的文档注释。
+fn trae_variant_of_region(region: TraeRegion) -> trae::variant::TraeVariant {
+    // ★ issue #28：必须给**合并版**（与 `src-tauri/src/commands.rs` 同款）。
+    // 原先给 `TraeWork` / `Global` 两条老程序线，而它们的客户端已被官方合并卸载 ⇒
+    // 「从本机客户端导入账号」永远报「未检测到【TraeWork CN】客户端」（issue #28 报障原文）。
+    match region {
+        TraeRegion::Cn => trae::variant::TraeVariant::TraeMerged,
+        TraeRegion::Global => trae::variant::TraeVariant::GlobalTraeMerged,
+    }
+}
+
+/// 从查询串的 `scope` 解析 Trae 变体（区域 → 主程序）；缺失 / 拼错 / 非 Trae 作用域 ⇒ `Err`。
+///
+/// 供 issue #47 的两条「按账号」读命令使用：P5 T03 之后新增的 Trae 命令一律收 `scope`
+/// （平台 + 区域），不再收 `variant` —— 同一族命令并存两套参数形状是漂移的温床。
+fn trae_variant_from_scope_query(
+    query: Option<&str>,
+) -> Result<trae::variant::TraeVariant, String> {
+    let scope = resolve_scope_param(query_value(query, "scope").as_deref())?;
+    Ok(trae_variant_of_region(require_trae_region(scope)?))
+}
+
+/// WorkBuddy 账号列表的**唯一实现**（旧 `api_accounts` 与参数化 `api_accounts_list` 共用）。
+fn wb_accounts_value(region: Region) -> Value {
+    json!({
         "region": region,
         "accounts": account::load_accounts_for(region)
             .iter()
@@ -452,7 +1127,669 @@ async fn api_accounts(RawQuery(query): RawQuery) -> Response {
             .collect::<Vec<_>>(),
         "current": auth_file::read_auth_file_for(region)
             .and_then(|a| a.get("account").and_then(|x| x.get("uid")).and_then(|x| x.as_str()).map(String::from)),
-    }))
+    })
+}
+
+async fn api_accounts(RawQuery(query): RawQuery) -> Response {
+    let region = parse_region(query_value(query.as_deref(), "region").as_deref());
+    json_ok(wb_accounts_value(region))
+}
+
+// ---------------------------------------------------------------------------
+// P5 T03 · 参数化命令（`scope` 同时决定平台与区域）
+// ---------------------------------------------------------------------------
+//
+// 与 `src-tauri/src/commands.rs` 的同名命令**一一对应**（刻意不去重）。旧路由保留为别名。
+// ⚠️ `scope` 必填且 fail-closed：未知 / 空 / 缺一律 4xx（[`resolve_scope_param`]），**不落盘**。
+
+/// GET /api/accounts/list —— 参数化账号列表（`scope` 决定平台与区域）。
+///
+/// 返回形状按 `scope.product()` 分叉（WB `{region, accounts, current}` / Trae 账号总览），
+/// 由前端平台专属 wrapper 解读。理由见 `src-tauri/src/commands.rs::accounts_list`。
+async fn api_accounts_list(RawQuery(query): RawQuery) -> Response {
+    let scope = match resolve_scope_param(query_value(query.as_deref(), "scope").as_deref()) {
+        Ok(scope) => scope,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    match scope.product() {
+        Product::Workbuddy => match require_wb_region(scope) {
+            Ok(region) => json_ok(wb_accounts_value(region)),
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        },
+        Product::Trae => match require_trae_region(scope) {
+            Ok(region) => json_ok(trae::handlers::accounts_overview_for(
+                trae_variant_of_region(region),
+            )),
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        },
+        Product::Qoder => qoder_scope_not_applicable(),
+    }
+}
+
+/// POST /api/accounts/remark —— 参数化设置账号备注（`scope` 决定平台与区域）。
+async fn api_account_remark(Json(body): Json<Value>) -> Response {
+    let scope = match resolve_scope_param(body.get("scope").and_then(Value::as_str)) {
+        Ok(scope) => scope,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let account_id = body.get("accountId").and_then(Value::as_str).unwrap_or("");
+    if account_id.trim().is_empty() {
+        return json_err("缺少 accountId".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let remark = body.get("remark").and_then(Value::as_str);
+    match scope.product() {
+        Product::Workbuddy => match require_wb_region(scope) {
+            Ok(region) => match account::set_account_remark_for(region, account_id, remark) {
+                Ok(meta) => json_ok(meta),
+                Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+            },
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        },
+        Product::Trae => match require_trae_region(scope) {
+            Ok(region) => {
+                let variant = trae_variant_of_region(region);
+                match trae::handlers::set_remark_for(
+                    variant,
+                    account_id,
+                    Some(remark.unwrap_or("")),
+                ) {
+                    Ok(value) => json_ok(value),
+                    Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+                }
+            }
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        },
+        Product::Qoder => qoder_scope_not_applicable(),
+    }
+}
+
+/// POST /api/accounts/delete —— 参数化删除账号（Trae 侧可选一并删除登录态快照）。
+async fn api_account_delete(Json(body): Json<Value>) -> Response {
+    let scope = match resolve_scope_param(body.get("scope").and_then(Value::as_str)) {
+        Ok(scope) => scope,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let account_id = body.get("accountId").and_then(Value::as_str).unwrap_or("");
+    if account_id.trim().is_empty() {
+        return json_err("缺少 accountId".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let delete_profile = body
+        .get("deleteProfile")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    match scope.product() {
+        Product::Workbuddy => match require_wb_region(scope) {
+            Ok(region) => {
+                api_delete(Json(
+                    json!({"accountId": account_id, "region": region.as_str()}),
+                ))
+                .await
+            }
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        },
+        Product::Trae => match require_trae_region(scope) {
+            Ok(region) => {
+                let variant = trae_variant_of_region(region);
+                let owned = account_id.to_string();
+                match tokio::task::spawn_blocking(move || {
+                    trae::handlers::delete_account_for(variant, &owned, delete_profile)
+                })
+                .await
+                {
+                    Ok(Ok(value)) => json_ok(value),
+                    Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+                    Err(error) => json_err(
+                        format!("删除账号失败: {error}"),
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                    ),
+                }
+            }
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        },
+        Product::Qoder => qoder_scope_not_applicable(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P5 §2.7 · 回收站 4 命令（**全新命令**，非参数化、无别名）
+// ---------------------------------------------------------------------------
+//
+// 与 `src-tauri/src/commands.rs` 的四条同名命令**一一对应**（刻意不去重，见共享知识）。
+// `scope` 决定平台 + 区域，从而决定读 / 写哪个 `*.trash.<region>.json`；非法 scope ⇒ 4xx
+// 且**不落盘**（fail-closed，§2.7 硬约束 1）。
+
+/// GET /api/accounts/trash —— 回收站列表（`scope` 决定平台与区域）。返回 `{ scope, entries }`。
+async fn api_account_trash_list(RawQuery(query): RawQuery) -> Response {
+    let scope = match resolve_scope_param(query_value(query.as_deref(), "scope").as_deref()) {
+        Ok(scope) => scope,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    match scope.product() {
+        Product::Workbuddy => match require_wb_region(scope) {
+            Ok(region) => json_ok(account::trash_list_value(region)),
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        },
+        Product::Trae => match require_trae_region(scope) {
+            Ok(region) => json_ok(trae::account::trash_list_value_for_region(region)),
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        },
+        Product::Qoder => match require_qoder_region(scope) {
+            Ok(region) => json_ok(qoder::trash::trash_list_value(region)),
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        },
+    }
+}
+
+/// POST /api/accounts/trash/restore —— 从回收站恢复账号（`id` **或** `uid` 谓词）。
+async fn api_account_restore(Json(body): Json<Value>) -> Response {
+    let scope = match resolve_scope_param(body.get("scope").and_then(Value::as_str)) {
+        Ok(scope) => scope,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let key = body.get("key").and_then(Value::as_str).unwrap_or("");
+    if key.trim().is_empty() {
+        return json_err("缺少 key".to_string(), StatusCode::BAD_REQUEST);
+    }
+    match scope.product() {
+        Product::Workbuddy => match require_wb_region(scope) {
+            Ok(region) => match account::restore_account_for(region, key) {
+                Ok(()) => json_ok(json!({ "ok": true })),
+                Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+            },
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        },
+        Product::Trae => match require_trae_region(scope) {
+            Ok(region) => match trae::account::restore_for_region(region, key) {
+                Ok(()) => json_ok(json!({ "ok": true })),
+                Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+            },
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        },
+        Product::Qoder => match require_qoder_region(scope) {
+            Ok(region) => match qoder::trash::restore_account_for(region, key) {
+                Ok(_) => json_ok(json!({ "ok": true })),
+                Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+            },
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        },
+    }
+}
+
+/// POST /api/accounts/trash/purge —— 永久删除（**唯一不可逆步**，前端须二次确认）。
+async fn api_account_purge(Json(body): Json<Value>) -> Response {
+    let scope = match resolve_scope_param(body.get("scope").and_then(Value::as_str)) {
+        Ok(scope) => scope,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let key = body.get("key").and_then(Value::as_str).unwrap_or("");
+    if key.trim().is_empty() {
+        return json_err("缺少 key".to_string(), StatusCode::BAD_REQUEST);
+    }
+    match scope.product() {
+        Product::Workbuddy => match require_wb_region(scope) {
+            Ok(region) => match account::purge_account_for(region, key) {
+                Ok(()) => json_ok(json!({ "ok": true })),
+                Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+            },
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        },
+        Product::Trae => match require_trae_region(scope) {
+            Ok(region) => match trae::account::purge_for_region(region, key) {
+                Ok(()) => json_ok(json!({ "ok": true })),
+                Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+            },
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        },
+        Product::Qoder => match require_qoder_region(scope) {
+            Ok(region) => match qoder::trash::purge_account_for(region, key) {
+                Ok(_) => json_ok(json!({ "ok": true })),
+                Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+            },
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        },
+    }
+}
+
+/// POST /api/accounts/trash/clear —— 清空回收站（**不可逆**），返回 `{ ok, removed }`。
+async fn api_account_trash_clear(Json(body): Json<Value>) -> Response {
+    let scope = match resolve_scope_param(body.get("scope").and_then(Value::as_str)) {
+        Ok(scope) => scope,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let removed = match scope.product() {
+        Product::Workbuddy => match require_wb_region(scope) {
+            Ok(region) => account::clear_trash_for(region),
+            Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+        },
+        Product::Trae => match require_trae_region(scope) {
+            Ok(region) => trae::account::clear_trash_for_region(region),
+            Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+        },
+        Product::Qoder => match require_qoder_region(scope) {
+            Ok(region) => qoder::trash::clear_trash_for(region),
+            Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+        },
+    };
+    json_ok(json!({ "ok": true, "removed": removed }))
+}
+
+/// 从请求体读取 `key` 字段为 `Vec<String>`（非数组 / 缺省 ⇒ 空表）。
+///
+/// 与既有 `api_export_accounts` / `api_import` 内联的解析**同款**，抽成小工具避免三条新
+/// handler 各写一遍（只做「过滤非字符串条目」，不改变既有语义）。
+fn body_string_list(body: &Value, key: &str) -> Vec<String> {
+    body.get(key)
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// POST /api/accounts/export —— 参数化导出账号完整记录（`scope` 决定平台与区域）。
+///
+/// 与 `src-tauri/src/commands.rs::accounts_export` **一一对应**（刻意不去重）。旧路由
+/// `/api/export-accounts`（WB）与 `/api/trae/accounts/export`（Trae）保留为别名。
+async fn api_accounts_export(Json(body): Json<Value>) -> Response {
+    let scope = match resolve_scope_param(body.get("scope").and_then(Value::as_str)) {
+        Ok(scope) => scope,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let account_ids = body_string_list(&body, "accountIds");
+    match scope.product() {
+        Product::Workbuddy => match require_wb_region(scope) {
+            Ok(region) => match export_import::export_accounts_for(region, &account_ids) {
+                Ok(records) => json_ok(json!({ "ok": true, "accounts": records })),
+                Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+            },
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        },
+        Product::Trae => match require_trae_region(scope) {
+            Ok(region) => {
+                let variant = trae_variant_of_region(region);
+                match trae::handlers::export_accounts_for(variant, &account_ids) {
+                    Ok(value) => json_ok(value),
+                    Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+                }
+            }
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        },
+        Product::Qoder => match require_qoder_region(scope) {
+            Ok(region) => {
+                match qoder::export_import::export_accounts_for(region, Some(&account_ids)) {
+                    Ok(value) => json_ok(value),
+                    Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+                }
+            }
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        },
+    }
+}
+
+/// POST /api/accounts/export-to-path —— 参数化导出到指定路径（`scope` 决定平台与区域）。
+///
+/// 与 `src-tauri/src/commands.rs::accounts_export_to_path` 一一对应（刻意不去重）。
+async fn api_accounts_export_to_path(Json(body): Json<Value>) -> Response {
+    let scope = match resolve_scope_param(body.get("scope").and_then(Value::as_str)) {
+        Ok(scope) => scope,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let account_ids = body_string_list(&body, "accountIds");
+    let path = body.get("path").and_then(Value::as_str).unwrap_or("");
+    match scope.product() {
+        Product::Workbuddy => match require_wb_region(scope) {
+            Ok(region) => {
+                match export_import::export_accounts_to_path_for(region, &account_ids, path) {
+                    Ok(path) => json_ok(json!({ "ok": true, "path": path })),
+                    Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+                }
+            }
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        },
+        Product::Trae => match require_trae_region(scope) {
+            Ok(region) => {
+                let variant = trae_variant_of_region(region);
+                match trae::handlers::export_accounts_to_path_for(variant, &account_ids, path) {
+                    Ok(value) => json_ok(value),
+                    Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+                }
+            }
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        },
+        Product::Qoder => match require_qoder_region(scope) {
+            Ok(region) => {
+                match qoder::export_import::export_accounts_to_path_for(
+                    region,
+                    Some(&account_ids),
+                    path,
+                ) {
+                    Ok(value) => json_ok(value),
+                    Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+                }
+            }
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        },
+    }
+}
+
+/// POST /api/accounts/import —— 参数化导入账号（`scope` 决定平台与区域）。
+///
+/// 与 `src-tauri/src/commands.rs::accounts_import` 一一对应（刻意不去重）。
+async fn api_accounts_import(Json(body): Json<Value>) -> Response {
+    let scope = match resolve_scope_param(body.get("scope").and_then(Value::as_str)) {
+        Ok(scope) => scope,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let text = body.get("fileText").and_then(Value::as_str).unwrap_or("");
+    let indexes: Vec<usize> = body
+        .get("indexes")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|x| x.as_u64().map(|n| n as usize))
+                .collect()
+        })
+        .unwrap_or_default();
+    match scope.product() {
+        Product::Workbuddy => match require_wb_region(scope) {
+            Ok(region) => match export_import::import_accounts_for(region, text, &indexes) {
+                Ok(result) => json_ok(json!({
+                    "ok": true,
+                    "imported": result.imported,
+                    "skipped": result.skipped,
+                    "overwritten": result.overwritten,
+                })),
+                Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+            },
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        },
+        Product::Trae => match require_trae_region(scope) {
+            Ok(region) => {
+                let variant = trae_variant_of_region(region);
+                match trae::handlers::import_accounts_for(variant, text, &indexes) {
+                    Ok(value) => json_ok(value),
+                    Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+                }
+            }
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        },
+        Product::Qoder => match require_qoder_region(scope) {
+            Ok(region) => {
+                match qoder::export_import::import_accounts_for(region, text, Some(&indexes), true)
+                {
+                    Ok(value) => json_ok(value),
+                    Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+                }
+            }
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        },
+    }
+}
+
+/// POST /api/accounts/import-local —— 参数化「从本机客户端登录态导入账号」
+/// （`scope` 决定平台与区域）。
+///
+/// 与 `src-tauri/src/commands.rs::accounts_import_local` **一一对应**（刻意不去重）。旧路由
+/// `/api/import-local`（WB）与 `/api/trae/accounts/import-local`（Trae）保留为别名。形状按
+/// `scope.product()` 分叉：WB 返回 `{ok, account}`，Trae 返回 `{userId, name, accounts}`。
+async fn api_accounts_import_local(Json(body): Json<Value>) -> Response {
+    let scope = match resolve_scope_param(body.get("scope").and_then(Value::as_str)) {
+        Ok(scope) => scope,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    match scope.product() {
+        Product::Workbuddy => {
+            let region = match require_wb_region(scope) {
+                Ok(region) => region,
+                Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+            };
+            match account::import_local_for(region) {
+                Ok(acc) => json_ok(json!({ "ok": true, "account": acc })),
+                Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+            }
+        }
+        Product::Trae => {
+            let variant = match require_trae_region(scope) {
+                Ok(region) => trae_variant_of_region(region),
+                Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+            };
+            match tokio::task::spawn_blocking(move || {
+                trae::handlers::import_local_account_for(variant)
+            })
+            .await
+            {
+                Ok(Ok(value)) => json_ok(value),
+                Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+                Err(error) => json_err(
+                    format!("导入本机账号失败: {error}"),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                ),
+            }
+        }
+        Product::Qoder => qoder_scope_not_applicable(),
+    }
+}
+
+/// POST /api/data-dir/open —— 参数化「打开客户端数据目录」（`scope` 决定平台与区域）。
+///
+/// 与 `src-tauri/src/commands.rs::open_data_dir` **一一对应**（刻意不去重）。旧路由
+/// `/api/gateway/open-data-dir`（WB）与 `/api/trae/open-data-dir`（Trae）保留为别名。
+/// 两平台同形（`{ok,path}` 或结构化 `Unsupported`）。
+async fn api_open_data_dir(Json(body): Json<Value>) -> Response {
+    let scope = match resolve_scope_param(body.get("scope").and_then(Value::as_str)) {
+        Ok(scope) => scope,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    match scope.product() {
+        Product::Workbuddy => match require_wb_region(scope) {
+            Ok(region) => {
+                match buddy_switch_core::modules::capability::open_workbuddy_data_dir(region) {
+                    Ok(value) => json_ok(value),
+                    Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+                }
+            }
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        },
+        Product::Trae => match require_trae_region(scope) {
+            Ok(region) => match trae::handlers::open_data_dir(trae_variant_of_region(region)) {
+                Ok(value) => json_ok(value),
+                Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+            },
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        },
+        Product::Qoder => qoder_scope_not_applicable(),
+    }
+}
+
+/// GET /api/cache/scan —— 只读扫描数据目录各类缓存体积（**不清任何东西**）。
+///
+/// 与 `src-tauri/src/commands.rs::cache_scan` **一一对应**（刻意不去重）。
+///
+/// `spawn_blocking`：扫描要遍历几千个目录，同步跑会占住 tokio worker
+/// （与 `api_codebuddy_cli_status` 同款纪律）。
+async fn api_cache_scan() -> Response {
+    match tokio::task::spawn_blocking(buddy_switch_core::modules::cache::scan).await {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(
+            format!("扫描缓存失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// POST /api/cache/clear —— 按类别清除缓存（**不可逆**）。
+///
+/// body：`{ "categories": ["session_backups", …] }`（缺失 ⇒ 空列表）。
+/// 未知类别 / 空列表 ⇒ 400 且**一个字节都不删**（fail-closed 由 core 保证：
+/// 先校验全部 id 再动手）。与 `src-tauri/src/commands.rs::cache_clear` 一一对应。
+///
+/// `spawn_blocking`：清除可能要卸载几十 GB（core 内有界并行），同步跑会占住
+/// tokio worker。
+async fn api_cache_clear(Json(body): Json<Value>) -> Response {
+    let categories: Vec<String> = body
+        .get("categories")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    match tokio::task::spawn_blocking(move || buddy_switch_core::modules::cache::clear(&categories))
+        .await
+    {
+        Ok(Ok(value)) => json_ok(value),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(
+            format!("清除缓存失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// POST /api/credits/query —— 参数化积分查询（`scope` 决定平台与区域）。
+///
+/// 与 `src-tauri/src/commands.rs::credits` **一一对应**（刻意不去重）。旧路由 `/api/credits`
+/// （WB）与 `/api/trae/credits`（Trae）保留为别名。形状按 `scope.product()` 分叉：
+/// WB 分支返回单账号 `CreditExpiry`（**必须**带 `accountId`），Trae 分支返回区域级
+/// `TraeCreditsOverview`（忽略 `accountId`）。
+/// POST /api/accounts/paste-credential —— 粘贴授权凭据（issue #62）。
+///
+/// 只接 WorkBuddy：另两家各有专用入口（Qoder `paste PAT`、Trae `import JWT`），
+/// 让一个「看起来通用」的端点在家家上静默失败是最坏的选择。
+async fn api_accounts_paste_credential(Json(body): Json<Value>) -> Response {
+    let scope = match resolve_scope_param(body.get("scope").and_then(Value::as_str)) {
+        Ok(scope) => scope,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let text = match body.get("text").and_then(Value::as_str) {
+        Some(text) => text.to_string(),
+        None => return json_err("缺少 text 参数".to_string(), StatusCode::BAD_REQUEST),
+    };
+    match scope.product() {
+        Product::Workbuddy => {
+            let region = match require_wb_region(scope) {
+                Ok(region) => region,
+                Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+            };
+            match auth_file::import_account_from_text_for(region, &text) {
+                Ok(collected) => match account::save_collected_account_for(region, collected) {
+                    Ok(saved) => json_ok(json!({
+                        "ok": true,
+                        "account": account::account_meta_for(region, &saved),
+                    })),
+                    Err(error) => {
+                        json_err(format!("写入账号库失败: {error}"), StatusCode::BAD_REQUEST)
+                    }
+                },
+                Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+            }
+        }
+        Product::Trae => json_err(
+            "Trae 请用「粘贴 JWT」或「浏览器授权」——换 token 需要客户端里的设备私钥".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        Product::Qoder => json_err(
+            "Qoder 请用「粘贴 PAT」".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+    }
+}
+
+/// POST /api/trae/oauth/submit-callback —— 手工提交回调链接（issue #62）。
+async fn api_trae_oauth_submit_callback(Json(body): Json<Value>) -> Response {
+    if let Err(error) = require_capability(Product::Trae, capability::Capability::Oauth) {
+        return json_err(error, StatusCode::FORBIDDEN);
+    }
+    let login_id = match body.get("loginId").and_then(Value::as_str) {
+        Some(value) if !value.trim().is_empty() => value.to_string(),
+        _ => return json_err("缺少 loginId".to_string(), StatusCode::BAD_REQUEST),
+    };
+    let callback_url = match body
+        .get("callbackUrl")
+        .and_then(Value::as_str)
+        .or_else(|| body.get("url").and_then(Value::as_str))
+    {
+        Some(value) if !value.trim().is_empty() => value.to_string(),
+        _ => return json_err("缺少 callbackUrl".to_string(), StatusCode::BAD_REQUEST),
+    };
+    match trae::handlers::oauth_login_submit_callback(&login_id, &callback_url).await {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_credits_query(Json(body): Json<Value>) -> Response {
+    let scope = match resolve_scope_param(body.get("scope").and_then(Value::as_str)) {
+        Ok(scope) => scope,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    match scope.product() {
+        Product::Workbuddy => {
+            if let Err(error) =
+                require_capability(Product::Workbuddy, capability::Capability::Credits)
+            {
+                return json_err(error, StatusCode::FORBIDDEN);
+            }
+            let region = match require_wb_region(scope) {
+                Ok(region) => region,
+                Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+            };
+            let id = body.get("accountId").and_then(Value::as_str).unwrap_or("");
+            let Some(acc) = account::find_account_for(region, id) else {
+                return json_err("账号不存在".to_string(), StatusCode::BAD_REQUEST);
+            };
+            json_ok(credits::get_credit_expiry_for(region, &acc).await)
+        }
+        Product::Trae => match require_trae_region(scope) {
+            Ok(region) => json_ok(trae::handlers::credits_overview_for(
+                trae_variant_of_region(region),
+            )),
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        },
+        Product::Qoder => qoder_scope_not_applicable(),
+    }
+}
+
+/// POST /api/checkin/status/query —— 参数化签到状态查询（`scope` 决定平台与区域）。
+///
+/// 与 `src-tauri/src/commands.rs::checkin_status` **一一对应**（刻意不去重）。旧路由
+/// `GET /api/checkin/status`（WB，**批量整端点**）与 `GET /api/trae/checkin/status`（Trae）
+/// 保留为别名。形状按 `scope.product()` 分叉：WB 分支返回单账号签到状态（**必须**带
+/// `accountId`），Trae 分支返回区域级摘要（忽略 `accountId`）。
+///
+/// ⚠️ 本 handler **不做批量** —— 它对齐的是**桌面端单账号**契约；webui 的批量语义仍由旧
+/// 路由 `api_checkin_status` 承担（见其文档）。
+async fn api_checkin_status_query(Json(body): Json<Value>) -> Response {
+    let scope = match resolve_scope_param(body.get("scope").and_then(Value::as_str)) {
+        Ok(scope) => scope,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    match scope.product() {
+        Product::Workbuddy => {
+            let region = match require_wb_region(scope) {
+                Ok(region) => region,
+                Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+            };
+            let id = body.get("accountId").and_then(Value::as_str).unwrap_or("");
+            let Some(acc) = account::find_account_for(region, id) else {
+                return json_err("账号不存在".to_string(), StatusCode::BAD_REQUEST);
+            };
+            json_ok(checkin::get_checkin_status_for(region, &acc).await)
+        }
+        Product::Trae => match require_trae_region(scope) {
+            Ok(region) => json_ok(trae::handlers::checkin_status_for(trae_variant_of_region(
+                region,
+            ))),
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        },
+        Product::Qoder => qoder_scope_not_applicable(),
+    }
 }
 
 /// 在系统文件管理器中打开目录（跨平台）。
@@ -508,27 +1845,117 @@ async fn api_open_accounts_dir(Json(body): Json<Value>) -> Response {
     }
 }
 
+// ⚠️ 与 `src-tauri/src/commands.rs` 的 `get_codebuddy_cli_status` 等**同款接线**
+// （刻意不去重，见共享知识「同款实现散落两 crate」）。**表驱动**：本体是
+// `programs::*("codebuddy_cli")`（core `modules/programs.rs`），新增程序位无需改本文件。
+
 async fn api_codebuddy_cli_status() -> Response {
-    json_ok(codebuddy_cli::status())
+    match programs::status("codebuddy_cli") {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::INTERNAL_SERVER_ERROR),
+    }
 }
 
 async fn api_codebuddy_cli_install_helper() -> Response {
-    match codebuddy_cli::install_helper() {
+    match programs::install_helper("codebuddy_cli") {
         Ok(result) => json_ok(result),
         Err(error) => json_err(error, StatusCode::BAD_REQUEST),
     }
 }
 
+/// POST /api/codebuddy-cli/enable-gateway —— 把 CLI 切到**本机网关**模式（issue #109 §PR-2）。
+///
+/// 与桌面宿主的同名命令**刻意各写一份**（本仓惯例）：两宿主的接线各自独立，
+/// 但都只调 core 的 `codebuddy_cli::enable_gateway_mode` + `rotate::disable_auto_rotate`，
+/// 判定逻辑不重复。
+async fn api_codebuddy_cli_enable_gateway(Json(body): Json<Value>) -> Response {
+    let region = parse_region(body.get("region").and_then(Value::as_str));
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let state = crate::gateway_host::shared_state();
+    let port = state.config_snapshot().await.port;
+    let base_url = format!("http://127.0.0.1:{port}");
+    let (record, plaintext) = state
+        .keys
+        .create("CodeBuddy CLI（网关）".to_string(), region);
+    match codebuddy_cli::enable_gateway_mode(&base_url, &plaintext, model) {
+        Ok(detail) => {
+            let rotate_disabled = rotate::disable_auto_rotate().is_ok();
+            json_ok(json!({
+                "ok": true,
+                "baseUrl": base_url,
+                "keyPrefix": record.prefix,
+                "key": record.masked(),
+                "rotateDisabled": rotate_disabled,
+                "detail": detail,
+                "message": "已切到本机网关模式：重启终端与 CodeBuddy CLI 后生效（env 不支持热重载）",
+            }))
+        }
+        Err(error) => {
+            // 写失败 ⇒ 吊销刚建的 Key，不留一把没人用的凭据。
+            let _ = state.keys.revoke(&record.id);
+            json_err(error, StatusCode::BAD_REQUEST)
+        }
+    }
+}
+
+/// POST /api/codebuddy-cli/disable-gateway —— 从「走本机网关」切回直连（issue #109）。
+///
+/// 与桌面宿主同名命令**刻意各写一份**（本仓惯例），但逻辑一致：先清网关键、再重建凭据。
+async fn api_codebuddy_cli_disable_gateway() -> Response {
+    let cleared = match codebuddy_cli::disable_gateway_mode() {
+        Ok(value) => value,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    /* `models.json` 里仍有网关地址 ⇒ 本工具没写过那个文件，停下让用户处理。 */
+    if let Some(warning) = cleared.get("warning").and_then(Value::as_str) {
+        return json_err(warning.to_string(), StatusCode::BAD_REQUEST);
+    }
+
+    let restored = tokio::task::spawn_blocking(|| programs::install_helper("codebuddy_cli"))
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result);
+
+    let rotate_enabled = config::load_auto_rotate_config()
+        .get("enabled")
+        .and_then(Value::as_bool)
+        == Some(true);
+    match restored {
+        Ok(_) => json_ok(json!({
+            "ok": true,
+            "changed": cleared.get("changed").cloned().unwrap_or(json!(false)),
+            "restored": true,
+            "rotateDisabled": !rotate_enabled,
+            "message": if rotate_enabled {
+                "已切回直连上游：网关配置已清理，直连凭据已重建；重启终端与 CLI 后生效"
+            } else {
+                "已切回直连上游：网关配置已清理，直连凭据已重建。⚠ 自动轮换仍是关闭的 —— 需要的话在「签到与积分」里开启"
+            },
+        })),
+        Err(error) => json_err(
+            format!("网关配置已清理，但重建直连凭据失败：{error}"),
+            StatusCode::BAD_REQUEST,
+        ),
+    }
+}
+
 async fn api_codebuddy_cli_switch(Json(body): Json<Value>) -> Response {
     let id = body.get("accountId").and_then(|v| v.as_str()).unwrap_or("");
-    match codebuddy_cli::set_active_account(id) {
+    match programs::switch("codebuddy_cli", id, None) {
         Ok(result) => json_ok(result),
         Err(error) => json_err(error, StatusCode::BAD_REQUEST),
     }
 }
 
 async fn api_codebuddy_cn_ide_status() -> Response {
-    json_ok(codebuddy_cn_ide::status())
+    match programs::status("codebuddy_cn_ide") {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::INTERNAL_SERVER_ERROR),
+    }
 }
 
 async fn api_codebuddy_cn_ide_switch(Json(body): Json<Value>) -> Response {
@@ -537,20 +1964,82 @@ async fn api_codebuddy_cn_ide_switch(Json(body): Json<Value>) -> Response {
         .or_else(|| body.get("account_id"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let restart = body.get("restart").and_then(|v| v.as_bool()).unwrap_or(true);
-    match codebuddy_cn_ide::switch_account(account_id, restart) {
+    let restart = body
+        .get("restart")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    match programs::switch("codebuddy_cn_ide", account_id, Some(restart)) {
         Ok(v) => json_ok(v),
         Err(e) => json_err(e, StatusCode::BAD_REQUEST),
     }
 }
 
 async fn api_codebuddy_cn_ide_detect() -> Response {
-    match codebuddy_cn_ide::detect_current_account() {
+    match programs::detect("codebuddy_cn_ide") {
         Ok(v) => json_ok(v),
         Err(e) => json_err(e, StatusCode::BAD_REQUEST),
     }
 }
 
+async fn api_vscode_codebuddy_plugin_status() -> Response {
+    match programs::status("vscode_codebuddy_plugin") {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn api_vscode_codebuddy_plugin_switch(Json(body): Json<Value>) -> Response {
+    let account_id = body
+        .get("accountId")
+        .or_else(|| body.get("account_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let restart = body
+        .get("restart")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    match programs::switch("vscode_codebuddy_plugin", account_id, Some(restart)) {
+        Ok(v) => json_ok(v),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_vscode_codebuddy_plugin_detect() -> Response {
+    match programs::detect("vscode_codebuddy_plugin") {
+        Ok(v) => json_ok(v),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_jetbrains_codebuddy_plugin_status() -> Response {
+    match programs::status("jetbrains_codebuddy_plugin") {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn api_jetbrains_codebuddy_plugin_switch(Json(body): Json<Value>) -> Response {
+    let account_id = body
+        .get("accountId")
+        .or_else(|| body.get("account_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let restart = body
+        .get("restart")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    match programs::switch("jetbrains_codebuddy_plugin", account_id, Some(restart)) {
+        Ok(v) => json_ok(v),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_jetbrains_codebuddy_plugin_detect() -> Response {
+    match programs::detect("jetbrains_codebuddy_plugin") {
+        Ok(v) => json_ok(v),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
 
 async fn api_delete(Json(body): Json<Value>) -> Response {
     let region = parse_region(body.get("region").and_then(Value::as_str));
@@ -597,6 +2086,98 @@ async fn api_set_account_remark(Json(body): Json<Value>) -> Response {
     }
 }
 
+/// POST /api/account/group —— 设置账号自定义分组（**字段级更新**）。
+///
+/// 只改 `groupName` 一个键：请求体里带的是脱敏 meta，整条写回会抹掉 token。
+/// `group` 缺失或为空串都表示**移出分组**（core 侧统一 trim 后删键）。
+async fn api_set_account_group(Json(body): Json<Value>) -> Response {
+    let region = parse_region(body.get("region").and_then(Value::as_str));
+    let id = body.get("accountId").and_then(Value::as_str).unwrap_or("");
+    if id.trim().is_empty() {
+        return json_err("缺少 accountId".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let group = body.get("group").and_then(Value::as_str);
+    match account::set_account_group_for(region, id, group) {
+        Ok(meta) => json_ok(meta),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// GET /api/account/token-today —— 逐账号「今日 Token」（网关 + 客户端两路，按 region）。
+///
+/// 与 `src-tauri/src/commands.rs` 的同名命令**一一对应**（刻意不去重，两宿主行为必须一致）。
+///
+/// ⚠️ 两条诚实边界（由 core 保证，展示层负责如实呈现）：
+/// ① `force=1` 才重扫客户端 `projects` 目录下的 jsonl —— 该扫描要读 500+ 个文件（最大 ~18MB），
+///    故 core 侧有「今日已扫」闸门：不带 `force` 的重复调用只读缓存，不会每次轮询重扫；
+/// ② 网关那路受 `log_keep`（默认 200）截断 ⇒ 响应里的 `gatewayTruncated` 表示该数字只是**下界**，
+///    展示层须写成 `≥N` 并说明，不得当作完整总量。
+///    ⚠️ 判据是「**今日**部分可能被裁」而非「日志到过上限」：滚动窗口可能被昨天的流量顶满，
+///    而今天的条目全在（FIFO 裁剪）—— 那种情况下今日总量是**完整**的，不标 `true`
+///    （旧判据只看条数，会误报）。见 core `token_daily::gateway_log_truncated_today`。
+async fn api_account_token_today(RawQuery(query): RawQuery) -> Response {
+    let region = parse_region(query_value(query.as_deref(), "region").as_deref());
+    let force = matches!(
+        query_value(query.as_deref(), "force").as_deref(),
+        Some("1") | Some("true")
+    );
+    token_daily::record_client_today(region, force);
+    token_daily::record_gateway_today(region);
+    json_ok(token_daily::account_token_today(region))
+}
+
+/// GET /api/account/token-trend —— 网关**逐日**用量趋势（读 `token_daily` 90 天落库历史）。
+///
+/// 与 `src-tauri/src/commands.rs` 的同名命令**一一对应**（刻意不去重，两宿主行为必须一致）。
+///
+/// ⚠️ 只读：不扫盘、不触发记录。`days` **只含落库过的日子** ⇒ 缺日 = 未记录（App 没在跑），
+/// **不是 0** —— 前端 join 窗口后按覆盖率披露，不许把未记录日画成「当天没用量」；
+/// 某日 `truncated: true` ⇒ 该日只是**下界**（判据见 `token_daily::gateway_log_truncated_today`）。
+async fn api_gateway_token_trend(RawQuery(query): RawQuery) -> Response {
+    let region = parse_region(query_value(query.as_deref(), "region").as_deref());
+    json_ok(token_daily::gateway_token_trend(region))
+}
+
+/// GET /api/account/usage-dim —— 网关四维度（密钥 / 模型 / 账号 / 端点）逐日历史。
+///
+/// 与 `src-tauri/src/commands.rs` 的 `get_gateway_usage_dim` **一一对应**。
+async fn api_gateway_usage_dim(RawQuery(query): RawQuery) -> Response {
+    let region = parse_region(query_value(query.as_deref(), "region").as_deref());
+    json_ok(token_daily::gateway_usage_dim(region))
+}
+
+/// GET /api/trae/gateway/usage-dim —— Trae 网关账本（四维度逐日）。
+///
+/// 与 `src-tauri/src/commands.rs` 的 `get_trae_gateway_usage_dim` **一一对应**。
+/// `scope` 取 `cn` / `global` / `unlabeled` / `all`（缺省 `all`，合并放后端）。
+async fn api_trae_gateway_usage_dim(RawQuery(query): RawQuery) -> Response {
+    let scope = query_value(query.as_deref(), "scope").unwrap_or_else(|| "all".to_string());
+    json_ok(gateway_ledger::usage_dim(
+        gateway_ledger::LedgerProduct::Trae,
+        &scope,
+    ))
+}
+
+/// GET /api/qoder/gateway/usage-dim —— Qoder 网关账本（四维度逐日）。
+///
+/// 与 `src-tauri/src/commands.rs` 的 `get_qoder_gateway_usage_dim` **一一对应**。
+async fn api_qoder_gateway_usage_dim(RawQuery(query): RawQuery) -> Response {
+    let scope = query_value(query.as_deref(), "scope").unwrap_or_else(|| "all".to_string());
+    json_ok(gateway_ledger::usage_dim(
+        gateway_ledger::LedgerProduct::Qoder,
+        &scope,
+    ))
+}
+
+/// GET /api/account/usage-reconcile —— 今日客户端 ↔ 网关对账。
+///
+/// 与 `src-tauri/src/commands.rs` 的 `get_usage_reconcile` **一一对应**。
+/// ⚠️ 只读、**不落盘**（结果随网关日志窗口滚动而变）。
+async fn api_usage_reconcile(RawQuery(query): RawQuery) -> Response {
+    let region = parse_region(query_value(query.as_deref(), "region").as_deref());
+    json_ok(token_daily::reconcile_today(region))
+}
+
 /// GET /api/switch/config —— 账号切换与账号列表展示配置。
 async fn api_switch_config() -> Response {
     json_ok(config::load_switch_config())
@@ -620,11 +2201,13 @@ async fn api_relay_config() -> Response {
 async fn api_public_config() -> Response {
     let relay = config::load_relay_config();
     let wb = relay
-        .get("workbuddy_base")
+        .get("workbuddyBase")
+        .or_else(|| relay.get("workbuddy_base"))
         .and_then(Value::as_str)
         .unwrap_or_default();
     let trae = relay
-        .get("trae_base")
+        .get("traeBase")
+        .or_else(|| relay.get("trae_base"))
         .and_then(Value::as_str)
         .unwrap_or_default();
     json_ok(json!({ "workbuddyBase": wb, "traeBase": trae }))
@@ -692,6 +2275,29 @@ async fn api_preview_import(Json(body): Json<Value>) -> Response {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    // ★ 2026-10-15：新增**可选** `scope`。Qoder 的预览要按区域判「归属不符」（跨区条目
+    //   导入时会被拒）—— 而裸 `region=cn` 分不出 `wb-cn` 与 `qoder-cn`。
+    //   缺省 / 非 Qoder 作用域 ⇒ 走既有的「纯解析、不做归属诊断」分支（旧行为逐字不变）。
+    if let Some(raw) = body
+        .get("scope")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        match resolve_scope_param(Some(raw)) {
+            Ok(scope) if scope.product() == Product::Qoder => {
+                return match require_qoder_region(scope) {
+                    Ok(region) => match qoder::export_import::preview_accounts(region, &text) {
+                        Ok(value) => json_ok(value),
+                        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+                    },
+                    Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+                };
+            }
+            // 非 Qoder 作用域：继续走下面的通用分支（不看 scope，保持旧行为）。
+            Ok(_) => {}
+            Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+        }
+    }
     match export_import::preview_accounts(&text) {
         Ok(v) => json_ok(v),
         Err(e) => json_err(e, StatusCode::BAD_REQUEST),
@@ -742,15 +2348,19 @@ async fn api_import_auths_dir(Json(body): Json<Value>) -> Response {
         return json_err("缺少 dir 参数".to_string(), StatusCode::BAD_REQUEST);
     }
     let dir = std::path::PathBuf::from(dir);
-    let result = match tokio::task::spawn_blocking(move || {
-        export_import::import_auths_dir(&dir, region)
-    })
-    .await
-    {
-        Ok(Ok(result)) => result,
-        Ok(Err(e)) => return json_err(e, StatusCode::BAD_REQUEST),
-        Err(e) => return json_err(format!("导入任务失败: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
-    };
+    let result =
+        match tokio::task::spawn_blocking(move || export_import::import_auths_dir(&dir, region))
+            .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => return json_err(e, StatusCode::BAD_REQUEST),
+            Err(e) => {
+                return json_err(
+                    format!("导入任务失败: {e}"),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                )
+            }
+        };
     json_ok(json!({
         "ok": true,
         "imported": result.imported,
@@ -760,11 +2370,228 @@ async fn api_import_auths_dir(Json(body): Json<Value>) -> Response {
     }))
 }
 
+/// POST /api/backup/export —— 导出**全局备份** envelope（跨 4 作用域的账号 / 配置 / 网关）。
+///
+/// 与 `src-tauri/src/commands.rs::export_backup` **一一对应**（刻意不去重）。请求体为
+/// `{ selection: { scopes, includesCredentials, appSettings } }`；`includesCredentials=false`
+/// 时按 `CREDENTIAL_KEYS` 逐条剥离凭据（**备份文件里不得含凭据**）。
+async fn api_export_backup(Json(body): Json<Value>) -> Response {
+    // 兼容 `{ selection: {...} }` 与平铺两种载荷（与其余 handler 的容错口径一致）。
+    let selection_value = body.get("selection").cloned().unwrap_or(body);
+    let selection: backup::BackupSelection = match serde_json::from_value(selection_value) {
+        Ok(selection) => selection,
+        Err(error) => return json_err(format!("导出参数不合法：{error}"), StatusCode::BAD_REQUEST),
+    };
+    match backup::export_backup(&selection) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/backup/import/preview —— 导入**预览**（**只读安全阀**，§1.7）。
+///
+/// 与 `src-tauri/src/commands.rs::preview_import_backup` **一一对应**（刻意不去重）。
+/// 请求体 `{ fileText, policy }`；`policy` 为空 ⇒ 默认保留本地（D16）。**不写盘**。
+async fn api_preview_import_backup(Json(body): Json<Value>) -> Response {
+    let file_text = body
+        .get("fileText")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let policy = body.get("policy").and_then(Value::as_str).unwrap_or("");
+    let policy = match export_import::ConflictPolicy::parse(policy) {
+        Ok(policy) => policy,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    match backup::preview_import_backup(&file_text, policy) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/backup/import —— 导入全局备份（先快照 → 逐 scope 合并 → 汇总）。
+///
+/// 请求体 `{ fileText, policy, selection }`；`selection` 缺省 ⇒ 全选（D14）。
+/// ★ `onlyScopes`（C1）：非空 ⇒ **只导入这些 scope**（「只重试失败项」）；
+/// 缺省 ⇒ 全量。与 `commands.rs::import_backup` 形状一一对应。
+async fn api_import_backup(Json(body): Json<Value>) -> Response {
+    let file_text = body
+        .get("fileText")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let policy = body.get("policy").and_then(Value::as_str).unwrap_or("");
+    let policy = match export_import::ConflictPolicy::parse(policy) {
+        Ok(policy) => policy,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let selection_value = body.get("selection").cloned().unwrap_or_else(|| json!({}));
+    let selection: backup::BackupSelection = match serde_json::from_value(selection_value) {
+        Ok(selection) => selection,
+        Err(error) => return json_err(format!("导入参数不合法：{error}"), StatusCode::BAD_REQUEST),
+    };
+    let only_scopes: Vec<String> = body
+        .get("onlyScopes")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    match backup::import_backup(&file_text, policy, &selection, &only_scopes) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/diagnostics/export —— 导出诊断包（Q1；只读）。
+///
+/// ⚠️ 与 `commands.rs::export_diagnostic` 是**同款接线**（刻意不去重），返回形状
+/// 必须一致：`{ name, text }`。凭据闸门在 core（`diagnostics::export_diagnostic`），
+/// 命中即 `Err` ⇒ 两端都不会发出一份含凭据的文件。
+async fn api_export_diagnostic() -> Response {
+    match diagnostics::export_diagnostic() {
+        Ok(text) => {
+            let name = format!(
+                "buddy-switch-diagnostic-{}.json",
+                buddy_switch_core::modules::cst::cst_datetime(config::now_ms())
+                    .format("%Y%m%d-%H%M%S")
+            );
+            json_ok(json!({ "name": name, "text": text }))
+        }
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// GET /api/logs/runtime —— 读取本工具**自身**的运行日志。
+///
+/// 参数：`level`（最低级别）/ `date`（`YYYY-MM-DD`）/ `keyword` / `limit`，全部可选。
+/// 过滤与解析逻辑只在 core（`runtime_log::read`）—— 两宿主共用一份，杜绝形状漂移。
+///
+/// 读若干文件 + 逐行解析属于阻塞 IO，故放进 blocking 线程池。
+async fn api_runtime_logs(RawQuery(query): RawQuery) -> Response {
+    let read = |key: &str| query_value(query.as_deref(), key);
+    let limit = read("limit").and_then(|value| value.parse::<u64>().ok());
+    let params = json!({
+        "level": read("level"),
+        "date": read("date"),
+        "keyword": read("keyword"),
+        "limit": limit,
+    });
+    match tokio::task::spawn_blocking(move || runtime_log::read(&params)).await {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(
+            format!("读取运行日志失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// POST /api/logs/runtime/clear —— 清空全部运行日志（**不可逆**，前端须二次确认）。
+async fn api_clear_runtime_logs() -> Response {
+    match tokio::task::spawn_blocking(runtime_log::clear).await {
+        Ok(Ok(value)) => json_ok(value),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(
+            format!("清空运行日志失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// POST /api/logs/open-dir —— 在文件管理器中打开日志目录（不存在则先创建）。
+///
+/// ⚠️ 会真的起一个 GUI 进程（`explorer` / `open` / `xdg-open`）—— Docker 部署时
+/// 容器里没有文件管理器，调用会失败并返回错误，属预期（webui 侧据此提示）。
+async fn api_open_logs_dir() -> Response {
+    match tokio::task::spawn_blocking(runtime_log::open_logs_dir).await {
+        Ok(Ok(value)) => json_ok(value),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(
+            format!("打开日志目录失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// POST /api/logs/runtime/slow-call —— 前端上报「慢 IPC 命令」（issue #80 诊断通道）。
+///
+/// 与桌面端 `commands::report_slow_call` 同形：webui 走 HTTP，慢的是整条请求链路
+/// （fetch 往返 + handler），同样值得留一条。命令名是代码标识符、不含用户数据。
+async fn api_report_slow_call(Json(body): Json<Value>) -> Response {
+    let cmd = body
+        .get("cmd")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let ms = body.get("ms").and_then(Value::as_u64).unwrap_or(0);
+    if cmd.is_empty() || ms == 0 {
+        return json_err(
+            "参数不完整（cmd / ms）".to_string(),
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    let _ = tokio::task::spawn_blocking(move || {
+        runtime_log::warn(
+            "ipc-slow",
+            format!("命令 {cmd} 耗时 {ms}ms（超过前端计时阈值）"),
+        );
+    })
+    .await;
+    json_ok(json!({ "ok": true }))
+}
+
+/// GET /api/backup/auto/list —— 列出自动备份 / 导入前快照（最新在前）。
+async fn api_list_auto_backups() -> Response {
+    match backup::list_auto_backups() {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/backup/auto/restore —— 从自动备份 / 导入前快照恢复（覆盖策略）。
+async fn api_restore_auto_backup(Json(body): Json<Value>) -> Response {
+    let file_name = body
+        .get("fileName")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    match backup::restore_auto_backup(&file_name) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// GET /api/backup/auto/config —— 读取自动备份配置（**默认开**）。
+async fn api_get_auto_backup_config() -> Response {
+    json_ok(config::load_auto_backup_config())
+}
+
+/// POST /api/backup/auto/config —— 保存自动备份配置（关掉后不再产生新备份）。
+async fn api_save_auto_backup_config(Json(body): Json<Value>) -> Response {
+    // 兼容 `{ config: {...} }` 与平铺两种载荷（与其余 handler 的容错口径一致）。
+    let cfg = body.get("config").cloned().unwrap_or(body);
+    match config::save_auto_backup_config(&cfg) {
+        Ok(()) => json_ok(config::load_auto_backup_config()),
+        Err(error) => json_err(
+            format!("保存自动备份配置失败：{error}"),
+            StatusCode::BAD_REQUEST,
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // OAuth 登录
 // ---------------------------------------------------------------------------
 
 async fn api_oauth_start(Json(body): Json<Value>) -> Response {
+    if let Err(error) = require_capability(Product::Workbuddy, capability::Capability::Oauth) {
+        return json_err(error, StatusCode::FORBIDDEN);
+    }
     let region = parse_region(body.get("region").and_then(Value::as_str));
     match oauth::oauth_start_for(region).await {
         Ok(v) => json_ok(v),
@@ -843,6 +2670,7 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
         }
         *running = true;
         *SWITCH_PROGRESS.lock().unwrap() = Some("开始切换账号…".to_string());
+        *SWITCH_REGION.lock().unwrap() = Some(region);
     }
 
     let progress: switch::ProgressFn = Box::new(|msg| {
@@ -862,6 +2690,7 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
     .await;
 
     *SWITCH_RUNNING.lock().unwrap() = false;
+    *SWITCH_REGION.lock().unwrap() = None;
 
     match result {
         Ok(Ok(v)) => json_ok(v),
@@ -881,6 +2710,10 @@ async fn api_switch_progress() -> Response {
 // ---------------------------------------------------------------------------
 
 async fn api_sessions(RawQuery(query): RawQuery) -> Response {
+    if let Err(error) = require_capability(Product::Workbuddy, capability::Capability::SessionCopy)
+    {
+        return json_err(error, StatusCode::FORBIDDEN);
+    }
     let region = parse_region(query_value(query.as_deref(), "region").as_deref());
     match session::current_user_uid_for(region) {
         Some(uid) => {
@@ -893,6 +2726,594 @@ async fn api_sessions(RawQuery(query): RawQuery) -> Response {
             }))
         }
         None => json_ok(json!({ "sessions": [], "current": null, "source": "empty" })),
+    }
+}
+
+/// GET /api/sessions/replicas —— 只读：copy ledger 连通成「会话副本组」（按 region）。
+///
+/// 与 Tauri 侧 `commands::list_session_replicas` **同契约**（两宿主同步）。
+/// 只回 ledger 里确有的字段（`accountUid` / `sessionId` / `region`）；
+/// `title` / `updatedAt` / `hasHistory` 由前端 join 补齐（见 `session::list_replica_groups_for`）。
+///
+/// ★ **内容状态随本响应一起回**（`groups[].content`）：状态判据在 core
+/// （`session::derive_content_status`），前端只拿结论 —— 逐行 hash 不过 IPC。
+async fn api_session_replicas(RawQuery(query): RawQuery) -> Response {
+    if let Err(error) = require_capability(Product::Workbuddy, capability::Capability::SessionCopy)
+    {
+        return json_err(error, StatusCode::FORBIDDEN);
+    }
+    let region = parse_region(query_value(query.as_deref(), "region").as_deref());
+    json_ok(session::list_replica_groups_for(region))
+}
+
+/// POST /api/sessions/replicas/prune —— remove ledger edges whose target
+/// session no longer exists (issue #203).
+///
+/// Explicit, user-triggered cleanup only. The core decision is fail-safe:
+/// unreadable DB, malformed keys and cross-region keys are retained.
+async fn api_prune_session_replicas(Json(body): Json<Value>) -> Response {
+    if let Err(error) = require_capability(Product::Workbuddy, capability::Capability::SessionCopy)
+    {
+        return json_err(error, StatusCode::FORBIDDEN);
+    }
+    let region = parse_region(body.get("region").and_then(Value::as_str));
+    json_ok(session::prune_deleted_replica_edges_for(region))
+}
+
+/// POST /api/sessions/sync —— P8 **安全同步（增量追加）**：把源副本的新增行追加到落后副本。
+///
+/// 与 Tauri 侧 `commands::sync_session_replicas` **同契约**（两宿主同步）。
+/// 批量 + 逐条结果 ⇒ 支持**部分失败**（`PLAN.md` §3.6）；判据在 core
+/// （`session::sync_session_replicas_for`），本处理器只做「鉴权 + 取参数」。
+///
+/// ⚠️ **写操作**：会往目标会话 jsonl **追加**行 —— 只追加，**绝不改写 / 删除**目标已有内容；
+/// 出现分歧则**逐条**失败且不落一个字节。
+async fn api_session_sync(Json(body): Json<Value>) -> Response {
+    if let Err(error) = require_capability(Product::Workbuddy, capability::Capability::SessionCopy)
+    {
+        return json_err(error, StatusCode::FORBIDDEN);
+    }
+    let region = parse_region(body.get("region").and_then(Value::as_str));
+    let items = body
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    json_ok(session::sync_session_replicas_for(region, &items))
+}
+
+/// POST /api/sessions/unify —— P8 **分歧处理（覆盖式统一）**：把选定保留的那一份覆盖到其余副本。
+///
+/// 与 Tauri 侧 `commands::unify_session_replicas` **同契约**（两宿主同步）。
+/// 批量 + 逐条结果 ⇒ 支持**部分失败**（`PLAN.md` §3.6）；判据在 core
+/// （`session::unify_session_replicas_for`），本处理器只做「鉴权 + 取参数」。
+///
+/// ⚠️ **破坏性写操作**：目标副本原有的分歧内容会被丢弃（`PLAN.md` §3.15.2「不许静默覆盖」）
+/// ⇒ 前端**必须**先二次确认并把 `lostLines` 如实告知；core 会**先备份再覆盖**，备份失败则不覆盖。
+async fn api_session_unify(Json(body): Json<Value>) -> Response {
+    if let Err(error) = require_capability(Product::Workbuddy, capability::Capability::SessionCopy)
+    {
+        return json_err(error, StatusCode::FORBIDDEN);
+    }
+    let region = parse_region(body.get("region").and_then(Value::as_str));
+    let items = body
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    json_ok(session::unify_session_replicas_for(region, &items))
+}
+
+/// POST /api/sessions/export —— 把选中的会话导出成一个 JSON 包（issue #87）。
+///
+/// 与 Tauri 侧 `commands::export_sessions_bundle` **同契约**（两宿主同步）。
+/// body：`{ uid, sessionIds: [...], outPath, region? }`。
+///
+/// **只读**：不碰客户端数据，只写用户指定的落点文件（单文件 JSON，不是 zip ——
+/// 见 core `session_bundle` 模块头：不为一个搬运功能引入解压攻击面）。
+async fn api_export_sessions_bundle(Json(body): Json<Value>) -> Response {
+    if let Err(error) = require_capability(Product::Workbuddy, capability::Capability::SessionCopy)
+    {
+        return json_err(error, StatusCode::FORBIDDEN);
+    }
+    // uid 省略 ⇒ 当前登录账号（与 Tauri 侧同契约）。
+    let uid = body
+        .get("uid")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let session_ids: Vec<String> = body
+        .get("sessionIds")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let Some(out_path) = body
+        .get("outPath")
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty())
+    else {
+        return json_err("缺少 outPath".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let region = parse_region(body.get("region").and_then(Value::as_str));
+    let uid = match uid {
+        Some(uid) => uid,
+        None => match session::current_user_uid_for(region) {
+            Some(uid) => uid,
+            None => {
+                return json_err(
+                    "读不到当前登录账号（客户端是否已登录？）".to_string(),
+                    StatusCode::BAD_REQUEST,
+                )
+            }
+        },
+    };
+    let path = std::path::Path::new(out_path);
+    // 空 sessionIds ⇒ 导出该账号全部会话（v1 口径，与 Tauri 侧一致）。
+    let result = if session_ids.is_empty() {
+        session_bundle::export_all_for(region, &uid, path)
+    } else {
+        session_bundle::export_sessions_for(region, &uid, &session_ids, path)
+    };
+    match result {
+        Ok(report) => json_ok(report),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// GET /api/sessions/import/preview —— 只读导出包，回报条数与标题（导入前确认）。
+///
+/// 查询参数：`path`（**必填**）。
+async fn api_preview_sessions_bundle(RawQuery(query): RawQuery) -> Response {
+    if let Err(error) = require_capability(Product::Workbuddy, capability::Capability::SessionCopy)
+    {
+        return json_err(error, StatusCode::FORBIDDEN);
+    }
+    let Some(path) = query_value(query.as_deref(), "path").filter(|path| !path.trim().is_empty())
+    else {
+        return json_err("缺少 path".to_string(), StatusCode::BAD_REQUEST);
+    };
+    match session_bundle::preview_bundle(std::path::Path::new(path.trim())) {
+        Ok(preview) => json_ok(preview),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/sessions/import —— 把导出包里的会话**作为新会话**写进指定账号（issue #87）。
+///
+/// 与 Tauri 侧 `commands::import_sessions_bundle` **同契约**（两宿主同步）。
+/// body：`{ uid, path, region? }`。
+///
+/// ★ **只做加法**：每条都生成新 id，绝不覆盖既有会话；同一份包导两次 = 两份副本
+/// （不静默去重 —— 「我以为覆盖了，结果两份」比「我以为合并了，结果只有一份」更难查）。
+async fn api_import_sessions_bundle(Json(body): Json<Value>) -> Response {
+    if let Err(error) = require_capability(Product::Workbuddy, capability::Capability::SessionCopy)
+    {
+        return json_err(error, StatusCode::FORBIDDEN);
+    }
+    let uid = body
+        .get("uid")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let Some(path) = body
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty())
+    else {
+        return json_err("缺少 path".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let region = parse_region(body.get("region").and_then(Value::as_str));
+    let uid = match uid {
+        Some(uid) => uid,
+        None => match session::current_user_uid_for(region) {
+            Some(uid) => uid,
+            None => {
+                return json_err(
+                    "读不到当前登录账号（客户端是否已登录？）".to_string(),
+                    StatusCode::BAD_REQUEST,
+                )
+            }
+        },
+    };
+    match session_bundle::import_sessions_for(region, &uid, std::path::Path::new(path.trim())) {
+        Ok(report) => json_ok(report),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// 把前端的 `client` 字符串解析成 [`vscode_session::ExtClient`]。
+///
+/// ⚠️ **空串与未知值一律 `Err`**（不回落默认值）：本仓不猜「用户指的是哪个客户端」——
+/// 猜错就是去读写**另一个客户端**的会话目录。前端必须显式传。
+fn parse_ext_client(raw: &str) -> Result<vscode_session::ExtClient, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "vscode" => Ok(vscode_session::ExtClient::Vscode),
+        "codebuddy-ide" => Ok(vscode_session::ExtClient::CodebuddyIde),
+        other => Err(format!("未知的客户端标识: {other}")),
+    }
+}
+
+/// GET /api/vscode-sessions —— 列出 VS Code 插件 / CodeBuddy IDE 某账号的会话（**只读**）。
+///
+/// 与 Tauri 侧 `commands::list_vscode_sessions` **同契约**（两宿主同步）。
+/// 查询参数：`client`（`vscode` / `codebuddy-ide`，**必填**）、`uid`（**必填**）。
+///
+/// ★ 与桌面版会话**不是同一套存储**（那边 `workbuddy.db` + jsonl，这边 JSON 记录仓）
+/// ⇒ 单开命令，**不往 `/api/sessions` 里塞 `client` 参数**（两套形状挤一个出口会让前端处处分支）。
+async fn api_vscode_sessions(RawQuery(query): RawQuery) -> Response {
+    if let Err(error) = require_capability(Product::Workbuddy, capability::Capability::SessionCopy)
+    {
+        return json_err(error, StatusCode::FORBIDDEN);
+    }
+    let client = match parse_ext_client(
+        query_value(query.as_deref(), "client")
+            .as_deref()
+            .unwrap_or_default(),
+    ) {
+        Ok(client) => client,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let Some(uid) = query_value(query.as_deref(), "uid").filter(|uid| !uid.trim().is_empty())
+    else {
+        return json_err("缺少 uid".to_string(), StatusCode::BAD_REQUEST);
+    };
+    json_ok(vscode_session::list_sessions_for(client, uid.trim()))
+}
+
+/// POST /api/codebuddy-ide/memory/merge —— 合并 CodeBuddy IDE 长期记忆（issue #86）。
+///
+/// 与 Tauri 侧 `commands::migrate_codebuddy_ide_memory` **同契约**（两宿主同步）。
+/// **加法**：逐行去重，不覆盖目标已有内容；结构认不出时返回 400 + 实际键名
+/// （见 core 的 `codebuddy_memory` 模块头：没有样本时「认清才写」）。
+async fn api_merge_codebuddy_ide_memory(Json(body): Json<Value>) -> Response {
+    if let Err(error) = require_capability(Product::Workbuddy, capability::Capability::SessionCopy)
+    {
+        return json_err(error, StatusCode::FORBIDDEN);
+    }
+    let source_uid = body
+        .get("sourceUid")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let target_uid = body
+        .get("targetUid")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    match codebuddy_memory::merge_memery(&source_uid, &target_uid) {
+        Ok(report) => json_ok(serde_json::to_value(report).unwrap_or(Value::Null)),
+        // 400 而不是 500：「没有记忆文件」「结构认不出」都是**可解释的业务结论**，
+        // 不是服务端故障 —— 状态码错了会让前端按「重试」处理。
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/vscode-sessions/copy —— 把插件侧会话复制给另一个账号（**加法**，绝不覆盖）。
+///
+/// 与 Tauri 侧 `commands::copy_vscode_sessions` **同契约**（两宿主同步）。
+/// body：`{ client, sourceUid, targetUid, items: [{ workspaceHash, conversationId }] }`。
+///
+/// ⚠️ **数据根找不到 ⇒ 4xx**（不是「复制了 0 条」）——后者会把「客户端没装」
+/// 伪装成一次成功的空操作（「失败不得谎报成功」）。
+async fn api_copy_vscode_sessions(Json(body): Json<Value>) -> Response {
+    if let Err(error) = require_capability(Product::Workbuddy, capability::Capability::SessionCopy)
+    {
+        return json_err(error, StatusCode::FORBIDDEN);
+    }
+    let client = match parse_ext_client(
+        body.get("client")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    ) {
+        Ok(client) => client,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let source_uid = body
+        .get("sourceUid")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let target_uid = body
+        .get("targetUid")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let items: Vec<vscode_session::CopyItem> = match body
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|item| serde_json::from_value(item).map_err(|e| format!("复制条目格式不对: {e}")))
+        .collect::<Result<_, _>>()
+    {
+        Ok(items) => items,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    match vscode_session::copy_conversations(client, &source_uid, &target_uid, &items) {
+        Ok(report) => json_ok(report),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// GET /api/vscode-sessions/diff —— **记录级 diff（只读）**：这份会话能不能做增量追加。
+///
+/// 与 Tauri 侧 `commands::diff_vscode_sessions` **同契约**（两宿主同步）。
+/// 查询参数：`client`（必填）、`sourceUid`、`targetUid`、`workspaceHash`、`conversationId`。
+///
+/// ★ 插件侧**不能**照搬桌面版的「按行 append」：顺序由 `index.json` 的 `messages[]`
+/// **数组次序**决定 ⇒ 目标缺的是**中间**几条时追加会**打乱会话顺序**。
+async fn api_diff_vscode_sessions(RawQuery(query): RawQuery) -> Response {
+    if let Err(error) = require_capability(Product::Workbuddy, capability::Capability::SessionCopy)
+    {
+        return json_err(error, StatusCode::FORBIDDEN);
+    }
+    let client = match parse_ext_client(
+        query_value(query.as_deref(), "client")
+            .as_deref()
+            .unwrap_or_default(),
+    ) {
+        Ok(client) => client,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let text = |key: &str| {
+        query_value(query.as_deref(), key)
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    json_ok(vscode_session::diff_conversation(
+        client,
+        &text("sourceUid"),
+        &text("targetUid"),
+        &text("workspaceHash"),
+        &text("conversationId"),
+    ))
+}
+
+/// POST /api/vscode-sessions/sync —— **增量追加**（只有 diff 说 `appendable` 才真写）。
+///
+/// 与 Tauri 侧 `commands::sync_vscode_sessions` **同契约**（两宿主同步）。
+/// body：`{ client, sourceUid, targetUid, workspaceHash, conversationId }`。
+///
+/// ★★ **不信任调用方**：core 里进来先自己重算 diff。其余状态一律**拒绝**并如实说原因
+/// （`divergent` 会静默改写目标内容、`unordered` 会打乱会话顺序 —— 两者都看不出来）。
+async fn api_sync_vscode_sessions(Json(body): Json<Value>) -> Response {
+    if let Err(error) = require_capability(Product::Workbuddy, capability::Capability::SessionCopy)
+    {
+        return json_err(error, StatusCode::FORBIDDEN);
+    }
+    let client = match parse_ext_client(
+        body.get("client")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    ) {
+        Ok(client) => client,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let text = |key: &str| {
+        body.get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    match vscode_session::sync_conversation(
+        client,
+        &text("sourceUid"),
+        &text("targetUid"),
+        &text("workspaceHash"),
+        &text("conversationId"),
+    ) {
+        Ok(report) => json_ok(report),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// GET /api/client/limits —— 客户端限流台账（**只读**观测：账号 × 模型 × 恢复时刻）。
+///
+/// 与 Tauri 侧 `commands::client_limits` **同契约**（两宿主同步）。判据在 core
+/// （`client_limits::client_limits_for`），本处理器只做「鉴权 + 取参数」。
+///
+/// 查询参数：`region`（cn / global）、`sinceDays`（`0` = 全量；缺省 = 近 7 天）。
+async fn api_client_limits(RawQuery(query): RawQuery) -> Response {
+    if let Err(error) = require_capability(Product::Workbuddy, capability::Capability::SessionCopy)
+    {
+        return json_err(error, StatusCode::FORBIDDEN);
+    }
+    let region = parse_region(query_value(query.as_deref(), "region").as_deref());
+    let since_days = query_value(query.as_deref(), "sinceDays").and_then(|v| v.parse::<i64>().ok());
+    json_ok(client_limits::client_limits_for(region, since_days))
+}
+
+// ---- Skill 管理（cc-switch 式）------------------------------------------------
+// ⚠️ 与 `src-tauri/src/commands.rs` 的 5 个同名命令**同契约**（两宿主同步）。本层只做
+// 「鉴权 + 取参数 + 丢给 core `skill::*`」，**不自己拼 JSON 形状** —— 两侧都调同一个 core
+// 函数，从根上杜绝「一侧透传、另一侧多包一层」的漂移（PRD §9）。
+//
+// 鉴权：5 条命令都读写**用户级文件**（`{data_dir}/skills`），沿用最贴近该语义的既有
+// capability `SessionCopy`（同为「WorkBuddy 桌面才有的用户数据读写」，见 `capability.rs`
+// 的枚举注释）。capability 表在 core（`product_spec`），本层只查表，**默认拒绝**。
+
+/// Skill 管理 5 条命令共用的 capability 门禁（缺能力即 403，不落盘）。
+fn skill_capability_denied() -> Option<Response> {
+    require_capability(Product::Workbuddy, capability::Capability::SessionCopy)
+        .err()
+        .map(|error| json_err(error, StatusCode::FORBIDDEN))
+}
+
+/// GET /api/skills —— 列出该 region 用户级 skills 目录下的 skill 清单（**只读**）。
+async fn api_list_skills(RawQuery(query): RawQuery) -> Response {
+    if let Some(denied) = skill_capability_denied() {
+        return denied;
+    }
+    let region = query_value(query.as_deref(), "region");
+    match skill::list_skills(region) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/skills/enabled —— 启停一个 skill（行级改写官方原生字段）。
+///
+/// 请求体：`{ region?, dirName, enabled }`。
+async fn api_set_skill_enabled(Json(body): Json<Value>) -> Response {
+    if let Some(denied) = skill_capability_denied() {
+        return denied;
+    }
+    let region = body
+        .get("region")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let dir_name = body.get("dirName").and_then(Value::as_str).unwrap_or("");
+    let Some(enabled) = body.get("enabled").and_then(Value::as_bool) else {
+        return json_err("缺少 enabled（布尔）".to_string(), StatusCode::BAD_REQUEST);
+    };
+    match skill::set_skill_enabled(region, dir_name, enabled) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/skills/copy-cross —— 跨 region「合并补齐」搬迁（冲突保留目标侧）。
+///
+/// 请求体：`{ sourceRegion, targetRegion }`（**两者都必须显式给出**）。
+async fn api_copy_skills_cross(Json(body): Json<Value>) -> Response {
+    if let Some(denied) = skill_capability_denied() {
+        return denied;
+    }
+    let source = body
+        .get("sourceRegion")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let target = body
+        .get("targetRegion")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    match skill::copy_skills_cross(source, target) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/skills/import —— 从本地目录或 zip 导入一个 skill。
+///
+/// 请求体：`{ region?, sourcePath }`。
+async fn api_import_skill(Json(body): Json<Value>) -> Response {
+    if let Some(denied) = skill_capability_denied() {
+        return denied;
+    }
+    let region = body
+        .get("region")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let source_path = body.get("sourcePath").and_then(Value::as_str).unwrap_or("");
+    match skill::import_skill(region, source_path) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/skills/open-dir —— 在文件管理器中打开该 region 的 skills 目录。
+///
+/// 目录不存在时先创建（避免「打开失败」）；响应形状由 core `skill::prepare_skills_dir`
+/// 统一产出，本层只负责平台相关的 `reveal_dir`。
+async fn api_open_skills_dir(Json(body): Json<Value>) -> Response {
+    if let Some(denied) = skill_capability_denied() {
+        return denied;
+    }
+    let region = body
+        .get("region")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    match skill::prepare_skills_dir(region) {
+        Ok((dir, payload)) => match reveal_dir(&dir) {
+            Ok(()) => json_ok(payload),
+            Err(error) => json_err(error, StatusCode::INTERNAL_SERVER_ERROR),
+        },
+        Err(error) => json_err(error, StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+// ---- 上游客户端 settings.json 统一托管 ----------------------------------------
+// ⚠️ 与 `src-tauri/src/commands.rs` 的 6 个同名命令**同契约**（两宿主同步）。两侧都调同一个
+// core `client_settings::*` 函数并原样返回其结果，本层**不自己拼 JSON 形状** —— 从根上杜绝
+// 「一侧透传、另一侧多包一层」的漂移（PRD §9）。
+//
+// 无 capability 门控：本模块跨 WorkBuddy / Trae 两个产品线托管**各自客户端**的本地设置文件，
+// 平台能力表里没有与之对应的能力项（不是签到 / 积分 / 会话复制之类），故不套用任何平台能力。
+
+/// GET /api/client-settings/slots —— 列出 6 个槽位（未安装者 `installed:false` **仍在列表**）。
+async fn api_client_settings_slots() -> Response {
+    json_ok(client_settings::list_slots())
+}
+
+/// GET /api/client-settings/read?slot=… —— 原文 + 解析后键值 + 格式指纹。
+///
+/// 解析失败 ⇒ 带 `client.settings.parse_failed` 码的错误，**绝不**返回空对象；
+/// 未安装（文件不存在）**不是错误**（`installed:false`，`text`/`values` 为 `null`）。
+async fn api_client_settings_read(RawQuery(query): RawQuery) -> Response {
+    let slot = query_value(query.as_deref(), "slot").unwrap_or_default();
+    match client_settings::read_settings(&slot) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/client-settings/patch —— 键值级 patch（**格式保持**，模块内部自动备份）。
+///
+/// 请求体：`{ slot, patch }`，`patch` 形如 `{ "<点号路径>": <新值> }`。
+async fn api_client_settings_patch(Json(body): Json<Value>) -> Response {
+    let slot = body.get("slot").and_then(Value::as_str).unwrap_or("");
+    let Some(patch) = body.get("patch") else {
+        return json_err("缺少 patch 对象".to_string(), StatusCode::BAD_REQUEST);
+    };
+    match client_settings::patch_settings(slot, patch) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// GET /api/client-settings/backups?slot=… —— 该槽位的历史备份点（按 id 降序）。
+async fn api_client_settings_backups(RawQuery(query): RawQuery) -> Response {
+    let slot = query_value(query.as_deref(), "slot").unwrap_or_default();
+    match client_settings::list_backups(&slot) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/client-settings/restore —— 整文件恢复（**恢复前对当前文件再备份一次**）。
+///
+/// 请求体：`{ slot, backupId }`。
+async fn api_client_settings_restore(Json(body): Json<Value>) -> Response {
+    let slot = body.get("slot").and_then(Value::as_str).unwrap_or("");
+    let backup_id = body.get("backupId").and_then(Value::as_str).unwrap_or("");
+    match client_settings::restore_backup(slot, backup_id) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/client-settings/diff —— 任选两个槽位比对（仅 A 有 / 仅 B 有 / 值不同）。
+///
+/// 请求体：`{ slotA, slotB }`。
+async fn api_client_settings_diff(Json(body): Json<Value>) -> Response {
+    let slot_a = body.get("slotA").and_then(Value::as_str).unwrap_or("");
+    let slot_b = body.get("slotB").and_then(Value::as_str).unwrap_or("");
+    match client_settings::diff_slots(slot_a, slot_b) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
     }
 }
 
@@ -923,7 +3344,14 @@ async fn api_copy_sessions(Json(body): Json<Value>) -> Response {
     // copy_sessions_for_switch_for 已返回完整报告（sourceUid / targetUid / copied /
     // skipped? / errors?）。这里必须**原样透传**，不能再包一层 "copied" —— 否则
     // 响应会变成 {copied:{copied:[...]}}，与 Tauri 通道及前端 CopyResult[] 契约不一致。
-    match session::copy_sessions_for_switch_cross(source_region, region, &target, &session_ids) {
+    // webui 侧没有进度事件通道，逐会话进度传 None（复制本身的时间优化不受影响）。
+    match session::copy_sessions_for_switch_cross(
+        source_region,
+        region,
+        None,
+        &target,
+        &session_ids,
+    ) {
         Some(report) => json_ok(report),
         None => json_ok(json!({
             "sourceUid": Value::Null,
@@ -1045,6 +3473,9 @@ fn checkin_status_item(account: &Value, mut status: Value) -> Value {
 }
 
 async fn api_credits(Json(body): Json<Value>) -> Response {
+    if let Err(error) = require_capability(Product::Workbuddy, capability::Capability::Credits) {
+        return json_err(error, StatusCode::FORBIDDEN);
+    }
     let region = parse_region(body.get("region").and_then(Value::as_str));
     let id = body.get("accountId").and_then(|v| v.as_str()).unwrap_or("");
     let Some(acc) = account::find_account_for(region, id) else {
@@ -1069,9 +3500,9 @@ async fn api_credit_statistics(RawQuery(query): RawQuery) -> Response {
 async fn api_token_statistics(RawQuery(query): RawQuery) -> Response {
     let filter = parse_region_filter(query_value(query.as_deref(), "region").as_deref());
     let days = query.as_deref().and_then(|value| {
-        value.split('&').find_map(|part| {
-            part.strip_prefix("days=")?.parse::<i64>().ok()
-        })
+        value
+            .split('&')
+            .find_map(|part| part.strip_prefix("days=")?.parse::<i64>().ok())
     });
     match tokio::task::spawn_blocking(move || token_stats::get_statistics_for_filter(filter, days))
         .await
@@ -1085,6 +3516,9 @@ async fn api_token_statistics(RawQuery(query): RawQuery) -> Response {
 }
 
 async fn api_checkin(Json(body): Json<Value>) -> Response {
+    if let Err(error) = require_capability(Product::Workbuddy, capability::Capability::Checkin) {
+        return json_err(error, StatusCode::FORBIDDEN);
+    }
     let region = parse_region(body.get("region").and_then(Value::as_str));
     let id = body.get("accountId").and_then(|v| v.as_str()).unwrap_or("");
     let Some(acc) = account::find_account_for(region, id) else {
@@ -1095,7 +3529,11 @@ async fn api_checkin(Json(body): Json<Value>) -> Response {
 
 async fn api_checkin_all(Json(body): Json<Value>) -> Response {
     let region = parse_region(body.get("region").and_then(Value::as_str));
-    json_ok(checkin::run_checkin_all_for(region).await)
+    // P15 · 签到进悬浮窗（首尾两条；WB 侧没有逐账号进度事件）。
+    let task = observe_workbuddy_checkin_start(region);
+    let result = checkin::run_checkin_all_for(region).await;
+    observe_workbuddy_checkin_end(&task, region, &result);
+    json_ok(result)
 }
 
 /// GET /api/checkin/config —— 自动签到开关。
@@ -1126,6 +3564,9 @@ async fn api_checkin_logs() -> Response {
 /// 上游能力时按「该功能独立降级」处理：前端按 region 账号 id 过滤后自然为空，
 /// 不影响同页其它功能。已知缺口，见发布报告。
 async fn api_travel_status() -> Response {
+    if let Err(error) = require_capability(Product::Workbuddy, capability::Capability::Travel) {
+        return json_err(error, StatusCode::FORBIDDEN);
+    }
     travel::reconcile_due_travel(None).await;
     let items = account::load_accounts()
         .iter()
@@ -1206,7 +3647,9 @@ async fn api_rotate_logs() -> Response {
 
 /// GET /api/schedule/config —— 六类定时任务的排程配置。
 async fn api_schedule_config() -> Response {
-    json_ok(schedule::schedule_to_value(&schedule::load_schedule_config()))
+    json_ok(schedule::schedule_to_value(
+        &schedule::load_schedule_config(),
+    ))
 }
 
 /// POST /api/schedule/config —— 写排程配置；小时越界返回 400（错误文案指向对应 `*_enabled`）。
@@ -1292,7 +3735,10 @@ async fn api_growth_tasks_list(RawQuery(query): RawQuery) -> Response {
     if let Ok(mp) = tasks::list_tasks(&io, region, &acc, true).await {
         let seen: std::collections::HashSet<&str> =
             merged.iter().map(|t| t.task_code.as_str()).collect();
-        let fresh: Vec<_> = mp.into_iter().filter(|t| !seen.contains(t.task_code.as_str())).collect();
+        let fresh: Vec<_> = mp
+            .into_iter()
+            .filter(|t| !seen.contains(t.task_code.as_str()))
+            .collect();
         merged.extend(fresh);
     }
     json_ok(json!({ "ok": true, "tasks": merged }))
@@ -1409,6 +3855,9 @@ async fn api_gateway_config() -> Response {
 }
 
 async fn api_save_gateway_config(Json(body): Json<Value>) -> Response {
+    if let Err(error) = require_capability(Product::Workbuddy, capability::Capability::Gateway) {
+        return json_err(error, StatusCode::FORBIDDEN);
+    }
     let submitted = body.get("config").cloned().unwrap_or(body);
     let config: GatewayConfig = match serde_json::from_value(submitted) {
         Ok(config) => config,
@@ -1418,12 +3867,24 @@ async fn api_save_gateway_config(Json(body): Json<Value>) -> Response {
         return json_err(error, StatusCode::BAD_REQUEST);
     }
     let state = crate::gateway_host::shared_state();
+    let previous = state.config.read().await.clone();
     *state.config.write().await = config.clone();
     state.log.set_keep(config.log_keep);
     state.log.set_log_bodies(config.log_bodies);
-    let addr = match crate::gateway_host::apply().await {
-        Ok(addr) => addr,
-        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    // 只有监听相关字段变了才重新 apply（理由同桌面命令：纯策略改动不该因端口被占而失败）。
+    let listener_changed = previous.enabled != config.enabled
+        || previous.bind_addr != config.bind_addr
+        || previous.port != config.port
+        || previous.allow_non_loopback != config.allow_non_loopback;
+    let addr = if listener_changed {
+        match crate::gateway_host::apply().await {
+            Ok(addr) => addr,
+            Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+        }
+    } else if config.enabled {
+        Some(format!("{}:{}", config.bind_addr, config.port))
+    } else {
+        None
     };
     json_ok(json!({
         "ok": true,
@@ -1431,6 +3892,54 @@ async fn api_save_gateway_config(Json(body): Json<Value>) -> Response {
         "running": addr.is_some(),
         "addr": addr,
     }))
+}
+
+async fn api_risk_control_settings() -> Response {
+    match buddy_switch_core::modules::risk_control::load_settings() {
+        Ok(settings) => json_ok(json!(settings)),
+        Err(error) => json_err(error, StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn api_save_risk_control_settings(Json(body): Json<Value>) -> Response {
+    let submitted = body.get("settings").cloned().unwrap_or(body);
+    let settings: buddy_switch_core::modules::risk_control::RiskControlSettings =
+        match serde_json::from_value(submitted) {
+            Ok(settings) => settings,
+            Err(error) => {
+                return json_err(
+                    format!("风控设置格式错误：{error}"),
+                    StatusCode::BAD_REQUEST,
+                )
+            }
+        };
+    match buddy_switch_core::modules::risk_control::save_settings(&settings) {
+        Ok(()) => json_ok(json!(settings)),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// GET /api/proxy/status —— P12 C 路（base URL 重定向）的**只读状态**。
+///
+/// ⚠️ 只反映**本地标记**（用户是否按引导设过），**应用不校验代理是否真的生效**。
+async fn api_proxy_status() -> Response {
+    json_ok(proxy::status_view())
+}
+
+/// POST /api/proxy/enable —— 记下「用户已按引导设置」的本地标记（**不改系统设置**）。
+async fn api_proxy_enable() -> Response {
+    match proxy::set_enabled(true) {
+        Ok(()) => json_ok(proxy::status_view()),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/proxy/disable —— **一键还原**：清标记（删文件，不留残留）。
+async fn api_proxy_disable() -> Response {
+    match proxy::set_enabled(false) {
+        Ok(()) => json_ok(proxy::status_view()),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
 }
 
 async fn api_gateway_status() -> Response {
@@ -1441,15 +3950,193 @@ async fn api_gateway_status() -> Response {
     view.running = running;
     view.addr = addr;
     view.version = update::APP_VERSION.to_string();
+    // 账号池视图（五态 / 逐账号 / 诊断）：形状与 Trae 侧同源，管理面共用一张「账号池」卡。
+    let state = crate::gateway_host::shared_state();
+    {
+        let mut pool = state.pool.write().await;
+        // 先与账号库对齐：否则「刚导入、还没发过请求」的账号在池里不存在，页面显示空池。
+        buddy_switch_gateway::sync_pool_with_accounts(&mut pool);
+        view.fill_pool(&pool, buddy_switch_gateway::timeutil::now_ms());
+    }
+    // 最近一次请求失败的原因（与 Trae 侧同名同义）。
+    view.last_error = state.last_error.read().await.clone();
+
+    // ★ 顺手触发一次余额刷新 —— **不阻塞本响应**（在另一个任务里跑）。
+    //
+    // 账号是在本函数里刚被同步进池的（见上面的 `sync_pool_with_accounts`），此刻它们
+    // 多半「从未取过余额」；而周期循环下一轮要等满一个刷新间隔（默认 30 分钟）——
+    // 用户看到的就是「刚导入账号，页面上积分一直是『—』」（2026-09-30 实测：
+    // 19:54 起服务、20:24 才出现第一条读数）。
+    //
+    // 刷新器自带 `needs_refresh` 节流（阈值内不发请求），所以反复读状态**不会**打上游。
+    // 与「绝不在**推理请求**路径上拉余额」那条硬约束不冲突：这是管理面查询，
+    // 且取数在别的任务里跑，本响应不等它。
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let _ = buddy_switch_gateway::credits_refresh::refresh_once(&state).await;
+        });
+    }
     match serde_json::to_value(view) {
         Ok(value) => json_ok(value),
         Err(error) => json_err(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
+/// GET /api/gateway/pool/exclusions —— 该 region 的**排除账号**列表（`?region=cn|global`）。
+///
+/// 与 Tauri 命令 `gateway_pool_exclusions` **同一份实现**
+/// （`buddy_switch_gateway::routes::pool_admin::view`）—— 两个入口各写一遍必然漂移。
+async fn api_gateway_pool_exclusions(
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let region = parse_region(query.get("region").map(String::as_str));
+    json_ok(buddy_switch_gateway::routes::pool_admin::view(region))
+}
+
+/// POST /api/gateway/pool/exclusions —— 设置 / 取消排除（`{region?, uid, excluded, note?}`）。
+///
+/// 落盘 + 刷新池内快照 + 按 uid 解绑粘性，三件事收在 `pool_admin::set`（唯一实现）。
+async fn api_gateway_set_pool_exclusion(Json(body): Json<Value>) -> Response {
+    let uid = body.get("uid").and_then(Value::as_str).unwrap_or("").trim();
+    if uid.is_empty() {
+        return json_err("缺少 uid".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let excluded = body
+        .get("excluded")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let note = body.get("note").and_then(Value::as_str).unwrap_or("");
+    let region = parse_region(body.get("region").and_then(Value::as_str));
+
+    let state = crate::gateway_host::shared_state();
+    match buddy_switch_gateway::routes::pool_admin::set(&state, region, uid, excluded, note).await {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/gateway/pool/revive —— **人工解除**账号池里某账号的禁用（`{uid}`）。
+///
+/// 与「API Key 的恢复」同构：`disabled` 是**终态且落盘持久化**，而改造前它
+/// **没有任何出口** —— 余额刷新被 `if entry.disabled` 挡住，`PoolEntry::revive`
+/// 在生产代码里零调用点（详见 `buddy_switch_gateway::pool::Pool::revive` 的文档）。
+///
+/// 幂等：账号本来可用时返回 `{ok:true,revived:false}` 而**不报错** —— 并发点两次、
+/// 或界面状态陈旧，都不该变成一个错误弹窗。
+///
+/// 「不在池中」是**真错误**（400）：那说明 uid 写错了或账号已被删除，
+/// 静默返回成功会让用户以为修好了。
+async fn api_gateway_revive_account(Json(body): Json<Value>) -> Response {
+    let uid = body.get("uid").and_then(Value::as_str).unwrap_or("").trim();
+    if uid.is_empty() {
+        return json_err("缺少 uid".to_string(), StatusCode::BAD_REQUEST);
+    }
+
+    let state = crate::gateway_host::shared_state();
+    let mut pool = state.pool.write().await;
+    // 先与账号库对齐：否则「刚导入、还没发过请求」的账号在池里根本不存在，
+    // 而界面刚刚明明显示过它 —— 用户会拿到一句莫名其妙的「不在池中」。
+    buddy_switch_gateway::sync_pool_with_accounts(&mut pool);
+    if pool.get(uid).is_none() {
+        return json_err(
+            format!("账号 {uid} 不在账号池中（可能已被删除）"),
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    let revived = pool.revive(uid);
+    drop(pool);
+    let risk_recovered_cn = match buddy_switch_gateway::risk_controls::recover_account(
+        &state.risk_store,
+        "workbuddy",
+        "cn",
+        uid,
+    ) {
+        Ok(()) => true,
+        Err(error) => return json_err(error, StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    let risk_recovered_global = match buddy_switch_gateway::risk_controls::recover_account(
+        &state.risk_store,
+        "workbuddy",
+        "global",
+        uid,
+    ) {
+        Ok(()) => true,
+        Err(error) => return json_err(error, StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    json_ok(
+        json!({ "ok": true, "revived": revived, "risk_recovered": risk_recovered_cn || risk_recovered_global }),
+    )
+}
+
+async fn api_gateway_risk_recover(Json(body): Json<Value>) -> Response {
+    let platform = body
+        .get("platform")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let region = body
+        .get("region")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let uid = body.get("uid").and_then(Value::as_str).unwrap_or("").trim();
+    let product = match platform.as_str() {
+        "workbuddy" => Product::Workbuddy,
+        "trae" => Product::Trae,
+        "qoder" => Product::Qoder,
+        _ => {
+            return json_err(
+                "platform 只支持 workbuddy、trae、qoder".into(),
+                StatusCode::BAD_REQUEST,
+            )
+        }
+    };
+    if let Err(error) = require_capability(product, capability::Capability::Gateway) {
+        return json_err(error, StatusCode::FORBIDDEN);
+    }
+    if uid.is_empty() || !matches!(region.as_str(), "cn" | "global") {
+        return json_err(
+            "platform/region/uid 参数无效".into(),
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    let store = match platform.as_str() {
+        "workbuddy" => crate::gateway_host::shared_state().risk_store,
+        "trae" => crate::trae_gateway_host::shared_state().risk_store,
+        "qoder" => crate::qoder_gateway_host::shared_state().risk_store,
+        _ => unreachable!(),
+    };
+    match buddy_switch_gateway::risk_controls::recover_account(&store, &platform, &region, uid) {
+        Ok(recovered) => json_ok(
+            json!({ "ok": true, "recovered": recovered, "platform": platform, "region": region, "uid": uid }),
+        ),
+        Err(error) => json_err(error, StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/gateway/open-data-dir —— 打开 **WorkBuddy 客户端**的数据目录（`{region?}`）。
+///
+/// 形状（`{ok,path}` 或结构化 `Unsupported`）由 `capability::open_workbuddy_data_dir` 唯一产出，
+/// 与 Trae 侧的 `open_trae_data_dir` 同形。
+async fn api_gateway_open_data_dir(Json(body): Json<Value>) -> Response {
+    let region = parse_region(body.get("region").and_then(Value::as_str));
+    match buddy_switch_core::modules::capability::open_workbuddy_data_dir(region) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
 async fn api_gateway_list_keys() -> Response {
     let state = crate::gateway_host::shared_state();
-    let keys: Vec<Value> = state.keys.list().iter().map(|record| record.masked()).collect();
+    let keys: Vec<Value> = state
+        .keys
+        .list()
+        .iter()
+        .map(|record| record.masked())
+        .collect();
     json_ok(json!({ "keys": keys }))
 }
 
@@ -1463,14 +4150,54 @@ async fn api_gateway_create_key(Json(body): Json<Value>) -> Response {
         .filter(|name| !name.is_empty())
         .unwrap_or("未命名")
         .to_string();
-    let (record, plaintext) = state.keys.create(name, region);
+    let (record, plaintext) =
+        match state
+            .keys
+            .create_with_key(name, region, custom_key_from_body(&body))
+        {
+            Ok(pair) => pair,
+            // 自定义密钥与台账里已有的 Key 撞车 ⇒ 400，把占用者名字原样带给前端。
+            Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+        };
+    // ★ 「接入即识别」（P10 §1.6 / ✅ #6）：同桌面端 —— 创建 Key 成功后**后台探测**该 region
+    // （复用全仓唯一探测入口 `catalog_probe::probe_region`，它只用本 region 的凭据）。
+    // fire-and-forget：探测失败不得阻断接入（§3.17.1 规则 3）；服务端已在 tokio 上下文，
+    // 故用 `tokio::spawn`（桌面端因无该上下文改用 `tauri::async_runtime::spawn`）。
+    // 顺序不可颠倒：先落 Key、再触发探测。
+    tokio::spawn(async move {
+        let _ = buddy_switch_gateway::catalog_probe::probe_region(&state, region).await;
+    });
     json_ok(json!({ "ok": true, "key": plaintext, "record": record.masked() }))
+}
+
+/// POST /api/gateway/keys/plaintext —— 用户点「保存到本软件」后把明文写入台账。
+///
+/// 创建时**不落盘**明文，本接口是唯一入口；后端校验 `sha256` 与记录一致才写。
+/// 四个产品线同形：空 id / 空明文一律由 `save_plaintext` 兜底报错，不在 handler 里各判一遍。
+async fn api_gateway_save_key_plaintext(Json(body): Json<Value>) -> Response {
+    let state = crate::gateway_host::shared_state();
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("");
+    let plaintext = body.get("plaintext").and_then(Value::as_str).unwrap_or("");
+    match state.keys.save_plaintext(id, plaintext) {
+        Ok(()) => json_ok(json!({ "ok": true })),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
 }
 
 async fn api_gateway_revoke_key(Json(body): Json<Value>) -> Response {
     let state = crate::gateway_host::shared_state();
     let id = body.get("id").and_then(Value::as_str).unwrap_or("");
     match state.keys.revoke(id) {
+        Ok(()) => json_ok(json!({ "ok": true })),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/gateway/keys/restore —— 撤销吊销（清 `revoked_at`，Key 重新可用）。
+async fn api_gateway_restore_key(Json(body): Json<Value>) -> Response {
+    let state = crate::gateway_host::shared_state();
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("");
+    match state.keys.restore(id) {
         Ok(()) => json_ok(json!({ "ok": true })),
         Err(error) => json_err(error, StatusCode::BAD_REQUEST),
     }
@@ -1485,6 +4212,62 @@ async fn api_gateway_delete_key(Json(body): Json<Value>) -> Response {
     }
 }
 
+/// POST /api/gateway/keys/policy —— 更新某把 Key 的策略（配额 + 账号范围）。
+///
+/// ★ 入参是**完整策略**（不是补丁）：两个 radio 必选其一由前端抽屉保证，
+/// 后端不猜「用户是不是想只改一半」。矛盾值（不限额却带上限）由
+/// [`KeyPolicy::normalized`] 收敛到安全的一边，空白名单直接拒绝。
+async fn api_gateway_set_key_policy(Json(body): Json<Value>) -> Response {
+    use buddy_switch_gateway::apikey::KeyPolicy;
+    let state = crate::gateway_host::shared_state();
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("");
+    let policy: KeyPolicy =
+        match serde_json::from_value(body.get("policy").cloned().unwrap_or(Value::Null)) {
+            Ok(policy) => policy,
+            Err(error) => {
+                return json_err(format!("策略字段不合法: {error}"), StatusCode::BAD_REQUEST)
+            }
+        };
+    match state.keys.update_policy(id, policy) {
+        Ok(()) => json_ok(json!({ "ok": true })),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// GET /api/gateway/keys/usage?id=… —— 读某把 Key 的用量快照（累计 + 本周期）。
+///
+/// 与 `list` 分开的理由：用量是**每请求写**的账本，让列表命令每次多读一个文件
+/// 不划算；且用量只在打开抽屉/展开行时才需要。
+async fn api_gateway_key_usage(RawQuery(query): RawQuery) -> Response {
+    let state = crate::gateway_host::shared_state();
+    let id = query_value(query.as_deref(), "id").unwrap_or_default();
+    if id.is_empty() {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let now = buddy_switch_core::modules::config::now_ms();
+    let Some(record) = state.keys.list().into_iter().find(|record| record.id == id) else {
+        return json_err("API Key 不存在".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let usage = state.key_usage.snapshot(&id);
+    let used = state
+        .key_usage
+        .used_for(&id, record.quota_unit, record.quota_period, now);
+    json_ok(json!({
+        "ok": true,
+        "keyId": id,
+        "unit": record.quota_unit,
+        "period": record.quota_period,
+        "periodKey": record.quota_period.period_key(now),
+        "used": used,
+        // 累计用量按**同一个口径**取（`KeyUsage` 现在是两个口径各自一份计数，
+        // 没有单一的 `total` —— 见 `key_usage::KeyUsage` 的文档）。
+        "total": usage
+            .as_ref()
+            .map(|entry| entry.counters(record.quota_unit).total)
+            .unwrap_or(0),
+    }))
+}
+
 async fn api_gateway_models(RawQuery(query): RawQuery) -> Response {
     let region = parse_region(query_value(query.as_deref(), "region").as_deref());
     let state = crate::gateway_host::shared_state();
@@ -1494,7 +4277,11 @@ async fn api_gateway_models(RawQuery(query): RawQuery) -> Response {
         .refresh_catalog(region)
         .await
         .unwrap_or_else(|| state.catalogs.current(region));
-    json_ok(serde_json::to_value(snapshot).unwrap_or(Value::Null))
+    let max_context = state.config.read().await.max_context;
+    json_ok(buddy_switch_gateway::routes::models::snapshot_view(
+        &snapshot,
+        max_context,
+    ))
 }
 
 async fn api_gateway_refresh_models(Json(body): Json<Value>) -> Response {
@@ -1529,10 +4316,13 @@ async fn api_gateway_save_strategy(Json(body): Json<Value>) -> Response {
         }
         clone
     });
-    let strategy: buddy_switch_gateway::AccountStrategy = match serde_json::from_value(strategy_value) {
-        Ok(strategy) => strategy,
-        Err(error) => return json_err(format!("策略格式错误: {error}"), StatusCode::BAD_REQUEST),
-    };
+    let strategy: buddy_switch_gateway::AccountStrategy =
+        match serde_json::from_value(strategy_value) {
+            Ok(strategy) => strategy,
+            Err(error) => {
+                return json_err(format!("策略格式错误: {error}"), StatusCode::BAD_REQUEST)
+            }
+        };
     {
         let mut strategies = state.strategies.write().await;
         strategies.insert(region, strategy);
@@ -1541,6 +4331,265 @@ async fn api_gateway_save_strategy(Json(body): Json<Value>) -> Response {
         }
     }
     json_ok(json!({ "ok": true }))
+}
+
+/// GET /api/gateway/disabled-models —— 某**作用域**被用户禁用的模型 id 列表（P11）。
+///
+/// 读的是**进程内唯一**的禁用存储（[`buddy_switch_gateway::disabled_models::shared`]），
+/// 即三个网关的出口此刻真正在用的那一份 —— 命令面与出口同源。
+///
+/// ⚠️ 键是**作用域**（`wb-cn` / `trae-global` / `qoder-cn` …），不是裸 region ——
+/// 三个平台互不相通的模型目录各自分家（2026-10-15 升级，含旧键迁移）。
+async fn api_gateway_disabled_models(RawQuery(query): RawQuery) -> Response {
+    let scope = match resolve_scope_param(query_value(query.as_deref(), "scope").as_deref()) {
+        Ok(scope) => scope,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let store = buddy_switch_gateway::disabled_models::shared();
+    let disabled = store.read().await;
+    let ids: Vec<String> = disabled.get(scope).iter().cloned().collect();
+    json_ok(json!({ "scope": scope.as_str(), "ids": ids }))
+}
+
+/// POST /api/gateway/disabled-models —— 置位 / 清位某**作用域**的一个模型（`{scope, modelId, disabled}`）。
+///
+/// ⚠️ `modelId` **必须带 camelCase 双读**（`modelId` → `model_id`）：前端经 `call()` 原样发
+/// camelCase，只读 snake 会造成**静默 no-op**（`set` 收空 id ⇒ `changed:false` 但前端仍乐观
+/// 翻转本地集合 = 假开关）。与 `accountId` / `bizNamespace` 的既有双读同一手法。
+///
+/// `set` 幂等：重复置位 / 清位不改集合、不落盘，`changed: false`。
+async fn api_gateway_set_model_disabled(Json(body): Json<Value>) -> Response {
+    let scope = match resolve_scope_param(body.get("scope").and_then(Value::as_str)) {
+        Ok(scope) => scope,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let model_id = body
+        .get("modelId")
+        .or_else(|| body.get("model_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let disabled = body
+        .get("disabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let store = buddy_switch_gateway::disabled_models::shared();
+    let changed = {
+        let mut guard = store.write().await;
+        let changed = guard.set(scope, model_id, disabled);
+        if changed {
+            if let Err(error) = guard.save() {
+                return json_err(error, StatusCode::BAD_REQUEST);
+            }
+        }
+        changed
+    };
+    json_ok(json!({
+        "ok": true,
+        "scope": scope.as_str(),
+        "model_id": model_id.trim(),
+        "disabled": disabled,
+        "changed": changed,
+    }))
+}
+
+/// 某作用域降级链的视图 JSON。
+///
+/// **与 Tauri 命令共用同一份派生**（`model_fallback::build_view`）—— 两个管理面
+/// （桌面 / WebUI）如果各拼一份，状态点迟早会在两边给出不同结论。
+async fn fallback_view_json(scope: buddy_switch_core::modules::product::Scope) -> Value {
+    let state = crate::gateway_host::shared_state();
+    let fb = state.fallback.read().await.clone();
+    let disabled = state.disabled.read().await.clone();
+    let gates: Vec<(String, i64)> = {
+        let pool = state.pool.read().await;
+        pool.model_gates()
+            .iter()
+            .map(|gate| (gate.model.clone(), gate.until_ms))
+            .collect()
+    };
+    let refs: Vec<(&str, i64)> = gates
+        .iter()
+        .map(|(model, until)| (model.as_str(), *until))
+        .collect();
+    let view = buddy_switch_gateway::model_fallback::build_view(
+        &fb,
+        &disabled,
+        scope,
+        &state.catalogs,
+        &refs,
+        buddy_switch_gateway::timeutil::now_ms(),
+    );
+    serde_json::to_value(view).unwrap_or(Value::Null)
+}
+
+/// GET /api/gateway/model-fallback —— 某作用域的降级链（含备选**实时**健康态）。
+async fn api_gateway_model_fallback(RawQuery(query): RawQuery) -> Response {
+    let scope = match resolve_scope_param(query_value(query.as_deref(), "scope").as_deref()) {
+        Ok(scope) => scope,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    json_ok(fallback_view_json(scope).await)
+}
+
+/// POST /api/gateway/model-fallback —— 保存某作用域的降级链（**立即生效**）。
+///
+/// `config` 是**整作用域覆盖**（与 Tauri 命令同一语义）：前端提交时必须把其它链带上。
+async fn api_save_gateway_model_fallback(Json(body): Json<Value>) -> Response {
+    let scope = match resolve_scope_param(body.get("scope").and_then(Value::as_str)) {
+        Ok(scope) => scope,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let raw = body.get("config").cloned().unwrap_or(Value::Null);
+    let parsed: buddy_switch_gateway::model_fallback::ScopeFallback =
+        match serde_json::from_value(raw) {
+            Ok(value) => value,
+            Err(error) => {
+                return json_err(format!("降级链格式错误: {error}"), StatusCode::BAD_REQUEST)
+            }
+        };
+    let normalized = buddy_switch_gateway::model_fallback::normalize(scope, parsed);
+    let store = buddy_switch_gateway::model_fallback::shared();
+    {
+        let mut guard = store.write().await;
+        guard.set_scope(scope, normalized);
+        // 写失败必须回传：否则用户以为保存了，重启后配置又变回去。
+        if let Err(error) = guard.save() {
+            return json_err(error, StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+    json_ok(fallback_view_json(scope).await)
+}
+
+/// GET /api/gateway/fallback-stats —— 某作用域近 `days` 天的降级统计（**落盘账本**）。
+async fn api_gateway_fallback_stats(RawQuery(query): RawQuery) -> Response {
+    let scope = match resolve_scope_param(query_value(query.as_deref(), "scope").as_deref()) {
+        Ok(scope) => scope,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let days = query_value(query.as_deref(), "days")
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(7);
+    json_ok(buddy_switch_gateway::model_fallback::stats_payload(
+        scope, days,
+    ))
+}
+
+/// POST /api/gateway/model-fallback/preview —— 保存前**预演**（**纯计算，零副作用**）。
+async fn api_preview_gateway_model_fallback(Json(body): Json<Value>) -> Response {
+    let scope = match resolve_scope_param(body.get("scope").and_then(Value::as_str)) {
+        Ok(scope) => scope,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let from = body.get("from").and_then(Value::as_str).unwrap_or("");
+    let targets: Vec<String> = body
+        .get("targets")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let state = crate::gateway_host::shared_state();
+    let now = buddy_switch_gateway::timeutil::now_ms();
+    let disabled = state.disabled.read().await.clone();
+    let gates: Vec<(String, i64)> = {
+        let pool = state.pool.read().await;
+        pool.model_gates()
+            .iter()
+            .map(|gate| (gate.model.clone(), gate.until_ms))
+            .collect()
+    };
+    let refs: Vec<(&str, i64)> = gates
+        .iter()
+        .map(|(model, until)| (model.as_str(), *until))
+        .collect();
+    json_ok(buddy_switch_gateway::model_fallback::preview_payload(
+        scope, from, &targets, &disabled, &refs, now,
+    ))
+}
+
+/// GET /api/gateway/model-image-caps —— 某**作用域**被用户手动指定的图片能力覆盖（issue #101）。
+///
+/// 形状 `{ scope, caps: { "<模型 id>": true|false } }`：**缺失的键 = 跟随上游**。
+/// 读的是进程内唯一存储，与三条产品线 `/v1/models` 的声明同源。
+async fn api_gateway_model_image_caps(RawQuery(query): RawQuery) -> Response {
+    let scope = match resolve_scope_param(query_value(query.as_deref(), "scope").as_deref()) {
+        Ok(scope) => scope,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let caps = match tokio::task::spawn_blocking(move || {
+        buddy_switch_gateway::model_capability::overrides_of(scope)
+    })
+    .await
+    {
+        Ok(caps) => caps,
+        Err(error) => {
+            return json_err(
+                format!("读取图片能力失败: {error}"),
+                StatusCode::BAD_REQUEST,
+            )
+        }
+    };
+    json_ok(json!({ "scope": scope.as_str(), "caps": caps }))
+}
+
+/// POST /api/gateway/model-image-caps —— 指定 / 清除某作用域一个模型的图片能力覆盖。
+///
+/// `supports`：`true` / `false` = 手动指定；**`null` = 还原上游声明**（删键，不是写 `false`）。
+/// ⚠️ `modelId` 按 camelCase 读（与前端 `call()` 原样发送的键一致）；只读 snake 会造成
+/// 静默 no-op —— 与 `api_gateway_set_model_disabled` 同一手法。
+async fn api_gateway_set_model_image_cap(Json(body): Json<Value>) -> Response {
+    let scope = match resolve_scope_param(body.get("scope").and_then(Value::as_str)) {
+        Ok(scope) => scope,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let model_id = body
+        .get("modelId")
+        .or_else(|| body.get("model_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if model_id.is_empty() {
+        return json_err("模型 id 不能为空".to_string(), StatusCode::BAD_REQUEST);
+    }
+    // `supports` 允许**显式 null**（= 还原上游）⇒ 不能把「缺失」当 `false`。
+    let supports = match body.get("supports") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(value)) => Some(*value),
+        Some(_) => {
+            return json_err(
+                "`supports` 只能是 true / false / null".to_string(),
+                StatusCode::BAD_REQUEST,
+            )
+        }
+    };
+    // 闭包要 `move` 走 id，但响应体还要回显它 ⇒ 先克隆一份给闭包。
+    let id_for_save = model_id.clone();
+    let changed = match tokio::task::spawn_blocking(move || {
+        buddy_switch_gateway::model_capability::set_and_save(scope, &id_for_save, supports)
+    })
+    .await
+    {
+        Ok(Ok(changed)) => changed,
+        Ok(Err(error)) => return json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => {
+            return json_err(
+                format!("保存图片能力失败: {error}"),
+                StatusCode::BAD_REQUEST,
+            )
+        }
+    };
+    json_ok(json!({
+        "ok": true,
+        "scope": scope.as_str(),
+        "model_id": model_id,
+        "supports": supports,
+        "changed": changed,
+    }))
 }
 
 async fn api_gateway_logs() -> Response {
@@ -1552,6 +4601,97 @@ async fn api_gateway_clear_logs() -> Response {
     let state = crate::gateway_host::shared_state();
     state.log.clear();
     json_ok(json!({ "ok": true }))
+}
+
+/// POST /api/gateway/probe/start —— 启动一轮「账号 × 模型」限流探测（异步作业）。
+///
+/// 形状照抄 `src-tauri/src/commands.rs::probe_start`：`start` 只**建作业**（原子抢占作业位），
+/// 逐格执行由 [`buddy_switch_gateway::model_probe::run`] 在后台任务里完成。
+///
+/// ★ **拿到 `Ok` 后必须 spawn `run`**：作业位是 `compare_exchange` 原子抢占的，
+/// 不 spawn 会让它一直占着 —— 之后所有 `start` 都报「已有探测在进行中」。
+/// 服务端已在 tokio 上下文，故用 `tokio::spawn`（桌面端改用 `tauri::async_runtime::spawn`）。
+///
+/// `uids` / `models` **缺省 = 用池里的全部账号 / 该作用域目录**（与 `start` 的 `Option` 语义一致）；
+/// 显式传空数组则走到 `start` 的「没有选中任何账号 / 没有可探测的模型」校验。
+///
+/// ★ `cells`（**显式格清单**）与那两根轴**互斥**：给了它就只探点名的格（账号页台账卡走这条）。
+///
+/// ★ **作用域参数化**：入参从 `region` 升级为 `scope`（`wb-cn` / `qoder-cn` …）。
+/// `target_for_scope` 是 **fail-closed** 解析（未知 / 拼错 ⇒ 可读错误），并据作用域挑出对应平台的目标。
+async fn api_probe_start(Json(body): Json<Value>) -> Response {
+    let scope = body
+        .get("scope")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let target = match buddy_switch_gateway::model_probe::target_for_scope(&scope) {
+        Ok(target) => target,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let uids: Option<Vec<String>> = body.get("uids").and_then(Value::as_array).map(|items| {
+        items
+            .iter()
+            .filter_map(|item| item.as_str().map(String::from))
+            .collect()
+    });
+    let models: Option<Vec<String>> = body.get("models").and_then(Value::as_array).map(|items| {
+        items
+            .iter()
+            .filter_map(|item| item.as_str().map(String::from))
+            .collect()
+    });
+    /* ★ 显式格清单（与 `uids` / `models` 互斥）：账号页台账卡只探点名的格。
+    逐项反序列化，坏项丢弃而不是整请求 400 —— 与 `uids` / `models` 的
+    `filter_map` 同款宽容度（前端偶尔会带 `null`）。 */
+    let cells: Option<Vec<buddy_switch_gateway::model_probe::ProbeStartCell>> =
+        body.get("cells").and_then(Value::as_array).map(|items| {
+            items
+                .iter()
+                .filter_map(|item| serde_json::from_value(item.clone()).ok())
+                .collect()
+        });
+    let adopt = body.get("adopt").and_then(Value::as_bool).unwrap_or(false);
+    match buddy_switch_gateway::model_probe::start(&target, uids, models, cells, adopt).await {
+        Ok(total) => {
+            tokio::spawn(buddy_switch_gateway::model_probe::run(target));
+            json_ok(json!({ "started": true, "total": total }))
+        }
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// GET /api/gateway/probe/status —— 探测作业快照（从未跑过时 `{ "phase": "idle" }`）。
+///
+/// `scope` 为**必填**（fail-closed）：作业槽是进程级全局，快照本身与作用域无关，但命令面
+/// 统一带 `scope`，未知 / 拼错的作用域一律拒绝（不静默接受）。
+async fn api_probe_status(RawQuery(query): RawQuery) -> Response {
+    let scope = query_value(query.as_deref(), "scope").unwrap_or_default();
+    if let Err(error) = resolve_scope_param(Some(&scope)) {
+        return json_err(error, StatusCode::BAD_REQUEST);
+    }
+    json_ok(buddy_switch_gateway::model_probe::status())
+}
+
+/// GET /api/gateway/probe/ledger —— 某作用域的**实测台账**（跨重启累积）。
+///
+/// 与 `/status` 的分工：`status` = 本轮作业（进度 / 相位）；本路由 = 这些格**最近一次**的
+/// 实判（落盘 `probe_results.json`，按作用域隔离）。账号页重启后仍要看到实测结论 ⇒ 读它。
+async fn api_probe_ledger(RawQuery(query): RawQuery) -> Response {
+    let scope = query_value(query.as_deref(), "scope").unwrap_or_default();
+    if let Err(error) = resolve_scope_param(Some(&scope)) {
+        return json_err(error, StatusCode::BAD_REQUEST);
+    }
+    json_ok(buddy_switch_gateway::model_probe::ledger_snapshot(&scope))
+}
+
+/// POST /api/gateway/probe/cancel —— 请求取消（逐格检查；已探到的格保留）。
+async fn api_probe_cancel(RawQuery(query): RawQuery) -> Response {
+    let scope = query_value(query.as_deref(), "scope").unwrap_or_default();
+    if let Err(error) = resolve_scope_param(Some(&scope)) {
+        return json_err(error, StatusCode::BAD_REQUEST);
+    }
+    json_ok(buddy_switch_gateway::model_probe::cancel())
 }
 
 // ---------------------------------------------------------------------------
@@ -1598,6 +4738,48 @@ async fn api_trae_credits(RawQuery(query): RawQuery) -> Response {
     json_ok(trae::handlers::credits_overview_for(variant))
 }
 
+/// GET /api/trae/checkin/status-map —— 逐账号「今日签到状态」（**只读**；issue #47）。
+///
+/// `scope` 决定区域（`trae-cn` / `trae-global`，**fail-closed**：缺失 / 拼错 ⇒ 400）；
+/// `accountIds` 是**逗号分隔**的 uid 列表（见 [`parse_id_list`]）；空 / 缺失 ⇒ `{}`
+/// （一次上游请求都不发）。未知 uid **不进** map —— 前端显示「—」，不是「未签到」。
+///
+/// ⚠️ 这是**读**：绝不在这里触发 claim（签到是写操作，走 `/api/trae/checkin`）。
+async fn api_trae_checkin_status_map(RawQuery(query): RawQuery) -> Response {
+    let variant = match trae_variant_from_scope_query(query.as_deref()) {
+        Ok(variant) => variant,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let ids = parse_id_list(query_value(query.as_deref(), "accountIds"));
+    json_ok(trae::checkin::status_map_for(variant, ids).await)
+}
+
+/// GET /api/trae/account/token-today —— 逐账号「今日 Token」（**只读**；issue #47）。
+///
+/// 形状与 WB 的 `/api/account/token-today` 同构；`clientSource: "unavailable"` 表示
+/// Trae 没有客户端会话落盘 ⇒ 客户端那一档**不可得**（不是 0）。见
+/// [`trae::token_stats::account_token_today`]。
+///
+/// 读网关日志是阻塞 IO ⇒ 放进 blocking 线程池。
+async fn api_trae_account_token_today(RawQuery(query): RawQuery) -> Response {
+    let variant = match trae_variant_from_scope_query(query.as_deref()) {
+        Ok(variant) => variant,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let force = query_flag_enabled(query.as_deref(), "force");
+    match tokio::task::spawn_blocking(move || {
+        trae::token_stats::account_token_today(variant, force)
+    })
+    .await
+    {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(
+            format!("读取今日 Token 失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
 /// GET /api/trae/token-stats —— Token 统计（`days` / `scope` 可选）。
 ///
 /// `scope` 为**变体范围**筛选维度：`work` / `cn` / `unlabeled` / `all`（缺省 `all`）。
@@ -1607,6 +4789,162 @@ async fn api_trae_token_statistics(RawQuery(query): RawQuery) -> Response {
         .map(|value| trae::token_stats::TraeTokenScope::parse(&value))
         .unwrap_or_default();
     json_ok(trae::handlers::token_statistics(days, scope))
+}
+
+/// GET /api/trae/client-import/probe —— 探测一个**用户自己导出的明文库**能否读。
+///
+/// 与 `src-tauri/src/commands.rs` 的 `probe_trae_client_db` **一一对应**。
+/// 只探测、不保存配置；`error.code` 决定界面文案（五种错误必须分开显示）。
+async fn api_trae_client_probe(RawQuery(query): RawQuery) -> Response {
+    let path = query_value(query.as_deref(), "path").unwrap_or_default();
+    let value = tokio::task::spawn_blocking(move || trae::client_import::probe(&path))
+        .await
+        .unwrap_or_else(|error| {
+            serde_json::json!({
+                "ok": false,
+                "path": "",
+                "error": { "code": "io", "message": format!("探测失败: {error}") },
+                "tables": [],
+            })
+        });
+    json_ok(value)
+}
+
+/// GET /api/trae/client-import/config —— 已保存的导入路径与「文件还在不在」。
+async fn api_trae_client_config() -> Response {
+    let value = tokio::task::spawn_blocking(|| {
+        let path = trae::client_import::configured_path();
+        let exists = path
+            .as_deref()
+            .map(|target| std::path::Path::new(target).is_file())
+            .unwrap_or(false);
+        serde_json::json!({ "path": path, "exists": exists })
+    })
+    .await
+    .unwrap_or_else(
+        |error| serde_json::json!({ "path": null, "exists": false, "error": error.to_string() }),
+    );
+    json_ok(value)
+}
+
+/// POST /api/trae/client-import/path —— 保存 / 清除导入路径（`path` 缺省或空串即清除）。
+async fn api_trae_save_client_path(Json(body): Json<Value>) -> Response {
+    let path = body
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let value = tokio::task::spawn_blocking(move || match path.as_deref() {
+        Some(target) => serde_json::json!({
+            "ok": trae::client_import::save_config(target),
+            "path": target,
+        }),
+        None => serde_json::json!({
+            "ok": trae::client_import::clear_config(),
+            "path": Value::Null,
+        }),
+    })
+    .await
+    .unwrap_or_else(
+        |error| serde_json::json!({ "ok": false, "path": null, "error": error.to_string() }),
+    );
+    json_ok(value)
+}
+
+/// POST /api/trae/client-import/unlock —— 用口令把**加密库**导出成明文副本。
+///
+/// 与 `src-tauri/src/commands.rs` 的 `unlock_trae_client_db` **一一对应**（同一套分支语义：
+/// `decrypted` / `plaintext` / `error`）。
+async fn api_trae_unlock_client_db(Json(body): Json<Value>) -> Response {
+    let path = body
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let passphrase = body
+        .get("passphrase")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    let value = tokio::task::spawn_blocking(move || {
+        let source = std::path::PathBuf::from(&path);
+        let plain = trae::client_import::plaintext_path();
+        let target = plain.to_string_lossy().to_string();
+        match buddy_switch_vault::verify(&source, &passphrase) {
+            Ok(info) => {
+                if let Err(error) =
+                    buddy_switch_vault::export_plaintext(&source, &passphrase, &plain)
+                {
+                    return serde_json::json!({
+                        "ok": false,
+                        "error": { "code": error.code(), "message": error.message() },
+                    });
+                }
+                let saved = trae::client_import::save_config(&target);
+                serde_json::json!({
+                    "ok": saved,
+                    "mode": "decrypted",
+                    "compatibility": info.compatibility,
+                    "tables": info.tables,
+                    "path": target,
+                    "probe": trae::client_import::probe(&target),
+                })
+            }
+            Err(buddy_switch_vault::VaultError::AlreadyPlaintext) => {
+                let saved = trae::client_import::save_config(&path);
+                serde_json::json!({
+                    "ok": saved,
+                    "mode": "plaintext",
+                    "path": path,
+                    "probe": trae::client_import::probe(&path),
+                })
+            }
+            Err(error) => serde_json::json!({
+                "ok": false,
+                "error": { "code": error.code(), "message": error.message() },
+            }),
+        }
+    })
+    .await
+    .unwrap_or_else(|error| {
+        serde_json::json!({
+            "ok": false,
+            "error": { "code": "io", "message": format!("解锁失败: {error}") },
+        })
+    });
+    json_ok(value)
+}
+
+/// GET /api/trae/client-usage —— 客户端账本（读导入的明文库）。
+///
+/// `path` 缺省时用已保存的路径；两者都没有 ⇒ `{ configured: false }`
+/// （**不是空统计**：「没导入」与「导入了但这段没用量」必须能分开）。
+async fn api_trae_client_usage(RawQuery(query): RawQuery) -> Response {
+    let path = query_value(query.as_deref(), "path").filter(|value| !value.trim().is_empty());
+    let days = query_value(query.as_deref(), "days").and_then(|value| value.parse::<i64>().ok());
+    let scope = query_value(query.as_deref(), "scope")
+        .map(|value| trae::token_stats::TraeTokenScope::parse(&value))
+        .unwrap_or_default();
+    let value = tokio::task::spawn_blocking(move || {
+        let target = path
+            .or_else(trae::client_import::configured_path)
+            .unwrap_or_default();
+        if target.trim().is_empty() {
+            return serde_json::json!({ "source": "trae-client", "configured": false });
+        }
+        trae::client_import::summarize(&target, days, scope)
+    })
+    .await
+    .unwrap_or_else(|error| {
+        serde_json::json!({
+            "source": "trae-client",
+            "error": { "code": "io", "message": format!("读取客户端账本失败: {error}") },
+        })
+    });
+    json_ok(value)
 }
 
 /// GET /api/trae/logs —— 运行日志（`kind` / `date` / `keyword` / `limit` / `variant` 均可选）。
@@ -1624,7 +4962,10 @@ async fn api_trae_logs(RawQuery(query): RawQuery) -> Response {
     });
     match tokio::task::spawn_blocking(move || trae::handlers::logs(&params)).await {
         Ok(value) => json_ok(value),
-        Err(error) => json_err(format!("读取日志失败: {error}"), StatusCode::INTERNAL_SERVER_ERROR),
+        Err(error) => json_err(
+            format!("读取日志失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
 }
 
@@ -1636,14 +4977,20 @@ async fn api_trae_profiles(RawQuery(query): RawQuery) -> Response {
     let variant = parse_trae_variant(query_value(query.as_deref(), "variant").as_deref());
     match tokio::task::spawn_blocking(move || trae::profile::overview_for(variant)).await {
         Ok(value) => json_ok(value),
-        Err(error) => json_err(format!("读取快照失败: {error}"), StatusCode::INTERNAL_SERVER_ERROR),
+        Err(error) => json_err(
+            format!("读取快照失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
 }
 
 async fn api_trae_settings() -> Response {
     match serde_json::to_value(trae::settings::load()) {
         Ok(value) => json_ok(value),
-        Err(error) => json_err(format!("读取设置失败: {error}"), StatusCode::INTERNAL_SERVER_ERROR),
+        Err(error) => json_err(
+            format!("读取设置失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
 }
 
@@ -1680,6 +5027,29 @@ async fn api_trae_update_account(Json(body): Json<Value>) -> Response {
     }
 }
 
+/// POST /api/trae/accounts/remark —— 设置账号备注（字段级更新）。
+///
+/// `remark` 是字符串：空串（或全空白）＝清空备注（后端删掉账号库里的 `remark` 键）。
+/// 与 `accounts/update` 分开，因为那条的 `name` 是「空串＝不动」——
+/// 两种语义挤进同一个参数位，迟早在某条路径上静默错一边。
+async fn api_trae_set_account_remark(Json(body): Json<Value>) -> Response {
+    let user_id = body.get("userId").and_then(Value::as_str).unwrap_or("");
+    if user_id.is_empty() {
+        return json_err("缺少 userId".to_string(), StatusCode::BAD_REQUEST);
+    }
+    // 缺 `remark` 键按空串处理：与「清空」同义，而不是报 400。
+    let remark = body
+        .get("remark")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let variant = parse_trae_variant(body.get("variant").and_then(Value::as_str));
+    match trae::handlers::set_remark_for(variant, user_id, Some(remark.as_str())) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
 async fn api_trae_delete_account(Json(body): Json<Value>) -> Response {
     let user_id = body.get("userId").and_then(Value::as_str).unwrap_or("");
     if user_id.is_empty() {
@@ -1698,7 +5068,10 @@ async fn api_trae_delete_account(Json(body): Json<Value>) -> Response {
     {
         Ok(Ok(value)) => json_ok(value),
         Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
-        Err(error) => json_err(format!("删除账号失败: {error}"), StatusCode::INTERNAL_SERVER_ERROR),
+        Err(error) => json_err(
+            format!("删除账号失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
 }
 
@@ -1712,7 +5085,8 @@ async fn api_trae_delete_account(Json(body): Json<Value>) -> Response {
 /// 保证旧调用点行为不变。
 async fn api_trae_import_local(Json(body): Json<Value>) -> Response {
     let variant = parse_trae_variant(body.get("variant").and_then(Value::as_str));
-    match tokio::task::spawn_blocking(move || trae::handlers::import_local_account_for(variant)).await
+    match tokio::task::spawn_blocking(move || trae::handlers::import_local_account_for(variant))
+        .await
     {
         Ok(Ok(value)) => json_ok(value),
         Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
@@ -1733,6 +5107,9 @@ async fn api_trae_import_local(Json(body): Json<Value>) -> Response {
 /// 变体必须**透传到 core**：授权 URL 的设备身份、会话归属、成功后落库的账号库
 /// 全部由它决定；在这里丢弃它会让两条产品线的登录互相串号。
 async fn api_trae_oauth_start(Json(body): Json<Value>) -> Response {
+    if let Err(error) = require_capability(Product::Trae, capability::Capability::Oauth) {
+        return json_err(error, StatusCode::FORBIDDEN);
+    }
     let variant = trae::handlers::parse_variant_param(&body);
     match trae::handlers::oauth_login_start_for(variant).await {
         Ok(value) => json_ok(value),
@@ -1777,11 +5154,15 @@ async fn api_trae_export_accounts(Json(body): Json<Value>) -> Response {
         })
         .unwrap_or_default();
     let variant = parse_trae_variant(body.get("variant").and_then(Value::as_str));
-    match tokio::task::spawn_blocking(move || trae::handlers::export_accounts_for(variant, &ids)).await
+    match tokio::task::spawn_blocking(move || trae::handlers::export_accounts_for(variant, &ids))
+        .await
     {
         Ok(Ok(value)) => json_ok(value),
         Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
-        Err(error) => json_err(format!("导出账号失败: {error}"), StatusCode::INTERNAL_SERVER_ERROR),
+        Err(error) => json_err(
+            format!("导出账号失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
 }
 
@@ -1810,7 +5191,10 @@ async fn api_trae_export_accounts_to_path(Json(body): Json<Value>) -> Response {
     {
         Ok(Ok(value)) => json_ok(value),
         Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
-        Err(error) => json_err(format!("导出账号失败: {error}"), StatusCode::INTERNAL_SERVER_ERROR),
+        Err(error) => json_err(
+            format!("导出账号失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
 }
 
@@ -1855,7 +5239,10 @@ async fn api_trae_import_accounts(Json(body): Json<Value>) -> Response {
     {
         Ok(Ok(value)) => json_ok(value),
         Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
-        Err(error) => json_err(format!("导入账号失败: {error}"), StatusCode::INTERNAL_SERVER_ERROR),
+        Err(error) => json_err(
+            format!("导入账号失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
 }
 
@@ -1895,15 +5282,33 @@ async fn api_trae_group_op(Json(body): Json<Value>) -> Response {
 /// 变体从 `options.variant` 解析（与其他端点「顶层 `variant`」不同：签到的入参
 /// 本就整体包在 `options` 里，再套一层顶层字段会让两条通道的契约分叉）。
 async fn api_trae_checkin(Json(body): Json<Value>) -> Response {
+    if let Err(error) = require_capability(Product::Trae, capability::Capability::Checkin) {
+        return json_err(error, StatusCode::FORBIDDEN);
+    }
     let options = body.get("options").cloned().unwrap_or(body);
     let parsed = match trae::handlers::parse_checkin_options(&options) {
         Ok(parsed) => parsed,
         Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
     };
-    json_ok(trae::handlers::run_checkin_report(parsed).await)
+    // P15 · 签到也进悬浮窗。⚠️ webui **没有事件通道** ⇒ 只能给首尾两条；
+    // 桌面侧（`commands.rs` 的 `trae_checkin`）有逐账号进度 —— 那是两条通道的
+    // **能力差异**，如实反映，不在这边编造中间进度。
+    let task = "trae-checkin";
+    agent_watch::record_local(
+        task,
+        "Trae 签到",
+        companion_state::CompanionState::Running,
+        config::now_ms(),
+    );
+    let report = trae::handlers::run_checkin_report(parsed).await;
+    observe_trae_checkin_summary(task, &report);
+    json_ok(report)
 }
 
 async fn api_trae_refresh_credits(Json(body): Json<Value>) -> Response {
+    if let Err(error) = require_capability(Product::Trae, capability::Capability::Credits) {
+        return json_err(error, StatusCode::FORBIDDEN);
+    }
     let user_id = body.get("userId").and_then(Value::as_str);
     let variant = parse_trae_variant(body.get("variant").and_then(Value::as_str));
     match trae::handlers::refresh_credits_for(variant, user_id).await {
@@ -1940,10 +5345,14 @@ async fn api_trae_save_login(Json(body): Json<Value>) -> Response {
     }
     let variant = trae::handlers::parse_variant_param(&body);
     let owned = user_id.to_string();
-    match tokio::task::spawn_blocking(move || trae::handlers::save_login_for(variant, &owned)).await {
+    match tokio::task::spawn_blocking(move || trae::handlers::save_login_for(variant, &owned)).await
+    {
         Ok(Ok(value)) => json_ok(value),
         Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
-        Err(error) => json_err(format!("保存登录态失败: {error}"), StatusCode::INTERNAL_SERVER_ERROR),
+        Err(error) => json_err(
+            format!("保存登录态失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
 }
 
@@ -1954,10 +5363,15 @@ async fn api_trae_backup_profile(Json(body): Json<Value>) -> Response {
     }
     let variant = trae::handlers::parse_variant_param(&body);
     let owned = user_id.to_string();
-    match tokio::task::spawn_blocking(move || trae::handlers::backup_profile_for(variant, &owned)).await {
+    match tokio::task::spawn_blocking(move || trae::handlers::backup_profile_for(variant, &owned))
+        .await
+    {
         Ok(Ok(value)) => json_ok(value),
         Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
-        Err(error) => json_err(format!("备份失败: {error}"), StatusCode::INTERNAL_SERVER_ERROR),
+        Err(error) => json_err(
+            format!("备份失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
 }
 
@@ -1968,10 +5382,15 @@ async fn api_trae_restore_profile(Json(body): Json<Value>) -> Response {
     }
     let variant = trae::handlers::parse_variant_param(&body);
     let owned = user_id.to_string();
-    match tokio::task::spawn_blocking(move || trae::handlers::restore_profile_for(variant, &owned)).await {
+    match tokio::task::spawn_blocking(move || trae::handlers::restore_profile_for(variant, &owned))
+        .await
+    {
         Ok(Ok(value)) => json_ok(value),
         Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
-        Err(error) => json_err(format!("恢复失败: {error}"), StatusCode::INTERNAL_SERVER_ERROR),
+        Err(error) => json_err(
+            format!("恢复失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
 }
 
@@ -1982,10 +5401,15 @@ async fn api_trae_delete_profile(Json(body): Json<Value>) -> Response {
     }
     let variant = trae::handlers::parse_variant_param(&body);
     let owned = slot.to_string();
-    match tokio::task::spawn_blocking(move || trae::handlers::delete_profile_for(variant, &owned)).await {
+    match tokio::task::spawn_blocking(move || trae::handlers::delete_profile_for(variant, &owned))
+        .await
+    {
         Ok(Ok(value)) => json_ok(value),
         Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
-        Err(error) => json_err(format!("删除快照失败: {error}"), StatusCode::INTERNAL_SERVER_ERROR),
+        Err(error) => json_err(
+            format!("删除快照失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
 }
 
@@ -2004,7 +5428,10 @@ async fn api_trae_switch(Json(body): Json<Value>) -> Response {
     .await
     {
         Ok(value) => json_ok(value),
-        Err(error) => json_err(format!("切换账号失败: {error}"), StatusCode::INTERNAL_SERVER_ERROR),
+        Err(error) => json_err(
+            format!("切换账号失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
 }
 
@@ -2014,7 +5441,10 @@ async fn api_trae_reset_device(Json(body): Json<Value>) -> Response {
     match tokio::task::spawn_blocking(move || trae::handlers::reset_device_for(variant)).await {
         Ok(Ok(value)) => json_ok(value),
         Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
-        Err(error) => json_err(format!("重置设备标识失败: {error}"), StatusCode::INTERNAL_SERVER_ERROR),
+        Err(error) => json_err(
+            format!("重置设备标识失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
 }
 
@@ -2041,8 +5471,14 @@ async fn api_doubao_detect_uid() -> Response {
 /// POST /api/doubao/accounts/save —— 保存/切换豆包账号。
 async fn api_doubao_account_save(Json(body): Json<Value>) -> Response {
     let user_id = body.get("userId").and_then(|v| v.as_str()).unwrap_or("");
-    let name = body.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let note = body.get("note").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let name = body
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let note = body
+        .get("note")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     match doubao::handlers::doubao_account_save(user_id.to_string(), name, note) {
         Ok(account) => json_ok(json!({ "account": account })),
         Err(error) => json_err(error, StatusCode::BAD_REQUEST),
@@ -2052,7 +5488,10 @@ async fn api_doubao_account_save(Json(body): Json<Value>) -> Response {
 /// DELETE /api/doubao/accounts —— 移除豆包账号。
 async fn api_doubao_account_remove(Json(body): Json<Value>) -> Response {
     let user_id = body.get("userId").and_then(|v| v.as_str()).unwrap_or("");
-    let remove_snapshot = body.get("removeSnapshot").and_then(|v| v.as_bool()).unwrap_or(false);
+    let remove_snapshot = body
+        .get("removeSnapshot")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     match doubao::handlers::doubao_account_remove(user_id.to_string(), remove_snapshot) {
         Ok(()) => json_ok(json!({ "ok": true })),
         Err(error) => json_err(error, StatusCode::BAD_REQUEST),
@@ -2193,11 +5632,16 @@ async fn api_trae_gateway_config() -> Response {
 }
 
 async fn api_save_trae_gateway_config(Json(body): Json<Value>) -> Response {
+    if let Err(error) = require_capability(Product::Trae, capability::Capability::Gateway) {
+        return json_err(error, StatusCode::FORBIDDEN);
+    }
     let submitted = body.get("config").cloned().unwrap_or(body);
     let config: buddy_switch_gateway::trae::TraeGatewayConfig =
         match serde_json::from_value(submitted) {
             Ok(config) => config,
-            Err(error) => return json_err(format!("配置格式错误: {error}"), StatusCode::BAD_REQUEST),
+            Err(error) => {
+                return json_err(format!("配置格式错误: {error}"), StatusCode::BAD_REQUEST)
+            }
         };
     if let Err(error) = config.save() {
         return json_err(error, StatusCode::BAD_REQUEST);
@@ -2240,7 +5684,22 @@ async fn api_trae_gateway_status(RawQuery(query): RawQuery) -> Response {
 /// 这里是 OpenAI `/v1/models` 形状的扁平去重清单。`variant` 缺失 / 未知 → 默认变体。
 async fn api_trae_gateway_models(RawQuery(query): RawQuery) -> Response {
     let variant = parse_trae_variant(query_value(query.as_deref(), "variant").as_deref());
-    json_ok(buddy_switch_gateway::trae::payload::models_response_for(variant))
+    // ★ 出口 ①（P11）：与 Trae 网关本体读**同一份** `disabled`（按**作用域**键控），
+    //   否则「管理面看到的清单」与「网关实际暴露的清单」会不一致。
+    let disabled = {
+        let store = buddy_switch_gateway::disabled_models::shared();
+        let guard = store.read().await;
+        guard
+            .get(buddy_switch_core::modules::product::scope_of_trae_region(
+                variant.region(),
+            ))
+            .clone()
+    };
+    buddy_switch_gateway::trae::catalog::ensure_fresh(variant).await;
+    let max_mode = buddy_switch_gateway::trae::TraeGateway::shared_state().max_mode_now();
+    json_ok(buddy_switch_gateway::trae::payload::models_response_for(
+        variant, &disabled, max_mode,
+    ))
 }
 
 /// GET /api/trae/gateway/client-models —— 客户端（**上游下发**）的模型清单。
@@ -2256,6 +5715,43 @@ async fn api_trae_client_models(RawQuery(query): RawQuery) -> Response {
     )
 }
 
+/// POST /api/trae/gateway/client-models/refresh —— 直连上游抓一次清单（issue #173）。
+///
+/// ## opt-in，不是后台轮询
+///
+/// 每次调用都是**一次带账号凭据的上游请求**，所以只由用户的显式动作触发
+/// （管理面模型卡的「从上游拉取」）。挂到渲染路径或定时器上 = 替用户花上游成本，
+/// 与本仓「打上游默认关」的纪律冲突（见 `credit-refresh-pref`）。
+///
+/// ## 返回形状与 GET 一致
+///
+/// 成功返回抓完后的清单（`source = "upstream"`）；失败返回 `source = "missing"` +
+/// 可读原因 —— 前端一次渲染即可，不必为两条通道各写一套错误处理。
+///
+/// 失败**不影响**已有数据：抓取只是给缓存换新，客户端缓存仍然照读。
+async fn api_trae_refresh_client_models(Json(body): Json<Value>) -> Response {
+    if let Err(error) = require_capability(Product::Trae, capability::Capability::Gateway) {
+        return json_err(error, StatusCode::FORBIDDEN);
+    }
+    let variant = parse_trae_variant(body.get("variant").and_then(Value::as_str));
+    match trae::model_list_upstream::refresh(variant).await {
+        Ok(_) => json_ok(
+            serde_json::to_value(trae::model_list::read_client_model_list(variant))
+                .unwrap_or_else(|error| json!({ "source": "missing", "note": error.to_string() })),
+        ),
+        // 抓取失败的**唯一出口**：把原因原样交给界面（含「缺请求头 / 版本过期」的提示），
+        // 不把「上游没回」包装成「没有模型」。
+        Err(error) => json_ok(json!({
+            "variant": variant.as_str(),
+            "variantLabel": variant.display_name(),
+            "source": "missing",
+            "readAt": buddy_switch_core::modules::config::now_ms(),
+            "groups": [],
+            "note": error,
+        })),
+    }
+}
+
 /// GET /api/trae/gateway/keys —— 多 Key 列表（形状与 Tauri 命令逐字一致）。
 ///
 /// **形状唯一来源**：直接调 gateway crate 的 `apikey::list_response`，
@@ -2267,9 +5763,14 @@ async fn api_trae_list_api_keys() -> Response {
     ))
 }
 
-/// POST /api/trae/gateway/keys —— 新建 Key（`{name, variant}`）。
+/// POST /api/trae/gateway/keys —— 新建 Key（`{name, variant, customKey?}`）。
 ///
-/// 明文仅此一次返回；`variant` 缺省 / 未知 → 默认变体（TraeWork）。
+/// 明文仅随本次响应返回（不落盘，等用户在面板里选「保存到本软件」）；
+/// `variant` 缺省 / 未知 → 默认变体（TraeWork）；`customKey` 非空 → 原样使用。
+///
+/// 自定义密钥撞车 ⇒ **400 + `{ok:false,error}`**：与 WB / Qoder / Unified 三条
+/// 产品线的 HTTP 口径一致（它们都是 `Err ⇒ json_err(…, BAD_REQUEST)`）。
+/// 桌面端走 IPC、没有状态码，仍沿用 `{ok:false,error}`（见 `create_response_with_key`）。
 async fn api_trae_create_api_key(Json(body): Json<Value>) -> Response {
     let name = body
         .get("name")
@@ -2280,11 +5781,26 @@ async fn api_trae_create_api_key(Json(body): Json<Value>) -> Response {
         .to_string();
     let variant = parse_trae_variant(body.get("variant").and_then(Value::as_str));
     let state = crate::trae_gateway_host::shared_state();
-    json_ok(buddy_switch_gateway::trae::apikey::create_response(
+    match buddy_switch_gateway::trae::apikey::create_result_with_key(
         &state.key_store,
         name,
         variant,
-    ))
+        custom_key_from_body(&body),
+    ) {
+        Ok(payload) => json_ok(payload),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/trae/gateway/keys/plaintext —— 用户点「保存到本软件」后把明文写入台账。
+async fn api_trae_save_api_key_plaintext(Json(body): Json<Value>) -> Response {
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("");
+    let plaintext = body.get("plaintext").and_then(Value::as_str).unwrap_or("");
+    let state = crate::trae_gateway_host::shared_state();
+    match state.key_store.save_plaintext(id, plaintext) {
+        Ok(()) => json_ok(json!({ "ok": true })),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
 }
 
 /// POST /api/trae/gateway/keys/revoke —— 吊销 Key（`{id}`）。
@@ -2295,6 +5811,82 @@ async fn api_trae_revoke_api_key(Json(body): Json<Value>) -> Response {
     }
     let state = crate::trae_gateway_host::shared_state();
     match state.key_store.revoke(id) {
+        Ok(()) => json_ok(json!({ "ok": true })),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/trae/gateway/keys/policy —— 更新某把 Trae Key 的策略（issue #76）。
+///
+/// 与 WB 侧同形：入参是**完整策略**（非补丁），矛盾值由 `KeyPolicy::normalized`
+/// 收敛到安全的一边，空白名单拒绝。
+async fn api_trae_set_key_policy(Json(body): Json<Value>) -> Response {
+    use buddy_switch_gateway::apikey::KeyPolicy;
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("").trim();
+    if id.is_empty() {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let policy: KeyPolicy =
+        match serde_json::from_value(body.get("policy").cloned().unwrap_or(Value::Null)) {
+            Ok(policy) => policy,
+            Err(error) => {
+                return json_err(format!("策略字段不合法: {error}"), StatusCode::BAD_REQUEST)
+            }
+        };
+    let state = crate::trae_gateway_host::shared_state();
+    match state.key_store.update_policy(id, policy) {
+        Ok(()) => json_ok(json!({ "ok": true })),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// GET /api/trae/gateway/keys/usage?id=… —— 读某把 Trae Key 的用量快照。
+async fn api_trae_key_usage(RawQuery(query): RawQuery) -> Response {
+    let id = query_value(query.as_deref(), "id").unwrap_or_default();
+    if id.is_empty() {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let state = crate::trae_gateway_host::shared_state();
+    let now = buddy_switch_core::modules::config::now_ms();
+    let Some(record) = state
+        .key_store
+        .list()
+        .into_iter()
+        .find(|record| record.id == id)
+    else {
+        return json_err("API Key 不存在".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let usage = state.key_usage.snapshot(&id);
+    let used = state
+        .key_usage
+        .used_for(&id, record.quota_unit, record.quota_period, now);
+    let exceeded = matches!(
+        buddy_switch_gateway::apikey::quota_verdict_for_policy(&record.policy(), used),
+        buddy_switch_gateway::apikey::QuotaVerdict::Exceeded { .. }
+    );
+    json_ok(json!({
+        "ok": true,
+        "keyId": id,
+        "unit": record.quota_unit,
+        "period": record.quota_period,
+        "periodKey": record.quota_period.period_key(now),
+        "used": used,
+        "total": usage
+            .as_ref()
+            .map(|entry| entry.counters(record.quota_unit).total)
+            .unwrap_or(0),
+        "exceeded": exceeded,
+    }))
+}
+
+/// POST /api/trae/gateway/keys/restore —— 撤销吊销（Key 重新可用，`{id}`）。
+async fn api_trae_restore_api_key(Json(body): Json<Value>) -> Response {
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("").trim();
+    if id.is_empty() {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let state = crate::trae_gateway_host::shared_state();
+    match state.key_store.restore(id) {
         Ok(()) => json_ok(json!({ "ok": true })),
         Err(error) => json_err(error, StatusCode::BAD_REQUEST),
     }
@@ -2345,6 +5937,373 @@ async fn api_trae_clear_gateway_logs() -> Response {
 }
 
 // ---------------------------------------------------------------------------
+// 桌面悬浮窗（P9 · 只读数据层）
+// ---------------------------------------------------------------------------
+//
+// 与 `src-tauri/src/commands.rs` 的 `companion_*` 一一对应（两宿主同步）。
+// ★ 只读红线：命令面**只有**读 / 显隐 / 聚焦，无任何写操作。
+// ★ 刷新全在前端 webview（20s 轮询 + 既有事件）⇒ 不新增 Rust 后台循环。
+
+/// 悬浮窗快照的 provider（**只读**，P9 §1.3）——与 Tauri 宿主**同一份数据域**：
+/// 只接由**现有**进度状态（`switch-progress`）推导出的「进行中操作」。
+///
+/// 无进行中操作 ⇒ 结构化空态（`source: "unavailable"` + `items: []`），**不造假**。
+fn companion_snapshot() -> companion_state::CompanionSnapshot {
+    let mut operations: Vec<companion_state::LiveOperation> = Vec::new();
+
+    let running = *SWITCH_RUNNING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if running {
+        let region = SWITCH_REGION
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or(Region::Cn);
+        let progress = SWITCH_PROGRESS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .unwrap_or_default();
+        operations.push(companion_state::LiveOperation {
+            id: format!("workbuddy:{}:switch", region.as_str()),
+            source: process::region_app_stems(region)[0].to_string(),
+            title: progress,
+            hint: String::new(),
+            state: companion_state::CompanionState::Running,
+        });
+    }
+
+    // ★ P15 · 外部 Agent 会话：由客户端 hook 事件驱动（接收端见 `agent_hook_rx`）。
+    // ★ 零周期任务 —— 过期在 `operations()` 里**读取时惰性判定**（见 `agent_watch` 模块头）。
+    // 两个数据源**合并进同一个快照**：悬浮窗是一个窗口，不是两个（`P15-SPIKE-RESULTS §2 Q1`）。
+    {
+        let watch = agent_watch::shared()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        operations.extend(watch.operations(config::now_ms()));
+    }
+
+    companion_state::snapshot_from_operations(&operations, config::now_ms())
+}
+
+/// GET /api/companion/status —— 悬浮窗的**只读**快照（两宿主同源）。
+async fn api_companion_status() -> Response {
+    json_ok(json!(companion_snapshot()))
+}
+
+/// POST /api/companion/visibility —— 显隐悬浮窗。
+///
+/// webui 是**浏览器**，没有 Tauri 独立窗口 ⇒ 结构化「仅桌面端可用」（**不假装成功**）。
+async fn api_companion_set_visible() -> Response {
+    json_err(
+        "桌面悬浮窗仅在桌面端可用".to_string(),
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+/// GET /api/qoder/web/proxy —— 读逐包出站代理配置（两个区域各一个 URL；空 = 直连）。
+async fn api_qoder_web_proxy_get() -> Response {
+    match serde_json::to_value(buddy_switch_core::modules::qoder::web_proxy::WebProxyConfig::load())
+    {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/qoder/web/proxy —— 保存逐包出站代理配置（两个字段都先过形状校验）。
+async fn api_qoder_web_proxy_set(Json(body): Json<Value>) -> Response {
+    let submitted = body.get("config").cloned().unwrap_or(body);
+    let config: buddy_switch_core::modules::qoder::web_proxy::WebProxyConfig =
+        match serde_json::from_value(submitted) {
+            Ok(config) => config,
+            Err(error) => {
+                return json_err(
+                    format!("代理配置格式错误: {error}"),
+                    StatusCode::BAD_REQUEST,
+                )
+            }
+        };
+    if let Err(error) = config.save() {
+        return json_err(error, StatusCode::BAD_REQUEST);
+    }
+    json_ok(json!({ "ok": true, "config": config }))
+}
+
+/// POST /api/qoder/web/{login-open,login-close,credit-packs/probe} —— Qoder 网页端逐包链路。
+///
+/// ★ **仅桌面端可用**，且是**原理性**限制而非未实现：逐包数据在网页端私有接口
+/// `/api/v2/me/usages/big_model_credits`，只认浏览器登录后的会话 Cookie；本进程是
+/// headless 服务端（Docker / npm CLI / 裸二进制），没有 Tauri 的 `Webview` ⇒ 拿不到
+/// 那份 Cookie（issue #111 §4）。
+///
+/// 三条路由共用同一句拒绝，理由见 [`api_companion_set_visible`] 的同一取舍：
+/// **不假装成功**。尤其不能返回 `packs: []` —— 那会被前端读成「该账号没有资源包」，
+/// 与「当前形态拿不到」是两件完全不同的事。
+async fn api_qoder_web_desktop_only() -> Response {
+    json_err(
+        "Qoder 逐包明细需要桌面版：当前运行的是一体化服务端/命令行形态，没有内嵌浏览器，无法采集网页会话。聚合额度（剩余/已用/总量）在任意形态都可用。".to_string(),
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+/// POST /api/auth/webview/{open,close} —— 内嵌授权窗是宿主能力（webui 无此窗口）。
+///
+/// 与上面 Qoder 的拒绝不同，这里的拒绝**不影响登录**：授权页照样可以在系统浏览器里完成，
+/// 令牌由后端轮询取回。所以文案要引导用户「继续在浏览器里登录」，而不是「该功能不可用」。
+async fn api_auth_webview_desktop_only() -> Response {
+    json_err(
+        "应用内授权窗仅在桌面端可用：当前形态请继续在浏览器里完成授权，登录结果会自动回到本页。"
+            .to_string(),
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+/// POST /api/companion/toggle —— 翻转可见性（webui 无此窗口，同上）。
+async fn api_companion_toggle() -> Response {
+    json_err(
+        "桌面悬浮窗仅在桌面端可用".to_string(),
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+/// POST /api/companion/jump —— 聚焦来源客户端（webui 无悬浮窗入口，同上）。
+async fn api_companion_jump() -> Response {
+    json_err(
+        "桌面悬浮窗仅在桌面端可用".to_string(),
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// 外部 Agent 会话监听（P15 · hook 安装面）
+// ---------------------------------------------------------------------------
+//
+// ⚠️ 与 `src-tauri/src/commands.rs` 的 `agent_hook_status` / `apply_agent_hook_enabled`
+// **同款实现**（本仓惯例：两宿主各留一份 + 注释互指，不抽公共层 —— 抽了会让
+// 「桌面要改、webui 不能改」这类真实差异无处安放）。
+
+/// hook 的安装目标（与桌面侧同一份清单，见 `commands.rs` 的 `AGENT_HOOK_TARGETS`）。
+///
+/// ⚠️ **只列机制已取证的客户端**：WorkBuddy 两区域 + Claude Code + CodeBuddy CLI + Trae 两个区域。
+/// `codex` / `qoder-*` 的 hook 路径或 schema **未一手取证** ⇒ 只作来源、不作安装目标
+/// （往不存在的机制上写配置只会污染用户文件）。
+///
+/// ★ Trae 的目标是**它的 hooks 文件**（`~/.trae-cn/hooks.json` / `~/.trae/hooks.json`），
+/// 不是 `settings.json` —— 该文件由客户端自己生成，**不存在时我们不创建**
+/// （见 `agent_hook_install::missing_config_message`）。
+const AGENT_HOOK_TARGETS: &[(&str, &str)] = &[
+    ("workbuddy-cn", agent_watch::SOURCE_WORKBUDDY_CN),
+    ("workbuddy-global", agent_watch::SOURCE_WORKBUDDY_GLOBAL),
+    ("claude", agent_watch::SOURCE_CLAUDE),
+    ("codebuddy", agent_watch::SOURCE_CODEBUDDY),
+    ("trae-hooks-cn", agent_watch::SOURCE_TRAE_CN),
+    ("trae-hooks-global", agent_watch::SOURCE_TRAE_GLOBAL),
+];
+
+/// 组装 hook 安装状态（**只读**，无副作用）。形状与桌面侧逐字段一致。
+fn agent_hook_status() -> Value {
+    let exe = std::env::current_exe().ok();
+    let slots: Vec<Value> = AGENT_HOOK_TARGETS
+        .iter()
+        .map(|(slot_key, source)| {
+            let read = client_settings::read_settings(slot_key)
+                .unwrap_or_else(|error| json!({ "error": error }));
+            let values = read.get("values").cloned().unwrap_or(Value::Null);
+            let events = if values.is_null() {
+                Vec::new()
+            } else {
+                agent_hook_install::installed_events_of(
+                    &values,
+                    agent_hook_install::profile_for(slot_key),
+                )
+            };
+            json!({
+                "slot": slot_key,
+                "source": source,
+                "clientInstalled": read.get("installed").and_then(Value::as_bool).unwrap_or(false),
+                "clientRunning": read.get("running").and_then(Value::as_bool).unwrap_or(false),
+                "installed": !events.is_empty(),
+                "events": events,
+                "command": exe.as_deref().map(|exe| agent_hook_install::hook_command(exe, source)),
+            })
+        })
+        .collect();
+
+    json!({
+        "enabled": app_prefs::watch_agent_sessions(),
+        "port": buddy_switch_core::modules::agent_hook_rx::HOOK_PORT,
+        "slots": slots,
+    })
+}
+
+/// 装 / 卸 hook 并同步偏好。语义见桌面侧同名函数的文档（「装不上就不写偏好」）。
+fn apply_agent_hook_enabled(enabled: bool) -> Result<Value, String> {
+    let mut errors: Vec<String> = Vec::new();
+    let mut changed: Vec<Value> = Vec::new();
+
+    if enabled {
+        let exe =
+            std::env::current_exe().map_err(|error| format!("取当前程序路径失败：{error}"))?;
+        for (slot_key, source) in AGENT_HOOK_TARGETS {
+            let command = agent_hook_install::hook_command(&exe, source);
+            match agent_hook_install::install(slot_key, &command) {
+                Ok(_) => changed.push(json!({ "slot": slot_key, "ok": true })),
+                Err(error) => errors.push(format!("{slot_key}：{error}")),
+            }
+        }
+        if changed.is_empty() {
+            return Err(format!("没有任何客户端装上 hook —— {}", errors.join("；")));
+        }
+    } else {
+        for (slot_key, _) in AGENT_HOOK_TARGETS {
+            match agent_hook_install::uninstall(slot_key) {
+                Ok(_) => changed.push(json!({ "slot": slot_key, "ok": true })),
+                Err(error) => errors.push(format!("{slot_key}：{error}")),
+            }
+        }
+    }
+
+    let mut prefs = app_prefs::load_app_prefs();
+    prefs["watch_agent_sessions"] = json!(enabled);
+    app_prefs::save_app_prefs(&prefs).map_err(|error| format!("保存偏好失败：{error}"))?;
+
+    Ok(json!({ "enabled": enabled, "changed": changed, "errors": errors }))
+}
+
+/// GET /api/agent-hooks/status —— hook 安装状态（**只读**，两宿主同源）。
+async fn api_agent_hook_status() -> Response {
+    json_ok(agent_hook_status())
+}
+
+/// POST /api/agent-hooks/enabled —— 开关监听（会**写上游客户端配置**，见 P15 决策 D41）。
+async fn api_agent_hook_set_enabled(Json(body): Json<Value>) -> Response {
+    let enabled = body
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    // 写客户端配置文件是慢 IO ⇒ 放 blocking 线程，不阻塞 webui 的事件循环。
+    match tokio::task::spawn_blocking(move || apply_agent_hook_enabled(enabled)).await {
+        Ok(Ok(value)) => json_ok(value),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(
+            format!("切换监听失败：{error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P15 · 「本工具自己的长操作」也送进悬浮窗（签到）
+// ---------------------------------------------------------------------------
+//
+// ⚠️ 与 `src-tauri/src/commands.rs` 的 `observe_*` **同款实现**（本仓惯例：两宿主各留一份
+// + 注释互指）。依据见 `P9-ARCH §1.3`：数据源本应有三路
+//（`switch-progress` / `checkin-progress` / `trae-checkin-progress`），后两路**长期缺席**
+// —— `src/lib/companion.ts` 一直在订阅一个从未被 emit 过的 `checkin-progress`。
+//
+// ★ webui **没有事件通道** ⇒ Trae 签到只能给**首尾两条**；桌面侧有逐账号进度。
+//   那是两条通道的**能力差异**，如实反映，不在这一侧编造中间进度。
+
+/// WorkBuddy 批量签到的**开始**一条，返回 task id（结束时用同一个 id 才能覆盖为终态）。
+fn observe_workbuddy_checkin_start(region: Region) -> String {
+    let task = format!("workbuddy-checkin:{}", region.as_str());
+    agent_watch::record_local(
+        &task,
+        &format!("WorkBuddy 签到（{}）", workbuddy_region_label(region)),
+        companion_state::CompanionState::Running,
+        config::now_ms(),
+    );
+    task
+}
+
+/// 见 [`observe_workbuddy_checkin_start`]。
+fn observe_workbuddy_checkin_end(task: &str, region: Region, result: &Value) {
+    // 带 `status` = 这轮**根本没跑**（`skipped` / `unsupported`）⇒ 把刚写的那行**撤掉**。
+    if result.get("status").is_some() {
+        forget_local(task);
+        return;
+    }
+    let accounts = result
+        .get("accounts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let total = accounts.len();
+    // **账号表是空的** ⇒ 同样什么都没发生（撤掉，不留「成功 0 / 共 0」的噪音行）。
+    if total == 0 {
+        forget_local(task);
+        return;
+    }
+    let failed = accounts
+        .iter()
+        .filter(|account| account.get("error").is_some_and(|error| !error.is_null()))
+        .count();
+    let ok = total.saturating_sub(failed);
+    let state = if ok == 0 {
+        companion_state::CompanionState::Failed
+    } else {
+        companion_state::CompanionState::Done
+    };
+    agent_watch::record_local(
+        task,
+        &format!(
+            "WorkBuddy 签到（{}）：成功 {ok} / 共 {total}",
+            workbuddy_region_label(region)
+        ),
+        state,
+        config::now_ms(),
+    );
+}
+
+/// Trae 签到的**汇总**（`{ok, already, failed, total}`）→ 悬浮窗终态。
+///
+/// 桌面侧从 `done` 事件里取这几个字段、webui 侧从一次性报告里取 —— **字段名相同**，
+/// 所以两条通道的终态判定共用一个来源，不可能分叉。
+fn observe_trae_checkin_summary(task: &str, summary: &Value) {
+    let ok = summary.get("ok").and_then(Value::as_u64).unwrap_or(0);
+    let already = summary.get("already").and_then(Value::as_u64).unwrap_or(0);
+    let failed = summary.get("failed").and_then(Value::as_u64).unwrap_or(0);
+    let total = summary.get("total").and_then(Value::as_u64).unwrap_or(0);
+    // **计划 0 个** ⇒ 这一行本就不该出现（一个字都没签）：撤掉，
+    // 而不是留下「成功 0 · 已签 0 · 失败 0」这种没信息量的噪音行。
+    if total == 0 {
+        forget_local(task);
+        return;
+    }
+    // **一个都没成**（既没有成功、也没有「今日已签」）才算失败。
+    let state = if ok == 0 && already == 0 {
+        companion_state::CompanionState::Failed
+    } else {
+        companion_state::CompanionState::Done
+    };
+    agent_watch::record_local(
+        task,
+        &format!("Trae 签到：成功 {ok} · 已签 {already} · 失败 {failed}"),
+        state,
+        config::now_ms(),
+    );
+}
+
+/// 撤掉一条「本工具自己的操作」（见 `agent_watch::AgentWatch::forget`）。
+fn forget_local(task: &str) {
+    agent_watch::shared()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .forget(agent_watch::SOURCE_THIS_TOOL, task);
+}
+
+/// WorkBuddy 区域的展示名（**只用于标题**，不进 `source`）。
+fn workbuddy_region_label(region: Region) -> &'static str {
+    if region == Region::Global {
+        "国际版"
+    } else {
+        "国内版"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 静态前端
+
 // TOTP 两步验证（Google Authenticator 兼容）
 // ---------------------------------------------------------------------------
 
@@ -2482,18 +6441,22 @@ async fn static_handler(uri: Uri) -> Response {
 
 #[cfg(test)]
 mod tests {
+    // 测试串行锁（`test_guard()`）故意持有到用例结束：它防的是多个用例同时改进程级
+    // 状态（env / 全局配置 / 端口）。`#[tokio::test]` 默认 current-thread ⇒ 无误报风险。
+    #![allow(clippy::await_holding_lock)]
+
     use super::{
         api_routes, cache_control_for, checkin_status_item, parse_region, parse_region_filter,
         query_flag_enabled, query_value, router, Assets,
     };
     use axum::body::{to_bytes, Body};
     use axum::http::{Method, Request, StatusCode};
+    use buddy_switch_core::modules::config::BUDDY_SWITCH_HOME_ENV;
+    use buddy_switch_core::modules::region::{Region, RegionFilter};
     use serde_json::{json, Value};
     use std::collections::BTreeSet;
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use tower::ServiceExt;
-    use buddy_switch_core::modules::config::BUDDY_SWITCH_HOME_ENV;
-    use buddy_switch_core::modules::region::{Region, RegionFilter};
 
     // -----------------------------------------------------------------------
     // 路由级测试脚手架
@@ -2514,7 +6477,9 @@ mod tests {
     static ISOLATED_HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
 
     fn test_guard() -> MutexGuard<'static, ()> {
-        TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// 返回隔离的 home 目录。必须作为每个测试的**第一步**调用。
@@ -2537,6 +6502,106 @@ mod tests {
             .as_path()
     }
 
+    #[tokio::test]
+    async fn merged_router_keeps_totp_on_all_api_routes_and_disable_persists() {
+        use super::init_totp;
+        use buddy_switch_core::modules::totp_auth;
+        let _guard = test_guard();
+        let home = isolated_home();
+        let config_path = home.join("totp_config.json");
+        std::fs::write(
+            &config_path,
+            serde_json::to_vec(&json!({
+                "secret": "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", "enabled": true,
+                "session_duration_minutes": 30,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        init_totp();
+        struct ResetTotp(std::path::PathBuf);
+        impl Drop for ResetTotp {
+            fn drop(&mut self) {
+                std::fs::write(
+                    &self.0,
+                    serde_json::to_vec(&json!({
+                        "secret": "", "enabled": false, "session_duration_minutes": 30,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                init_totp();
+            }
+        }
+        let _reset = ResetTotp(config_path);
+        for path in [
+            "/api/accounts",
+            "/api/qoder/accounts",
+            "/api/schedule/config",
+            "/api/backup/auto/list",
+        ] {
+            assert_eq!(
+                call_full(Method::GET, path).await.0,
+                StatusCode::UNAUTHORIZED,
+                "{path}"
+            );
+        }
+        for path in ["/api/public-config", "/api/auth/totp/status"] {
+            assert_eq!(
+                call_full(Method::GET, path).await.0,
+                StatusCode::OK,
+                "{path}"
+            );
+        }
+        let (_, gateway_type, gateway_body) = call_full(Method::GET, "/v1/models").await;
+        assert!(
+            gateway_type.contains("application/json"),
+            "网关应走自己的JSON鉴权：{gateway_body}"
+        );
+        let totp = totp_rs::Builder::new()
+            .with_algorithm(totp_rs::Algorithm::SHA1)
+            .with_digits(6)
+            .with_skew(1)
+            .with_step_duration(30)
+            .with_secret(totp_rs::Secret::new(
+                b"12345678901234567890".to_vec().into_boxed_slice(),
+            ))
+            .build()
+            .unwrap();
+        let code = totp.generate_current().to_string();
+        let session = totp_auth::validate(&code).unwrap();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/api/backup/auto/list")
+            .header("host", "127.0.0.1:57890")
+            .header("x-session-token", session)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            router().oneshot(request).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/auth/totp/disable")
+            .header("host", "127.0.0.1:57890")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({"code": code})).unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(
+            router().oneshot(request).await.unwrap().status(),
+            StatusCode::OK
+        );
+        init_totp(); // 模拟刷新/重启后重新读盘，不应再次要求初始化。
+        assert!(!totp_auth::is_enabled());
+        assert_eq!(
+            call_full(Method::GET, "/api/backup/auto/list").await.0,
+            StatusCode::OK
+        );
+    }
+
     fn exact_keys(value: &Value) -> BTreeSet<String> {
         value
             .as_object()
@@ -2553,7 +6618,10 @@ mod tests {
     fn assert_has_keys(value: &Value, keys: &[&str]) {
         let actual = exact_keys(value);
         for key in keys {
-            assert!(actual.contains(*key), "response is missing key `{key}`: {actual:?}");
+            assert!(
+                actual.contains(*key),
+                "response is missing key `{key}`: {actual:?}"
+            );
         }
     }
 
@@ -2602,6 +6670,7 @@ mod tests {
         let request = Request::builder()
             .method(method)
             .uri(uri)
+            .header("host", "127.0.0.1:57890")
             .body(Body::empty())
             .unwrap();
         let response = router().oneshot(request).await.expect("router call");
@@ -2615,7 +6684,122 @@ mod tests {
         let bytes = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("read body");
-        (status, content_type, String::from_utf8_lossy(&bytes).to_string())
+        (
+            status,
+            content_type,
+            String::from_utf8_lossy(&bytes).to_string(),
+        )
+    }
+
+    /// 驱动**完整** `router()`（含 `api_guard` 中间件），只回状态码。
+    ///
+    /// 三个 header 分别对应 guard 的三条判据，`None` 表示该头**不发送**。
+    async fn status_with_headers(
+        method: Method,
+        uri: &str,
+        host: Option<&str>,
+        origin: Option<&str>,
+        sec_fetch_site: Option<&str>,
+        content_type: Option<&str>,
+    ) -> StatusCode {
+        let mut builder = Request::builder().method(method).uri(uri);
+        for (name, value) in [
+            ("host", host),
+            ("origin", origin),
+            ("sec-fetch-site", sec_fetch_site),
+            ("content-type", content_type),
+        ] {
+            if let Some(value) = value {
+                builder = builder.header(name, value);
+            }
+        }
+        router()
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .expect("router call")
+            .status()
+    }
+
+    /// ★★ 安全审计 P0-1：**`api_guard` 必须真的挂在 `router()` 上**。
+    ///
+    /// 这条是「中间件写好了但没接线」的唯一防线 —— `api_guard` 自己的单测只能证明
+    /// `judge()` 判得对，证明不了它被装进了管理面。变异验证：把 `router()` 里的
+    /// `.layer(...)` 去掉，本用例立刻红。
+    #[tokio::test]
+    async fn management_surface_rejects_foreign_host_and_cross_site_requests() {
+        let _home = isolated_home();
+
+        // ① 正常同源访问 ⇒ 放行。
+        assert_ne!(
+            status_with_headers(
+                Method::GET,
+                "/api/status",
+                Some("127.0.0.1:57890"),
+                None,
+                None,
+                None
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "回环 Host 必须放行"
+        );
+
+        // ② DNS rebinding 形态：Host 与 Origin **同源**，但主机名是攻击者的。
+        assert_eq!(
+            status_with_headers(
+                Method::GET,
+                "/api/status",
+                Some("attacker.com:57890"),
+                Some("http://attacker.com:57890"),
+                None,
+                None,
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "同源 Origin 不是防线，Host 必须是回环"
+        );
+
+        // ③ 普通跨站（Host 是回环、Origin 是别人的）⇒ 也拒。
+        assert_eq!(
+            status_with_headers(
+                Method::GET,
+                "/api/status",
+                Some("127.0.0.1:57890"),
+                Some("http://evil.example"),
+                None,
+                None,
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+
+        // ④ 完全没有 Host（HTTP/1.0 / 伪造）⇒ 拒。
+        assert_eq!(
+            status_with_headers(Method::GET, "/api/status", None, None, None, None).await,
+            StatusCode::FORBIDDEN
+        );
+
+        // ⑤ 写接口必须是 JSON —— 挡「`text/plain` 简单请求绕过预检」的 CSRF。
+        assert_eq!(
+            status_with_headers(
+                Method::POST,
+                "/api/accounts/remark",
+                Some("127.0.0.1:57890"),
+                None,
+                None,
+                Some("text/plain"),
+            )
+            .await,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+
+        // ⑥ 静态资源（fallback）**不受**管理面校验影响：公开可读，且 GET 没有 Content-Type。
+        let (status, _, _) = call_full(Method::GET, "/").await;
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "SPA 首页不能被管理面校验拦掉（它不在 /api/* 上）"
+        );
     }
 
     /// 取响应的 `Cache-Control`（无该头时返回空串）。
@@ -2623,6 +6807,7 @@ mod tests {
         let request = Request::builder()
             .method(Method::GET)
             .uri(uri)
+            .header("host", "127.0.0.1:57890")
             .body(Body::empty())
             .unwrap();
         let response = router().oneshot(request).await.expect("router call");
@@ -2642,7 +6827,11 @@ mod tests {
 
     #[test]
     fn parse_region_defaults_to_cn_and_binds_known_values() {
-        assert_eq!(parse_region(None), Region::Cn, "missing region must default to CN");
+        assert_eq!(
+            parse_region(None),
+            Region::Cn,
+            "missing region must default to CN"
+        );
         assert_eq!(parse_region(Some("cn")), Region::Cn);
         assert_eq!(parse_region(Some("global")), Region::Global);
         assert_eq!(parse_region(Some("ai")), Region::Global);
@@ -2670,7 +6859,10 @@ mod tests {
 
     #[test]
     fn query_value_reads_first_match_and_handles_missing() {
-        assert_eq!(query_value(Some("region=global"), "region").as_deref(), Some("global"));
+        assert_eq!(
+            query_value(Some("region=global"), "region").as_deref(),
+            Some("global")
+        );
         assert_eq!(
             query_value(Some("a=1&region=global&b=2"), "region").as_deref(),
             Some("global")
@@ -2679,6 +6871,33 @@ mod tests {
         assert_eq!(query_value(None, "region"), None);
         assert_eq!(query_value(Some("flag"), "flag").as_deref(), Some(""));
         assert_eq!(query_value(Some("x=1&x=2"), "x").as_deref(), Some("1"));
+    }
+
+    /// GET 参数必须解码：Windows 路径经 `URLSearchParams` 编码后要能还原。
+    ///
+    /// 这条是 2026-10-28 的缺陷回归测试：不解码时 `path=D%3A%5Cx` 会原样传给后端，
+    /// 桌面端（IPC）却正常 —— 两个通道语义分叉，且只在「传路径」时暴露。
+    #[test]
+    fn query_value_decodes_percent_and_plus() {
+        assert_eq!(
+            query_value(Some("path=D%3A%5Ctrae-plain%5Cdatabase.db"), "path").as_deref(),
+            Some(r"D:\trae-plain\database.db")
+        );
+        // `URLSearchParams` 把空格编码成 `+`（不是 `%20`），必须还原。
+        assert_eq!(
+            query_value(Some("path=C%3A%5CProgram+Files%5Cx.db"), "path").as_deref(),
+            Some(r"C:\Program Files\x.db")
+        );
+        // 非法的 `%` 序列原样保留（不静默丢字符）。
+        assert_eq!(
+            query_value(Some("q=100%ZZ"), "q").as_deref(),
+            Some("100%ZZ")
+        );
+        // 中文路径（多字节 UTF-8）也要能还原。
+        assert_eq!(
+            query_value(Some("path=%E6%A1%8C%E9%9D%A2%5Cx.db"), "path").as_deref(),
+            Some("桌面\\x.db")
+        );
     }
 
     #[test]
@@ -2738,7 +6957,10 @@ mod tests {
         // 空库上的 `== []` 无法证伪「账号映射」是否真的生效（数据层回归不可见），
         // 故此处仅断言形状；内容映射由
         // `accounts_route_returns_seeded_account_contents` 播种后精确断言。
-        assert!(body["accounts"].is_array(), "accounts must be a JSON array: {body}");
+        assert!(
+            body["accounts"].is_array(),
+            "accounts must be a JSON array: {body}"
+        );
         assert_eq!(body["current"], Value::Null);
 
         let (status, body) = call_api(Method::GET, "/api/sessions", None).await;
@@ -2747,7 +6969,10 @@ mod tests {
         // 空库上的 `== []` 无法证伪「uid → sessions 表 → 响应」这条链路，
         // 故此处仅断言形状；内容映射由
         // `sessions_route_returns_seeded_session_rows` 播种真实 workbuddy.db 后精确断言。
-        assert!(body["sessions"].is_array(), "sessions must be a JSON array: {body}");
+        assert!(
+            body["sessions"].is_array(),
+            "sessions must be a JSON array: {body}"
+        );
 
         let (status, body) = call_api(Method::GET, "/api/checkin/status", None).await;
         assert_eq!(status, StatusCode::OK);
@@ -2827,8 +7052,7 @@ mod tests {
             }]),
         );
 
-        let (status, body) =
-            call_api(Method::GET, "/api/checkin/status?region=global", None).await;
+        let (status, body) = call_api(Method::GET, "/api/checkin/status?region=global", None).await;
         // 先清理再断言：即便断言失败也不把种子留给后续用例。
         clear_accounts(Region::Global);
 
@@ -3008,7 +7232,11 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         let current = &body["current"];
-        assert_eq!(current["uid"], json!("u-1"), "字符串字段必须原样保留：{body}");
+        assert_eq!(
+            current["uid"],
+            json!("u-1"),
+            "字符串字段必须原样保留：{body}"
+        );
         assert_eq!(
             current["nickname"],
             json!("12345"),
@@ -3153,7 +7381,11 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let account = &body["accounts"][0];
         assert_eq!(account["id"], json!("a1"), "字符串 id 必须原样保留：{body}");
-        assert_eq!(account["uid"], json!("u1"), "字符串 uid 必须原样保留：{body}");
+        assert_eq!(
+            account["uid"],
+            json!("u1"),
+            "字符串 uid 必须原样保留：{body}"
+        );
         assert_eq!(
             account["nickname"],
             json!("12345"),
@@ -3211,28 +7443,66 @@ mod tests {
                 conn.execute(
                     insert,
                     rusqlite::params![
-                        id,
-                        uid,
-                        cwd,
-                        title,
-                        custom,
-                        updated_at,
-                        deleted_at,
-                        playground
+                        id, uid, cwd, title, custom, updated_at, deleted_at, playground
                     ],
                 )
                 .expect("insert seeded session");
             };
             // 可见 1：普通会话，无 custom_title；无正文 jsonl → hasHistory=false。
-            seed("cid-alpha", UID, "/home/u/ws-alpha", "Alpha 原标题", None, 2_000, None, 0);
+            seed(
+                "cid-alpha",
+                UID,
+                "/home/u/ws-alpha",
+                "Alpha 原标题",
+                None,
+                2_000,
+                None,
+                0,
+            );
             // 可见 2：custom_title 应**覆盖** title；is_playground=1 → isPlayground=true。
-            seed("cid-beta", UID, "/home/u/ws-beta", "Beta 原标题", Some("Beta 自定义名"), 3_000, None, 1);
+            seed(
+                "cid-beta",
+                UID,
+                "/home/u/ws-beta",
+                "Beta 原标题",
+                Some("Beta 自定义名"),
+                3_000,
+                None,
+                1,
+            );
             // 过滤 3：已软删除（updated_at 最新，若漏过滤会排在首位，最易被发现）。
-            seed("cid-deleted", UID, "/home/u/ws-alpha", "已删除", None, 4_000, Some(1_000), 0);
+            seed(
+                "cid-deleted",
+                UID,
+                "/home/u/ws-alpha",
+                "已删除",
+                None,
+                4_000,
+                Some(1_000),
+                0,
+            );
             // 过滤 4：属于其它账号。
-            seed("cid-otheruser", "uid-other", "/home/u/ws-alpha", "别人的", None, 5_000, None, 0);
+            seed(
+                "cid-otheruser",
+                "uid-other",
+                "/home/u/ws-alpha",
+                "别人的",
+                None,
+                5_000,
+                None,
+                0,
+            );
             // 跳过 5：claw 工作区（账号绑定 IM 渠道，换账号后不可用）。
-            seed("cid-claw", UID, "/home/u/claw", "Claw", None, 6_000, None, 0);
+            seed(
+                "cid-claw",
+                UID,
+                "/home/u/claw",
+                "Claw",
+                None,
+                6_000,
+                None,
+                0,
+            );
         }
         // cid-beta 有正文 jsonl → hasHistory=true；cid-alpha 没有 → false。
         std::fs::write(
@@ -3260,7 +7530,11 @@ mod tests {
             exact_keys(&body),
             set_of(&["sessions", "current", "source", "warning"])
         );
-        assert_eq!(body["current"], json!(UID), "current must come from the seeded auth file");
+        assert_eq!(
+            body["current"],
+            json!(UID),
+            "current must come from the seeded auth file"
+        );
         assert_eq!(body["source"], json!("db"), "db 可读时应标 source=db");
 
         let sessions = body["sessions"].as_array().expect("sessions array");
@@ -3275,19 +7549,42 @@ mod tests {
         let beta = &sessions[0];
         assert_eq!(
             exact_keys(beta),
-            set_of(&["id", "title", "cwd", "updatedAt", "hasHistory", "isPlayground"]),
+            set_of(&[
+                "id",
+                "title",
+                "cwd",
+                "updatedAt",
+                "hasHistory",
+                "isPlayground"
+            ]),
             "session item key set must be pinned"
         );
-        assert_eq!(beta["title"], json!("Beta 自定义名"), "custom_title must win over title");
+        assert_eq!(
+            beta["title"],
+            json!("Beta 自定义名"),
+            "custom_title must win over title"
+        );
         assert_eq!(beta["cwd"], json!("/home/u/ws-beta"));
         assert_eq!(beta["updatedAt"], json!(3_000));
-        assert_eq!(beta["hasHistory"], json!(true), "cid-beta has a project jsonl");
+        assert_eq!(
+            beta["hasHistory"],
+            json!(true),
+            "cid-beta has a project jsonl"
+        );
         assert_eq!(beta["isPlayground"], json!(true));
 
         let alpha = &sessions[1];
-        assert_eq!(alpha["title"], json!("Alpha 原标题"), "no custom_title → fall back to title");
+        assert_eq!(
+            alpha["title"],
+            json!("Alpha 原标题"),
+            "no custom_title → fall back to title"
+        );
         assert_eq!(alpha["updatedAt"], json!(2_000));
-        assert_eq!(alpha["hasHistory"], json!(false), "cid-alpha has no project jsonl");
+        assert_eq!(
+            alpha["hasHistory"],
+            json!(false),
+            "cid-alpha has no project jsonl"
+        );
         assert_eq!(alpha["isPlayground"], json!(false));
     }
 
@@ -3314,12 +7611,28 @@ mod tests {
                 "autoclaw_base_url",
                 "autoclaw_healthy",
                 "autoclaw_model_count",
+                // 账号池视图 + 最近失败原因（与 Trae 侧 `trae_gateway_status` 对位）。
+                "pools",
+                "accounts",
+                "diagnose",
+                "last_error",
             ]),
             "gateway_status key set must be pinned (snake_case)"
         );
         // 前端归一化读取 base_url；不得再出现 camelCase 键。
-        assert!(body["base_url"].is_string(), "base_url must be present for the frontend");
+        assert!(
+            body["base_url"].is_string(),
+            "base_url must be present for the frontend"
+        );
         assert!(!body.as_object().unwrap().contains_key("baseUrl"));
+        // `pools` 的两个版本键**恒定存在**：空池不是「未知」，前端据此直接渲染两张卡。
+        assert_eq!(
+            exact_keys(&body["pools"]),
+            set_of(&["cn", "global"]),
+            "pools 必须恒含 cn / global 两个键"
+        );
+        assert!(body["accounts"].is_array(), "accounts 必须是数组（可为空）");
+        assert!(body["diagnose"].is_array(), "diagnose 必须是数组（可为空）");
 
         // config：snake_case 键集合。
         let (status, body) = call_api(Method::GET, "/api/gateway/config", None).await;
@@ -3343,6 +7656,12 @@ mod tests {
                 "allow_model_region_prefix",
                 "max_body_mb",
                 "autoclaw",
+                "max_context",
+                // WorkBuddy 上游代理方式（#199）与按模型默认思考档（#200）。
+                "upstream_via_proxy",
+                "model_efforts",
+                // ★ issue #129：账号故障时自动切换（WB / Trae / Qoder 三份配置同名）。
+                "auto_failover",
             ])
         );
 
@@ -3366,7 +7685,10 @@ mod tests {
         assert_eq!(exact_keys(&body), set_of(&["logs"]));
         // 空日志上的 `== []` 无法证伪「写入 → 读出」这条链路，故此处仅断言形状；
         // 内容由 `gateway_logs_route_returns_recorded_entries` 写入一条后精确断言。
-        assert!(body["logs"].is_array(), "gateway logs must be a JSON array: {body}");
+        assert!(
+            body["logs"].is_array(),
+            "gateway logs must be a JSON array: {body}"
+        );
 
         // strategy
         let (status, body) = call_api(Method::GET, "/api/gateway/strategy", None).await;
@@ -3410,12 +7732,18 @@ mod tests {
         // 命中 static_handler 的已知资源。
         let (status, content_type, body) = call_full(Method::GET, "/index.html").await;
         assert_eq!(status, StatusCode::OK);
-        assert!(content_type.contains("text/html"), "content-type: {content_type}");
+        assert!(
+            content_type.contains("text/html"),
+            "content-type: {content_type}"
+        );
         assert!(body.to_lowercase().contains("<!doctype html"));
 
         let (status, content_type, _) = call_full(Method::GET, "/vite.svg").await;
         assert_eq!(status, StatusCode::OK);
-        assert!(content_type.contains("image/svg+xml"), "content-type: {content_type}");
+        assert!(
+            content_type.contains("image/svg+xml"),
+            "content-type: {content_type}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3442,7 +7770,11 @@ mod tests {
 
         for deep_link in ["/accounts", "/gateway", "/settings/nested/deep"] {
             let (status, content_type, body) = call_full(Method::GET, deep_link).await;
-            assert_eq!(status, StatusCode::OK, "SPA deep link {deep_link} must be 200");
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "SPA deep link {deep_link} must be 200"
+            );
             assert_eq!(
                 content_type, "text/html; charset=utf-8",
                 "SPA deep link {deep_link} must be served as HTML, not an octet-stream download"
@@ -3484,7 +7816,11 @@ mod tests {
             .find(|path| path.ends_with(".css"))
             .expect("dist must embed a css asset");
         let (status, content_type, _) = call_full(Method::GET, &format!("/{css}")).await;
-        assert_eq!(status, StatusCode::OK, "embedded asset {css} must be served");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "embedded asset {css} must be served"
+        );
         assert_eq!(content_type, "text/css", "asset {css} mime");
 
         let js = Assets::iter()
@@ -3517,7 +7853,10 @@ mod tests {
         for deep_link in ["/accounts", "/gateway", "/settings/nested/deep", "/"] {
             let (status, cache) = call_cache_control(deep_link).await;
             assert_eq!(status, StatusCode::OK, "SPA 深链 {deep_link}");
-            assert_eq!(cache, "no-cache", "SPA 深链 {deep_link} 回退 index.html，必须同策略");
+            assert_eq!(
+                cache, "no-cache",
+                "SPA 深链 {deep_link} 回退 index.html，必须同策略"
+            );
         }
 
         // 哈希产物：immutable 长缓存。从嵌入清单取**真实**路径，避免硬编码哈希名失稳。
@@ -3565,7 +7904,10 @@ mod tests {
                 content_type, "text/html; charset=utf-8",
                 "{uri} must be served as HTML regardless of case/query"
             );
-            assert_eq!(body, index_body, "{uri} must serve the exact index.html body");
+            assert_eq!(
+                body, index_body,
+                "{uri} must serve the exact index.html body"
+            );
         }
     }
 
@@ -3622,7 +7964,9 @@ mod tests {
                 let tail = &rest[found + 1..];
                 let Some(end) = tail.find(quote) else { break };
                 let value = &tail[..end];
-                if value.starts_with("assets/") && (value.ends_with(".js") || value.ends_with(".css")) {
+                if value.starts_with("assets/")
+                    && (value.ends_with(".js") || value.ends_with(".css"))
+                {
                     names.push(value.to_string());
                 }
                 rest = &tail[end..];
@@ -3643,7 +7987,10 @@ mod tests {
             "<a href=\"#top\">top</a>",
             r#"<a href="/relative-ok.css">css</a>"#,
         );
-        assert_eq!(asset_refs_in(html), vec!["/assets/a.js", "/icon.png", "/relative-ok.css"]);
+        assert_eq!(
+            asset_refs_in(html),
+            vec!["/assets/a.js", "/icon.png", "/relative-ok.css"]
+        );
         assert!(asset_refs_in("<p>no refs</p>").is_empty());
     }
 
@@ -3665,7 +8012,7 @@ mod tests {
             assert!(
                 Assets::get(key).is_some(),
                 "dist/index.html references `{reference}` which is NOT embedded. \
-                 `dist/` most likely holds a **demo** build (Vite base `/trae-workbuddy-switch/`). \
+                 `dist/` most likely holds a **demo** build (Vite base `/qoder-trae-workbuddy-switch/`). \
                  Run `npm run build` (NOT `npm run build:demo`) before compiling the server / Tauri app. \
                  Embedded paths: {:?}",
                 Assets::iter().collect::<Vec<_>>()
@@ -3677,7 +8024,10 @@ mod tests {
     /// （`/` 与 `/index.html` 两个入口都要能命中，避免只修一个出口。）
     #[test]
     fn embedded_index_html_is_servable_at_root_and_index() {
-        assert!(Assets::get("index.html").is_some(), "dist/index.html must be embedded");
+        assert!(
+            Assets::get("index.html").is_some(),
+            "dist/index.html must be embedded"
+        );
         let files: Vec<String> = Assets::iter().map(|path| path.to_string()).collect();
         assert!(
             files.iter().any(|f| f.starts_with("assets/")),
@@ -3750,7 +8100,10 @@ mod tests {
         );
         assert_eq!(
             quoted_asset_names_in(js),
-            vec!["assets/AccountsPage-C5GdpMAe.js", "assets/chart-DDcOHMGW.js"],
+            vec![
+                "assets/AccountsPage-C5GdpMAe.js",
+                "assets/chart-DDcOHMGW.js"
+            ],
             "只收「引号包裹 + assets/ 前缀 + .js/.css 结尾」的整串"
         );
         assert!(quoted_asset_names_in("no assets here").is_empty());
@@ -3783,7 +8136,7 @@ mod tests {
         let _guard = test_guard();
         isolated_home();
 
-        // create：一次性明文必须返回（且只在 create 响应里）。
+        // create：明文随创建响应返回（此刻**不落盘**，用户选「保存到本软件」后才随列表下发）。
         let (status, body) = call_api(
             Method::POST,
             "/api/gateway/keys",
@@ -3794,7 +8147,7 @@ mod tests {
         assert_eq!(body["ok"], json!(true));
         let plaintext = body["key"]
             .as_str()
-            .expect("create must return once-only plaintext")
+            .expect("create must return the plaintext of this key")
             .to_string();
         assert!(plaintext.starts_with("sk-wb-"), "plaintext: {plaintext}");
         assert_eq!(plaintext.len(), "sk-wb-".len() + 32);
@@ -3803,7 +8156,7 @@ mod tests {
             .expect("create record id")
             .to_string();
 
-        // list：脱敏红线——仅 prefix，绝无 hash / 明文 / 64 位摘要。
+        // list：掩码 + 可空明文字段；hash / sha256 摘要仍绝不下发。
         let (status, body) = call_api(Method::GET, "/api/gateway/keys", None).await;
         assert_eq!(status, StatusCode::OK);
         let keys = body["keys"].as_array().expect("keys array");
@@ -3815,21 +8168,39 @@ mod tests {
                 "name",
                 "region",
                 "prefix",
+                // ⚠️ `suffix`（明文末 4 位）是 `apikey.rs` 的**显式白名单**成员
+                // （E3 新增，用户靠它确认是哪一把）。本用例原先漏了这一格，
+                // 于是 `suffix` 一加进来就变红 —— 属**用例未同步**，不是泄露。
+                // 真正的红线在下面两条断言（无 hash / 无 sha256 摘要）。
+                "suffix",
                 "createdAt",
                 "revokedAt",
                 "revoked",
                 "lastUsedAt",
+                // ★ issue #76：策略七件套（`apikey.rs` 同款白名单已同步）。
+                //   与 `suffix` 同一性质：**显式批准**才进列表视图；
+                //   真正的红线是下面两条（无 hash / 无摘要）。
+                "quotaMode",
+                "quotaLimit",
+                "quotaUnit",
+                "quotaPeriod",
+                "scopeMode",
+                "scopeAccounts",
+                "scopeGroups",
+                // ★ 2026-11-04：明文随列表下发（前端眼睛显隐），旧记录为 null。
+                "plaintext",
             ]),
-            "masked record must be an explicit non-secret whitelist"
+            "list record must be an explicit whitelist"
         );
         assert!(!keys[0].as_object().unwrap().contains_key("hash"));
 
         let serialized = serde_json::to_string(&body).unwrap();
-        assert!(!serialized.contains("hash"), "list body must not contain a `hash` field");
         assert!(
-            !serialized.contains(&plaintext),
-            "list body must never echo the plaintext key"
+            !serialized.contains("hash"),
+            "list body must not contain a `hash` field"
         );
+        // ★ 2026-11-04：创建时不落盘明文 ⇒ 列表默认是 null，用户选「保存到本软件」后才有值。
+        assert!(keys[0]["plaintext"].is_null(), "未保存前列表不得下发明文");
         assert!(
             !serialized.contains(&buddy_switch_gateway::apikey::sha256_hex(&plaintext)),
             "list body must not contain the sha256 digest"
@@ -3838,6 +8209,32 @@ mod tests {
             !contains_hex_run(&serialized, 64),
             "list body must not contain any 64-char hex digest: {serialized}"
         );
+
+        // 走「保存到本软件」那条 HTTP 路由 → 明文才落盘、列表才下发。
+        let (status, body) = call_api(
+            Method::POST,
+            "/api/gateway/keys/plaintext",
+            Some(json!({"id": record_id, "plaintext": plaintext})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "save plaintext: {body}");
+        let (status, body) = call_api(Method::GET, "/api/gateway/keys", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["keys"][0]["plaintext"],
+            json!(plaintext),
+            "保存后明文应随列表下发"
+        );
+        // 传错值必须被拒（sha256 校验），不得写进一条「眼睛显示的值不能用」的记录。
+        let (status, _) = call_api(
+            Method::POST,
+            "/api/gateway/keys/plaintext",
+            Some(json!({"id": record_id, "plaintext": "sk-wb-ffffffffffffffffffffffffffffffff"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "已有明文时幂等成功，不改值");
+        let (_, body) = call_api(Method::GET, "/api/gateway/keys", None).await;
+        assert_eq!(body["keys"][0]["plaintext"], json!(plaintext), "幂等不覆盖");
 
         // 未吊销直接删除 → 400 + 可读错误。
         let (status, body) = call_api(
@@ -3853,7 +8250,21 @@ mod tests {
             "error should instruct to revoke first: {body}"
         );
 
-        // 吊销 → 删除成功 → 列表清空。
+        // 未吊销直接恢复 → 400 + 可读错误（恢复只对**已吊销**的 Key 有意义）。
+        let (status, body) = call_api(
+            Method::POST,
+            "/api/gateway/keys/restore",
+            Some(json!({"id": record_id})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["ok"], json!(false));
+        assert!(
+            body["error"].as_str().unwrap_or("").contains("未吊销"),
+            "error should say the key is not revoked: {body}"
+        );
+
+        // 吊销 → 恢复 → 列表回到「启用」（两条出口都可用，故用户在吊销后**两个选择都在**）。
         let (status, body) = call_api(
             Method::POST,
             "/api/gateway/keys/revoke",
@@ -3865,6 +8276,35 @@ mod tests {
 
         let (_, body) = call_api(Method::GET, "/api/gateway/keys", None).await;
         assert_eq!(body["keys"][0]["revoked"], json!(true));
+        assert!(
+            body["keys"][0]["revokedAt"].as_i64().is_some(),
+            "revokedAt 应落时间戳"
+        );
+
+        let (status, body) = call_api(
+            Method::POST,
+            "/api/gateway/keys/restore",
+            Some(json!({"id": record_id})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+
+        let (_, body) = call_api(Method::GET, "/api/gateway/keys", None).await;
+        assert_eq!(body["keys"][0]["revoked"], json!(false), "恢复后应回到启用");
+        assert!(
+            body["keys"][0]["revokedAt"].is_null(),
+            "恢复必须清空 revokedAt"
+        );
+
+        // 再吊销 → 删除成功 → 列表清空（吊销 → 恢复 → 再吊销 → 删除 全链路可反复）。
+        let (status, _) = call_api(
+            Method::POST,
+            "/api/gateway/keys/revoke",
+            Some(json!({"id": record_id})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
 
         let (status, body) = call_api(
             Method::POST,
@@ -3894,7 +8334,10 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["ok"], json!(false));
         assert!(
-            body["error"].as_str().unwrap_or("").contains("配置格式错误"),
+            body["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("配置格式错误"),
             "error: {body}"
         );
 
@@ -3918,8 +8361,13 @@ mod tests {
         assert_eq!(body["addr"], Value::Null);
 
         // 配置必须落盘到隔离 home（证明读写未触碰真实用户目录）。
-        let config_file = isolated_home().join(".buddy-switch").join("gateway_config.json");
-        assert!(config_file.is_file(), "config must persist to the isolated home");
+        let config_file = isolated_home()
+            .join(".buddy-switch")
+            .join("gateway_config.json");
+        assert!(
+            config_file.is_file(),
+            "config must persist to the isolated home"
+        );
         let saved: Value =
             serde_json::from_str(&std::fs::read_to_string(&config_file).unwrap()).unwrap();
         assert_eq!(saved["enabled"], json!(false));
@@ -3950,29 +8398,97 @@ mod tests {
         assert_eq!(item["error"], "status failed");
     }
 
-    /// 排程配置路由：GET 返回默认值；POST 越界小时返回 400 且错误指向 `*_enabled`。
+    /// 排程配置路由：GET 输出新键 `*_times`；POST 校验非法时点、旧键仍被接受，
+    /// 且错误指向 `*_enabled`。
+    ///
+    /// issue #27 起时点粒度到分钟（`"HH:MM"`）。路由层是**唯一**把配置直接交给客户端的
+    /// 出口，因此这里要钉住三件事：① 响应只出新键（旧键留着会让两套字段长期并存）；
+    /// ② 分钟值原样往返（被截成整点就等于功能没生效）；③ 老客户端提交的 `*_hours`
+    /// 不会 400、也不会静默落默认。
     #[tokio::test]
-    async fn schedule_config_route_validates_hours() {
+    async fn schedule_config_route_validates_times() {
         let _guard = test_guard();
         isolated_home();
 
         let (status, body) = call_api(Method::GET, "/api/schedule/config", None).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["checkin_hours"], json!([9, 21]));
-        assert_eq!(body["activity_hours"], json!([10]));
+        assert_eq!(body["checkin_times"], json!(["09:00", "21:00"]));
+        assert_eq!(body["activity_times"], json!(["10:00"]));
         assert_eq!(body["activity_report_count"], json!(5));
         assert_eq!(body["checkin_enabled"], json!(true));
+        assert!(
+            // 用 `contains_key` 而不是 `body.get("…")`：`check:api` 的 [naming] 规则要求
+            // 服务端任何 `.get("snake_key")` 都必须带 camelCase 双读（前端发 camelCase），
+            // 而这里要断言的恰恰是「旧键**不存在**」，双读语义完全不适用。
+            !body
+                .as_object()
+                .is_some_and(|map| map.contains_key("checkin_hours")),
+            "响应不得再输出旧键（新旧两套字段并存会让「哪份是真的」无从判断）：{body}"
+        );
+
+        // 分钟粒度必须原样往返。
+        let (status, body) = call_api(
+            Method::POST,
+            "/api/schedule/config",
+            Some(json!({"checkin_times": ["09:37"]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["checkin_times"], json!(["09:37"]));
+
+        // 旧键（整点整数）仍可写：等价于 `hour:00`。
+        let (status, body) = call_api(
+            Method::POST,
+            "/api/schedule/config",
+            Some(json!({"travel_hours": [7, 19]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["travel_times"], json!(["07:00", "19:00"]));
+
+        // 抖动幅度：默认 0（关闭）→ 可写 → 非法值 400。
+        let (status, body) = call_api(Method::GET, "/api/schedule/config", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["checkin_jitter_minutes"], json!(0), "抖动默认必须关闭");
 
         let (status, body) = call_api(
             Method::POST,
             "/api/schedule/config",
-            Some(json!({"checkin_hours": [25]})),
+            Some(json!({"checkin_jitter_minutes": 15})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["checkin_jitter_minutes"], json!(15));
+
+        let (status, body) = call_api(
+            Method::POST,
+            "/api/schedule/config",
+            Some(json!({"checkin_jitter_minutes": 61})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("checkin_enabled"),
+            "抖动越界的文案必须指向 *_enabled：{body}"
+        );
+
+        // 非法时点（分钟越界）→ 400，且文案指向开关。
+        let (status, body) = call_api(
+            Method::POST,
+            "/api/schedule/config",
+            Some(json!({"checkin_times": ["24:00"]})),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["ok"], json!(false));
         assert!(
-            body["error"].as_str().unwrap_or("").contains("checkin_enabled"),
+            body["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("checkin_enabled"),
             "错误文案必须指向 *_enabled：{body}"
         );
     }
@@ -4082,7 +8598,11 @@ mod tests {
             Some(json!({"accountId": "global-victim", "region": "cn"})),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "CN 库不得删除 Global 账号：{body}");
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "CN 库不得删除 Global 账号：{body}"
+        );
         assert_eq!(body["ok"], json!(false));
 
         let (_, still_there) = call_api(Method::GET, "/api/accounts?region=global", None).await;
@@ -4104,7 +8624,11 @@ mod tests {
         clear_accounts(Region::Cn);
         clear_accounts(Region::Global);
 
-        assert_eq!(status, StatusCode::OK, "Global 必须能删除 Global 账号：{body}");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "Global 必须能删除 Global 账号：{body}"
+        );
         assert_eq!(body["ok"], json!(true));
         assert!(
             account_ids(&emptied).is_empty(),
@@ -4119,59 +8643,133 @@ mod tests {
         let _guard = test_guard();
         let home = isolated_home();
 
-        seed_accounts(
-            Region::Cn,
-            json!(
-              [
-                {"id": "del-me", "uid": "pool-uid-del", "email": "d@example.com"},
-                {"id": "keep-me", "uid": "pool-uid-keep", "email": "k@example.com"}
-              ]
+        for (uri, payload) in [
+            (
+                "/api/delete",
+                json!({"accountId": "del-me", "region": "cn"}),
             ),
-        );
+            (
+                "/api/accounts/delete",
+                json!({"accountId": "del-me", "scope": "wb-cn"}),
+            ),
+        ] {
+            seed_accounts(
+                Region::Cn,
+                json!(
+                  [
+                    {"id": "del-me", "uid": "pool-uid-del", "email": "d@example.com"},
+                    {"id": "keep-me", "uid": "pool-uid-keep", "email": "k@example.com"}
+                  ]
+                ),
+            );
 
-        // 把两个 uid 放进共享网关池 + 粘性表（模拟此前服务过这两个账号）。
-        {
-            let state = crate::gateway_host::shared_state();
-            let mut pool = state.pool.write().await;
-            pool.upsert("pool-uid-del", Some(buddy_switch_gateway::pool::RealmTag::Cn), "已删");
-            pool.upsert("pool-uid-keep", Some(buddy_switch_gateway::pool::RealmTag::Cn), "保留");
-            pool.save(&home.join("state.json")).expect("save pool");
-            let mut sticky = state.sticky.write().await;
-            sticky.bind("cn|glm-5.3|conv-1", "pool-uid-del", buddy_switch_core::modules::config::now_ms());
-            drop(sticky);
-            assert_eq!(pool.len(), 2, "前置：池里应有两个 uid");
+            // 把两个 uid 放进共享网关池 + 粘性表（模拟此前服务过这两个账号）。
+            {
+                let state = crate::gateway_host::shared_state();
+                let mut pool = state.pool.write().await;
+                pool.upsert(
+                    "pool-uid-del",
+                    Some(buddy_switch_gateway::pool::RealmTag::Cn),
+                    "已删",
+                );
+                pool.upsert(
+                    "pool-uid-keep",
+                    Some(buddy_switch_gateway::pool::RealmTag::Cn),
+                    "保留",
+                );
+                pool.save(&home.join("state.json")).expect("save pool");
+                let mut sticky = state.sticky.write().await;
+                sticky.bind(
+                    "cn|glm-5.3|conv-1",
+                    "pool-uid-del",
+                    buddy_switch_core::modules::config::now_ms(),
+                );
+                drop(sticky);
+                assert_eq!(pool.len(), 2, "前置：池里应有两个 uid");
+            }
+
+            let (status, body) = call_api(Method::POST, uri, Some(payload)).await;
+            assert_eq!(status, StatusCode::OK, "删除必须成功：{body}");
+
+            {
+                let state = crate::gateway_host::shared_state();
+                let pool = state.pool.read().await;
+                assert!(
+                    pool.get("pool-uid-del").is_none(),
+                    "已删账号的池条目必须立即移除"
+                );
+                assert!(
+                    pool.get("pool-uid-keep").is_some(),
+                    "其它账号的池条目不受影响"
+                );
+                let sticky = state.sticky.read().await;
+                assert!(
+                    sticky
+                        .get(
+                            "cn|glm-5.3|conv-1",
+                            buddy_switch_core::modules::config::now_ms()
+                        )
+                        .is_none(),
+                    "指向已删 uid 的粘性绑定必须立即清除"
+                );
+            }
+
+            clear_accounts(Region::Cn);
+            clear_accounts(Region::Global);
         }
+    }
 
-        let (status, body) = call_api(
-            Method::POST,
-            "/api/delete",
-            Some(json!({"accountId": "del-me", "region": "cn"})),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "删除必须成功：{body}");
+    /// P5 T03：参数化命令（导出 / 导入 / 积分）的 `scope` 必须 fail-closed（未知 / 空 / 缺 ⇒ 400）。
+    ///
+    /// 与 `src-tauri/src/commands.rs` 的 `parameterized_scope_tests` **互为镜像**
+    /// （同款实现散落两 crate 是刻意不去重，见共享知识）。
+    ///
+    /// 可证伪：把某条 handler 的 `resolve_scope_param(...)` 换成 `unwrap_or(Scope::WbCn)`
+    /// 式回落，第一条断言立即变红 —— 那正是「拼错 `trae-glboal` 静默读写 `wb-cn` 的库」的缺陷形态。
+    #[tokio::test]
+    async fn parameterized_account_commands_reject_unknown_scope() {
+        let _guard = test_guard();
+        isolated_home();
 
-        {
-            let state = crate::gateway_host::shared_state();
-            let pool = state.pool.read().await;
-            assert!(pool.get("pool-uid-del").is_none(), "已删账号的池条目必须立即移除");
-            assert!(pool.get("pool-uid-keep").is_some(), "其它账号的池条目不受影响");
-            let sticky = state.sticky.read().await;
+        for uri in [
+            "/api/accounts/export",
+            "/api/accounts/export-to-path",
+            "/api/accounts/import",
+            "/api/accounts/import-local",
+            "/api/data-dir/open",
+            "/api/credits/query",
+            "/api/checkin/status/query",
+        ] {
+            // 未知 / 拼错的作用域 ⇒ 400（`resolve_scope_param` 在落盘之前失败）。
+            let (status, body) = call_api(
+                Method::POST,
+                uri,
+                Some(json!({ "scope": "trae-glboal", "accountIds": [] })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+            assert_eq!(body["ok"], json!(false), "{uri}: {body}");
             assert!(
-                sticky.get("cn|glm-5.3|conv-1", buddy_switch_core::modules::config::now_ms()).is_none(),
-                "指向已删 uid 的粘性绑定必须立即清除"
+                body["error"].as_str().unwrap_or("").contains("wb-cn"),
+                "{uri} 的错误文案必须列出合法作用域: {body}"
+            );
+
+            // 缺 scope 同样 400（scope 是必填维度，缺它无从判断该读哪个库）。
+            let (status, body) = call_api(Method::POST, uri, Some(json!({}))).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{uri} 缺 scope 必须 400: {body}"
             );
         }
-
-        clear_accounts(Region::Cn);
-        clear_accounts(Region::Global);
     }
 }
 
 /// `parse_trae_variant` 的回归护栏。
 ///
-/// 覆盖：合法值、大小写与空白、**未知值回落默认**（且不 panic）。
+/// 覆盖：合法值、大小写与空白、**区域标识落到本区域合并版**、**未知值回落默认**。
 /// 与 `src-tauri/src/commands.rs` 的同名单测**互为镜像**，
-/// 两处实现必须保持一致（见 [`parse_trae_variant`] 的文档注释）。
+/// 两处实现必须保持一致（规则本身在 `trae::handlers::parse_variant_id`）。
 #[cfg(test)]
 mod parse_trae_variant_tests {
     use super::parse_trae_variant;
@@ -4179,20 +8777,27 @@ mod parse_trae_variant_tests {
 
     #[test]
     fn parses_known_canonical_values() {
-        assert_eq!(
-            parse_trae_variant(Some("trae_work")),
-            TraeVariant::TraeWork
-        );
+        assert_eq!(parse_trae_variant(Some("trae_work")), TraeVariant::TraeWork);
         assert_eq!(parse_trae_variant(Some("trae_cn")), TraeVariant::Trae);
+    }
+
+    /// ★ 前端只传区域（`cn` / `global`）：必须落到**本区域的合并版**。
+    ///
+    /// 反例（2026-10-20 用户报障）：`global` → 国际版 TraeWork ⇒ 授权页
+    /// `auth_from=solo` ⇒ 「TraeWork is currently not available in your region」。
+    #[test]
+    fn region_ids_resolve_to_the_regions_merged_client() {
+        assert_eq!(parse_trae_variant(Some("cn")), TraeVariant::TraeMerged);
+        assert_eq!(
+            parse_trae_variant(Some("global")),
+            TraeVariant::GlobalTraeMerged
+        );
     }
 
     #[test]
     fn parses_case_and_whitespace_insensitively() {
         // `TraeVariant::parse` 内部会 `trim + to_ascii_lowercase`。
-        assert_eq!(
-            parse_trae_variant(Some("TRAE_WORK")),
-            TraeVariant::TraeWork
-        );
+        assert_eq!(parse_trae_variant(Some("TRAE_WORK")), TraeVariant::TraeWork);
         assert_eq!(parse_trae_variant(Some(" Trae CN ")), TraeVariant::Trae);
     }
 
@@ -4207,4 +8812,1025 @@ mod parse_trae_variant_tests {
         assert_eq!(parse_trae_variant(Some("   ")), default);
         assert_eq!(parse_trae_variant(None), default);
     }
+}
+
+// ---------------------------------------------------------------------------
+// 统一网关（第三个产品线 · 管理面）
+//
+// ★ 它**跨平台**（把两个产品线的模型合成一个入口）⇒ 能力门控取 WorkBuddy 的 `gateway`
+//   能力（桌面端恒具备；「网关类能力可用与否」对两个产品线是一致的）。
+// ---------------------------------------------------------------------------
+
+/// GET /api/unified-gateway/config —— 配置 + 运行状态 + 命名空间（已启用 / 全部在册）。
+async fn api_unified_gateway_config() -> Response {
+    let state = crate::unified_gateway_host::shared_state();
+    // ★ 共同字段一律走**共享构造**（与桌面端同源；只有 `running`/`addr` 由本宿主补）。
+    let mut payload = buddy_switch_gateway::unified::admin::config_payload(&state).await;
+    let (running, addr) = crate::unified_gateway_host::status().await;
+    payload["running"] = json!(running);
+    payload["addr"] = json!(addr);
+    json_ok(payload)
+}
+
+/// POST /api/unified-gateway/config —— 保存并应用（启动 / 重启独立监听）。
+async fn api_save_unified_gateway_config(Json(body): Json<Value>) -> Response {
+    if let Err(error) = require_capability(Product::Workbuddy, capability::Capability::Gateway) {
+        return json_err(error, StatusCode::FORBIDDEN);
+    }
+    let submitted = body.get("config").cloned().unwrap_or(body);
+    let config: UnifiedGatewayConfig = match serde_json::from_value(submitted) {
+        Ok(config) => config,
+        Err(error) => return json_err(format!("配置格式错误: {error}"), StatusCode::BAD_REQUEST),
+    };
+    // ★ 不在册的命名空间 ⇒ 明确报错（不静默丢弃用户填的值）
+    if let Err(error) = config.validate() {
+        return json_err(error, StatusCode::BAD_REQUEST);
+    }
+    if let Err(error) = config.save() {
+        return json_err(error, StatusCode::BAD_REQUEST);
+    }
+    let state = crate::unified_gateway_host::shared_state();
+    state.set_config(config.clone()).await;
+    match crate::unified_gateway_host::apply().await {
+        Ok(addr) => json_ok(json!({
+            "ok": true,
+            "config": config,
+            "running": addr.is_some(),
+            "addr": addr,
+        })),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// GET /api/unified-gateway/models —— 已启用命名空间的清单预览（管理面专用，不过滤 Key 授权）。
+///
+/// `?refresh=true` ⇒ 绕过各产品线的识别缓存重取（同桌面端
+/// `get_unified_gateway_models(refresh)`；见 `unified::routes::models_preview` 的文档）。
+/// ⚠️ 与 `src-tauri/src/commands.rs` 的同名命令**刻意不去重**（两宿主各一份）。
+async fn api_unified_gateway_models(RawQuery(query): RawQuery) -> Response {
+    // 查询串只做「是否为真」判定：`true` / `1` 都算（手工调 API 的人两种都会写）。
+    let refresh = matches!(
+        query_value(query.as_deref(), "refresh").as_deref(),
+        Some("true") | Some("1")
+    );
+    json_ok(buddy_switch_gateway::unified::routes::models_preview(refresh).await)
+}
+
+/// GET /api/unified-gateway/pool-overview —— 已启用命名空间指向的**账号池总览**（只读投影）。
+///
+/// 统一网关没有自己的池：它按命名空间把请求分派到三条产品线各自的池。本 handler 把它们
+/// **已有的**池视图投影成一份跨平台汇总（**不新增任何选号逻辑**）。
+///
+/// ★ 形状 / 分组的**唯一构造点**在 gateway crate 的
+///   `unified::admin::pool_overview_payload`（两处宿主不各自拼 JSON，见那里的模块文档）。
+/// ⚠️ 与桌面端 `unified_gateway_pool_overview` **刻意不去重**。
+async fn api_unified_gateway_pool_overview() -> Response {
+    json_ok(buddy_switch_gateway::unified::admin::pool_overview_payload().await)
+}
+
+/// GET /api/unified-gateway/keys —— 统一密钥列表（**只出脱敏**）。
+async fn api_unified_gateway_list_keys() -> Response {
+    json_ok(buddy_switch_gateway::unified::admin::keys_list_payload(
+        &crate::unified_gateway_host::shared_state().keys,
+    ))
+}
+
+/// POST /api/unified-gateway/keys —— 创建（支持可选自定义密钥）。
+async fn api_unified_gateway_create_key(Json(body): Json<Value>) -> Response {
+    let namespaces: Vec<String> = body
+        .get("namespaces")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    // ⚠️ 前端发 **camelCase**（门禁按 `commands.rs` 的形参名比对），手工调 API 的人可能发
+    //   snake_case ⇒ **两种都收**（服务端是手工读 body，不像 Tauri 那样自动映射）。
+    let biz_namespace = body
+        .get("bizNamespace")
+        .or_else(|| body.get("biz_namespace"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let name = body
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("未命名")
+        .to_string();
+    match crate::unified_gateway_host::shared_state()
+        .keys
+        .create_with_key(name, namespaces, biz_namespace, custom_key_from_body(&body))
+    {
+        Ok((record, plaintext)) => {
+            json_ok(json!({ "ok": true, "key": plaintext, "record": record.masked() }))
+        }
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/unified-gateway/keys/plaintext —— 用户点「保存到本软件」后把明文写入台账。
+async fn api_unified_gateway_save_key_plaintext(Json(body): Json<Value>) -> Response {
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("");
+    let plaintext = body.get("plaintext").and_then(Value::as_str).unwrap_or("");
+    match crate::unified_gateway_host::shared_state()
+        .keys
+        .save_plaintext(id, plaintext)
+    {
+        Ok(()) => json_ok(json!({ "ok": true })),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/unified-gateway/keys/revoke —— 吊销（置标记，**可逆**）。
+async fn api_unified_gateway_revoke_key(Json(body): Json<Value>) -> Response {
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("");
+    match crate::unified_gateway_host::shared_state().keys.revoke(id) {
+        Ok(()) => json_ok(json!({ "ok": true })),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/unified-gateway/keys/policy —— 更新某把统一 Key 的策略（issue #76）。
+///
+/// ★ **不动命名空间授权**（`namespaces` / `biz_namespace`）—— 那是「能访问哪些平台」，
+/// 与配额是两个维度，混进同一个入口会让「只改配额」意外清掉授权。
+async fn api_unified_gateway_set_key_policy(Json(body): Json<Value>) -> Response {
+    use buddy_switch_gateway::apikey::KeyPolicy;
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("");
+    let policy: KeyPolicy =
+        match serde_json::from_value(body.get("policy").cloned().unwrap_or(Value::Null)) {
+            Ok(policy) => policy,
+            Err(error) => {
+                return json_err(format!("策略字段不合法: {error}"), StatusCode::BAD_REQUEST)
+            }
+        };
+    match crate::unified_gateway_host::shared_state()
+        .keys
+        .update_policy(id, policy)
+    {
+        Ok(()) => json_ok(json!({ "ok": true })),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// GET /api/unified-gateway/keys/usage-all —— **批量**用量（密钥表每行一列）。
+///
+/// 为什么不复用单 Key 命令循环调用：密钥表一屏十几行，N 次往返会让打开分区明显变慢；
+/// 账本本来就是一次 `load()` 全量读，批量反而更省。
+async fn api_unified_gateway_key_usage_all() -> Response {
+    let state = crate::unified_gateway_host::shared_state();
+    let now = buddy_switch_core::modules::config::now_ms();
+    let mut rows = serde_json::Map::new();
+    for record in state.keys.list() {
+        let policy = record.policy();
+        let used =
+            state
+                .key_usage
+                .used_for(&record.id, policy.quota_unit, policy.quota_period, now);
+        let exceeded = matches!(
+            buddy_switch_gateway::apikey::quota_verdict_for_policy(&policy, used),
+            buddy_switch_gateway::apikey::QuotaVerdict::Exceeded { .. }
+        );
+        rows.insert(
+            record.id.clone(),
+            json!({
+                "ok": true,
+                "keyId": record.id,
+                "unit": policy.quota_unit,
+                "period": policy.quota_period,
+                "periodKey": policy.quota_period.period_key(now),
+                "used": used,
+                "total": state
+                    .key_usage
+                    .snapshot(&record.id)
+                    .map(|entry| entry.counters(policy.quota_unit).total)
+                    .unwrap_or(0),
+                "exceeded": exceeded,
+            }),
+        );
+    }
+    json_ok(Value::Object(rows))
+}
+
+/// GET /api/unified-gateway/keys/usage?id=… —— 读某把统一 Key 的用量快照。
+async fn api_unified_gateway_key_usage(RawQuery(query): RawQuery) -> Response {
+    let id = query_value(query.as_deref(), "id").unwrap_or_default();
+    if id.is_empty() {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let state = crate::unified_gateway_host::shared_state();
+    let now = buddy_switch_core::modules::config::now_ms();
+    let Some(record) = state.keys.list().into_iter().find(|record| record.id == id) else {
+        return json_err("API Key 不存在".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let policy = record.policy();
+    let usage = state.key_usage.snapshot(&id);
+    let used = state
+        .key_usage
+        .used_for(&id, policy.quota_unit, policy.quota_period, now);
+    let exceeded = matches!(
+        buddy_switch_gateway::apikey::quota_verdict_for_policy(&policy, used),
+        buddy_switch_gateway::apikey::QuotaVerdict::Exceeded { .. }
+    );
+    json_ok(json!({
+        "ok": true,
+        "keyId": id,
+        "unit": policy.quota_unit,
+        "period": policy.quota_period,
+        "periodKey": policy.quota_period.period_key(now),
+        "used": used,
+        "total": usage
+            .as_ref()
+            .map(|entry| entry.counters(policy.quota_unit).total)
+            .unwrap_or(0),
+        "exceeded": exceeded,
+    }))
+}
+
+/// POST /api/unified-gateway/keys/restore —— 撤销吊销（同一把 Key 重新可用）。
+async fn api_unified_gateway_restore_key(Json(body): Json<Value>) -> Response {
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("");
+    match crate::unified_gateway_host::shared_state().keys.restore(id) {
+        Ok(()) => json_ok(json!({ "ok": true })),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/unified-gateway/keys/delete —— 物理删除（**仅限已吊销**）。
+async fn api_unified_gateway_delete_key(Json(body): Json<Value>) -> Response {
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("");
+    match crate::unified_gateway_host::shared_state().keys.delete(id) {
+        Ok(()) => json_ok(json!({ "ok": true })),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Qoder（第三个平台）
+// ---------------------------------------------------------------------------
+//
+// ★ 全部 handler **参数化 `scope`**，一律经 `resolve_scope_param` **fail-closed** 解析。
+//   Qoder 的双区域是**两本互不相通的账号库**，缺 scope 就无从判断该读哪本。
+//
+// ⚠️ 本文件在 `src-tauri/src/commands.rs` 有**同款**接线（刻意不去重，见文件头说明）。
+//   改一处必须 grep 另一处。
+
+/// 该端点**只服务 WorkBuddy / Trae** —— Qoder 作用域一律给可诊断的 400。
+///
+/// ★ **刻意不回落**到任何既有平台：把 Qoder 的请求静默打到 WorkBuddy 的账号库上，
+/// 比报错坏得多（用户会看到「账号凭空消失」或「改错了别的平台的号」）。
+fn qoder_scope_not_applicable() -> Response {
+    json_err(
+        "该端点只服务 WorkBuddy / Trae 作用域，不支持 Qoder —— \
+         Qoder 的账号管理请用 Qoder 分区自己的端点（/api/qoder/*）。"
+            .to_string(),
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+/// 解析 `?scope=`（GET）—— 失败即 400，**不回落默认作用域**。
+fn qoder_region_from_query(query: Option<&str>) -> Result<QoderRegion, String> {
+    let scope = resolve_scope_param(query_value(query, "scope").as_deref())?;
+    require_qoder_region(scope)
+}
+
+/// 从请求体取 `scope` 并解析成区域。
+fn qoder_region_from_body(body: &Value) -> Result<QoderRegion, String> {
+    let scope = resolve_scope_param(body.get("scope").and_then(Value::as_str))?;
+    require_qoder_region(scope)
+}
+
+/// GET /api/qoder/accounts —— 账号列表（**不含令牌明文**）。
+async fn api_qoder_accounts(RawQuery(query): RawQuery) -> Response {
+    match qoder_region_from_query(query.as_deref()) {
+        Ok(region) => json_ok(qoder::account::accounts_view_for(region)),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// GET /api/qoder/local-sources —— 本机凭据来源探测（**只读、不落库**）。
+async fn api_qoder_local_sources(RawQuery(query): RawQuery) -> Response {
+    match qoder_region_from_query(query.as_deref()) {
+        Ok(region) => json_ok(qoder::profile::probe_view_for(region)),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/qoder/accounts/import-local —— 从本机已登录的客户端导入账号。
+async fn api_qoder_import_local(Json(body): Json<Value>) -> Response {
+    let region = match qoder_region_from_body(&body) {
+        Ok(region) => region,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    match tokio::task::spawn_blocking(move || qoder::profile::import_from_local_for(region)).await {
+        Ok(Ok(value)) => json_ok(value),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(
+            format!("导入 Qoder 本机账号失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// POST /api/qoder/accounts/import-pat —— 由 PAT 导入一条账号（**纯本地**，不访问上游）。
+async fn api_qoder_import_pat(Json(body): Json<Value>) -> Response {
+    let region = match qoder_region_from_body(&body) {
+        Ok(region) => region,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let pat = body
+        .get("pat")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let nickname = body
+        .get("nickname")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    match tokio::task::spawn_blocking(move || {
+        qoder::profile::import_from_pat_for(region, &pat, nickname)
+    })
+    .await
+    {
+        Ok(Ok(value)) => json_ok(value),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(
+            format!("导入 Qoder PAT 失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// POST /api/qoder/accounts/remark —— 改备注（唯一的「只改一个字段」入口）。
+async fn api_qoder_set_account_remark(Json(body): Json<Value>) -> Response {
+    let region = match qoder_region_from_body(&body) {
+        Ok(region) => region,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let uid = body
+        .get("uid")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let remark = body
+        .get("remark")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    match tokio::task::spawn_blocking(move || qoder::account::set_remark_for(region, &uid, remark))
+        .await
+    {
+        Ok(Ok(changed)) => json_ok(json!({ "ok": changed })),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(
+            format!("保存 Qoder 备注失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// POST /api/qoder/accounts/delete —— 删除一条账号（**软删除**：移入回收站，可恢复）。
+async fn api_qoder_delete_account(Json(body): Json<Value>) -> Response {
+    let region = match qoder_region_from_body(&body) {
+        Ok(region) => region,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let uid = body
+        .get("uid")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    match tokio::task::spawn_blocking(move || qoder::trash::trash_account_for(region, &uid)).await {
+        Ok(Ok(removed)) => json_ok(json!({ "ok": removed })),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(
+            format!("删除 Qoder 账号失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// POST /api/qoder/accounts/refresh —— 刷新一条账号的令牌（device / job / PAT 三路由）。
+async fn api_qoder_refresh_account(Json(body): Json<Value>) -> Response {
+    let region = match qoder_region_from_body(&body) {
+        Ok(region) => region,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let uid = body
+        .get("uid")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    match qoder::refresh::refresh_for(region, &uid).await {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// GET /api/qoder/checkin/status —— 区域签到状态（逐账号 + 汇总；国际版如实报未开放）。
+async fn api_qoder_checkin_status(RawQuery(query): RawQuery) -> Response {
+    match qoder_region_from_query(query.as_deref()) {
+        Ok(region) => json_ok(qoder::checkin::status_for(region).await),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// GET /api/qoder/checkin/status-map —— 逐账号「今日签到状态」（**只读**；issue #47）。
+///
+/// `scope` 决定区域（`qoder-cn` / `qoder-global`），`accountIds` 是逗号分隔的 uid 列表。
+/// 未知 uid **不进** map；读失败回 `{ok:false, error}` —— 前端据 `ok` 区分「没签」与
+/// 「读不到」。**绝不**在这里调 claim。
+async fn api_qoder_checkin_status_map(RawQuery(query): RawQuery) -> Response {
+    let region = match qoder_region_from_query(query.as_deref()) {
+        Ok(region) => region,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let ids = parse_id_list(query_value(query.as_deref(), "accountIds"));
+    json_ok(qoder::checkin::status_map_for(region, ids).await)
+}
+
+/// GET /api/qoder/checkin/logs —— 自动签到台账（**只读**，零上游请求）。
+///
+/// 存在的理由：签到在后台静默执行，用户只能看到「今天签没签」，看不到「排程到底
+/// 跑没跑、为什么没领到」。本接口把最近若干轮的结论（成功 / 已有 / 未开放 / 失败，
+/// 以及「等 10:00 刷新后补跑」的待办时刻）原样下发。
+async fn api_qoder_checkin_logs(RawQuery(query): RawQuery) -> Response {
+    match qoder_region_from_query(query.as_deref()) {
+        Ok(region) => json_ok(qoder::checkin::logs_for(region)),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/qoder/checkin/claim —— 单账号签到（状态驱动；见 checkin 模块头）。
+async fn api_qoder_checkin_claim(Json(body): Json<Value>) -> Response {
+    let region = match qoder_region_from_body(&body) {
+        Ok(region) => region,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let uid = body
+        .get("uid")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    match qoder::checkin::claim_for(region, &uid).await {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// GET /api/qoder/pro-pack/status —— Pro 升级包资格（**只读**）。
+///
+/// `available=false` ⇒ 活动已下线 / 本区域没有（真机 404 就是这一档）⇒ 前端**不渲染**入口。
+async fn api_qoder_pro_pack_status(RawQuery(query): RawQuery) -> Response {
+    let region = match qoder_region_from_query(query.as_deref()) {
+        Ok(region) => region,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let uid = query_value(query.as_deref(), "uid").unwrap_or_default();
+    match qoder::checkin::pro_pack_status_for(region, &uid).await {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/qoder/pro-pack/claim —— 领取 Pro 升级包（幂等；已领过 `already=true`）。
+async fn api_qoder_pro_pack_claim(Json(body): Json<Value>) -> Response {
+    let region = match qoder_region_from_body(&body) {
+        Ok(region) => region,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let uid = body.get("uid").and_then(Value::as_str).unwrap_or("");
+    match qoder::checkin::pro_pack_claim_for(region, uid).await {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// GET /api/qoder/credits —— 区域额度 / 套餐视图（逐账号 + 汇总；部分失败如实报）。
+async fn api_qoder_credits(RawQuery(query): RawQuery) -> Response {
+    match qoder_region_from_query(query.as_deref()) {
+        Ok(region) => {
+            let view = qoder::credits::region_view(region).await;
+            // ★ 顺手喂**限额护栏**的余额快照（G1 的唯一数据来源）：
+            //   余额是慢变数据，只有这里真的查过一次才有值；没查过 ⇒ G1 恒不触发。
+            //   「余额 > 0」也是解除 402 停放的唯一路径（见 `quota::note_credits_view`）。
+            buddy_switch_gateway::qoder::quota::note_credits_view(region, &view);
+            json_ok(view)
+        }
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/qoder/oauth/start —— 发起设备授权，返回 `{ loginId, verificationUri, expiresIn }`。
+///
+/// ⚠️ **不发网络**（只读本机 machine_id + 本地算 PKCE），故无需 `spawn_blocking`。
+async fn api_qoder_oauth_start(Json(body): Json<Value>) -> Response {
+    let region = match qoder_region_from_body(&body) {
+        Ok(region) => region,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    match qoder::oauth::login_start_for(region).await {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/qoder/oauth/status —— 轮询一次登录结果（`{ done, result?, error? }`）。
+///
+/// ★ 形状与 WB 的 `/api/oauth/status` **逐字一致**：前端 `OAuthLoginDialog` 是共用壳，
+/// 它只读 `done` / `result` / `error` 三个键。
+async fn api_qoder_oauth_status(Json(body): Json<Value>) -> Response {
+    let region = match qoder_region_from_body(&body) {
+        Ok(region) => region,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let login_id = body
+        .get("loginId")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    json_ok(qoder::oauth::login_poll_for(region, &login_id).await)
+}
+
+/// GET /api/qoder/programs —— 程序位状态（只读；界面据此渲染胶囊行与「当前登录」徽章）。
+async fn api_qoder_program_status(RawQuery(query): RawQuery) -> Response {
+    match qoder_region_from_query(query.as_deref()) {
+        Ok(region) => {
+            match tokio::task::spawn_blocking(move || qoder::switch::program_status_for(region))
+                .await
+            {
+                Ok(value) => json_ok(value),
+                Err(error) => json_err(
+                    format!("读取 Qoder 程序位状态失败: {error}"),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                ),
+            }
+        }
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/qoder/accounts/switch —— 切换账号（把凭据写回指定程序位的登录态）。
+///
+/// ⚠️ 写客户端文件（与 `switch_account` 同级）：客户端在跑时被守卫拒绝，失败自动还原备份。
+///
+/// `close_first`（同名 body 字段，缺省 `false`）与桌面端同一条语义：**先关客户端再写**
+/// （`switch::switch_account_for_closing`）。两条通道必须收同一个字段 —— 否则会出现
+/// 「桌面端能关闭并切换、浏览器里点了没反应」。
+async fn api_qoder_switch_account(Json(body): Json<Value>) -> Response {
+    let region = match qoder_region_from_body(&body) {
+        Ok(region) => region,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let raw_program = body
+        .get("program")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let Some(program) = qoder::switch::QoderProgram::parse(&raw_program) else {
+        return json_err(
+            format!("未知的 Qoder 程序位: {raw_program}"),
+            StatusCode::BAD_REQUEST,
+        );
+    };
+    let uid = body
+        .get("uid")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let close_first = body
+        .get("closeFirst")
+        .or_else(|| body.get("close_first"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    match tokio::task::spawn_blocking(move || {
+        if close_first {
+            qoder::switch::switch_account_for_closing(region, program, &uid)
+        } else {
+            qoder::switch::switch_account_for(region, program, &uid)
+        }
+    })
+    .await
+    {
+        Ok(Ok(value)) => json_ok(value),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(
+            format!("切换 Qoder 账号失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// POST /api/qoder/accounts/group —— 改自定义分组（与备注同构）。
+async fn api_qoder_set_account_group(Json(body): Json<Value>) -> Response {
+    let region = match qoder_region_from_body(&body) {
+        Ok(region) => region,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let uid = body
+        .get("uid")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let group = body
+        .get("group")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    match tokio::task::spawn_blocking(move || qoder::account::set_group_for(region, &uid, group))
+        .await
+    {
+        Ok(Ok(changed)) => json_ok(json!({ "ok": changed })),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(
+            format!("保存 Qoder 分组失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// GET /api/qoder/usage —— 逐日用量（**单位是 credits，不是 token**；理由见 `qoder::usage`）。
+async fn api_qoder_usage(RawQuery(query): RawQuery) -> Response {
+    let region = match qoder_region_from_query(query.as_deref()) {
+        Ok(region) => region,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let days = query_value(query.as_deref(), "days").and_then(|raw| raw.trim().parse::<u32>().ok());
+    match tokio::task::spawn_blocking(move || qoder::usage::usage_view_for(region, days)).await {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(
+            format!("读取 Qoder 用量失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Qoder API 网关（管理面）
+// ---------------------------------------------------------------------------
+//
+// 与 Trae 侧的管理面形状一致（config / status / models / keys / logs），差异有两处：
+// ① 归属轴是**区域**而不是程序位（Key 绑定 `region`）；② **一个监听服务两个区域** ——
+//    监听是否起来、端口是多少是两区域共用的事实，只有池 / Key 前缀按 `scope` 分家。
+
+/// GET /api/qoder/gateway/config —— Qoder 网关配置（**全局唯一**，不分区域）。
+async fn api_qoder_gateway_config() -> Response {
+    match serde_json::to_value(buddy_switch_gateway::qoder::QoderGatewayConfig::load()) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/qoder/gateway/config —— 保存配置并应用（启动 / 重启独立监听）。
+///
+/// ⚠️ `max_body_mb` 是**构造期**固化进 axum `DefaultBodyLimit` 的，改它要等下一次
+/// `apply()` —— 而本 handler 每次都会 `apply()`，所以只要走这条路由就一定生效。
+async fn api_save_qoder_gateway_config(Json(body): Json<Value>) -> Response {
+    if let Err(error) = require_capability(Product::Qoder, capability::Capability::Gateway) {
+        return json_err(error, StatusCode::FORBIDDEN);
+    }
+    let submitted = body.get("config").cloned().unwrap_or(body);
+    let config: buddy_switch_gateway::qoder::QoderGatewayConfig =
+        match serde_json::from_value(submitted) {
+            Ok(config) => config,
+            Err(error) => {
+                return json_err(format!("配置格式错误: {error}"), StatusCode::BAD_REQUEST)
+            }
+        };
+    if let Err(error) = config.save() {
+        return json_err(error, StatusCode::BAD_REQUEST);
+    }
+    let state = crate::qoder_gateway_host::shared_state();
+    *state.config.write().await = config.clone();
+    state.log.set_keep(config.log_keep);
+    state.log.set_log_bodies(config.log_bodies);
+    let addr = match crate::qoder_gateway_host::apply().await {
+        Ok(addr) => addr,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    json_ok(json!({
+        "ok": true,
+        "config": config,
+        "running": addr.is_some(),
+        "addr": addr,
+    }))
+}
+
+/// POST /api/trae/gateway/pool/exclusions —— 设置 / 取消排除（`{variant?, uid, excluded, note?}`）。
+async fn api_set_trae_pool_exclusion(Json(body): Json<Value>) -> Response {
+    let uid = body.get("uid").and_then(Value::as_str).unwrap_or("").trim();
+    if uid.is_empty() {
+        return json_err("缺少 uid".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let excluded = body
+        .get("excluded")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let note = body.get("note").and_then(Value::as_str).unwrap_or("");
+    let variant = parse_trae_variant(body.get("variant").and_then(Value::as_str));
+    let scope = format!("trae:{}", variant.as_str());
+
+    match buddy_switch_gateway::routes::pool_admin::persist(&scope, uid, excluded, note) {
+        Ok(value) => {
+            if excluded {
+                crate::trae_gateway_host::shared_state()
+                    .sticky
+                    .lock()
+                    .await
+                    .purge_uid(uid);
+            }
+            json_ok(value)
+        }
+        Err(error) => json_err(error, StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/qoder/gateway/pool/exclusions —— 设置 / 取消排除。
+async fn api_set_qoder_pool_exclusion(Json(body): Json<Value>) -> Response {
+    let uid = body.get("uid").and_then(Value::as_str).unwrap_or("").trim();
+    if uid.is_empty() {
+        return json_err("缺少 uid".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let excluded = body
+        .get("excluded")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let note = body.get("note").and_then(Value::as_str).unwrap_or("");
+    let region = match qoder_region_from_body(&body) {
+        Ok(region) => region,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let scope = format!("qoder:{}", region.as_str());
+
+    match buddy_switch_gateway::routes::pool_admin::persist(&scope, uid, excluded, note) {
+        Ok(value) => {
+            if excluded {
+                crate::qoder_gateway_host::shared_state()
+                    .sticky
+                    .lock()
+                    .await
+                    .purge_uid(uid);
+            }
+            json_ok(value)
+        }
+        Err(error) => json_err(error, StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// GET /api/qoder/gateway/status —— 运行状态 + **该区域**账号池 + 账号明细 + 诊断。
+///
+/// `scope` 必填且 fail-closed（`qoder-cn` / `qoder-global`）：Qoder 的双区域是两本
+/// 互不相通的账号库，缺 scope 就无从判断该看哪本 —— **不**回落任意一本。
+async fn api_qoder_gateway_status(RawQuery(query): RawQuery) -> Response {
+    let region = match qoder_region_from_query(query.as_deref()) {
+        Ok(region) => region,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let (running, addr) = crate::qoder_gateway_host::status().await;
+    json_ok(
+        buddy_switch_gateway::qoder::status_view(
+            &crate::qoder_gateway_host::shared_state(),
+            running,
+            addr,
+            update::APP_VERSION,
+            region,
+        )
+        .await,
+    )
+}
+
+/// GET /api/qoder/gateway/quota —— **限额护栏**视图（逐账号当日用量 + 拦截原因）。
+///
+/// `scope` 必填且 fail-closed（与 `/status` 同一条纪律）：两个区域的计数是**两份文件**，
+/// 缺 scope 就无从判断该看哪一份。
+///
+/// 表里的 `blocked` / `blockedReason` 由**选号用的同一个函数**产出
+/// （`quota::blocked`）⇒ 面板说「已拦」就是真的会拦，不会两处口径。
+async fn api_qoder_gateway_quota(RawQuery(query): RawQuery) -> Response {
+    match qoder_region_from_query(query.as_deref()) {
+        Ok(region) => {
+            let state = crate::qoder_gateway_host::shared_state();
+            json_ok(state.quota_view(region).await)
+        }
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// GET /api/qoder/gateway/models —— 对外暴露的模型清单（**随上游刷新**）。
+///
+/// 与 Trae 侧不同：Qoder **没有静态常量清单**，清单只能向官方拉（需账号凭据）。
+/// 拉不到时给空清单 + 可读 `note` + `source`（`live` / `cached` / `unavailable`），
+/// **绝不**伪造一份「像真的」清单。
+///
+/// `?refresh=1`（或 `refresh=true`）绕过 10 分钟缓存强制重拉（管理面「重新识别」按钮）。
+/// 响应形状由 gateway crate 的 `payload::admin_models_response` **唯一产出**
+/// （两宿主共用，本层不拼装）。
+async fn api_qoder_gateway_models(RawQuery(query): RawQuery) -> Response {
+    let region = match qoder_region_from_query(query.as_deref()) {
+        Ok(region) => region,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let force = matches!(
+        query_value(query.as_deref(), "refresh").as_deref(),
+        Some("1") | Some("true")
+    );
+    let state = crate::qoder_gateway_host::shared_state();
+    let catalog = if force {
+        state.refresh_catalog(region).await
+    } else {
+        state.catalog_for(region).await
+    };
+    // ★ 出口 ①（P11）：与网关本体（`qoder/routes.rs` 的 `models`）读**同一份** `disabled`
+    //   （按**作用域**键控），否则「管理面看到的清单」与「网关实际暴露的清单」会不一致。
+    let disabled = {
+        let guard = state.disabled.read().await;
+        guard
+            .get(buddy_switch_core::modules::product::scope_of_qoder_region(
+                region,
+            ))
+            .clone()
+    };
+    json_ok(buddy_switch_gateway::qoder::payload::admin_models_response(
+        region,
+        &catalog,
+        &disabled,
+        state.max_context_now(),
+    ))
+}
+
+/// GET /api/qoder/gateway/keys —— 多 Key 列表（含归属区域，形状与 Tauri 命令逐字一致）。
+///
+/// **形状唯一来源**：直接调 gateway crate 的 `list`，本层不拼装
+/// （`MEMORY.md §二`：`copy_sessions` 事故的直接对策）。
+async fn api_qoder_list_api_keys() -> Response {
+    let state = crate::qoder_gateway_host::shared_state();
+    json_ok(json!({ "keys": state.key_store.list() }))
+}
+
+/// POST /api/qoder/gateway/keys —— 新建 Key（`{name, scope, customKey?}`）。
+///
+/// 明文仅随本次响应返回（不落盘，等用户选择）；`scope` 决定归属区域（fail-closed）；
+/// `customKey` 非空 → 原样使用。
+async fn api_qoder_create_api_key(Json(body): Json<Value>) -> Response {
+    let region = match qoder_region_from_body(&body) {
+        Ok(region) => region,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let name = body
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("未命名 Key")
+        .to_string();
+    let state = crate::qoder_gateway_host::shared_state();
+    match state
+        .key_store
+        .create_with_key(name, region, custom_key_from_body(&body))
+    {
+        Ok((record, plaintext)) => json_ok(json!({
+            "ok": true,
+            "key": plaintext,
+            "record": record.masked(),
+        })),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/qoder/gateway/keys/plaintext —— 用户点「保存到本软件」后把明文写入台账。
+async fn api_qoder_save_api_key_plaintext(Json(body): Json<Value>) -> Response {
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("");
+    let plaintext = body.get("plaintext").and_then(Value::as_str).unwrap_or("");
+    let state = crate::qoder_gateway_host::shared_state();
+    match state.key_store.save_plaintext(id, plaintext) {
+        Ok(()) => json_ok(json!({ "ok": true })),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/qoder/gateway/keys/revoke —— 吊销 Key（`{id}`）。
+async fn api_qoder_revoke_api_key(Json(body): Json<Value>) -> Response {
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("").trim();
+    if id.is_empty() {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let state = crate::qoder_gateway_host::shared_state();
+    match state.key_store.revoke(id) {
+        Ok(()) => json_ok(json!({ "ok": true })),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/qoder/gateway/keys/policy —— 更新某把 Qoder Key 的策略（issue #76）。
+async fn api_qoder_set_key_policy(Json(body): Json<Value>) -> Response {
+    use buddy_switch_gateway::apikey::KeyPolicy;
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("").trim();
+    if id.is_empty() {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let policy: KeyPolicy =
+        match serde_json::from_value(body.get("policy").cloned().unwrap_or(Value::Null)) {
+            Ok(policy) => policy,
+            Err(error) => {
+                return json_err(format!("策略字段不合法: {error}"), StatusCode::BAD_REQUEST)
+            }
+        };
+    let state = crate::qoder_gateway_host::shared_state();
+    match state.key_store.update_policy(id, policy) {
+        Ok(()) => json_ok(json!({ "ok": true })),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// GET /api/qoder/gateway/keys/usage?id=… —— 读某把 Qoder Key 的用量快照。
+///
+/// ⚠️ Qoder 的 `key_store.list()` 返回**掩码视图**（`Vec<Value>`）——按 `id` 取出后
+/// 从 JSON 键读策略（`quotaUnit` / `quotaPeriod`），不是记录本体。
+async fn api_qoder_key_usage(RawQuery(query): RawQuery) -> Response {
+    let id = query_value(query.as_deref(), "id").unwrap_or_default();
+    if id.is_empty() {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let state = crate::qoder_gateway_host::shared_state();
+    let now = buddy_switch_core::modules::config::now_ms();
+    let Some(row) = state
+        .key_store
+        .list()
+        .into_iter()
+        .find(|row| row["id"] == serde_json::json!(id))
+    else {
+        return json_err("API Key 不存在".to_string(), StatusCode::BAD_REQUEST);
+    };
+    // 掩码视图是 camelCase ⇒ 按字符串解析枚举（与前端同形态）。
+    let policy: buddy_switch_gateway::apikey::KeyPolicy = match serde_json::from_value(row.clone())
+    {
+        Ok(policy) => policy,
+        Err(error) => {
+            return json_err(
+                format!("策略字段异常: {error}"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+        }
+    };
+    let usage = state.key_usage.snapshot(&id);
+    let used = state
+        .key_usage
+        .used_for(&id, policy.quota_unit, policy.quota_period, now);
+    let exceeded = matches!(
+        buddy_switch_gateway::apikey::quota_verdict_for_policy(&policy, used),
+        buddy_switch_gateway::apikey::QuotaVerdict::Exceeded { .. }
+    );
+    json_ok(json!({
+        "ok": true,
+        "keyId": id,
+        "unit": policy.quota_unit,
+        "period": policy.quota_period,
+        "periodKey": policy.quota_period.period_key(now),
+        "used": used,
+        "total": usage
+            .as_ref()
+            .map(|entry| entry.counters(policy.quota_unit).total)
+            .unwrap_or(0),
+        "exceeded": exceeded,
+    }))
+}
+
+/// POST /api/qoder/gateway/keys/restore —— 撤销吊销（Key 重新可用，`{id}`）。
+async fn api_qoder_restore_api_key(Json(body): Json<Value>) -> Response {
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("").trim();
+    if id.is_empty() {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let state = crate::qoder_gateway_host::shared_state();
+    match state.key_store.restore(id) {
+        Ok(()) => json_ok(json!({ "ok": true })),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/qoder/gateway/keys/delete —— 物理删除已吊销的 Key（`{id}`）。
+async fn api_qoder_delete_api_key(Json(body): Json<Value>) -> Response {
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("").trim();
+    if id.is_empty() {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let state = crate::qoder_gateway_host::shared_state();
+    match state.key_store.delete(id) {
+        Ok(()) => json_ok(json!({ "ok": true })),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_qoder_gateway_logs() -> Response {
+    let state = crate::qoder_gateway_host::shared_state();
+    json_ok(json!({ "logs": state.log.list() }))
+}
+
+async fn api_qoder_clear_gateway_logs() -> Response {
+    let state = crate::qoder_gateway_host::shared_state();
+    state.log.clear();
+    json_ok(json!({ "ok": true }))
 }

@@ -23,7 +23,6 @@ export const zh = {
 
   // ---- 页面：设置 ----
   "wbSettings.page.title": "设置",
-  "wbSettings.page.subtitle": "自动签到、权限检测与网关配置。外观、开机自启与自动更新属应用级设置，见侧栏底部「通用设置」。",
 
   // ---- 自动签到 ----
   "wbSettings.checkin.groupTitle": "自动签到",
@@ -41,6 +40,11 @@ export const zh = {
   "wbSettings.checkin.resultSuccess": "签到成功",
   "wbSettings.checkin.resultAlready": "已签到",
   "wbSettings.checkin.resultFailed": "失败",
+  // 自动旅行（真实键：`auto_travel_config.json` 的 `enabled`；原型 签到与积分 → 自动旅行）。
+  "wbSettings.checkin.travelLabel": "启用自动旅行",
+  "wbSettings.checkin.travelDesc": "通过旅行任务获取额外积分",
+  "wbSettings.checkin.travelOn": "已开启自动旅行",
+  "wbSettings.checkin.travelOff": "已关闭自动旅行",
 
   // ---- CodeBuddy CLI 自动轮换 ----
   "wbSettings.rotate.groupTitle": "CodeBuddy CLI 自动轮换",
@@ -71,6 +75,37 @@ export const zh = {
   "wbSettings.rotate.actionDisabled": "未启用",
   "wbSettings.rotate.actionError": "出错",
 
+  // ---- 客户端检测（只读；数据来自真实探测命令） ----
+  // P15 · 外部 Agent 会话监听（往客户端 `settings.json` 装 hook；默认关，可一键还原）。
+  "wbSettings.agentWatch.title": "会话监听",
+  "wbSettings.agentWatch.enable": "监听客户端会话",
+  "wbSettings.agentWatch.enableDesc":
+    "给客户端装 hook，把会话状态显示在悬浮窗里。会修改客户端的 settings.json（可一键还原），默认关闭。",
+  "wbSettings.agentWatch.slot.workbuddy-cn": "WorkBuddy（国内版）",
+  "wbSettings.agentWatch.slot.workbuddy-global": "WorkBuddy（国际版）",
+  // CLI 系客户端（槽位在家目录，见 client_settings 的 HOOK_FILE_SLOTS）。
+  "wbSettings.agentWatch.slot.claude": "Claude Code",
+  "wbSettings.agentWatch.slot.codebuddy": "CodeBuddy",
+  // Trae 的 **hooks 文件**（`~/.trae-cn/hooks.json` / `~/.trae/hooks.json`，按区域分家）。
+  "wbSettings.agentWatch.slot.trae-hooks-cn": "Trae（国内版）",
+  "wbSettings.agentWatch.slot.trae-hooks-global": "Trae（国际版）",
+  "wbSettings.agentWatch.state.running": "客户端运行中，请先退出再开启",
+  "wbSettings.agentWatch.state.installed": "已装 {count} 条",
+  "wbSettings.agentWatch.state.off": "未开启",
+  "wbSettings.agentWatch.state.missing": "未检测到该客户端",
+  "wbSettings.client.detectTitle": "客户端检测",
+  "wbSettings.client.detectWorkbuddy": "WorkBuddy Desktop",
+  "wbSettings.client.detectWorkbuddyDesc": "检测安装路径与版本",
+  "wbSettings.client.detectCli": "CodeBuddy CLI",
+  "wbSettings.client.detectCliDesc": "命令行工具的可用性",
+  "wbSettings.client.detectCnIde": "CodeBuddy CN IDE",
+  "wbSettings.client.detectCnIdeDesc": "国内版 IDE 的接入状态",
+  "wbSettings.client.detected": "已检测到",
+  "wbSettings.client.detectedVersion": "已检测到 · {version}",
+  "wbSettings.client.notDetected": "未检测到",
+  "wbSettings.client.configured": "已接入",
+  "wbSettings.client.notConfigured": "未接入",
+
   // ---- 权限检测 ----
   "wbSettings.permission.groupTitle": "权限检测",
   "wbSettings.permission.authFileMissing": "认证文件路径未获取",
@@ -88,6 +123,28 @@ export const zh = {
   "wbSettings.permission.guideStep3Drag": "直接拖进",
   "wbSettings.permission.guideStep3Post": "完全磁盘访问的列表区域（即使没有提示框，拖入即生效），然后打开它的开关",
   "wbSettings.permission.guideStep4": "回到本页点「检测权限」，或直接重试切换",
+
+  // ---- 危险操作（Q1）----
+  // ⚠️ 刻意**不含**「重置设备标识」：那是 Trae 客户端自己的 6 层文件，WorkBuddy 没有
+  //   这套结构，本工具在网关侧的身份是 sha256 派生的纯函数值（不落盘、无可重置对象）。
+  "wbSettings.danger.groupTitle": "危险操作",
+  "wbSettings.danger.intro": "以下操作会影响本机数据。执行前请确认已知后果。",
+  "wbSettings.danger.diagLabel": "导出诊断包",
+  "wbSettings.danger.diagDesc":
+    "打包版本、平台、各数据源是否可读与网关配置摘要，便于反馈问题。不含任何凭据、也不含会话正文。",
+  "wbSettings.danger.diag": "导出诊断包",
+  "wbSettings.danger.exporting": "导出中…",
+  "wbSettings.danger.diagSaved": "诊断包已保存：{name}",
+  "wbSettings.danger.diagFailed": "导出诊断包失败",
+  "wbSettings.danger.logsLabel": "清空网关请求日志",
+  "wbSettings.danger.logsDesc": "删除本机全部网关请求记录，用于排查代理问题。不可撤销。",
+  "wbSettings.danger.logsClear": "清空日志",
+  "wbSettings.danger.logsCleared": "网关请求日志已清空",
+  "wbSettings.danger.logsClearFailed": "清空网关请求日志失败",
+  "wbSettings.danger.logsConfirmTitle": "清空网关请求日志？",
+  "wbSettings.danger.logsConfirmDesc":
+    "本机全部网关请求记录会被删除，且无法恢复。账号、配置与凭据不受影响。",
+  "wbSettings.danger.logsConfirmBtn": "确认清空",
 
   // ---- 账号切换 ----
   "wbSettings.switch.groupTitle": "账号切换",
@@ -126,10 +183,12 @@ export const zh = {
   "wbSettings.gateway.bodiesDesc": "含隐私风险；默认关闭，仅记录时间/模型/状态码等元数据",
   "wbSettings.gateway.invalidPort": "端口需为 1-65535 之间的整数",
   "wbSettings.gateway.invalidKeep": "保留条数需为 0-10000 之间的整数",
+  "wbSettings.gateway.enabledLabel": "启用本地网关",
+  "wbSettings.gateway.enabledDesc": "在 127.0.0.1 上提供 OpenAI / Anthropic 兼容接口",
 
   // ---- 定时任务排程 ----
   "wbSettings.schedule.groupTitle": "定时任务排程",
-  "wbSettings.schedule.intro": "六类任务各自独立开关与小时表，到点由调度器触发。小时使用 24 小时制本地时间，可配置多个小时点。改完可用「立即执行」当场跑一轮验证，无需等到下一个整点。",
+  "wbSettings.schedule.intro": "六类任务各自独立开关与时点表，到点由调度器触发。时点使用 24 小时制本地时间，可精确到分钟（如 09:37），可配置多个；每个任务还可叠加「抖动」（±5/15/30 分钟），让每天的实际触发时刻错开。改完可用「立即执行」当场跑一轮验证，无需等到下一个时点。",
   "wbSettings.schedule.task.checkin.label": "签到",
   "wbSettings.schedule.task.checkin.desc": "自动签到各账号",
   "wbSettings.schedule.task.travel.label": "自动旅行",
@@ -142,27 +201,29 @@ export const zh = {
   "wbSettings.schedule.task.school.desc": "开学季任务",
   "wbSettings.schedule.task.cat.label": "夜猫子",
   "wbSettings.schedule.task.cat.desc": "夜猫子（猫猫领取）任务",
-  "wbSettings.schedule.task.growth.label": "成长任务",
-  "wbSettings.schedule.task.growth.desc": "全账号成长任务队列（仅 CN；默认每天 01:00）",
   "wbSettings.schedule.enableAria": "启用{label}",
   "wbSettings.schedule.runNowBtn": "立即执行",
   "wbSettings.schedule.activityCountLabel": "活跃上报次数",
   "wbSettings.schedule.activityCountDesc": "每个账号每天上报的对话次数",
   "wbSettings.schedule.saveBtn": "保存排程",
   "wbSettings.schedule.savedMsg": "排程配置已保存",
-  "wbSettings.schedule.invalidHour": "「{label}」包含非法小时 {hour}，小时必须是 0-23 的整数",
-  "wbSettings.schedule.emptyHours": "「{label}」已启用，请至少设置一个小时点，或关闭该任务",
+  "wbSettings.schedule.invalidTime": "「{label}」包含非法时点 {time}，时点格式必须是 HH:MM（00:00–23:59）",
+  "wbSettings.schedule.emptyTimes": "「{label}」已启用，请至少设置一个时点，或关闭该任务",
   "wbSettings.schedule.invalidReportCount": "活跃上报次数必须是大于 0 的整数",
   "wbSettings.schedule.runDone": "「{label}」{summary}",
   "wbSettings.schedule.summaryExecuted": "已执行",
   "wbSettings.schedule.summaryNoStreak": "已上报 {reported} 条（未读到连登天数）",
   "wbSettings.schedule.summaryStreak": "已上报 {reported} 条，当前连登 {streak} 天",
-  // ---- 小时点编辑器（schedule-hours-editor.tsx，被上面各任务行复用） ----
-  "wbSettings.schedule.hourInvalid": "小时必须是 0-23 之间的整数",
-  "wbSettings.schedule.hourDuplicate": "{hour} 点已在列表中",
-  "wbSettings.schedule.hourEmpty": "未设置小时点",
-  "wbSettings.schedule.hourRemoveAria": "移除 {hour} 点",
-  "wbSettings.schedule.hourAdd": "添加",
+  // ---- 时点编辑器（schedule-times-editor.tsx，被上面各任务行复用） ----
+  "wbSettings.schedule.timeInvalid": "时点格式必须是 HH:MM（00:00–23:59）",
+  "wbSettings.schedule.timeDuplicate": "{time} 已在列表中",
+  "wbSettings.schedule.timeEmpty": "未设置时点",
+  "wbSettings.schedule.timeRemoveAria": "移除 {time}",
+  "wbSettings.schedule.timeAdd": "添加",
+  "wbSettings.schedule.jitterLabel": "抖动",
+  "wbSettings.schedule.jitterAria": "抖动幅度",
+  "wbSettings.schedule.jitterOff": "不抖动",
+  "wbSettings.schedule.jitterOption": "±{minutes} 分钟",
 
   // ---- 更新安装弹框 ----
   "wbSettings.update.timeoutError": "检查更新超时，请检查网络连接后重试",
@@ -183,25 +244,61 @@ export const zh = {
   "wbSettings.update.connecting": "正在连接公开 Release 更新源…",
   "wbSettings.update.downloadingLabel": "下载更新包",
   "wbSettings.update.downloading": "下载中…",
-  "wbSettings.update.downloadUrlLabel": "下载地址（点击可手动下载）",
   "wbSettings.update.readyToRestart": "v{version} 已准备完成，重启应用后生效。",
   "wbSettings.update.unknownError": "未知更新错误",
-  "wbSettings.update.openRelease": "打开 GitHub Release",
   "wbSettings.update.retry": "重试",
-  "wbSettings.update.closeNow": "立即关闭",
   "wbSettings.update.restarting": "正在重启…",
   "wbSettings.update.restartNow": "立即重启",
+
+  // ---- 升级前说明（版本内容）：先说明，再由用户决定是否现在装 ----
+  "wbSettings.update.titleAvailable": "发现新版本 v{version}",
+  "wbSettings.update.descAvailable": "先看清这一版改了什么，再决定要不要现在升级。",
+  "wbSettings.update.metaCurrent": "当前 v{version}",
+  "wbSettings.update.metaPublished": "发布于 {date}",
+  "wbSettings.update.startNow": "立即升级",
+  "wbSettings.update.later": "稍后升级",
+  "wbSettings.update.breakingTitle": "升级前必读",
+  "wbSettings.update.breakingCount": "{count} 项会改变既有行为",
+  "wbSettings.update.sectionsTitle": "本版更新",
+  "wbSettings.update.sectionsMeta": "{groups} 组 · {items} 条",
+  "wbSettings.update.olderShow": "更早的 {count} 个版本",
+  "wbSettings.update.olderHide": "收起更早版本",
+  "wbSettings.update.notesEmpty": "这次发布没有附带说明。",
+  "wbSettings.update.notesEmptyHint": "可以打开完整发布说明查看提交记录（离线或发布方未提供时会是这个状态）。",
+  "wbSettings.update.downloadingHint": "下载完成后会提示你重启",
+  "wbSettings.update.downloadingBusy": "下载中",
+  "wbSettings.update.restartLater": "稍后重启",
+  "wbSettings.update.openDownloadPage": "打开下载页",
+  "wbSettings.update.errorProxyHint": "若本机需要代理，可在「应用设置 → 更新代理」里填写后重试；也可以直接打开下载页手动安装。",
+  "wbSettings.update.viewFullNotes": "查看完整发布说明",
 
   // ---- 打赏弹框 ----
   "wbSettings.donate.trigger": "请作者喝杯饮料",
   "wbSettings.donate.title": "支持 Buddy Switch",
-  "wbSettings.donate.desc": "Buddy Switch 免费开源。如果它帮到了你，可以扫码请作者喝杯饮料。",
+  "wbSettings.donate.desc": "Buddy Switch 免费开源。如果它帮到了你，可以扫码或走爱发电请作者喝杯饮料。",
   "wbSettings.donate.wechat": "微信支付",
   "wbSettings.donate.alipay": "支付宝",
+  "wbSettings.donate.ifdianLead": "也可以通过爱发电支持",
+  "wbSettings.donate.ifdianCta": "打开爱发电主页",
   "wbSettings.donate.qrAlt": "{name}收款码",
   "wbSettings.donate.repoHome": "项目主页",
+  "wbSettings.donate.starLead": "觉得好用？顺手给项目点个 Star（零成本，是继续维护最大的动力）",
+  "wbSettings.donate.starCta": "去 GitHub 点 Star",
 
-  // ---- 两步验证（TOTP） ----
+  // fork扩展：保留成长任务、两步验证及会员信息词条。
+  "wbSettings.page.subtitle": "自动签到、权限检测与网关配置。外观、开机自启与自动更新属应用级设置，见侧栏底部「通用设置」。",
+  "wbSettings.schedule.task.growth.label": "成长任务",
+  "wbSettings.schedule.task.growth.desc": "全账号成长任务队列（仅 CN；默认每天 01:00）",
+  "wbSettings.schedule.invalidHour": "「{label}」包含非法小时 {hour}，小时必须是 0-23 的整数",
+  "wbSettings.schedule.emptyHours": "「{label}」已启用，请至少设置一个小时点，或关闭该任务",
+  "wbSettings.schedule.hourInvalid": "小时必须是 0-23 之间的整数",
+  "wbSettings.schedule.hourDuplicate": "{hour} 点已在列表中",
+  "wbSettings.schedule.hourEmpty": "未设置小时点",
+  "wbSettings.schedule.hourRemoveAria": "移除 {hour} 点",
+  "wbSettings.schedule.hourAdd": "添加",
+  "wbSettings.update.downloadUrlLabel": "下载地址（点击可手动下载）",
+  "wbSettings.update.openRelease": "打开 GitHub Release",
+  "wbSettings.update.closeNow": "立即关闭",
   "wbSettings.totp.groupTitle": "两步验证",
   "wbSettings.totp.enableDesc": "启用后，登录时需要输入 Google Authenticator 动态口令。",
   "wbSettings.totp.disableDesc": "禁用后，登录时不再需要验证码。",

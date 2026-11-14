@@ -1,0 +1,401 @@
+#!/usr/bin/env node
+/**
+ * `src/lib/credit-packs.ts` 的**真实断言**（issue #144 复核 §5「门禁从文本断言升级为行为断言」）。
+ *
+ * ## 为什么不用文本断言
+ *
+ * 旧门禁对聚合详情只做字符串匹配（`check-scope-registry.cjs:9164`「文件里有没有某个
+ * `account.platform === ...`」）。它能证明「三个分支都在」，**证明不了**「到期时间没被
+ * 当成毫秒」—— 而 #144 的回归正是这样漏过去的：代码结构完全正确，只有量纲错了。
+ *
+ * 所以这里照抄 `check-key-usage.mjs` 的做法：用 esbuild 把**生产代码本身**转译成 ESM、
+ * 经 `data:` URL 导入，跑真断言。不复制逻辑（复制的那份必然与生产漂移）。
+ *
+ * ## 钉住四条
+ *
+ * 1. **秒 → 毫秒**：`secondsToMs` 之后必须等于 2026-11-21 02:40（+08:00），而不是 1970
+ *    （#144 的指纹）。注意断言的是**固定 fixture 的换算结果**，不读系统时钟 —— 与运行日历无关；
+ * 2. **`remaining <= 0` / `total <= 0` 剔除**（#143 / #144 共用的判据）；
+ * 3. **排序**：已过期垫底 → 未过期按到期升序 → `null`（永久）垫在未过期的最后；
+ * 4. **`ratio` 是 0..100**（抽屉直接拼 `%`，给 0..1 就是 1/100 宽的进度条）。
+ *
+ * 另加两条「用法」断言（这类必须看源码）：Trae 的秒值只能经 `secondsToMs` 归一，
+ * 不许再出现就地 `* 1000`；四个调用方都必须走 `toDetailPacks`。
+ *
+ * 用法：`node scripts/check-credit-packs.mjs`（已挂进 `npm run check:scope`）。
+ */
+
+import { readFileSync, readdirSync, statSync } from "node:fs";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import path from "node:path";
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+async function loadTs(relative) {
+  const source = readFileSync(path.join(root, relative), "utf8");
+  // ★ Windows：绝对路径必须转 `file://` URL，否则 ESM loader 把 `D:` 当成协议。
+  const { transform } = await import(
+    pathToFileURL(path.join(root, "node_modules/esbuild/lib/main.js")).href
+  );
+  const { code } = await transform(source, { loader: "ts", format: "esm" });
+  return import(`data:text/javascript;base64,${Buffer.from(code).toString("base64")}`);
+}
+
+const { normalizePacks, toDetailPacks, packIsExpired, packRatio, secondsToMs } = await loadTs(
+  "src/lib/credit-packs.ts",
+);
+/* 临期窗口的镜像常量（#144 复核 §3.3）：与后端 `EXPIRING_SOON_SECS` 必须同值。 */
+const { TRAE_EXPIRING_SOON_MS, remainingSpan, summarizeExpiring, expiringSubtextAmount } =
+  await loadTs("src/lib/credit-expiry.ts");
+
+/** 递归列出 `src/**` 的 ts/tsx（用法断言的扫描面）。 */
+function walkTs(dir, out = []) {
+  for (const entry of readdirSync(dir)) {
+    const abs = path.join(dir, entry);
+    if (statSync(abs).isDirectory()) walkTs(abs, out);
+    else if (/\.(ts|tsx)$/.test(entry)) out.push(abs);
+  }
+  return out;
+}
+
+let failed = 0;
+let passed = 0;
+function check(name, fn) {
+  try {
+    fn();
+    passed += 1;
+  } catch (error) {
+    failed += 1;
+    console.error(`  ✗ ${name}\n    ${error.message}`);
+  }
+}
+function eq(actual, expected, hint) {
+  const a = JSON.stringify(actual);
+  const e = JSON.stringify(expected);
+  if (a !== e) throw new Error(`${hint ? hint + "：" : ""}期望 ${e}，实际 ${a}`);
+}
+
+/* 判定基准时刻：2026-11-03T00:00:00+08:00。用固定值而不是 `Date.now()`，
+   否则「已过期 / 临期」的断言会随日历漂移。 */
+const NOW = Date.UTC(2026, 10, 2, 16, 0, 0);
+const DAY = 86_400_000;
+/** 2026-11-21 02:40 +08:00，即截图里那批「近期到期」的量级（Unix **秒**）。 */
+const SEC_2026_11_21 = 1795200000;
+
+const pack = (over = {}) => ({
+  key: "k",
+  name: "pack",
+  total: 100,
+  remaining: 100,
+  used: 0,
+  expireAtMs: NOW + 10 * DAY,
+  ...over,
+});
+
+check("★ 秒 → 毫秒：Trae 的 Unix 秒必须换算成 2026-11-21 02:40（+08:00），不是 1970（#144 回归）", () => {
+  const ms = secondsToMs(SEC_2026_11_21);
+  eq(ms, SEC_2026_11_21 * 1000, "secondsToMs 的倍率");
+  /* 钉住绝对值：输入是常量、不读 `Date.now()`，所以这条断言与运行年份无关
+     （2027 年跑同样是这个时刻，不是「必须在 2026 年」）。 */
+  eq(new Date(ms).toISOString(), "2026-11-20T18:40:00.000Z", "换算后的绝对时刻（= 2026-11-21 02:40 +08:00）");
+  /* 反证：直接当毫秒解释会落到 1970-01-22 02:40（+08:00，即截图里那串时间的来源）——
+     把错误方向也钉住，避免有人「顺手」改回裸值。 */
+  eq(new Date(SEC_2026_11_21).toISOString(), "1970-01-21T18:40:00.000Z", "未换算时的时刻（这是错误方向，仅作对照）");
+  eq(secondsToMs(null), null, "null 必须原样透传（永久有效 ≠ 0）");
+});
+
+check("remaining <= 0 / total <= 0 不列（#143 / #144 共用判据）", () => {
+  const rows = normalizePacks(
+    [
+      pack({ key: "used-up", remaining: 0 }),
+      pack({ key: "zero-limit", total: 0, remaining: 0 }),
+      pack({ key: "ok", remaining: 5 }),
+    ],
+    NOW,
+  );
+  eq(
+    rows.map((row) => row.key),
+    ["ok"],
+    "过滤后的 key",
+  );
+});
+
+check("排序：已过期垫底 → 到期升序 → null（永久）垫在未过期最后", () => {
+  const rows = normalizePacks(
+    [
+      pack({ key: "expired", expireAtMs: NOW - DAY, expired: true }),
+      pack({ key: "forever", expireAtMs: null }),
+      pack({ key: "late", expireAtMs: NOW + 30 * DAY }),
+      pack({ key: "soon", expireAtMs: NOW + 2 * DAY }),
+    ],
+    NOW,
+  );
+  eq(
+    rows.map((row) => row.key),
+    ["soon", "late", "forever", "expired"],
+    "排序结果",
+  );
+});
+
+check("expired 取「后端标记 或 到期时刻已过」的并集（不只信后端）", () => {
+  if (!packIsExpired(pack({ expireAtMs: NOW - 1 }), NOW)) {
+    throw new Error("到期时刻已过却没判过期 —— 界面会把过期包标成临期");
+  }
+  if (!packIsExpired(pack({ expired: true, expireAtMs: NOW + DAY }), NOW)) {
+    throw new Error("后端说过期却不认 —— 后端口径与前端显示会打架");
+  }
+  if (packIsExpired(pack({ expireAtMs: null }), NOW)) {
+    throw new Error("永久有效被判成过期");
+  }
+});
+
+check("expiringSoon 只认后端标记（缺字段 = 未知，不推测窗口）", () => {
+  const rows = normalizePacks(
+    [
+      pack({ key: "no-flag", expiringSoon: undefined }),
+      pack({ key: "flagged", expiringSoon: true }),
+      pack({ key: "expired-flagged", expiringSoon: true, expired: true }),
+    ],
+    NOW,
+  );
+  const byKey = Object.fromEntries(rows.map((row) => [row.key, row.expiringSoon]));
+  eq(byKey, { "no-flag": false, flagged: true, "expired-flagged": false }, "临期标记");
+});
+
+check("★ ratio 是 0..100 且已夹紧（给 0..1 就是 1/100 宽的进度条）", () => {
+  eq(packRatio(86.01, 100), 86.01, "正常值");
+  eq(packRatio(200, 100), 100, "超额夹紧到 100");
+  eq(packRatio(0, 0), 0, "分母为 0");
+  eq(packRatio(-5, 100), 0, "负值夹紧到 0");
+  const rows = normalizePacks([pack({ remaining: 86.01, total: 100 })], NOW);
+  eq(rows[0].ratio, 86.01, "normalizePacks 里的 ratio");
+});
+
+check("toDetailPacks 把**毫秒**交给 expiryText（不是原始秒）", () => {
+  const seen = [];
+  toDetailPacks(
+    [pack({ key: "t", expireAtMs: secondsToMs(SEC_2026_11_21) })],
+    {
+      remainingText: String,
+      totalText: String,
+      usedText: String,
+      expiryText: (ms, expired) => {
+        seen.push({ ms, expired });
+        return "x";
+      },
+    },
+    NOW,
+  );
+  eq(seen, [{ ms: SEC_2026_11_21 * 1000, expired: false }], "expiryText 的入参");
+});
+
+/* ── 用法断言：这类只能看源码（「谁在调」不是纯函数行为）────────────────── */
+
+check("Trae 的秒值只经 secondsToMs 归一，不许再就地 `* 1000`", () => {
+  for (const file of ["src/lib/aggregate-detail.ts", "src/pages/TraeAccountsPage.tsx"]) {
+    const code = readFileSync(path.join(root, file), "utf8");
+    if (!code.includes("secondsToMs(")) {
+      throw new Error(`${file} 没有用 secondsToMs 归一 Trae 的秒口径`);
+    }
+    if (/expireAt\s*\*\s*1000/.test(code)) {
+      throw new Error(`${file} 里还有就地 \`expireAt * 1000\` —— 下一次漏乘就是再一个 1970`);
+    }
+  }
+});
+
+check("四个装配点都走共用 toDetailPacks（不许再各写一份过滤/排序/比例）", () => {
+  for (const file of [
+    "src/pages/AccountsPage.tsx",
+    "src/pages/TraeAccountsPage.tsx",
+    "src/pages/QoderAccountsPage.tsx",
+    "src/lib/aggregate-detail.ts",
+  ]) {
+    const code = readFileSync(path.join(root, file), "utf8");
+    if (!code.includes("toDetailPacks(")) {
+      throw new Error(`${file} 没有走 toDetailPacks —— 又回到了四份实现`);
+    }
+  }
+});
+
+/* ── 「打上游」的自动刷新必须 opt-in（issue #133 复核 §3）────────────────
+ *
+ * 这条只能看源码：它是「谁在调、传了什么」而不是纯函数行为。失败模式很具体 ——
+ * 新增一个打上游的视图时忘了接开关，于是它默认就开始每 10 分钟花一次上游成本，
+ * 而界面文案还写着「自动刷新已关闭」。
+ */
+check("★ 打上游的三处自动刷新都接到 opt-in 开关（新增视图不许漏接）", () => {
+  const upstreamViews = [
+    "src/pages/CreditStatsPage.tsx",
+    "src/pages/QoderCreditsPage.tsx",
+    "src/pages/QoderAccountsPage.tsx",
+  ];
+  for (const file of upstreamViews) {
+    const code = readFileSync(path.join(root, file), "utf8");
+    if (!code.includes("useCreditRefreshPref(")) {
+      throw new Error(`${file} 会打上游却没有读 opt-in 开关 —— 默认就开始花钱`);
+    }
+    if (!/useAutoRefreshWhenVisible\([\s\S]{0,400}?upstreamAutoRefresh,\s*\)/.test(code)) {
+      throw new Error(`${file} 读了开关却没把它传给 useAutoRefreshWhenVisible 的第 4 参`);
+    }
+  }
+  /* 只读本地快照的两页**不该**受这个开关约束（零上游成本，关掉只损失新鲜度）。 */
+  for (const file of ["src/pages/TraeCreditsPage.tsx", "src/pages/TraeAccountsPage.tsx"]) {
+    const code = readFileSync(path.join(root, file), "utf8");
+    if (code.includes("useCreditRefreshPref(")) {
+      throw new Error(`${file} 只读本地快照，却被 opt-in 开关拦住 —— 关掉后它不会自己更新`);
+    }
+  }
+  /* 全局的余额轮询同样打上游 ⇒ 必须读同一个 store（不是自己存一份 state）。 */
+  const hook = readFileSync(path.join(root, "src/lib/use-credit-auto-refresh.ts"), "utf8");
+  if (!hook.includes("useCreditRefreshPref(")) {
+    throw new Error("useCreditAutoRefresh 没有读 opt-in 开关 —— 卡片余额仍在自动打上游");
+  }
+});
+
+/* ── 临期窗口：只认后端标记，缺标记时用**镜像常量**（#144 复核 §3.3）────────
+ *
+ * 这条失败模式很隐蔽：同一个包在卡片上说「临期」、点开抽屉却不说 —— 因为两处用了
+ * 不同窗口。#144 复核当时数出五处实现，其中三处是前端自设窗口；现在收敛成
+ * 「后端标记 + 两个镜像常量」。
+ *
+ * ★ 2026-11-09：窗口从 14 天统一到 **7 天**（与 WorkBuddy 的 `EXPIRING_SOON_DAYS` 同值）。
+ *   因此本门禁不再「禁止 7 天写法」，而是断言两个镜像常量都等于 7 天，并且**这两个文件
+ *   之外**不许再出现写死的窗口。
+ */
+check("★ 临期窗口只剩两档：后端标记，或镜像后端的 7 天常量（不许在别处写死）", () => {
+  eq(TRAE_EXPIRING_SOON_MS, 7 * DAY, "TRAE_EXPIRING_SOON_MS 必须镜像后端 EXPIRING_SOON_SECS（7 天）");
+  /* Qoder 那个文件带值导入（`@/lib/credit-expiry`），esbuild 出来的 ESM 仍带 `@/` 别名、
+     node 解不了 ⇒ 这里用源码断言，不动态 import。 */
+  const qoderSource = readFileSync(path.join(root, "src/lib/qoder-packs.ts"), "utf8");
+  if (!/export const EXPIRING_SOON_MS\s*=\s*7\s*\*\s*24\s*\*\s*3600\s*\*\s*1000\s*;/.test(qoderSource)) {
+    throw new Error("qoder-packs.EXPIRING_SOON_MS 必须与后端 EXPIRING_SOON_SECS 同值（7 天）");
+  }
+  const mirrorFiles = new Set([
+    path.join(root, "src/lib/credit-expiry.ts"),
+    path.join(root, "src/lib/qoder-packs.ts"),
+  ]);
+  const offenders = [];
+  for (const file of walkTs(path.join(root, "src"))) {
+    if (mirrorFiles.has(file)) continue;
+    const code = readFileSync(file, "utf8")
+      .split("\n")
+      .filter((line) => !/^\s*(\*|\/\/|\/\*)/.test(line))
+      .join("\n");
+    /* 抓「写死的临期窗口」：`7 * 86_400_000` / `7 * 86400000` / `7 * 24 * 3600`。 */
+    if (/\b7\s*\*\s*(?:86_?400_?000|24\s*\*\s*3600)/.test(code)) {
+      offenders.push(path.relative(root, file));
+    }
+  }
+  if (offenders.length > 0) {
+    throw new Error(
+      `这些文件仍在自行写死临期窗口（应用后端标记或 TRAE_EXPIRING_SOON_MS / EXPIRING_SOON_MS）：${offenders.join("、")}`,
+    );
+  }
+});
+
+/* ── 剩余时长的展示粒度：**只有一处判据** ─────────────────────────────────
+ *
+ * 2026-11-09：#189 把徽章改成「≤ 48 小时说小时」，但 WB 账号页表格的「积分到期」列
+ * 仍用只到天的 `daysUntil()` ⇒ 2 小时后到期的批在徽章上「2小时」、在同一行的表格里
+ * 「1 天」。这类分叉不会被 tsc 抓（两个函数都合法），只能靠行为断言把「同源」钉住。
+ *
+ * 可证伪点：
+ * ① 边界：48 小时（含等号）仍算小时，49 小时才是 3 天（向上取整、宁可说晚）；
+ * ② 同源：`summarizeExpiring().soonestUnit` 必须等于 `remainingSpan()` 对同一剩余时长的
+ *    结论 —— 变异：把 summarizeExpiring 里的 `remainingSpan(remaining).unit` 换回
+ *    内联三元 ⇒ 这一组仍可能过，所以还要 ③；
+ * ③ 用法：表格列读 `remainingSpan`，且 `daysUntil` 这个「只到天」的旧出口已删除
+ *    （留着它，下一个人一定会再用一次）。
+ */
+check("★ 剩余时长粒度只有一处判据（remainingSpan）：徽章与表格列同源", () => {
+  const HOUR = 3_600_000;
+  eq(remainingSpan(2 * HOUR), { unit: "hours", value: 2 }, "2 小时");
+  eq(remainingSpan(48 * HOUR), { unit: "hours", value: 48 }, "48 小时（边界含等号）");
+  eq(remainingSpan(49 * HOUR), { unit: "days", value: 3 }, "49 小时应向上取整成 3 天");
+  eq(remainingSpan(3 * DAY), { unit: "days", value: 3 }, "3 天");
+  const only = (hours) => [
+    { expireAt: NOW + hours * HOUR, remaining: 10, expired: false, expiringSoon: true },
+  ];
+  for (const hours of [1, 47, 48, 49, 72]) {
+    const summary = summarizeExpiring(only(hours), { now: NOW });
+    eq(summary.soonestUnit, remainingSpan(hours * HOUR).unit, `${hours} 小时后徽章的单位`);
+  }
+  const page = readFileSync(path.join(root, "src/pages/AccountsPage.tsx"), "utf8");
+  if (!/remainingSpan\(/.test(page)) {
+    throw new Error("AccountsPage 的「积分到期」列没读 remainingSpan —— 会与卡片徽章的粒度分叉");
+  }
+  const pageCode = page
+    .split("\n")
+    .filter((line) => !/^\s*(\*|\/\/|\/\*)/.test(line))
+    .join("\n");
+  if (/\bdaysUntil\s*\(/.test(pageCode)) {
+    throw new Error("AccountsPage 又出现 daysUntil —— 只到天的出口应改 remainingSpan");
+  }
+  const expirySource = readFileSync(path.join(root, "src/lib/credit-expiry.ts"), "utf8");
+  if (/export function daysUntil/.test(expirySource)) {
+    throw new Error("credit-expiry 又长回了 daysUntil —— 判据只允许 remainingSpan 一处");
+  }
+});
+
+/* ── 「7 天内到期 X 积分」副文本：0 与未知都不渲染 ──────────────────────────
+ *
+ * 这行是**警示**不是读数：0 是绝大多数账号的常态，写成「7 天内到期 0 积分」等于把
+ * 「一切正常」说成一条提醒（看久了这一行就被无视）；而「读不到」更不能塌成 0
+ * （把不知道说成没有）。两件事在同一个出口挡掉，五个调用点只判 `null`。
+ *
+ * 可证伪点：
+ * ① 闸门本身：0 / 负数 / NaN / null / undefined ⇒ `null`；正数原样返回；
+ * ② 用法：四个文件（WB / Trae / Qoder 抽屉 + 聚合详情两个分支）都必须走它 ——
+ *    各自写 `!= null && > 0` 会漏掉其中一个分支，而 tsc 不会报。
+ */
+check("★ 「7 天内到期 X 积分」副文本：0 与未知都不渲染（同一出口）", () => {
+  eq(expiringSubtextAmount(12.5), 12.5, "有金额应原样返回");
+  eq(expiringSubtextAmount(0), null, "0 = 常态，不渲染");
+  eq(expiringSubtextAmount(-1), null, "负数不渲染");
+  eq(expiringSubtextAmount(Number.NaN), null, "NaN（非数）不渲染");
+  eq(expiringSubtextAmount(null), null, "未知（null）不渲染");
+  eq(expiringSubtextAmount(undefined), null, "缺失（undefined）不渲染");
+  const callSites = [
+    "src/pages/AccountsPage.tsx",
+    "src/pages/QoderAccountsPage.tsx",
+    "src/pages/TraeAccountsPage.tsx",
+    "src/lib/aggregate-detail.ts",
+  ];
+  for (const rel of callSites) {
+    const src = readFileSync(path.join(root, rel), "utf8");
+    if (!/expiringSubtextAmount\(/.test(src)) {
+      throw new Error(`${rel} 的副文本没走 expiringSubtextAmount —— 0 / 未知 会各自判错`);
+    }
+  }
+});
+
+/* ── 文案里的窗口天数 ──────────────────────────────────────────────────────
+ *
+ * 「7 天内到期 X 积分」把窗口**写进了句子**（不是参数化的 `{days}`）。常量改了、
+ * 文案没改，界面就会说假话 —— 而且这种假话没有任何测试会红。
+ * 这里把两边钉在一起：文案里的天数必须等于 `TRAE_EXPIRING_SOON_MS / DAY`。
+ */
+check("★ 抽屉副文本的「7 天」与窗口常量同值（改窗口必须同步改文案）", () => {
+  const days = TRAE_EXPIRING_SOON_MS / DAY;
+  for (const lang of ["zh", "en"]) {
+    const source = readFileSync(path.join(root, `src/locales/domains/shared.${lang}.ts`), "utf8");
+    const line = source.match(/^\s*"shared\.detail\.creditsExpiring":\s*"([^"]*)"/m);
+    if (!line) {
+      throw new Error(`src/locales/domains/shared.${lang}.ts 里找不到 shared.detail.creditsExpiring`);
+    }
+    /* 尾部不锚 `\b`：中文「7 天内」的「天」与「内」之间没有单词边界，锚了就永远匹配不上。 */
+    if (!new RegExp(`\\b${days}\\s*(天|days?)`).test(line[1])) {
+      throw new Error(
+        `shared.${lang}.ts 的 creditsExpiring 文案（"${line[1]}"）没有写 ${days} 天 —— 与 TRAE_EXPIRING_SOON_MS 不一致`,
+      );
+    }
+  }
+});
+
+if (failed > 0) {
+  console.error(`\ncredit-packs 门禁：${passed} 通过 / ${failed} 失败`);
+  process.exit(1);
+}
+console.log(
+  `credit-packs 门禁：${passed} 项通过（秒→毫秒 · 过滤 · 排序 · ratio · 临期标记 · 调用点 · opt-in 接线 · 临期窗口）`,
+);

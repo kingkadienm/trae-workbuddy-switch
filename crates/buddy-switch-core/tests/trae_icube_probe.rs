@@ -36,7 +36,11 @@ fn appdata_root() -> Option<std::path::PathBuf> {
     std::env::var("USERPROFILE")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .map(|home| std::path::PathBuf::from(home).join("AppData").join("Roaming"))
+        .map(|home| {
+            std::path::PathBuf::from(home)
+                .join("AppData")
+                .join("Roaming")
+        })
 }
 
 /// 本机是否存在至少一条产品线的 storage.json。
@@ -82,7 +86,10 @@ fn probe_real_machine_icube_decryption() {
                 println!("  machineId  = {}", identity.machine_id);
                 println!("  appVersion = {:?}", identity.app_version);
                 println!("  sourceApp  = {}", identity.source_app);
-                println!("  publicKeyPEM 长度 = {} 字节", identity.public_key_pem.len());
+                println!(
+                    "  publicKeyPEM 长度 = {} 字节",
+                    identity.public_key_pem.len()
+                );
 
                 // ★ 公钥必须是标准 EC P-256 SPKI。
                 let body: String = identity
@@ -94,7 +101,12 @@ fn probe_real_machine_icube_decryption() {
                 let der = base64::engine::general_purpose::STANDARD
                     .decode(body)
                     .expect("真机公钥必须是合法 base64 SPKI");
-                assert_eq!(der.len(), 91, "EC P-256 SPKI 应为 91 字节，实得 {}", der.len());
+                assert_eq!(
+                    der.len(),
+                    91,
+                    "EC P-256 SPKI 应为 91 字节，实得 {}",
+                    der.len()
+                );
                 assert_eq!(
                     &der[..SPKI_PREFIX.len()],
                     &SPKI_PREFIX[..],
@@ -103,17 +115,27 @@ fn probe_real_machine_icube_decryption() {
 
                 // 脱敏：Debug 与诊断视图都不得含私钥。
                 let debug = format!("{identity:?}");
-                assert!(!debug.contains("PRIVATE"), "DeviceIdentity::Debug 泄漏了私钥");
+                assert!(
+                    !debug.contains("PRIVATE"),
+                    "DeviceIdentity::Debug 泄漏了私钥"
+                );
                 let status = icube::credential_status_for(variant);
                 let status_text = serde_json::to_string(&status).unwrap();
                 assert!(!status_text.contains("BEGIN"), "{status_text}");
                 assert!(!status_text.contains("PRIVATE KEY"), "{status_text}");
-                assert_eq!(status.get("available").and_then(|v| v.as_bool()), Some(true));
+                assert_eq!(
+                    status.get("available").and_then(|v| v.as_bool()),
+                    Some(true)
+                );
                 println!("  credential_status_for = {status}");
                 checked += 1;
             }
             Err(error) => {
-                println!("  设备身份不可用: {}（kind={}）", error.user_message(variant), error.kind());
+                println!(
+                    "  设备身份不可用: {}（kind={}）",
+                    error.user_message(variant),
+                    error.kind()
+                );
             }
         }
 
@@ -121,7 +143,10 @@ fn probe_real_machine_icube_decryption() {
         match icube::device_credential_for(variant) {
             Ok(credential) => {
                 let debug = format!("{credential:?}");
-                assert!(debug.contains("<redacted>"), "DeviceCredential::Debug 未脱敏: {debug}");
+                assert!(
+                    debug.contains("<redacted>"),
+                    "DeviceCredential::Debug 未脱敏: {debug}"
+                );
                 assert!(!debug.contains("BEGIN PRIVATE KEY"), "Debug 泄漏私钥正文");
                 let proof = icube::device_proof(
                     &credential,
@@ -142,7 +167,11 @@ fn probe_real_machine_icube_decryption() {
                 );
             }
             Err(error) => {
-                println!("  设备凭证不可用: {}（kind={}）", error.user_message(variant), error.kind());
+                println!(
+                    "  设备凭证不可用: {}（kind={}）",
+                    error.user_message(variant),
+                    error.kind()
+                );
             }
         }
 
@@ -150,7 +179,10 @@ fn probe_real_machine_icube_decryption() {
         match icube::cloudide_auth_info_for(variant) {
             Ok(info) => {
                 let debug = format!("{info:?}");
-                assert!(!debug.contains(&info.token), "CloudideAuthInfo::Debug 泄漏了 token");
+                assert!(
+                    !debug.contains(&info.token),
+                    "CloudideAuthInfo::Debug 泄漏了 token"
+                );
                 println!(
                     "  cloudide：host={} userRegion={:?} userId={:?} token长度={} refreshToken长度={}",
                     info.host,
@@ -161,7 +193,11 @@ fn probe_real_machine_icube_decryption() {
                 );
             }
             Err(error) => {
-                println!("  cloudide 键不可用: {}（kind={}）", error.user_message(variant), error.kind());
+                println!(
+                    "  cloudide 键不可用: {}（kind={}）",
+                    error.user_message(variant),
+                    error.kind()
+                );
             }
         }
     }

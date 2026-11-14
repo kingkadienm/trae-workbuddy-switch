@@ -17,14 +17,14 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::modules::trae::account_base_for;
 use crate::modules::trae::device::DeviceEntry;
 use crate::modules::trae::jwt;
 use crate::modules::trae::paths;
-use crate::modules::trae::store;
-use crate::modules::trae::{TRAE_APP_VERSION, TRAE_ENTITLEMENT_PATH, TRAE_ENTITLEMENT_PATH_GLOBAL};
 use crate::modules::trae::region::TraeRegion;
+use crate::modules::trae::store;
 use crate::modules::trae::variant::TraeVariant;
-use crate::modules::trae::account_base_for;
+use crate::modules::trae::{TRAE_APP_VERSION, TRAE_ENTITLEMENT_PATH, TRAE_ENTITLEMENT_PATH_GLOBAL};
 
 // ---------------------------------------------------------------------------
 // HTTP
@@ -119,10 +119,7 @@ pub fn build_headers(jwt_value: &str, device: &DeviceEntry) -> HashMap<String, S
     let mut headers = HashMap::new();
     headers.insert("accept".into(), "*/*".into());
     headers.insert("accept-language".into(), "zh-CN".into());
-    headers.insert(
-        "authorization".into(),
-        jwt::authorization_header(jwt_value),
-    );
+    headers.insert("authorization".into(), jwt::authorization_header(jwt_value));
     headers.insert("content-type".into(), "application/json".into());
     headers.insert("user-agent".into(), user_agent());
     headers.insert("x-market-client-id".into(), market_client_id());
@@ -238,6 +235,19 @@ pub async fn post_json_for(
     jwt_value: &str,
     device: &DeviceEntry,
 ) -> (u16, String) {
+    let uid = jwt::user_id_of(jwt_value).unwrap_or_default();
+    if uid.is_empty() {
+        return (0, "账号 JWT 中缺少 user id".into());
+    }
+    let region_key = variant.region().as_str();
+    let _risk_permit = match crate::modules::risk_control::admit_platform_request(
+        "trae", region_key, &uid,
+    )
+    .await
+    {
+        Ok(permit) => permit,
+        Err(error) => return (429, format!("风控准入拦截：{error}")),
+    };
     let base = account_base_for(variant);
     let url = format!("{base}{path}");
     let mut request = trae_http_client().post(&url).body("{}");
@@ -248,6 +258,13 @@ pub async fn post_json_for(
         Ok(response) => {
             let status = response.status().as_u16();
             let text = response.text().await.unwrap_or_default();
+            let _ = crate::modules::risk_control::record_platform_response(
+                "trae",
+                region_key,
+                &uid,
+                i64::from(status),
+                text.chars().take(200).collect(),
+            );
             (status, text)
         }
         // 带码版：文本与 `describe_transport_error` 逐字节相同，另带 `net.transport.*` 码，
@@ -348,12 +365,71 @@ pub struct CreditPackage {
     pub expire_at: Option<i64>,
     /// 是否已过期（`expire_at` 存在且 `< now`）。
     pub expired: bool,
-    /// 是否 7 天内到期（未过期且 `expire_at - now <= 7 天`）。
+    /// 是否**临期**（未过期且 `expire_at - now <= ` [`EXPIRING_SOON_SECS`]）。
     pub expiring_soon: bool,
 }
 
-/// 「7 天内到期」的判定窗口（秒）。
+/// 「临期」的判定窗口（秒）—— **7 天**。
+///
+/// ## 为什么统一下来（2026-11-09）
+///
+/// 三个平台此前是**两个口径**：WorkBuddy 7 天（`credits.rs::EXPIRING_SOON_DAYS`）、
+/// Trae / Qoder 14 天。同一批「10 天后到期」的积分，在 WB 分区不标黄、在 Trae / Qoder
+/// 分区标黄 —— 用户在三处来回看，只会认为其中一个在撒谎。现统一为 7 天，三处同值。
+///
+/// 历史：issue #83 · 3 曾把这里从 7 天放宽到 14 天（理由是「多数人一周才打开一次工具，
+/// 7 天窗口常常在用户下次打开之前就滑过去了」）。那条理由单独看成立，但它只在 Trae 一侧
+/// 生效，代价就是口径分裂 —— 统一口径优先于单平台的宽松度。
+///
+/// ⚠️ 这是**产品口径**，不是技术常量：改它等于改文案的承诺
+/// （`trae.comp.card.chip.expiring` 写的是「N 天内过期」，由本窗口决定 N 的上界）。
+/// 前端镜像常量 `src/lib/credit-expiry.ts::TRAE_EXPIRING_SOON_MS` 与
+/// `src/lib/qoder-packs.ts::EXPIRING_SOON_MS` **必须同值**（跨语言不能共享常量）。
 const EXPIRING_SOON_SECS: i64 = 7 * 24 * 3600;
+
+/// 「这份响应里**一个可解析的额度包都没有**」的原因前缀（issue #186）。
+///
+/// ## 为什么要能识别它
+///
+/// `credits_limit` 只描述**积分制**额度。Free / SOLO 这类账户的权益包里**根本没有**
+/// 这个字段（额度是「快请求/月」这类维度，在另一个接口里），旧实现把「读不到」当成
+/// 「0 积分」写进缓存 ⇒ 卡片显示「积分 0 / 长期有效」，用户以为额度被清空了。
+/// 缺失 ≠ 0（参考实现 `reference/agent2api-main` 的 `usage.rs` 专门修过同一个 bug）。
+///
+/// 因此这种响应**不写缓存**：把该账号的余额标成未知（卡片显示「—」），
+/// 并在应用日志里留下**结构特征**（键名，不含取值），下次报障一句就能定死。
+pub const NO_QUOTA_REASON: &str = "上游权益包里没有可解析的 credits_limit";
+
+/// 描述响应结构（**只给键名，不给取值**）：用于「为什么读不到额度」的诊断。
+pub fn quota_shape_hint(packs: &[Value]) -> String {
+    let pack_keys = packs
+        .first()
+        .and_then(Value::as_object)
+        .map(|object| object.keys().cloned().collect::<Vec<_>>().join(","))
+        .unwrap_or_default();
+    let quota_keys = packs
+        .first()
+        .and_then(|pack| pack.get("entitlement_base_info"))
+        .and_then(|base| base.get("quota"))
+        .and_then(Value::as_object)
+        .map(|object| object.keys().cloned().collect::<Vec<_>>().join(","))
+        .unwrap_or_default();
+    format!(
+        "包数={}，首个包的键=[{pack_keys}]，quota 键=[{quota_keys}]",
+        packs.len()
+    )
+}
+
+/// 这批包里**是否有**可解析的额度（`entitlement_base_info.quota.credits_limit` 存在）。
+pub fn has_parseable_quota(packs: &[Value]) -> bool {
+    packs.iter().any(|pack| {
+        pack.get("entitlement_base_info")
+            .and_then(|info| info.get("quota"))
+            .and_then(|quota| quota.get("credits_limit"))
+            .and_then(Value::as_f64)
+            .is_some()
+    })
+}
 
 /// 由一组 `user_entitlement_pack_list` 元素解析逐包明细（纯函数，便于单测）。
 ///
@@ -377,16 +453,26 @@ pub fn parse_credit_packages(packs: &[Value], now_ts: i64) -> Vec<CreditPackage>
             .unwrap_or(0.0);
         let remaining = (limit - used).max(0.0);
         let expire_at = pack.get("expire_time").and_then(Value::as_i64);
-        let expired = expire_at.map(|expire| expire > 0 && expire < now_ts).unwrap_or(false);
+        let expired = expire_at
+            .map(|expire| expire > 0 && expire < now_ts)
+            .unwrap_or(false);
         let expiring_soon = !expired
             && expire_at
                 .map(|expire| expire - now_ts <= EXPIRING_SOON_SECS)
                 .unwrap_or(false);
-        let package_name = base
-            .and_then(|info| {
-                info.get("package_name")
-                    .or_else(|| info.get("name"))
-                    .and_then(Value::as_str)
+        // ★ issue #143：包名在 **pack 顶层**（`group_name` / `display_desc`），不在
+        //   `entitlement_base_info` 里 —— 旧实现只读后者，线上命中率恒 0，
+        //   于是所有包都显示成「未命名包」。`entitlement_base_info.package_name`
+        //   保留为最后的兼容回退（旧版本 / 旧缓存可能真有这个形状）。
+        let package_name = ["group_name", "display_desc"]
+            .iter()
+            .find_map(|key| pack.get(*key).and_then(Value::as_str))
+            .or_else(|| {
+                base.and_then(|info| {
+                    info.get("package_name")
+                        .or_else(|| info.get("name"))
+                        .and_then(Value::as_str)
+                })
             })
             .map(str::to_string)
             .filter(|text| !text.trim().is_empty());
@@ -442,6 +528,45 @@ pub struct CooldownEntry {
     pub reason: String,
     #[serde(default)]
     pub error_count: i32,
+    /// 判定时那份 JWT 的 `exp`（Unix 秒）。**凭据指纹**（issue #108 §P0-A）。
+    ///
+    /// ## 为什么需要它
+    ///
+    /// 冷却表只记了「什么错、多久」，**没记「判的是哪一份凭据」**。于是当凭据被换掉
+    /// （OAuth 重新登录 / JWT 续期 / 手动粘贴），那条「会话已死」的判定无法自证失效 ——
+    /// 用户看到的是「重新登录后仍显示需重新登录」，而且重启多少次都一样。
+    ///
+    /// ## 为什么取 `exp` 而不是 access token 原文
+    ///
+    /// 用 token 原文当指纹等于「每次保活刷新都把所有被禁用的号洗白」，三振机制直接被取消
+    /// （WorkBuddy 侧 `pool/mod.rs` 已就此论证过）。`exp` 是**上游签发**的量：真正换到
+    /// 新令牌时它才变；刷新失败时 token 根本不会被写回，因此不会误放行。
+    ///
+    /// ## 兼容性
+    ///
+    /// 旧文件缺这个键 ⇒ `None` ⇒ 按「无指纹」处理，**照旧生效**（保守方向，不会误放行）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_exp: Option<i64>,
+    /// 这条判定**写入的时刻**（Unix 秒，issue #108 §P1-A）。
+    ///
+    /// 前端此前直接把 `reason` 原文渲染成一行红字，用户会把它读成「刚才又失败了」——
+    /// 而事实可能是「11 小时前失败过一次」。带上时刻才能说「11 小时前」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judged_at: Option<i64>,
+}
+
+impl CooldownEntry {
+    /// 这条判定是否仍然针对**当前**这份凭据。
+    ///
+    /// - 记录里没有指纹（旧数据 / 无 JWT）⇒ `true`（照旧生效，保守）；
+    /// - 当前 JWT 解析不出 `exp` ⇒ `true`（拿不到证据时不做放行）；
+    /// - 两者都有 ⇒ 相等才生效。
+    pub fn matches_credential(&self, current_exp: Option<i64>) -> bool {
+        match (self.credential_exp, current_exp) {
+            (Some(recorded), Some(current)) => recorded == current,
+            _ => true,
+        }
+    }
 }
 
 /// 冷却状态文件。
@@ -630,7 +755,8 @@ pub fn parse_entitlement_meta(packs: &[Value]) -> EntitlementMeta {
                 .or_else(|| pack.get("expire_time").and_then(|v| v.as_i64()));
             if let Some(end) = end {
                 if end > now_ts {
-                    meta.membership_expire = Some(meta.membership_expire.map_or(end, |e| e.max(end)));
+                    meta.membership_expire =
+                        Some(meta.membership_expire.map_or(end, |e| e.max(end)));
                     let nb = pack
                         .get("next_billing_time")
                         .and_then(|v| v.as_i64())
@@ -777,10 +903,8 @@ pub fn mark_checked_in_for(variant: TraeVariant, user_id: &str) -> Result<(), St
 /// 因此「今天有记录」等价于「今天签过」。失败路径只写冷却，不写明细。
 pub fn checked_in_today_for(variant: TraeVariant) -> std::collections::HashSet<String> {
     let today = store::today();
-    let mut checked: std::collections::HashSet<String> = load_ledger_for(variant)
-        .checked_in
-        .into_iter()
-        .collect();
+    let mut checked: std::collections::HashSet<String> =
+        load_ledger_for(variant).checked_in.into_iter().collect();
     for record in load_history_for(variant).records {
         if record.date == today {
             checked.insert(record.user_id);
@@ -809,9 +933,8 @@ pub fn append_history_for(
         credits,
         delta,
     });
-    let cutoff = (chrono::Local::now() - chrono::Duration::days(
-        crate::modules::trae::TRAE_HISTORY_KEEP_DAYS,
-    ))
+    let cutoff = (chrono::Local::now()
+        - chrono::Duration::days(crate::modules::trae::TRAE_HISTORY_KEEP_DAYS))
     .format("%Y-%m-%d")
     .to_string();
     file.records.retain(|record| record.date >= cutoff);
@@ -851,8 +974,7 @@ pub fn record_daily_snapshot_for(variant: TraeVariant, non_checkin_earned: f64) 
     let yesterday_total = file
         .snapshots
         .iter()
-        .filter(|snapshot| snapshot.date < today)
-        .last()
+        .rfind(|snapshot| snapshot.date < today)
         .map(|snapshot| snapshot.total)
         .unwrap_or(0.0);
     let consumed = round2((total - earned - yesterday_total).abs());
@@ -875,9 +997,8 @@ pub fn record_daily_snapshot_for(variant: TraeVariant, non_checkin_earned: f64) 
         }),
     }
 
-    let cutoff = (chrono::Local::now() - chrono::Duration::days(
-        crate::modules::trae::TRAE_HISTORY_KEEP_DAYS,
-    ))
+    let cutoff = (chrono::Local::now()
+        - chrono::Duration::days(crate::modules::trae::TRAE_HISTORY_KEEP_DAYS))
     .format("%Y-%m-%d")
     .to_string();
     file.snapshots.retain(|snapshot| snapshot.date >= cutoff);
@@ -901,7 +1022,8 @@ fn round2(value: f64) -> f64 {
 /// 计算规则（与参考实现一致）：
 /// - 只统计 `entitlement_base_info.quota.credits_limit` 存在的资源包；
 /// - 每包剩余 = `credits_limit - usage.credits_amount`（无 usage 视为已用 0），**下限为 0**；
-/// - 「最早过期」只在 `expire_time > now` 的包里取（已过期的包不影响紧迫度排序）；
+/// - 「最早过期」由 [`earliest_live_expire`] 计算：只在**还有剩余**、且 `expire_time > now`
+///   的包里取（已过期、已用完的包都不影响紧迫度排序）；
 /// - 「今日购买获得」只计 `start_time` 落在**北京时区**今日、且 `charge_amount > 0` 的包
 ///   ——签到获得的包 `charge_amount = 0`，因此天然不会被误计为购买；
 /// - 逐包明细（第 4 个返回值）由 [`parse_credit_packages`] 统一解析，供账号卡进度条。
@@ -941,6 +1063,18 @@ pub async fn calc_remaining_credits_for(
 ) -> Result<(f64, Option<i64>, f64, Vec<CreditPackage>), String> {
     let packs = fetch_entitlement_packs_for(variant, jwt_value).await?;
 
+    // ★ issue #186：包里**一个额度字段都没有** ≠ 余额为 0。
+    //   典型是 Free / SOLO 账户：积分制额度不在这份响应里。此时**不写缓存**
+    //   （调用方据此把该账号标成「未知」），并把结构特征写进日志。
+    if variant.region() != TraeRegion::Global && !packs.is_empty() && !has_parseable_quota(&packs) {
+        let hint = quota_shape_hint(&packs);
+        store::append_log(
+            &paths::app_log_file(),
+            &format!("积分读数跳过：{NO_QUOTA_REASON}（{hint}）"),
+        );
+        return Err(format!("{NO_QUOTA_REASON}（{hint}）"));
+    }
+
     // 固定 UTC+8：上游时间戳按北京时间切日，若用本地时区，
     // 身处非 +08 时区的用户会算错「今日购买」。
     let cst = chrono::FixedOffset::east_opt(8 * 3600).expect("valid offset");
@@ -957,7 +1091,6 @@ pub async fn calc_remaining_credits_for(
     let today_end = today_start + 86_400;
 
     let mut total = 0.0_f64;
-    let mut earliest_expire: Option<i64> = None;
     let mut purchased_today = 0.0_f64;
 
     for pack in &packs {
@@ -978,15 +1111,6 @@ pub async fn calc_remaining_credits_for(
             .unwrap_or(0.0);
         total += (limit - used).max(0.0);
 
-        if let Some(expire) = pack.get("expire_time").and_then(|value| value.as_i64()) {
-            if expire > now_ts {
-                earliest_expire = Some(match earliest_expire {
-                    Some(current) => current.min(expire),
-                    None => expire,
-                });
-            }
-        }
-
         let charge_amount = base
             .and_then(|info| info.get("charge_amount"))
             .and_then(|value| value.as_i64())
@@ -1005,10 +1129,57 @@ pub async fn calc_remaining_credits_for(
 
     Ok((
         round2(total),
-        earliest_expire,
+        earliest_live_expire(&packs, now_ts),
         round2(purchased_today),
         parse_credit_packages(&packs, now_ts),
     ))
+}
+
+/// 「最早到期」：只在**还有剩余**、且 `expire_time > now` 的包里取（纯函数，便于单测）。
+///
+/// ## ★ 为什么必须要求「还有剩余」
+///
+/// 已经用完的包（剩余 0）只要 `expire_time` 还没到，就仍然带着一个「到期时刻」。
+/// 若把它算进去，这个账号会被**伪装成快过期**：徽标显示它的到期日、选号据
+/// [`expiry_urgency`](crate::modules::trae) 把它排到最前 —— 而它真正还有余额的积分
+/// 可能几十天后才到期，真正快过期的账号反而永远轮不到（issue #7）。
+///
+/// 判据在两侧本就不该分家：WorkBuddy 的快过期口径是「把快过期包的**剩余**加总」
+/// （见 `buddy-switch-gateway` 的 `credits_refresh`），空包天然贡献 0；Trae 侧只看
+/// 到期时刻，必须自己排除空包，否则同一条语义在两条产品线上行为相反。
+///
+/// 已过期的包同样不参与：它们的额度已经作废，不构成紧迫度。
+pub fn earliest_live_expire(packs: &[Value], now_ts: i64) -> Option<i64> {
+    let mut earliest: Option<i64> = None;
+    for pack in packs {
+        let limit = pack
+            .get("entitlement_base_info")
+            .and_then(|info| info.get("quota"))
+            .and_then(|quota| quota.get("credits_limit"))
+            .and_then(Value::as_f64);
+        // 无额度上限的包不参与（与聚合口径一致）。
+        let Some(limit) = limit else {
+            continue;
+        };
+        let used = pack
+            .get("usage")
+            .and_then(|usage| usage.get("credits_amount"))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        // ★ 已用完的包不得参与「最早到期」。
+        if (limit - used).max(0.0) <= 0.0 {
+            continue;
+        }
+        if let Some(expire) = pack.get("expire_time").and_then(Value::as_i64) {
+            if expire > now_ts {
+                earliest = Some(match earliest {
+                    Some(current) => current.min(expire),
+                    None => expire,
+                });
+            }
+        }
+    }
+    earliest
 }
 
 /// 由 JWT 解析 uid 并取（必要时创建）设备标识（默认变体，兼容壳）。
@@ -1034,14 +1205,31 @@ pub async fn refresh_remaining_for_variant(
     variant: TraeVariant,
     user_id: &str,
 ) -> Result<f64, String> {
-    let account =
-        crate::modules::trae::account::find_for(variant, user_id).ok_or("账号不存在")?;
+    let account = crate::modules::trae::account::find_for(variant, user_id).ok_or("账号不存在")?;
     let packs = fetch_entitlement_packs_for(variant, &account.jwt).await?;
-    let (credits, expire_at, _purchased, packages) = calc_remaining_credits_for(variant, &account.jwt).await?;
+    let (credits, expire_at, _purchased, packages) =
+        match calc_remaining_credits_for(variant, &account.jwt).await {
+            Ok(values) => values,
+            Err(error) => {
+                // ★ issue #186：「额度不可解析」不是失败，是**这个账号不走积分口径**。
+                //   此时必须清掉旧值 —— 留着一个过期的 0 会让卡片继续撒谎（显示「积分 0」）。
+                if error.starts_with(NO_QUOTA_REASON) {
+                    let mut remaining = load_remaining_for(variant);
+                    remaining.credits.remove(user_id);
+                    remaining.expire_times.remove(user_id);
+                    remaining.packages.remove(user_id);
+                    remaining.updated_at = Some(store::now_iso());
+                    let _ = save_remaining_for(variant, &remaining);
+                }
+                return Err(error);
+            }
+        };
     let mut remaining = load_remaining_for(variant);
     remaining.credits.insert(user_id.to_string(), credits);
     if let Some(expire_at) = expire_at {
-        remaining.expire_times.insert(user_id.to_string(), expire_at);
+        remaining
+            .expire_times
+            .insert(user_id.to_string(), expire_at);
     }
     remaining.packages.insert(user_id.to_string(), packages);
     remaining.updated_at = Some(store::now_iso());
@@ -1049,7 +1237,9 @@ pub async fn refresh_remaining_for_variant(
 
     // 同时写入权益元信息
     let mut meta_file = load_entitlement_meta_file_for(variant);
-    meta_file.entries.insert(user_id.to_string(), parse_entitlement_meta(&packs));
+    meta_file
+        .entries
+        .insert(user_id.to_string(), parse_entitlement_meta(&packs));
     meta_file.updated_at = Some(store::now_iso());
     save_entitlement_meta_for(variant, &meta_file)?;
 
@@ -1063,9 +1253,11 @@ pub async fn refresh_all_remaining() -> usize {
 
 /// 批量刷新**该变体**所有账号的剩余积分（按变体分家），返回成功账号数。
 ///
-/// 顺带执行**自动解冻**：某账号查询成功、剩余积分 > 0、且其冷却类型不是
-/// `SessionDead`（会话彻底失效，积分再正常也不代表会话可用）时清除冷却。
-/// 这解决了「账号因临时 5xx 被冷却，实际早已恢复」导致的长期误封。
+/// 顺带执行**自动解冻**：某账号查询成功且剩余积分 > 0 时清除冷却（**含 `SessionDead`**）。
+///
+/// 判据是「这份凭据刚刚成功访问了上游」—— 一个独立的**正向事实**，不是对
+/// 「账号库变没变」的推断（后者已被 WorkBuddy 侧论证为不可靠）。
+/// issue #108 §P0-C：排除 `SessionDead` 会让永久记录没有任何自愈路径。
 pub async fn refresh_all_remaining_for(variant: TraeVariant) -> usize {
     let accounts = crate::modules::trae::account::entries_for(variant);
     let mut remaining = load_remaining_for(variant);
@@ -1073,63 +1265,57 @@ pub async fn refresh_all_remaining_for(variant: TraeVariant) -> usize {
     let mut succeeded = 0usize;
     let mut thawed = 0usize;
     let mut purchased_today = 0.0_f64;
-    // 收集各账号的权益包 raw packs，统一在循环结束后写 meta 缓存。
-    let mut meta_map: HashMap<String, EntitlementMeta> = HashMap::new();
+    let mut meta_file = load_entitlement_meta_file_for(variant);
 
     for (uid, account) in &accounts {
-        match fetch_entitlement_packs_for(variant, &account.jwt).await {
-            Ok(packs) => {
-                // 解析积分（同 calc_remaining_credits_for 的逻辑）
-                match calc_remaining_credits_for(variant, &account.jwt).await {
-                    Ok((credits, expire_at, purchased, packages)) => {
-                        remaining.credits.insert(uid.clone(), credits);
-                        if let Some(expire_at) = expire_at {
-                            remaining.expire_times.insert(uid.clone(), expire_at);
-                        }
-                        remaining.packages.insert(uid.clone(), packages);
-                        purchased_today += purchased;
-                        succeeded += 1;
+        match calc_remaining_credits_for(variant, &account.jwt).await {
+            Ok((credits, expire_at, purchased, packages)) => {
+                if let Ok(packs) = fetch_entitlement_packs_for(variant, &account.jwt).await {
+                    meta_file
+                        .entries
+                        .insert(uid.clone(), parse_entitlement_meta(&packs));
+                }
+                remaining.credits.insert(uid.clone(), credits);
+                if let Some(expire_at) = expire_at {
+                    remaining.expire_times.insert(uid.clone(), expire_at);
+                }
+                remaining.packages.insert(uid.clone(), packages);
+                purchased_today += purchased;
+                succeeded += 1;
 
-                        // 同时解析权益元信息
-                        meta_map.insert(uid.clone(), parse_entitlement_meta(&packs));
-
-                        let thawable = credits > 0.0
-                            && cooldowns
-                                .cooldowns
-                                .get(uid)
-                                .map(|entry| {
-                                    !entry.error_type.is_empty() && entry.error_type != "SessionDead"
-                                })
-                                .unwrap_or(false);
-                        if thawable {
-                            cooldowns.cooldowns.remove(uid);
-                            thawed += 1;
-                            store::append_log(
-                                &paths::app_log_file(),
-                                &format!(
-                                    "自动解冻账号 {uid} [{}]: 剩余积分 {credits}，冷却已清除",
-                                    variant.display_name()
-                                ),
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        store::append_log(
-                            &paths::app_log_file(),
-                            &format!(
-                                "获取剩余积分失败 [{} / {}]: {error}",
-                                variant.display_name(),
-                                account.name
-                            ),
-                        );
-                    }
+                // ★★ issue #108 §P0-C：**取积分成功本身就是会话可用的证据**。
+                //
+                // 改造前这里显式排除 `SessionDead`，理由写的是「会话彻底失效，积分再正常
+                // 也不代表会话可用」。这个理由在**凭据未更新**时也站不住：`calc_remaining_credits`
+                // 用的是同一个 JWT 打上游，它能成功就证明这份凭据有效。
+                //
+                // 后果是闭环死锁：`SessionDead` ⇒ `disabled` ⇒ 不路由（`note_success` 断掉）
+                // ⇒ 签到跳过（`clear_cooldown_for` 轮不到）⇒ 只剩人工「解除冷却」一条路。
+                // 现场证据：积分文件 08:07 仍在刷新，冷却文件停在 10-26 19:40 一动不动。
+                let thawable = should_thaw(credits, cooldowns.cooldowns.get(uid));
+                if thawable {
+                    cooldowns.cooldowns.remove(uid);
+                    thawed += 1;
+                    store::append_log(
+                        &paths::app_log_file(),
+                        &format!(
+                            "自动解冻账号 {uid} [{}]: 剩余积分 {credits}，冷却已清除",
+                            variant.display_name()
+                        ),
+                    );
                 }
             }
             Err(error) => {
+                // ★ issue #186：额度不可解析 ⇒ 清掉旧值（卡片显示「—」而不是「0」）。
+                if error.starts_with(NO_QUOTA_REASON) {
+                    remaining.credits.remove(uid);
+                    remaining.expire_times.remove(uid);
+                    remaining.packages.remove(uid);
+                }
                 store::append_log(
                     &paths::app_log_file(),
                     &format!(
-                        "获取权益包失败 [{} / {}]: {error}",
+                        "获取剩余积分失败 [{} / {}]: {error}",
                         variant.display_name(),
                         account.name
                     ),
@@ -1138,24 +1324,34 @@ pub async fn refresh_all_remaining_for(variant: TraeVariant) -> usize {
         }
     }
 
+    meta_file.updated_at = Some(store::now_iso());
+    let _ = save_entitlement_meta_for(variant, &meta_file);
     remaining.updated_at = Some(store::now_iso());
     let _ = save_remaining_for(variant, &remaining);
     record_daily_snapshot_for(variant, purchased_today);
-
-    // 批量写入权益元信息缓存（uid → meta map）
-    if !meta_map.is_empty() {
-        let meta_file = EntitlementMetaFile {
-            entries: meta_map,
-            updated_at: Some(store::now_iso()),
-        };
-        let _ = store::write_json(&paths::entitlement_meta_file_for(variant), &meta_file);
-    }
 
     if thawed > 0 {
         cooldowns.updated_at = Some(store::now_iso());
         let _ = store::write_json(&paths::cooldowns_file_for(variant), &cooldowns);
     }
     succeeded
+}
+
+/// 自动解冻的判据（**唯一实现**，issue #108 §P0-C）。
+///
+/// 语义：**这份凭据刚刚成功访问了上游**（取积分成功）⇒ 会话可用 ⇒ 冷却应当清除，
+/// `SessionDead` 也不例外。
+///
+/// 改造前这里显式排除 `SessionDead`，理由是「积分正常不代表会话可用」。该理由在
+/// 凭据未更新时也站不住 —— `calc_remaining_credits` 用同一个 JWT 打上游，它能成功
+/// 就证明这份凭据有效。而排除的后果是**闭环死锁**：
+/// `SessionDead` ⇒ `disabled` ⇒ 不路由（`note_success` 断掉）⇒ 签到跳过
+/// （`clear_cooldown_for` 轮不到）⇒ 只剩人工「解除冷却」一条路，重启也没用。
+pub(crate) fn should_thaw(credits: f64, entry: Option<&CooldownEntry>) -> bool {
+    credits > 0.0
+        && entry
+            .map(|entry| !entry.error_type.is_empty())
+            .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -1165,16 +1361,30 @@ pub async fn refresh_all_remaining_for(variant: TraeVariant) -> usize {
 ///
 /// `冷却秒数` 语义：`-1` = 永久、`0` = 不冷却（仅计数）、`>0` = 冷却秒数。
 ///
-/// 分类依据是参考实现在长期使用中总结的经验值，不要随意调小：
-/// `SessionDead`（401）是凭据失效，冷却 1 分钟只会让它被反复重试并持续触发风控。
-pub fn classify_error(http_status: u16, code: Option<i64>) -> (&'static str, i64) {
+/// 分类依据是参考实现在长期使用中总结的经验值，不要随意调小。
+///
+/// ★ issue #108 §P0-B：**先看 body 里的会话作废标记，再按状态码归类**。
+///
+/// - 带 `12153` / `Offline user session not found` ⇒ `SessionDead`（`-1` 永久）；
+/// - 裸 401/403 ⇒ `AuthRejected`（60 秒，可自愈，**不禁用**）。
+///
+/// 改造前 401 一律永久，把「access token 过期」这种保活刷新一轮就好、可自愈的问题
+/// 打成了终态 —— 用户看到的是「号没坏却再也用不了」。
+pub fn classify_error(http_status: u16, code: Option<i64>, body: &str) -> (&'static str, i64) {
     // 200 + 业务码 1005：套餐额度限制，半天内不会有变化。
     if http_status == 200 && code == Some(1005) {
         return ("PlanLimit", 43_200);
     }
+    // 作废标记优先于状态码：上游也可能用 200/400 返回它。
+    if crate::modules::upstream::SESSION_DEAD_MARKERS
+        .iter()
+        .any(|marker| body.contains(marker))
+    {
+        return ("SessionDead", -1);
+    }
     match http_status {
         429 => ("SoftRate", 60),
-        401 => ("SessionDead", -1),
+        401 | 403 => ("AuthRejected", 60),
         404 => ("NotFound", 60),
         500..=599 => ("Server", 600),
         400..=499 => ("Client", 600),
@@ -1190,7 +1400,13 @@ pub fn classify_error(http_status: u16, code: Option<i64>) -> (&'static str, i64
 
 /// 写入/更新账号冷却状态（默认变体，兼容壳）。
 pub fn save_cooldown(user_id: &str, error_type: &str, cooldown_seconds: i64, reason: &str) {
-    save_cooldown_for(TraeVariant::default(), user_id, error_type, cooldown_seconds, reason)
+    save_cooldown_for(
+        TraeVariant::default(),
+        user_id,
+        error_type,
+        cooldown_seconds,
+        reason,
+    )
 }
 
 /// 写入/更新账号冷却状态（按变体分家）。
@@ -1207,6 +1423,25 @@ pub fn save_cooldown_for(
     error_type: &str,
     cooldown_seconds: i64,
     reason: &str,
+) {
+    save_cooldown_with_credential_for(variant, user_id, error_type, cooldown_seconds, reason, None);
+}
+
+/// 写入冷却，并记下「判定时那份凭据的 `exp`」作为**指纹**（issue #108 §P0-A）。
+///
+/// `credential_exp` 为 `None` 时与 [`save_cooldown_for`] 完全等价（不写指纹 ⇒
+/// 该条判定永远不会因凭据更新而自动失效，即旧行为）。
+///
+/// 传 `Some(exp)` 后，`account_view` 会在渲染时比对当前 JWT 的 `exp`：
+/// 不一致 ⇒ 这条判定针对的是**上一份**凭据，自动失效。于是「重新登录 / 续期 /
+/// 手动粘贴」这些只写账号库、不碰冷却表的出口，**无需改动即可自愈**。
+pub fn save_cooldown_with_credential_for(
+    variant: TraeVariant,
+    user_id: &str,
+    error_type: &str,
+    cooldown_seconds: i64,
+    reason: &str,
+    credential_exp: Option<i64>,
 ) {
     let mut file = load_cooldowns_for(variant);
     let now = chrono::Local::now().timestamp();
@@ -1244,6 +1479,8 @@ pub fn save_cooldown_for(
             until,
             reason: reason.to_string(),
             error_count,
+            credential_exp,
+            judged_at: Some(now),
         },
     );
     file.updated_at = Some(store::now_iso());
@@ -1287,6 +1524,50 @@ pub fn clear_all_cooldowns_for(variant: TraeVariant) -> Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
+    /// ★ issue #186：`credits_limit: 0`（真的是 0 积分）与**没有这个字段**（Free/SOLO
+    /// 不走积分口径）必须分开 —— 混为一谈就是把「不知道」写成「0」，卡片会撒谎。
+    #[test]
+    fn quota_detection_distinguishes_zero_from_missing() {
+        // 有字段、值为 0 ⇒ 可解析（真的是 0）。
+        assert!(super::has_parseable_quota(&[json!({
+            "entitlement_base_info": { "quota": { "credits_limit": 0 } }
+        })]));
+        // 有 quota 但没有 credits_limit（Free/SOLO 形态）⇒ 不可解析。
+        assert!(!super::has_parseable_quota(&[json!({
+            "entitlement_base_info": { "quota": { "fast_request_limit": 50 } }
+        })]));
+        // 连 entitlement_base_info 都没有 ⇒ 不可解析。
+        assert!(!super::has_parseable_quota(&[
+            json!({ "group_name": "free" })
+        ]));
+        // 空列表由调用方判（`packs.is_empty()` 不算这个错误）。
+        assert!(!super::has_parseable_quota(&[]));
+        // 多个包里只要有一个可解析就算有额度。
+        assert!(super::has_parseable_quota(&[
+            json!({ "group_name": "free" }),
+            json!({ "entitlement_base_info": { "quota": { "credits_limit": 100 } } }),
+        ]));
+    }
+
+    /// 诊断串**只给键名、不给取值** —— 它会进应用日志，不能泄漏任何额度数字。
+    #[test]
+    fn quota_shape_hint_lists_key_names_only() {
+        let packs = vec![json!({
+            "group_name": "g",
+            "usage": { "credits_amount": 3 },
+            "entitlement_base_info": { "quota": { "fast_request_limit": 50 } }
+        })];
+        let hint = super::quota_shape_hint(&packs);
+        assert!(hint.contains("包数=1"), "{hint}");
+        assert!(
+            hint.contains("fast_request_limit"),
+            "要报出 quota 的键名: {hint}"
+        );
+        assert!(!hint.contains("50"), "只给键名，不给取值: {hint}");
+    }
+
     use super::*;
     use crate::modules::trae::device::DeviceEntry;
 
@@ -1308,20 +1589,22 @@ mod tests {
     fn parse_credit_packages_extracts_per_package_details() {
         let now = 1_000_000_i64;
         let packs = vec![
+            // 线上真实形状：包名在 **pack 顶层**（`group_name` / `display_desc`），
+            // `entitlement_base_info` 里只有 `quota` / 时间字段（issue #143）。
             serde_json::json!({
                 "entitlement_base_info": {
-                    "package_name": "月卡",
-                    "package_code": "month",
+                    "entitlement_id": "ent-1",
                     "quota": { "credits_limit": 100.0 }
                 },
+                "group_name": "月卡",
+                "display_desc": "月度积分包",
                 "usage": { "credits_amount": 30.0 },
                 "expire_time": now + 3 * 24 * 3600,
             }),
             serde_json::json!({
-                "entitlement_base_info": {
-                    "name": "年卡",
-                    "quota": { "credits_limit": 500.0 }
-                },
+                "entitlement_base_info": { "quota": { "credits_limit": 500.0 } },
+                // 只有 display_desc 时也要能取到名字（回退顺序 group_name → display_desc）。
+                "display_desc": "年卡",
                 "usage": { "credits_amount": 600.0 },
                 "expire_time": now - 10,
             }),
@@ -1331,8 +1614,11 @@ mod tests {
         let packages = parse_credit_packages(&packs, now);
         assert_eq!(packages.len(), 2, "无额度上限的包应被跳过");
 
-        assert_eq!(packages[0].package_name.as_deref(), Some("月卡"));
-        assert_eq!(packages[0].package_code.as_deref(), Some("month"));
+        assert_eq!(
+            packages[0].package_name.as_deref(),
+            Some("月卡"),
+            "包名必须从 pack 顶层取（取 entitlement_base_info 会恒为 None）"
+        );
         assert_eq!(packages[0].total, 100.0);
         assert_eq!(packages[0].remaining, 70.0);
         assert_eq!(packages[0].used, 30.0);
@@ -1340,9 +1626,118 @@ mod tests {
         assert!(!packages[0].expired);
 
         // 已用超过额度 → remaining 下限 0；已过期 → expired 且不再 expiringSoon。
+        assert_eq!(
+            packages[1].package_name.as_deref(),
+            Some("年卡"),
+            "group_name 缺失时应回退 display_desc"
+        );
         assert_eq!(packages[1].remaining, 0.0);
         assert!(packages[1].expired);
         assert!(!packages[1].expiring_soon);
+    }
+
+    /// ★ 临期窗口的**边界**：7 天以内算临期，超过不算。
+    ///
+    /// 这条用例的价值不在于「验证一个常量」，而在于把**产品口径**钉住（三平台同值）：
+    /// 变异：把 `EXPIRING_SOON_SECS` 改成 6 天 ⇒ 7 天那条变红；改回 14 天 ⇒ 8 天那条变红。
+    #[test]
+    fn expiring_soon_window_is_seven_days() {
+        let now = 1_000_000_i64;
+        let pack = |days: i64| {
+            serde_json::json!({
+                "entitlement_base_info": { "quota": { "credits_limit": 10.0 } },
+                "expire_time": now + days * 24 * 3600,
+            })
+        };
+        let edge = parse_credit_packages(&[pack(7)], now);
+        assert!(
+            edge[0].expiring_soon,
+            "7 天后到期应算临期（窗口 7 天，边界含等号）"
+        );
+        let far = parse_credit_packages(&[pack(8)], now);
+        assert!(!far[0].expiring_soon, "8 天后到期不应算临期（窗口 7 天）");
+    }
+
+    /// ★★ 护栏（issue #7）：「最早到期」**不得**由已用完的包决定。
+    ///
+    /// 现场：某账号真正还有余额的包 10/30 才到期，但它有一条**已用尽**的包
+    /// 09/30 到期（徽标因此显示「09/30 到期」，而卡片列表里第一条是 10/30 ——
+    /// 列表只显示还有剩余的包）。旧口径把这条空包算进「最早到期」，于是该账号的
+    /// 到期紧迫度被顶到 ≈1.0，恒压过真正今天到期的账号 ⇒「老是消耗那个几十天后
+    /// 才到期的账号」（issue #7）。
+    #[test]
+    fn earliest_live_expire_ignores_fully_consumed_pack() {
+        let now = 1_000_000_i64;
+        let dead_but_soon = serde_json::json!({
+            "entitlement_base_info": { "quota": { "credits_limit": 500.0 } },
+            "usage": { "credits_amount": 500.0 }, // 剩余 0
+            "expire_time": now + 100,             // 但到期时刻很近
+        });
+        let live_but_late = serde_json::json!({
+            "entitlement_base_info": { "quota": { "credits_limit": 4_000.0 } },
+            "usage": { "credits_amount": 6.21 },
+            "expire_time": now + 30 * 86_400,
+        });
+
+        let packs = vec![dead_but_soon, live_but_late];
+        assert_eq!(
+            earliest_live_expire(&packs, now),
+            Some(now + 30 * 86_400),
+            "空包（剩余 0）不得把账号伪装成快过期"
+        );
+    }
+
+    /// 已过期的包不参与：额度已作废，不构成紧迫度（既有语义，一并钉住）。
+    #[test]
+    fn earliest_live_expire_ignores_expired_pack() {
+        let now = 1_000_000_i64;
+        let expired = serde_json::json!({
+            "entitlement_base_info": { "quota": { "credits_limit": 100.0 } },
+            "usage": { "credits_amount": 0.0 },
+            "expire_time": now - 1,
+        });
+        let live = serde_json::json!({
+            "entitlement_base_info": { "quota": { "credits_limit": 100.0 } },
+            "usage": { "credits_amount": 0.0 },
+            "expire_time": now + 5_000,
+        });
+        assert_eq!(
+            earliest_live_expire(&[expired, live], now),
+            Some(now + 5_000),
+            "已过期的包不得参与"
+        );
+    }
+
+    /// 多个活包取最早；无额度上限 / 无到期时间 / 全空包的组合返回 `None`
+    /// （`None` 在选号里对应紧迫度 0，即「无到期信息」——中性降级，不是惩罚）。
+    #[test]
+    fn earliest_live_expire_takes_min_among_live_and_none_when_no_evidence() {
+        let now = 1_000_000_i64;
+        let pack = |limit: f64, used: f64, expire: Option<i64>| {
+            let mut value = serde_json::json!({
+                "entitlement_base_info": { "quota": { "credits_limit": limit } },
+                "usage": { "credits_amount": used },
+            });
+            if let Some(expire) = expire {
+                value["expire_time"] = serde_json::json!(expire);
+            }
+            value
+        };
+
+        let live = vec![
+            pack(100.0, 0.0, Some(now + 9_000)),
+            pack(100.0, 0.0, Some(now + 3_000)),
+            pack(100.0, 0.0, None),
+        ];
+        assert_eq!(earliest_live_expire(&live, now), Some(now + 3_000));
+
+        // 无额度上限的包（可能是无限制资源）不参与统计。
+        let unlimited = vec![serde_json::json!({ "entitlement_base_info": { "quota": {} } })];
+        assert_eq!(earliest_live_expire(&unlimited, now), None);
+
+        // 全部用完 ⇒ 无紧迫度证据。
+        let all_dead = vec![pack(100.0, 100.0, Some(now + 100))];
+        assert_eq!(earliest_live_expire(&all_dead, now), None);
     }
 
     #[test]
@@ -1426,8 +1821,14 @@ mod tests {
         };
         let headers = build_headers("t", &device);
         // 缺失可选字段时下发空串而不是 panic
-        assert_eq!(headers.get("x-market-user-id").map(String::as_str), Some(""));
-        assert_eq!(headers.get("vscode-sessionid").map(String::as_str), Some(""));
+        assert_eq!(
+            headers.get("x-market-user-id").map(String::as_str),
+            Some("")
+        );
+        assert_eq!(
+            headers.get("vscode-sessionid").map(String::as_str),
+            Some("")
+        );
     }
 
     #[test]
@@ -1442,30 +1843,110 @@ mod tests {
 
     #[test]
     fn classify_error_maps_known_cases() {
-        assert_eq!(classify_error(200, Some(1005)), ("PlanLimit", 43_200));
-        assert_eq!(classify_error(429, None), ("SoftRate", 60));
-        assert_eq!(classify_error(401, None), ("SessionDead", -1));
-        assert_eq!(classify_error(404, None), ("NotFound", 60));
-        assert_eq!(classify_error(503, None), ("Server", 600));
-        assert_eq!(classify_error(400, None), ("Client", 600));
-        assert_eq!(classify_error(200, Some(7)), ("BusinessError", 300));
-        assert_eq!(classify_error(200, Some(0)), ("Unknown", 0));
-        assert_eq!(classify_error(200, None), ("Unknown", 0));
+        assert_eq!(classify_error(200, Some(1005), ""), ("PlanLimit", 43_200));
+        assert_eq!(classify_error(429, None, ""), ("SoftRate", 60));
+        // ★ issue #108：裸 401 是浅冷却（可自愈）；带作废标记才是永久。
+        assert_eq!(classify_error(401, None, ""), ("AuthRejected", 60));
+        assert_eq!(classify_error(403, None, ""), ("AuthRejected", 60));
+        assert_eq!(
+            classify_error(401, None, r#"{"code":12153}"#),
+            ("SessionDead", -1)
+        );
+        assert_eq!(
+            classify_error(200, None, "Offline user session not found"),
+            ("SessionDead", -1),
+            "作废标记优先于状态码（上游可能用 200 返回业务错误）"
+        );
+        assert_eq!(classify_error(404, None, ""), ("NotFound", 60));
+        assert_eq!(classify_error(503, None, ""), ("Server", 600));
+        assert_eq!(classify_error(400, None, ""), ("Client", 600));
+        assert_eq!(classify_error(200, Some(7), ""), ("BusinessError", 300));
+        assert_eq!(classify_error(200, Some(0), ""), ("Unknown", 0));
+        assert_eq!(classify_error(200, None, ""), ("Unknown", 0));
     }
 
     #[test]
     fn classify_error_plan_limit_only_on_200() {
         // 同样 code=1005 但 HTTP 状态非 200 时不能误判为套餐限制。
-        assert_eq!(classify_error(500, Some(1005)), ("Server", 600));
+        assert_eq!(classify_error(500, Some(1005), ""), ("Server", 600));
+    }
+
+    /// ★★ issue #108 §P0-C：「积分拉到了」必须成为**解冻证据**（含 `SessionDead`）。
+    ///
+    /// 变异：把 `should_thaw` 改回「排除 SessionDead」⇒ 第三条断言红。
+    #[test]
+    fn thaw_accepts_session_dead_because_a_successful_fetch_proves_the_session() {
+        let dead = CooldownEntry {
+            error_type: "SessionDead".into(),
+            until: 9_999_999_999,
+            reason: "401".into(),
+            error_count: 0,
+            credential_exp: None,
+            judged_at: None,
+        };
+        assert!(
+            should_thaw(1.0, Some(&dead)),
+            "取积分成功 ⇒ 凭据有效 ⇒ 永久冷却必须能自愈"
+        );
+        // 反向对照：积分 0 不是「会话可用」的证据（可能只是额度用完），不解冻。
+        assert!(!should_thaw(0.0, Some(&dead)));
+        // 无冷却记录 ⇒ 无事可做。
+        assert!(!should_thaw(1.0, None));
+        // 空类型是「占位记录」，不清（与 `until > now && !error_type.is_empty()` 同口径）。
+        let empty = CooldownEntry {
+            error_type: String::new(),
+            ..dead.clone()
+        };
+        assert!(!should_thaw(1.0, Some(&empty)));
+    }
+
+    /// ★★ issue #108 §P0-A：凭据指纹必须**双向**成立。
+    ///
+    /// - `exp` 变了 ⇒ 判定失效（重新登录 / 续期后自动恢复）；
+    /// - `exp` 未变 ⇒ 判定继续生效（否则保活刷新会洗白所有禁用，三振机制被取消）。
+    #[test]
+    fn credential_fingerprint_only_invalidates_when_exp_actually_changed() {
+        let entry = CooldownEntry {
+            error_type: "SessionDead".into(),
+            until: 9_999_999_999,
+            reason: "401".into(),
+            error_count: 0,
+            credential_exp: Some(1_700_000_000),
+            judged_at: None,
+        };
+        assert!(
+            !entry.matches_credential(Some(1_800_000_000)),
+            "换了新令牌（exp 变）⇒ 旧判定必须失效"
+        );
+        assert!(
+            entry.matches_credential(Some(1_700_000_000)),
+            "exp 未变（只换了 access token 原文）⇒ 判定必须继续生效"
+        );
+        // 拿不到证据时保守：不放行。
+        assert!(entry.matches_credential(None));
+        // 旧数据没有指纹 ⇒ 照旧生效（不会误放行）。
+        let legacy = CooldownEntry {
+            credential_exp: None,
+            ..entry.clone()
+        };
+        assert!(legacy.matches_credential(Some(1_800_000_000)));
     }
 
     #[test]
     fn session_dead_cooldown_is_effectively_permanent() {
-        // 401 的 until 必须远大于任何现实时间，否则会话失效会被反复重试。
+        // **带作废标记**的 401：until 必须远大于任何现实时间，否则会话失效会被反复重试。
+        // ★ issue #108：判据从「状态码 401」改成「body 里有 12153」—— 裸 401 已降级为
+        //   60 秒浅冷却（见 `classify_error_separates_session_dead_from_plain_401`）。
         let now = chrono::Local::now().timestamp();
-        let (_, seconds) = classify_error(401, None);
+        let (kind, seconds) = classify_error(401, None, r#"{"code":12153}"#);
+        assert_eq!(kind, "SessionDead");
         assert_eq!(seconds, -1);
         assert!(9_999_999_999_i64 > now + 100 * 365 * 86_400);
+
+        // 反向对照：裸 401 **不得**是永久（否则可自愈的 token 过期被打成终态）。
+        let (kind, seconds) = classify_error(401, None, "");
+        assert_eq!(kind, "AuthRejected");
+        assert_eq!(seconds, 60, "裸 401 必须是浅冷却，且不禁用");
     }
 
     #[test]
@@ -1494,6 +1975,8 @@ mod tests {
             until: 1,
             reason: "r".into(),
             error_count: 2,
+            credential_exp: None,
+            judged_at: None,
         };
         let value = serde_json::to_value(&entry).unwrap();
         assert_eq!(value.get("type").unwrap().as_str(), Some("Server"));
@@ -1514,8 +1997,9 @@ mod tests {
 
     #[test]
     fn history_retention_days_is_positive() {
-        // 保留天数为 0 或负数会让明细被立即清空。
-        assert!(crate::modules::trae::TRAE_HISTORY_KEEP_DAYS > 0);
+        // 保留天数为 0 或负数会让明细被立即清空。常量断言放到编译期（`const _`）：
+        // 运行时 `assert!` 对常量是恒真，测不出任何东西，clippy 的 assertions_on_constants 正是这个意思。
+        const _: () = assert!(crate::modules::trae::TRAE_HISTORY_KEEP_DAYS > 0);
     }
 
     /// 钉死上游请求头的固定取值。

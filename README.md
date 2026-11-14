@@ -1,378 +1,492 @@
+> 此仓库为 [kingkadienm 维护的 fork](https://github.com/kingkadienm/trae-workbuddy-switch)，上游为 [NextAgentX](https://github.com/NextAgentX/qoder-trae-workbuddy-switch)。本 fork 保留 TOTP、成长任务中心、豆包分区、Panel auths 导入、账号停用、最早到期选号与自有更新源；上游新增的 Qoder、统一作用域、备份与风控能力同时可用。
+
 <p align="center">
-  <img src="public/icon-transparent.png" alt="Buddy Switch 图标" width="128" />
+  <img src="public/icon-transparent.png" alt="Buddy Switch 图标" width="120" />
+</p>
+
+<h1 align="center">Buddy Switch</h1>
+
+<p align="center">
+  <b>WorkBuddy · CodeBuddy · TraeWork · Qoder 多账号工作台</b><br />
+  把「现在登的是哪个号」变成一次点击
 </p>
 
 <p align="center">
-  <strong>Buddy Switch</strong><br />
-  WorkBuddy / CodeBuddy / Trae 账号切换工具
+  <img alt="平台" src="https://img.shields.io/badge/%E5%B9%B3%E5%8F%B0-macOS%20%7C%20Windows%20%7C%20Linux-2ea043" />
+  <a href="https://github.com/kingkadienm/trae-workbuddy-switch/releases/latest"><img alt="最新版本" src="https://img.shields.io/github/v/release/NextAgentX/qoder-trae-workbuddy-switch?label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC" /></a>
+  <a href="./LICENSE"><img alt="许可" src="https://img.shields.io/badge/%E8%AE%B8%E5%8F%AF-PolyForm%20Noncommercial-4c8bf5" /></a>
+  <a href="https://github.com/NextAgentX/qoder-trae-workbuddy-switch/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/NextAgentX/qoder-trae-workbuddy-switch?style=social" /></a>
 </p>
 
 <p align="center">
-  <strong>简体中文</strong> · <a href="README.en.md">English</a>
+  <strong>简体中文</strong> ·
+  <a href="README.en.md">English</a>
 </p>
 
-# Buddy Switch
+一个**本地运行**的多账号工作台：把 **WorkBuddy / CodeBuddy / TraeWork / Qoder** 四条产品线、**6 个作用域**的账号收在一处——扫码登录、一键切号、签到与积分、用量统计、会话副本同步，并把模型额度以 OpenAI / Anthropic 兼容接口开放给本机其它 AI 工具。所有数据只放在你自己的机器上。
 
-**WorkBuddy / TraeWork 多账号管理工具**：OAuth 扫码登录、一键切换登录态、积分到期监控与自动签到、Token 用量统计，并可以把模型额度以 OpenAI / Anthropic 兼容接口提供给本机其它工具。
+|  |  |
+| --- | --- |
+| 🪪 **6 个作用域一屏管完** | 三条产品线 × 国内 / 国际，各有独立账号库；切号带实时进度，写失败自动回滚 |
+| ✅ **该做的事自己冒出来** | 概览把「要重新登录 / 今日未签到 / 积分将过期 / 客户端没开」列成待办，点一下处理完 |
+| 📊 **用量与限流看得见** | Token、积分、账号 × 模型限流、会话副本谁落后谁分叉，全在一屏 |
+| 🔌 **额度还能喂给别的工具** | 一键暴露成 OpenAI / Anthropic 兼容接口，直接配进 Cursor、Claude Code、OpenWebUI |
 
-> ⚠️ **免责声明**：本项目是**非官方的第三方源码公开工具**（source-available，非商业许可），与 WorkBuddy、CodeBuddy、Trae / TraeWork 及其各自权利人不存在隶属、授权或背书关系。它会读写本机第三方客户端的认证数据、按你的配置自动发起请求，并可将你的模型额度通过本地接口转发给其它工具。使用前请完整阅读[免责声明](docs/DISCLAIMER.md)，自行评估风险并确保使用方式符合相关服务条款。
+> **定位与使用边界**
+>
+> 本项目是作者**个人自用与学习**的产物——为解决自己多账号切换的麻烦而写。**欢迎参考、fork 与改进，但不承诺维护**：不提供商业支持、SLA 或特定客户端版本的兼容性承诺。
+>
+> 许可为 **PolyForm Noncommercial 1.0.0**：**仅允许个人非商业使用，禁止任何形式的商业使用**（含企业内部商业项目、SaaS / 托管服务、售卖与捆绑分发）。商业使用须事先取得作者书面授权。
 
-同一套界面提供三种形态：
+> ⚠️ **非官方 · 非商业**：与 WorkBuddy、CodeBuddy、TraeWork、Qoder 及其权利人不存在隶属、授权、赞助或背书关系；**不得商用**。它会读写本机客户端的认证数据、按你的配置自动发起请求，并可通过本地端口转发额度。使用前请读完 **[免责声明](docs/policies/DISCLAIMER.md)**。
+
+## 界面预览
+
+<table>
+  <thead>
+    <tr><th>概览（浅色）</th><th>概览（深色）</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><img src="docs/images/overview-light.png" alt="概览页（浅色）" /></td>
+      <td><img src="docs/images/overview-dark.png" alt="概览页（深色）" /></td>
+    </tr>
+  </tbody>
+</table>
+
+<table>
+  <thead>
+    <tr><th>WorkBuddy 账号（浅色）</th><th>WorkBuddy 账号（深色）</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><img src="docs/images/workbuddy-accounts-light.png" alt="WorkBuddy 账号页（浅色）" /></td>
+      <td><img src="docs/images/workbuddy-accounts-dark.png" alt="WorkBuddy 账号页（深色）" /></td>
+    </tr>
+  </tbody>
+</table>
+
+<table>
+  <thead>
+    <tr><th>用量 · 趋势（浅色）</th><th>用量 · 趋势（深色）</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><img src="docs/images/usage-trend-light.png" alt="用量趋势（浅色）" /></td>
+      <td><img src="docs/images/usage-trend-dark.png" alt="用量趋势（深色）" /></td>
+    </tr>
+  </tbody>
+</table>
+
+<table>
+  <thead>
+    <tr><th>网关（浅色）</th><th>网关（深色）</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><img src="docs/images/api-service-light.png" alt="网关页（浅色）" /></td>
+      <td><img src="docs/images/api-service-dark.png" alt="网关页（深色）" /></td>
+    </tr>
+  </tbody>
+</table>
+
+<table>
+  <thead>
+    <tr><th>Qoder 网关（浅色）</th><th>Qoder 网关（深色）</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><img src="docs/images/qoder-gateway-light.png" alt="Qoder 网关（浅色）" /></td>
+      <td><img src="docs/images/qoder-gateway-dark.png" alt="Qoder 网关（深色）" /></td>
+    </tr>
+  </tbody>
+</table>
+
+<details>
+<summary><b>更多截图（会话同步 / 设置 / TraeWork 账号 / Qoder 账号）</b></summary>
+
+<table>
+  <thead>
+    <tr><th>会话副本（浅色）</th><th>会话副本（深色）</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><img src="docs/images/sessions-light.png" alt="会话页（浅色）" /></td>
+      <td><img src="docs/images/sessions-dark.png" alt="会话页（深色）" /></td>
+    </tr>
+  </tbody>
+</table>
+
+<table>
+  <thead>
+    <tr><th>设置（浅色）</th><th>设置（深色）</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><img src="docs/images/settings-light.png" alt="设置页（浅色）" /></td>
+      <td><img src="docs/images/settings-dark.png" alt="设置页（深色）" /></td>
+    </tr>
+  </tbody>
+</table>
+
+<table>
+  <thead>
+    <tr><th>TraeWork 账号（浅色）</th><th>TraeWork 账号（深色）</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><img src="docs/images/trae-accounts-light.png" alt="TraeWork 账号页（浅色）" /></td>
+      <td><img src="docs/images/trae-accounts-dark.png" alt="TraeWork 账号页（深色）" /></td>
+    </tr>
+  </tbody>
+</table>
+
+<table>
+  <thead>
+    <tr><th>Qoder 账号（浅色）</th><th>Qoder 账号（深色）</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><img src="docs/images/qoder-accounts-light.png" alt="Qoder 账号页（浅色）" /></td>
+      <td><img src="docs/images/qoder-accounts-dark.png" alt="Qoder 账号页（深色）" /></td>
+    </tr>
+  </tbody>
+</table>
+
+</details>
+
+> 图由 `scripts/gen-readme-shots.mjs` 从演示构建（`VITE_DEMO_MODE=1`）自动生成，账号、积分与请求记录均为虚构数据；界面改版后重跑一次即可同步。
+
+## 全景
+
+```mermaid
+flowchart TB
+    subgraph SRC["3 条产品线 · 6 个作用域"]
+        direction LR
+        WB["WorkBuddy<br/>国内版 / 国际版"]
+        TR["TraeWork<br/>国内版 / 国际版"]
+        QD["Qoder<br/>国内版 / 国际版"]
+    end
+    subgraph CORE["本机核心 · ~/.buddy-switch/"]
+        direction LR
+        AC["账号库<br/>凭据 · 回收站"]
+        AU["自动化<br/>签到 · 保活 · 轮换"]
+        US["用量<br/>Token / 积分"]
+        SE["会话副本<br/>内容指纹 · 加法同步"]
+        GW["额度网关<br/>OpenAI / Anthropic 兼容"]
+    end
+    WB --> AC
+    TR --> AC
+    QD --> AC
+    AC --- AU --- US --- SE
+    US --> GW
+    GW --> OUT["本机其它 AI 工具<br/>Cursor · Claude Code · OpenWebUI"]
+```
+
+**三条硬纪律**，贯穿全部功能：数据只落本机、凭据只写客户端登录态（不代登录、不改上游协议）、任何写入前先备份。
+
+## 四种形态
 
 | 形态 | 获取方式 | 说明 |
 | --- | --- | --- |
-| **桌面 App** | 从 [GitHub Releases](https://github.com/kingkadienm/trae-workbuddy-switch/releases/latest) 下载安装包 | Tauri 打包，推荐日常使用 |
-| **webui（浏览器）** | 从源码构建，见 [webui 形态](#webui-形态源码构建) | 与桌面 App 同一份前端产物，走本地 HTTP 通道 |
-| **在线演示** | [GitHub Pages](https://kingkadienm.github.io/trae-workbuddy-switch/) | 只读演示；账号、积分与请求记录均为虚构数据，所有业务操作已禁用 |
+| **桌面 App** | [GitHub Releases](https://github.com/kingkadienm/trae-workbuddy-switch/releases/latest) 下载安装包 | Tauri 打包，推荐日常使用 |
+| **webui** | [Releases 的 CLI 裸二进制](docs/guides/LINUX-WEBUI-FALLBACK.md)或从源码构建（见下） | 与桌面 App 同一份前端产物，走本地 HTTP 通道 |
+| **Docker** | 拉预构建镜像 `ghcr.io/nextagentx/buddy-switch`（amd64 / arm64） | 容器内是 **headless 服务端**（webui + API 网关），**不是**桌面切换器；见 [Docker 部署](docs/guides/DOCKER.md) |
+| **在线演示** | [GitHub Pages](https://nextagentx.github.io/qoder-trae-workbuddy-switch/) | 只读演示，账号与用量均为虚构数据 |
 
-> **暂未提供 npm 安装**：npm 包 `@kingkadienm/buddy-switch` 尚未发布，`npm i -g …` 还装不到它。
-> 需要 webui 形态请按下方[从源码构建](#webui-形态源码构建)；发布后会在这里补上安装命令。
-
-
-## 两个产品分区
-
-侧栏顶部切换产品分区。两个分区**彼此独立**：独立的账号库、独立的客户端、独立的配置，互不影响。
-
-| 分区 | 管理的客户端 | 区域 |
-| --- | --- | --- |
-| **WorkBuddy** | WorkBuddy 桌面客户端、CodeBuddy CLI、CodeBuddy CN IDE | 国内版（WorkBuddy）/ 国际版（WorkBuddy AI） |
-| **TraeWork** | Trae Work（客户端 `TRAE SOLO CN` / `TRAE SOLO`）、Trae IDE（`Trae CN` / `Trae`） | 国内版 / 国际版 |
-| **豆包 Doubao**（🚧 开发中） | 豆包 App | — |
-
-两个分区下的页面结构**逐条同构**：账号管理、Token 统计、积分统计、API 服务、设置。
-
-> **豆包分区**（🚧 开发中）：账号池管理与快照槽已可用（添加 / 移除 / 探测登录 / 保活），会话续期、会员额度查询与对话备份等功能正在开发中。
-
-> **Trae 侧的区域与程序位**：Trae 有两条可同机并存的产品线（Trae Work 与 Trae IDE，客户端自述别名 `TraeWork CN` / `TraeCode CN`），它们在 Trae 分区**内部**切换，不占侧栏。变体由 URL 的 `?line=` 承载，因此刷新、分享链接、前进后退都能保持当前位置。
+> Linux 上若桌面「创建密钥」弹窗无响应，可改用 [本机 WebUI 备用方案](docs/guides/LINUX-WEBUI-FALLBACK.md)。
+>
+> npm 包尚未发布，`npm i -g` 暂时装不到；webui 可直接使用 Releases 提供的 CLI 裸二进制，或按下面步骤从源码构建。
+>
+> Docker 形态只跑**服务端**：切换客户端登录态、启动客户端、托盘、悬浮窗这些依赖**同机图形客户端**的能力在容器里一律不可用（webui 上会显示为不可用/无数据）。
 
 ## 快速开始
 
-### 桌面 App
+**桌面 App**：从 Releases 下载对应平台的安装包。
 
-前往 [GitHub Releases](https://github.com/kingkadienm/trae-workbuddy-switch/releases/latest) 下载对应平台的安装包：
-
-| 平台 | 安装包 | 安装方式 |
+| 平台 | 安装包 | 安装 |
 | --- | --- | --- |
-| macOS Apple Silicon（M 系列，arm64） | `BuddySwitch_<版本>_aarch64.dmg` | 打开 DMG，将 `BuddySwitch.app` 拖入「应用程序」 |
-| macOS Intel（x86_64） | `BuddySwitch_<版本>_x86_64.dmg` | 打开 DMG，将 `BuddySwitch.app` 拖入「应用程序」 |
-| Windows x64 | `BuddySwitch_<版本>_x64-setup.exe` | 运行安装程序并按提示完成安装 |
-| Linux x64 | `BuddySwitch_<版本>_amd64.deb` / `BuddySwitch_<版本>_amd64.AppImage` | Debian/Ubuntu 安装 `.deb`；其他发行版可给 AppImage 添加执行权限后直接运行 |
+| macOS Apple Silicon（arm64） | `BuddySwitch_<版本>_aarch64.dmg` | 打开 DMG，把 `BuddySwitch.app` 拖进「应用程序」 |
+| macOS Intel（x86_64） | `BuddySwitch_<版本>_x86_64.dmg` | 同上 |
+| Windows x64 | `BuddySwitch_<版本>_x64-setup.exe` | 运行安装程序 |
+| Linux x64 | `BuddySwitch_<版本>_amd64.deb` / `.AppImage` | 装 `.deb`，或给 AppImage 加执行权限后直接运行 |
 
-macOS 首次启动若提示无法验证开发者，先在 Finder 中按住 Control 点击应用并选择「打开」，或前往「系统设置 → 隐私与安全性」选择「仍要打开」。仅当安装包来自上述官方 Releases、且系统仍提示「已损坏」时，再执行：
+> **下错了？** Release 资产列表里还有 `buddy-switch-cli-*` 文件，那是 **webui 形态的命令行程序**（裸二进制），**不是安装包**。它的特征是没有扩展名、30 MB 上下，下载后双击打不开（下载过程会丢掉执行位）—— 要用它得先 `chmod +x`，见 [本机 WebUI 备用方案](docs/guides/LINUX-WEBUI-FALLBACK.md)。桌面 App 一定带 `.dmg` / `-setup.exe` / `.deb` / `.AppImage` 扩展名。
 
-```bash
-xattr -rd com.apple.quarantine "/Applications/BuddySwitch.app"
-```
-
-应用能启动但切换账号时提示无权限，请参阅下方 [macOS 权限说明](#macos-权限说明)。
-
-### webui 形态（源码构建）
-
-本项目暂未通过 npm 分发，因此 webui 形态需要自己编译。**注意顺序**：前端产物是被服务端二进制在**编译期**嵌入的（`rust-embed`），所以必须先构建前端，再编译服务端：
+**webui（源码构建）**：前端产物在**编译期**被服务端嵌入（`rust-embed`），所以顺序不能反。
 
 ```bash
 npm install
-npm run build                                    # 1) 构建前端 → dist/
+npm run build                                    # 1) 前端 → dist/
 cargo build --release -p buddy-switch-server     # 2) 编译服务端（把 dist/ 嵌进去）
-./target/release/buddy-switch                    # 3) 启动本地服务 + 自动打开浏览器（Windows 为 buddy-switch.exe）
+./target/release/buddy-switch                    # 3) 起服务并打开浏览器（默认 127.0.0.1:57890）
 ```
 
-启动后可用的子命令：
-
 ```bash
-buddy-switch              # 启动本地服务 + 自动打开浏览器
-buddy-switch serve        # 只起服务，不开浏览器（--port 指定端口）
+buddy-switch              # 起服务 + 打开浏览器
+buddy-switch serve        # 只起服务（--port 指定端口）
 buddy-switch status       # 终端查看当前账号
 buddy-switch version      # 版本号
 ```
 
-webui 默认监听 `127.0.0.1:57890`。界面与桌面 App 完全一致——同一份前端产物，桌面端走 Tauri 命令通道，webui 走本地 HTTP 通道。
+<details>
+<summary><b>macOS 提示「已损坏」／「无法验证开发者」／切换时提示无权限</b></summary>
 
-> 改了前端但没重新编译服务端时，界面不会变（嵌入的是旧产物）。重编前请先停掉正在运行的 `buddy-switch`，否则 Windows 上会因二进制被占用而链接失败。
+- **提示「BuddySwitch 已损坏，无法打开」**（Gatekeeper 对**已下载但未签名**的应用会给这句，而不是「无法验证开发者」）：
+  把应用拖进「应用程序」后执行 `xattr -dr com.apple.quarantine /Applications/BuddySwitch.app`，再正常双击打开。
+  这条命令只删「从网络下载」这个标记，不改动应用本身。
+- 无法验证开发者：Finder 里按住 Control 点击应用 → 「打开」，或到「系统设置 → 隐私与安全性」→「仍要打开」。
+- 切换账号需要写入客户端认证文件：在「系统设置 → 隐私与安全性」的 **App 管理**（或 **完全磁盘访问**）中授权 BuddySwitch，然后重启应用。设置页的「权限检测」可随时验证。
+- webui 形态的权限跟随启动服务的终端进程。
+- **macOS 反复弹出「允许访问钥匙串」**：客户端（Qoder / CodeBuddy IDE）的 Safe Storage 主密钥存在系统钥匙串里，首次读取必然要一次授权，点「始终允许」即可；同一进程内只会读一次（已缓存，见 issue #104）。
+  若每次操作都弹，通常是应用被移动过或重新安装导致签名身份变化 —— 在「钥匙串访问」里把该条目删除后，重开一次客户端与 BuddySwitch，重新授权一次即可。
 
-## 功能
+</details>
 
-### WorkBuddy 分区
+## 6 个作用域（平台 × 区域）
 
-| 模块 | 说明 |
+顶栏左上角的作用域选择器决定「现在管哪一套账号」。作用域写进 URL（`/s/wb-cn/accounts`），刷新、分享、前进后退都留在原地；`⌘K` / `Ctrl+K` 跨作用域搜索，`⌘1`–`⌘6` 直接切换。
+
+| 作用域 | 平台 | 区域 | 管理的客户端 |
+| --- | --- | --- | --- |
+| `wb-cn` | WorkBuddy | 国内版 | WorkBuddy 桌面端、CodeBuddy CN IDE / CLI、VS Code / JetBrains 的 CodeBuddy 插件 |
+| `wb-global` | WorkBuddy | 国际版 | 同上（国际版客户端） |
+| `trae-cn` | TraeWork | 国内版 | Trae CN |
+| `trae-global` | TraeWork | 国际版 | Trae |
+| `qoder-cn` | Qoder | 国内版 | Qoder CN 桌面版 / CLI |
+| `qoder-global` | Qoder | 国际版 | Qoder 桌面版 / CLI |
+
+六个作用域**彼此独立**：独立账号库、独立客户端、独立配置、独立网关 Key。Trae 的两条老程序线（TraeWork / TraeCode）已被官方合并成同一个客户端，旧标识仅作兼容。
+
+## 侧栏 6 个目的地
+
+三个平台**逐条同构**：**概览 · 账号 · 用量 · 会话 · 网关 · 设置**。入口按**能力门控**（不是平台分支）：缺哪个能力就不画哪个入口，URL 直达时给结构化空态。
+
+| 目的地 | 一句话 |
 | --- | --- |
-| 账号管理 | OAuth 扫码登录、从本机导入、从备份文件导入、手动添加 token、删除账号、导出账号备份 |
-| 账号切换 | 备份认证文件 → 关闭 WorkBuddy → 写入目标账号 → 重启，切换过程实时进度反馈 |
-| 会话复制 | 将当前账号勾选的会话以新 id 复制给目标账号（jsonl 正文 + `workbuddy.db` 索引 + edge-sync 注册） |
-| 自动签到 | 默认开启；启动即检查，并按排程自动补签；支持一键全部签到与签到日志 |
-| 自动旅行 | 自动派发 / 领取「猫猫旅行」任务 |
-| Token 保活 | 惰性刷新（操作前不足阈值才刷新）+ 每日保活（默认每天无条件刷新一次），避免 refresh token 过期 |
-| 积分到期查询 | 查询每个账号的积分资源、剩余量与到期时间；7 天内到期高亮并按到期优先排序，最紧迫的标记为「建议优先使用」 |
-| 积分统计 | 汇总 WorkBuddy 官方请求用量，展示每日趋势、模型分布、账号消耗与请求明细；官方数据不可用时明确回退到本地余额快照观察 |
-| Token 统计 | 分别查看 WorkBuddy、CodeBuddy CLI 与 CodeBuddy IDE 的 Token 总览；输入、输出、缓存读写按 K/M/B 展示，并提供构成占比、活跃热力图、项目/模型 Top 10 与会话排行 |
-| CodeBuddy CLI | 与 WorkBuddy 复用同一账号库，但默认账号独立；macOS/Linux 通过 `apiKeyHelper`，Windows 通过 `settings.json` 的 `env.CODEBUDDY_AUTH_TOKEN` 设置后续会话使用的账号 |
-| CodeBuddy CN IDE | 复用同一账号库，向 `CodeBuddy CN` 桌面客户端注入 Safe Storage 凭证并重启 IDE |
-| 自动轮换 | 后台定时把 CodeBuddy CLI 的后续启动账号设为积分最紧迫（最早到期）的账号；当前会话保持原账号 |
-| 定时任务排程 | 六类任务——签到、猫猫旅行、活跃地图、token 保活、开学季、夜猫子——各自可独立开关并配置执行小时 |
-| 切换时迁移数据 | 把当前账号的长期记忆（Memory）与连接器配置合并到目标账号（同名条目递归合并、按内容去重），支持同版本与跨版本迁移；改写前自动备份原文 |
-| 权限检测 | macOS 授权引导（App 管理 / 完全磁盘访问拖拽授权 + 自动检测） |
-| 自动更新 | 检查 GitHub Releases 新版本；整包更新经签名校验（tauri-updater） |
+| **概览** | 待处理清单（需重新登录 / 今日未签到 / 积分将过期 / 客户端未运行）+ 统计卡 + 近 14 天 Token 柱状图 + 其他作用域速览 |
+| **账号** | 卡片 / 表格双视图、程序位切换、扫码或设备码登录、本机导入、签到、回收站（30 天）、客户端限流台账（WorkBuddy 专有） |
+| **用量** | 一个工作台四个视图：趋势 · 模型 · 会话 · 积分；参数条只有一条（范围 + 数据来源） |
+| **会话** | 同一份会话在各账号的副本：谁落后、谁分叉、同步给谁（**仅 WorkBuddy**） |
+| **网关** | 独立网关（每个作用域一套）与统一网关（跨作用域一个 provider） |
+| **设置** | 九个分区：通用 · 账号与登录 · 签到与积分 · 网关 · 计划任务 · 客户端 · 权限与诊断 · 日志 · 备份与恢复 |
 
-### TraeWork 分区
+### 能力矩阵
 
-| 模块 | 说明 |
+| 能力 | WorkBuddy | TraeWork | Qoder |
+| --- | :---: | :---: | :---: |
+| 账号库 / 登录 / 本机导入 | ✅ 扫码 + 导入 | ✅ 网页登录 + JWT | ✅ 设备码 + PAT |
+| 一键切程序位 | ✅ 5 个（4 可切换 + 1 只读探测） | ✅ 1 个（合并客户端） | ✅ 2 个（桌面版 / CLI） |
+| 签到 / 积分 | ✅ 含自动旅行、自动轮换 | ✅ | ✅ 每日活动领取（campaigns）+ 套餐 / 额度 |
+| 用量统计 | ✅ Token + 积分 | ✅ Token + 积分 | ✅ 仅积分（客户端本地把 token 计数恒记为 0） |
+| 会话副本同步 | ✅ 内容指纹 + 加法同步 | — | — |
+| 模型额度网关 | ✅ `:57891` | ✅ `:57894` | ✅ `:57895` |
+
+## 切换账号是怎么做的
+
+```mermaid
+flowchart LR
+    A["选中账号"] --> B["备份当前登录态"] --> C["关闭客户端"] --> D["写入目标账号"] --> E["校验并重启"]
+    D -->|"可选"| F["附带：会话复制<br/>记忆与连接器合并"]
+```
+
+- **先备份后写入**：认证文件、Trae 登录态快照、会话覆盖前，都会先留一份可回滚的副本。
+- **写后校验**：写入失败自动还原；客户端运行中直接拒写，避免退出时把内存里的旧登录态写回覆盖。
+- **删除是软的**：账号先进回收站保留 30 天，可随时恢复；永久删除才连带清凭据与快照。
+
+## 模型额度网关
+
+把当前账号的额度以**兼容接口**暴露给本机工具：OpenAI 兼容（`/v1/models`、`/v1/chat/completions`、`/v1/responses`）+ Anthropic 兼容（`/v1/messages`），都支持 SSE 流式。默认只监听 `127.0.0.1`。
+
+```mermaid
+flowchart LR
+    C["本机 AI 工具"] -->|"sk-wb-…"| G1[":57891<br/>WorkBuddy 网关"]
+    C -->|"sk-trae-…"| G2[":57894<br/>Trae 网关"]
+    C -->|"sk-qoder-…"| G3[":57895<br/>Qoder 网关"]
+    C -->|"sk-uni-…"| G4[":57892<br/>统一网关"]
+    G1 --> P1["wb-cn / wb-global 账号池"]
+    G2 --> P2["trae-cn / trae-global 账号池"]
+    G3 --> P3["qoder-cn / qoder-global 账号池"]
+    G4 -->|"模型名带命名空间前缀"| P1
+    G4 --> P2
+    G4 --> P3
+```
+
+- **四条监听彼此独立**：端口按 **`5789x` 一段**排开——`57890` 界面 · `57891` WorkBuddy · `57892` 统一 · `57893` 会话 hook · `57894` Trae · `57895` Qoder；关掉统一网关不影响任何既有客户端。路由 `/v1/*` 逐字重叠，所以**不能**合成一个 Router。
+- **Key 前缀同族**：`sk-wb-` · `sk-trae-` · **`sk-qoder-`** · `sk-uni-`，看一眼前缀就知道该配哪个端口。
+- **Key 三态**：吊销 · 恢复 · 删除（仅已吊销可删）。明文只在创建时返回一次，库里只存 sha256 + 前 4 / 后 4 位。
+- **Key 配额与白名单**：每把 Key 可设「上限 × 重置周期」（计量单位二选一：token / 请求数；周期：不重置 / 每日 / 每周 / 自然月），并限定只能落到哪些账号（可按分组整组选取）。超额返回 429 `quota_exceeded`；白名单内一个都不可用时返回 401 `no_credential`（与「池空」同码；错误体 `message` 会写明名单覆盖了几个号、为什么都不可用），**不回退全池**。
+- **账号池**：按余额与限流状态挑账号，可排除不可用账号、可做「账号 × 模型」限流探测，恢复后一键复活。
+
+**统一网关**解决「同名模型在不同平台互相覆盖」：模型名写成 `<命名空间>:<模型id>`，命名空间由作用域注册表派生（当前 6 条：`wb-cn` / `wb-global` / `trae-cn` / `trae-global` / `qoder-cn` / `qoder-global`）。
+
+| 规则 | 行为 |
 | --- | --- |
-| 账号管理 | OAuth 网页登录（浏览器回调）、手动粘贴 `Cloud-IDE-JWT`、从本机导入、从备份文件导入、删除账号、导出账号备份 |
-| 分组 | 账号可分组，列表支持按分组筛选 |
-| 签到 | 一键签到并刷新积分；支持「跳过今日已签到账号」与自动续期；账号卡片展示签到状态与冷却 |
-| 积分 | 逐账号展示剩余积分、逐包明细与到期时间；近 7 天积分总数 / 获得 / 消耗趋势 |
-| Token 统计 | 近 7 天 / 30 天 / 90 天 / 全部历史窗口的 Token 与调用次数统计 |
-| 登录态切换 | 把选定账号写入 Trae 客户端的登录态（`profiles/`），切换前自动备份；重启客户端后生效 |
-| 登录态快照 | 保存 / 恢复 / 删除客户端登录态快照，便于回滚 |
-| JWT 刷新 | 手动刷新账号 JWT 并查看剩余有效期（临期高亮） |
-| 设备标识 | 查看与重置设备标识 |
-| 环境探测 | 自动探测本机安装的产品线、客户端版本、运行状态与 userData 目录 |
-| 运行日志 | 客户端数据目录、网关请求日志与操作日志集中查看 |
+| 裸模型名（不带前缀） | **一律 400**，并列出可用前缀（不猜默认值，避免静默走错账号池） |
+| 命名空间解析 | **只做整段精确匹配**（`trae` / `traework` / `traecode` 互为前缀） |
+| 一把 Key 跨平台 | 同一个 `sk-uni-` Key 可同时授权多个平台 |
+| `/v1/responses` | 所有命名空间都可用（Trae 于 2026-10-22 补齐；Qoder 内部翻译成 chat） |
+| 默认状态 | **默认关**，需在网关页「统一网关」分区手动启用 |
 
-### API 网关（两个分区各自独立）
+> 架构与决策：[UNIFIED-GATEWAY-ARCH.md](docs/specs/UNIFIED-GATEWAY-ARCH.md) · 接入片段：[guides/GATEWAY-CLIENT-INTEGRATION.md](docs/guides/GATEWAY-CLIENT-INTEGRATION.md)
 
-把当前账号的模型额度以**兼容接口**暴露给本机其它 AI 工具（Cursor、Claude Code、OpenWebUI 等），Key 与账号池按产品分区、按区域隔离。
+## 自动化
+
+计划任务支持**分钟粒度**时点（如 `09:37`）、多个时点，以及**随机抖动**（±5/15/30 分钟）——让每天的实际触发时刻错开，而不是整点齐发。
+
+| 侧 | 任务 |
+| --- | --- |
+| WorkBuddy（6 类） | 签到 · 猫猫旅行 · 活跃地图 · Token 保活 · 开学季 · 夜猫子 |
+| Trae（2 类） | 签到 · JWT 自动续期 |
+| Qoder（2 类） | 签到 · 令牌保活 |
+
+自动轮换（仅 WorkBuddy）是**独立的后台循环**，不是排程表里的一项——见下。
+
+<details>
+<summary><b>自动轮换策略（WorkBuddy，防积分过期）</b></summary>
+
+后台定时把 **CodeBuddy CLI 后续启动**的默认账号设为「最紧迫」的账号（最早到期且仍有剩余积分）。依次判定：
+
+1. 有效账号（查询成功、未过期、有剩余积分）
+2. 紧迫度检查（最紧迫的剩余超过 `min_urgency_hours`，默认 72h → 不切）
+3. 已是目标 → 不切
+4. 冷却期（`cooldown_minutes`，默认 120）
+5. 活跃保护（最近 `active_guard_minutes`，默认 30 内有对话 → 不切）
+6. 价值过滤（剩余积分低于 `min_remaining_credits` → 不值得切）
+7. 防抖动（差异小于 `min_gap_hours`，默认 24 → 不切）
+
+**生效边界**：只更新后续会话使用的默认账号，不热切换当前会话——需 ACP 重新加载会话或重启 CLI。
+
+</details>
+
+<details>
+<summary><b>应用级能力（六个作用域共用，不随作用域切换）</b></summary>
 
 | 能力 | 说明 |
 | --- | --- |
-| 兼容协议 | OpenAI 兼容（`/v1/models`、`/v1/chat/completions`）与 Anthropic 兼容（`/v1/messages`），均支持 SSE 流式 |
-| 监听配置 | 默认仅监听 `127.0.0.1`；改为 `0.0.0.0` 需二次风险确认 |
-| 默认端口 | WorkBuddy 网关 `57891`；Trae 网关 `7864`（Trae 另有本地 MITM 代理端口 `8899`，登录态捕获依赖它） |
-| API Key | 可创建多个 Key，归属到具体区域；列表只显示前缀，**不落明文、不回显 hash**；支持吊销与删除 |
-| 模型目录 | 拉取并展示可用模型清单，可手动刷新 |
-| 账号策略 | 配置账号选择策略与账号池余额刷新间隔 |
-| 请求日志 | 记录每次请求的模型、账号、Token 与状态，可清空 |
+| 应用设置（顶栏 ⚙） | 主题（浅 / 深 / 纯黑 OLED / 跟随系统）、界面语言（简体中文 / English）、开机静默启动、关闭窗口进托盘、自动更新 |
+| 全局备份与恢复 | 一次覆盖全部作用域，按账号 / 配置 / 网关分区勾选，**默认不含凭据** |
+| Skill 管理 | 扫描 `skills/*/SKILL.md`，逐项启停（行级重写、其余字节原样保留），支持跨区域搬迁与 zip 导入 |
+| 客户端设置托管 | 统一读写上游客户端自己的 `settings.json`：6 槽位规格表 + 格式指纹 + 字节级最小补丁 + 备份 / 恢复 / 差异对比 |
+| 会话悬浮窗（仅桌面端） | 独立小窗展示跨来源的任务状态，只读、可点回原会话 |
+| 客户端会话监听（默认关） | 在 WorkBuddy `settings.json` 装 hook，把任务状态实时送进悬浮窗（接收端 `127.0.0.1:57893`） |
+| 运行日志 | 本工具**自己**的日志（`~/.buddy-switch/logs/runtime-YYYY-MM-DD.log`），在「设置 → 日志」里按级别 / 日期 / 关键字筛选、复制、打开目录、清空。保留 7 天，单文件 4 MiB、每天最多 4 个分片；写盘前脱敏凭据。`BUDDY_SWITCH_LOG_LEVEL=debug` 后重启可看逐请求明细 |
 
-### 豆包分区（🚧 开发中）
-
-> 该分区正在开发中：账号池 / 快照槽 / 探测 / 保活已可用，会话续期、会员额度查询与对话备份 / 恢复 / 导出为**开发中**占位。
-
-| 模块 | 状态 | 说明 |
-| --- | --- | --- |
-| 账号管理 | ✅ 可用 | 豆包账号池：添加 / 移除（可选删快照槽）、别名与备注 |
-| 探测登录 | ✅ 可用 | 读取豆包客户端写入的当前登录 UID 标记 |
-| 账号切换 | ✅ 可用 | 保存 / 切换账号并写入当前登录标记 |
-| 保活 | ✅ 可用 | 手动触发保活（更新池级时间戳） |
-| 会话续期 | 🚧 开发中 | sessionid / sid_guard 滑动续期 |
-| 会员额度 | 🚧 开发中 | 会员等级、到期时间与额度查询 |
-| 对话数据 | 🚧 开发中 | 对话历史、聊天数据备份 / 恢复 / 导出 |
-
-## 使用
-
-### WorkBuddy
-
-1. **添加账号**：账号页 →「OAuth 扫码添加」（device flow）、「导入本机账号」或「导入备份」
-   - 客户端 5.6 起把登录态 token 加密存储。**「导入本机账号」会自动调用本机客户端解开这层加密**（需已安装 WorkBuddy 桌面端），导入后签到 / 积分 / Token 统计可直接使用。若本机没装客户端或客户端换了加密实现，账号**仍会导入成功**，但仅能用于「切换账号」；此时可对账号点「刷新 Token」重试解锁
-2. **切换账号**：账号卡片 →「切换」，可勾选把当前账号的会话一并复制过去，并把长期记忆与连接器配置合并到目标账号（跨版本迁移时可选数据来源版本）
-3. **自动签到 / 自动旅行**：账号页顶部直接开关；设置页可调整参数、立即签到并查看日志
-4. **查看积分到期**：账号页自动查询各账号积分资源；点击「刷新积分」手动更新，临期资源会高亮并按紧迫程度排序
-5. **查看积分统计**：侧栏「积分统计」——总览、近 30 天趋势、模型分类、账号消耗与请求明细；筛选账号或时间范围不会重复请求官方接口，点「刷新统计」才重新采集
-6. **查看 Token 统计**：侧栏「Token 统计」，选择 WorkBuddy、CodeBuddy CLI 或 CodeBuddy IDE，查看输入、输出、缓存读写与调用次数
-7. **接入 CodeBuddy CLI**：账号页一键接入 / 更新认证。「切换 CodeBuddy」只更新**后续加载会话**使用的默认账号，当前运行会话不会切换——请由 ACP 重新加载会话，或重启 CodeBuddy CLI 后生效
-8. **切换 CodeBuddy CN IDE**：账号卡片一键切换国内版桌面客户端（www.codebuddy.cn）。切换会关闭并重启 CodeBuddy CN；首次使用前请先手动打开并登录一次以生成 Keychain Safe Storage
-9. **自动轮换**：设置 → CodeBuddy CLI 自动轮换（策略见下）
-10. **更新**：应用自动检查公开 GitHub Releases，发现新版本后可在左下角直接升级
-
-### TraeWork
-
-1. **添加账号**：账号页 →「OAuth 网页登录」（浏览器完成授权后回调）或「粘贴 JWT」；也可「导入本机账号」「导入备份」
-2. **选择区域与产品线**：页面顶部切换国内版 / 国际版；账号卡片上按程序位切换要操作的客户端（TraeWork / TraeCode）
-3. **签到**：账号页「签到并刷新积分」，或对单个账号执行；开启「跳过已签到」避免重复请求
-4. **切换登录态**：账号卡片 →「切换」，写入所选客户端登录态并重启客户端；切换前自动保存快照
-5. **快照回滚**：设置 →「登录态快照」，可保存 / 恢复 / 删除
-6. **API 服务**：侧栏「API 服务」，创建 Key 后按页面上的接入指引配置到你的工具里
-
-### 自动轮换策略（WorkBuddy）
-
-自动轮换的目标是防止积分过期浪费：后台定时查询所有账号的积分到期情况，把 CodeBuddy CLI 后续会话的默认账号设为「最紧迫」的账号（最早到期且仍有剩余积分）。macOS/Linux 的 `apiKeyHelper` 与 Windows 的 settings env 都不会替换正在运行会话已经持有的 token；轮换结果需在 ACP 重新加载会话或重启 CLI 后生效。为避免默认账号频繁变化，每次检查按以下顺序决策：
-
-1. **有效账号**：查询成功、未过期、有剩余积分的账号才可被选为目标
-2. **紧迫度检查**：所有账号到期都还早（最紧迫的剩余超过 `min_urgency_hours`，默认 72 小时）→ 不切
-3. **已是目标**：CLI 默认账号就是最紧迫账号 → 不切
-4. **冷却期**：切换后 `cooldown_minutes`（默认 120）内不重复切
-5. **活跃保护**：最近 `active_guard_minutes`（默认 30）内 CLI 会话有写入（正在对话）→ 不切
-6. **价值过滤**：目标账号剩余积分低于 `min_remaining_credits` → 不值得切（默认 0 关闭；每次检查会把各账号剩余积分写入日志，可据此调整）
-7. **防抖动**：目标比当前早到期但差异小于 `min_gap_hours`（默认 24）→ 不切
-
-> **生效边界**：自动轮换只更新后续 restore/load 使用的默认账号，不会热切换当前会话。macOS/Linux 下一次 helper 执行会读取最新账号；Windows 会把最新 Token 写入 settings。正在运行的会话继续使用启动或加载时取得的账号；请由 ACP 重新加载会话，或重启 CodeBuddy CLI。
-
-配置项：`check_interval_minutes`（检查间隔，默认 5）、`cooldown_minutes`、`min_urgency_hours`、`active_guard_minutes`、`min_remaining_credits`、`min_gap_hours`。可在设置页调整，或直接编辑 `~/.buddy-switch/auto_rotate_config.json`。
-
-## 界面预览
-
-### WorkBuddy 账号管理
-
-账号卡片集中展示登录状态、签到状态、积分余额与临期资源；顶部区域切换器在 WorkBuddy 国内版 / 国际版之间切换，两版账号库互相隔离。
-
-<table>
-  <thead>
-    <tr>
-      <th>浅色模式</th>
-      <th>深色模式</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td><img src="docs/images/workbuddy-accounts-light.png" alt="WorkBuddy 账号管理页（浅色模式，演示数据）" /></td>
-      <td><img src="docs/images/workbuddy-accounts-dark.png" alt="WorkBuddy 账号管理页（深色模式，演示数据）" /></td>
-    </tr>
-  </tbody>
-</table>
-
-### 积分统计
-
-展示官方请求用量、每日趋势、模型分布与账号消耗，并明确标注数据来源与更新时间；顶部可在国内版、国际版与合并视图之间切换。
-
-<table>
-  <thead>
-    <tr>
-      <th>浅色模式</th>
-      <th>深色模式</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td><img src="docs/images/credit-stats-light.png" alt="积分统计页（浅色模式，演示数据）" /></td>
-      <td><img src="docs/images/credit-stats-dark.png" alt="积分统计页（深色模式，演示数据）" /></td>
-    </tr>
-  </tbody>
-</table>
-
-### TraeWork 账号管理
-
-顶部切换国内版 / 国际版，状态条展示客户端版本、运行状态、今日签到、可用积分与 JWT 临期情况；账号卡片提供程序位切换、签到、切换登录态与冷却解除。
-
-<table>
-  <thead>
-    <tr>
-      <th>浅色模式</th>
-      <th>深色模式</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td><img src="docs/images/trae-accounts-light.png" alt="TraeWork 账号管理页（浅色模式，演示数据）" /></td>
-      <td><img src="docs/images/trae-accounts-dark.png" alt="TraeWork 账号管理页（深色模式，演示数据）" /></td>
-    </tr>
-  </tbody>
-</table>
-
-### API 服务
-
-按版本分别给出 Base URL 与代表性 Key，Key 列表支持创建、吊销与删除；下方提供模型清单、账号策略、接入指引与请求日志。
-
-<table>
-  <thead>
-    <tr>
-      <th>浅色模式</th>
-      <th>深色模式</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td><img src="docs/images/api-service-light.png" alt="API 服务页（浅色模式，演示数据）" /></td>
-      <td><img src="docs/images/api-service-dark.png" alt="API 服务页（深色模式，演示数据）" /></td>
-    </tr>
-  </tbody>
-</table>
-
-> 以上截图取自演示构建，账号、积分与请求记录均为虚构数据。
+</details>
 
 ## 数据与隐私
 
-- 所有数据都保存在本机 `~/.buddy-switch/` 下，不上传到任何第三方服务
-- 账号库：WorkBuddy 为 `accounts.json`（国内版）/ `accounts.global.json`（国际版）；Trae 为 `trae/checkin_accounts.json`（国内版）/ `trae/checkin_accounts.global.json`（国际版）
-- 认证文件：WorkBuddy 为 `workbuddy-desktop.info` / `workbuddy-desktop-ai.info`
-- 切换账号前会先备份原认证文件；Trae 切换登录态前会先保存快照
-- 网关 API Key 只保存前缀与哈希，明文仅在创建时返回一次
-- 仓库不提交本地数据；发布前会扫描 token 模式（`ghp_` / `npm_` / `gho_` 等）
-
-## macOS 权限说明
-
-切换账号需要写入 WorkBuddy 认证文件，macOS 要求授权「App 管理」（或「完全磁盘访问」）：
-
-1. 首次切换报「无权限」时，点「打开系统设置」
-2. 优先在 **App 管理** 里打开 BuddySwitch 开关；若没有，则去 **完全磁盘访问** 把 BuddySwitch 拖进带箭头的框
-3. 授权后重启本应用生效；设置页「权限检测」可随时验证
-
-> webui 模式：由启动服务的终端进程权限决定；若终端已授权完全磁盘访问则无需额外操作。
+- 全部数据落在本机 `~/.buddy-switch/`，不上传任何第三方服务；界面偏好只存本地。
+- 账号库按作用域分家（如 `accounts.json` / `accounts.global.json`、`trae/checkin_accounts*.json`）。
+- 导出备份**默认不含 token**；显式勾选并二次确认后才会写明文，页面同步警告该文件可直接用于登录。
+- 网关 Key 只存哈希与前缀；**仓库不提交本地数据**，发布前会扫描 token 模式。
+- 运行日志留在本机，且**写盘前脱敏凭据**（token 参数、`Bearer` 值、JWT）。本机路径照原样保留——那正是让一份反馈可定位的关键。
 
 ## 开发
 
-环境要求、构建命令、发布流程与目录结构见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。简要说明：
+```mermaid
+flowchart TB
+    FE["src/ · React 19 + Vite<br/>6 目的地 · api.ts 双通道"] --> H["宿主：Tauri commands ｜ HTTP (axum)"]
+    H --> CORE["crates/buddy-switch-core<br/>账号 · 认证 · 签到 · 会话 · 作用域"]
+    H --> GW["crates/buddy-switch-gateway<br/>WB / Trae / Qoder / 统一"]
+    CORE --> DATA[("~/.buddy-switch/")]
+    GW --> DATA
+```
 
 ```bash
 npm install
-npm run tauri dev     # 桌面端开发模式
-npm run build         # 构建前端（dist/）
-npm run check:api     # 校验前端 API 契约与后端一致
+npm run tauri dev     # 桌面端开发
+npm run build         # 前端构建 + 契约 / 作用域 / 平台门禁
+npm run check:api     # 只校验前端 API 契约
 ```
-
-仓库为 Rust workspace + Vite/React 前端：
 
 ```
 crates/
-  buddy-switch-core/     # 核心逻辑：账号、认证、OAuth、进程、切换、会话、签到、刷新、区域与 Trae 模块
-  buddy-switch-gateway/  # OpenAI / Anthropic 兼容网关（WorkBuddy 与 Trae 各一套实现）
+  buddy-switch-core/     # 账号、认证、OAuth、进程、切换、会话、签到、区域、Trae / Qoder 模块
+  buddy-switch-gateway/  # OpenAI / Anthropic 兼容网关（四套：WB / Trae / Qoder / 统一）
   buddy-switch-server/   # HTTP server + CLI（axum API + rust-embed 内嵌前端）
-src-tauri/               # 桌面宿主（Tauri command 薄包装 + 托盘）
-src/                     # 前端：components / pages / lib（api.ts 双通道：Tauri invoke 或 HTTP fetch）
-npm/                     # npm 包（**尚未发布**）：主包 @kingkadienm/buddy-switch + 5 个平台分包
+src-tauri/               # 桌面宿主（Tauri command 薄包装 + 托盘 + 网关宿主）
+src/                     # 前端：components / pages / lib / locales
+npm/                     # npm 包（尚未发布）
 ```
+
+## 文档
+
+完整索引在 [docs/README.md](docs/README.md) —— 按生命周期分区：指南 / 现行规格 / 只读历史 / 原型。最常翻的几份：
+
+| 文档 | 讲什么 |
+| --- | --- |
+| [guides/DEVELOPMENT.md](docs/guides/DEVELOPMENT.md) | 环境要求、本地开发、门禁清单、发布流程、目录约定 |
+| [guides/DOCKER.md](docs/guides/DOCKER.md) | 容器部署：预构建镜像 / 源码构建、端口与安全、排障 |
+| [guides/GATEWAY-CLIENT-INTEGRATION.md](docs/guides/GATEWAY-CLIENT-INTEGRATION.md) | 把 Codex / Claude Code / 其它客户端接到本机网关 |
+| [specs/](docs/specs/) | 现行架构与决策（改代码前该读的依据） |
+| [policies/](docs/policies/) | 许可与免责声明 |
 
 ## 参与贡献
 
-**欢迎一切形式的贡献，也欢迎 PR。** 提 Issue、补文档、修 Bug、加功能都算 —— 完整的贡献指引（能做什么、PR 自检清单、本仓库的几条代码约定）见 **[CONTRIBUTING.md](CONTRIBUTING.md)**（[English](CONTRIBUTING.en.md)）。
+**这个项目的形态就是被贡献推着长出来的**：Qoder 平台、统一网关、随机抖动、多语言 README，都来自 Issue 与 PR。不需要"很懂"才能参与：
 
-<!-- ## 支持这个项目
+| 你可以做的事 | 起点 |
+| --- | --- |
+| 🐞 **报 Bug**（附版本 + 日志截图） | [新建 Issue](https://github.com/NextAgentX/qoder-trae-workbuddy-switch/issues/new) |
+| 🧩 **接新平台**（Galaxy / 其它 IDE） | 平台差异只在 `src/lib/platforms/registry.ts` 与 core 的 `product.rs` 各声明一次，页面组件不用改 |
+| 🌍 **修翻译 / 补语言** | 界面文案在 `src/locales/domains/*.zh.ts` ↔ `*.en.ts` 一一对应；README 中英两版也欢迎校订 |
+| 📸 **更新截图** | `scripts/gen-readme-shots.mjs` 一条命令重拍全部浅/深色图（见文件头注释） |
+| 🧪 **补测试** | 仓里大量护栏测试都是贡献者补的；先读 `docs/guides/DEVELOPMENT.md` 的门禁清单 |
 
-如果 Buddy Switch 帮到了你，可以请作者喝杯饮料 ☕
-
-<table>
-  <thead>
-    <tr>
-      <th>微信支付</th>
-      <th>支付宝</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td><img src="docs/images/donate-wechat.jpeg" alt="微信支付收款码" width="260" /></td>
-      <td><img src="docs/images/donate-alipay.jpeg" alt="支付宝收款码" width="260" /></td>
-    </tr>
-  </tbody>
-</table> -->
-
+完整指引（能做什么、PR 自检清单、代码约定）见 **[CONTRIBUTING.md](CONTRIBUTING.md)**（[English](CONTRIBUTING.en.md)）。
 
 ## 致谢
 
-本项目在实现过程中参考了以下开源项目，在此向作者致谢：
+- [changexbc/workbuddy-switch](https://github.com/changexbc/workbuddy-switch) — 借鉴 WorkBuddy 账号数据格式与多账号切换思路。
+- [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) — 借鉴把模型额度封装成 OpenAI 兼容接口的思路。
 
-- [changexbc/workbuddy-switch](https://github.com/changexbc/workbuddy-switch) —— 借鉴了 WorkBuddy 账号数据格式与多账号切换的整体思路。
-- [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) —— 借鉴了将 WorkBuddy 模型额度封装为 OpenAI 兼容接口、对外提供 API 服务的思路。
+以上项目各自遵循其自身许可；本项目为独立实现，与它们不存在隶属、合作或背书关系，相关名称与商标归各自权利人所有。
 
-以上项目各自遵循其自身许可；本项目为独立实现，与上述项目之间不存在隶属、合作或背书关系。相关名称与商标归各自权利人所有。本项目拥有独立的代码库、发布通道与数据目录，不会替换、覆盖或改写其他项目的升级源或数据目录。
+## 相关项目
+
+- **[NextAgentX/omni-game-studio-codex](https://github.com/NextAgentX/omni-game-studio-codex)** — 面向 Codex 的**游戏开发工作室插件**：20 个技能覆盖策划、引擎工程（Cocos / Unity / Godot / Unreal）、美术与音频生产、QA 与发布，另有一条软著申报流水线；配 G1–G5 里程碑与文档门禁，让 Codex 交出「可运行的构建」而不是只有纸面计划。
+
+以上为生态内独立项目，与本项目不存在隶属、合作或背书关系，其许可与使用条件以该项目自身为准。
+
+## 支持这个项目
+
+Buddy Switch 免费、开源，且仅授权个人非商业使用。如果它每天帮你省下几分钟，可以扫码请作者喝杯饮料：
+
+<table>
+  <tr>
+    <td align="center"><img src="docs/images/donate-wechat.png" alt="微信支付收款码" width="220" /><br /><sub>微信支付</sub></td>
+    <td align="center"><img src="docs/images/donate-alipay.jpg" alt="支付宝收款码" width="220" /><br /><sub>支付宝</sub></td>
+  </tr>
+</table>
+
+也可以走 **[爱发电](https://ifdian.net/a/NextAgentX)**。
+
+不想花钱也完全没问题：**给项目点个 Star** 同样有用——它是作者继续维护下去最大的动力。
+
+> **打赏与功能无关**：所有功能对所有人一致，打赏**不解锁、不影响、也不改变**任何功能或授权。它属自愿赠与，不构成购买、订阅、付费服务、商业授权或技术支持承诺，亦不构成任何对价关系；不因打赏获得优先响应、定制开发或任何额外权益。软件许可与使用条件仍完全以 [LICENSE](./LICENSE) 为准，见[许可](#许可)一节。
 
 ## 免责声明
 
-使用本项目即表示你已完整阅读、理解并同意全部免责条款；如不同意，请立即停止使用并卸载。
-
-完整条款见 **[docs/DISCLAIMER.md](docs/DISCLAIMER.md)**（[English](docs/DISCLAIMER.en.md)），共 6 条：非官方第三方工具、服务条款与合规自理、数据写入与备份、自动化行为风险、API 网关暴露风险、按「原样」提供。
+完整条款见 **[docs/policies/DISCLAIMER.md](docs/policies/DISCLAIMER.md)**（[English](docs/policies/DISCLAIMER.en.md)），共 7 条：非官方第三方工具、服务条款与合规自理、数据写入与备份、自动化行为风险、API 网关暴露风险、按「原样」提供、用途限制（不得商用、不得转售或共享额度）。使用即表示已阅读并同意；如不同意，请立即停止使用并卸载。
 
 ## 许可
 
-本项目采用 **[PolyForm Noncommercial License 1.0.0](./LICENSE)**：**个人非商业使用是允许的，商业使用不被授权**（商业用途须事先取得作者的书面授权）。
+**[PolyForm Noncommercial License 1.0.0](./LICENSE)**：个人非商业使用允许，**商业使用不被授权**。
 
 - 条款全文：[LICENSE](./LICENSE)
-- 白话说明、允许与禁止的具体情形、常见问题、以及 2026-09-22 之前版本的 MIT 说明：[docs/LICENSING.md](docs/LICENSING.md)
-- 如需商业授权，请通过本仓库 Issues 联系作者。
+- 白话说明与常见问题：[docs/policies/LICENSING.md](docs/policies/LICENSING.md)（[English](docs/policies/LICENSING.en.md)）
+- 商业授权请通过本仓库 Issues 联系作者。
+- **捐赠与授权无关**：赞助属自愿赠与，不构成付费购买、商业授权或任何服务承诺。
+- 本项目为**个人项目**，不提供商业支持、SLA 或维护承诺；Issue 与 PR 会尽力回应，但不保证时限。
 
 ## Star 趋势
 
-<a href="https://www.star-history.com/?repos=kingkadienm%2Ftrae-workbuddy-switch&type=date&legend=top-left">
+<a href="https://www.star-history.com/?repos=NextAgentX%2Fqoder-trae-workbuddy-switch&type=date&legend=top-left">
+
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=kingkadienm/trae-workbuddy-switch&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=kingkadienm/trae-workbuddy-switch&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=kingkadienm/trae-workbuddy-switch&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=NextAgentX/qoder-trae-workbuddy-switch&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=NextAgentX/qoder-trae-workbuddy-switch&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=NextAgentX/qoder-trae-workbuddy-switch&type=date&legend=top-left" />
  </picture>
 </a>

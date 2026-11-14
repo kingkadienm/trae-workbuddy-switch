@@ -1,0 +1,77 @@
+# Buddy Switch 服务端（headless）—— webui + API 网关。
+#
+#   docker compose up -d                 # 拉预构建镜像并后台启动（推荐）
+#   docker compose up -d --pull build    # 忽略镜像、纯源码构建
+#   docker compose logs -f               # 看启动日志（会打印最终监听地址）
+#   docker compose down                  # 停止（数据保留在命名卷里）
+#
+# 镜像从 GHCR 拉取（`linux/amd64` / `linux/arm64` 各一份，打 tag 时由
+# `.github/workflows/docker.yml` 发布）。这里同时写了 `image:` 与 `build:`，走的是
+# Compose 的既定语义：**先 pull，拉不到才 build**（见
+# https://docs.docker.com/reference/compose-file/build/ → "Using build and image"）。
+# 于是 `up -d` = 用预构建镜像（快）；拉不到（离线 / 镜像还没发布 / 想自己改代码）时
+# 才回落到本地全量构建（`npm ci` + 前端门禁 + Rust release，很慢）。
+# ⚠️ 别把 `build:` 删掉 —— 它是**唯一**的源码构建入口。
+#
+# ⚠️ 安全须知（先读再改端口映射）
+#
+# webui 能**读写账号库与网关 Key**，本身**没有登录**。因此这里默认只发布到宿主机回环
+# `127.0.0.1:57890`，只有本机能访问。要跨机访问，请二选一：
+#   1. 走 SSH 隧道（推荐）：`ssh -L 57890:127.0.0.1:57890 <host>`，再在本地开
+#      http://127.0.0.1:57890 —— **不要**改这里的映射；
+#   2. 反代加鉴权（Nginx/Caddy + Basic Auth 或 mTLS），并把映射改成
+#      `"57890:57890"`。**不要**在无鉴权的情况下把 57890 直接暴露到公网/局域网。
+#
+# 详细说明见 `docs/guides/DOCKER.md`。
+
+services:
+  buddy-switch:
+    # 预构建镜像。名字必须与 .github/workflows/docker.yml 的 `IMAGE` 逐字一致
+    # （`scripts/check-docker.cjs` 会校验，连 README 与 docs/guides/DOCKER.md 一起）。
+    image: ghcr.io/nextagentx/buddy-switch:latest
+    # 源码构建 fallback：只有 pull 不到时才用到，见文件头。
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: buddy-switch
+    restart: unless-stopped
+    ports:
+      # 只绑宿主机回环 —— 见文件头的安全须知。
+      - "127.0.0.1:57890:57890"
+      # ---- API 网关（默认关闭，需在 webui 的网关页开启后才监听）----
+      # ⚠️ 网关监听地址来自它自己的配置（`gateway_config.json` 等），**不是**环境变量；
+      #    且默认**拒绝非回环监听**（需在配置里开 `allow_non_loopback`）。
+      #    想从宿主直连网关，先开网关并允许非回环，再放开下面的映射：
+      # - "127.0.0.1:57891:57891"   # WorkBuddy API 网关
+      # - "127.0.0.1:57892:57892"   # 统一网关
+      # - "127.0.0.1:57894:57894"   # Trae API 网关
+      # - "127.0.0.1:57895:57895"   # Qoder API 网关
+    volumes:
+      # 账号库、网关 Key、签到/积分记录、备份都在这里。
+      # 命名卷首次创建时会继承镜像里 /data 的属主（uid 10001），无需手工 chown。
+      - buddy-switch-data:/data
+    environment:
+      # 容器内必须绑 0.0.0.0，否则宿主访问不到（CLI 默认 127.0.0.1）。
+      BUDDY_SWITCH_HOST: "0.0.0.0"
+      BUDDY_SWITCH_PORT: "57890"
+      # 数据根目录。**必须是已存在的绝对目录**，否则 CLI 拒绝启动
+      # （entrypoint 会 mkdir，但 bind mount 的属主不对时仍会失败 —— 那是故意的）。
+      BUDDY_SWITCH_HOME: "/data"
+      # 管理面的 Host 白名单（2026-10 起有来源校验）。**默认不用设**：
+      # 本文件把端口发布到宿主回环（127.0.0.1:57890），浏览器用 localhost 访问时
+      # Host 是回环，天然放行；SSH 隧道同理。
+      # 只有「映射成 "57890:57890" 且从别的机器用 IP/域名直连」才需要，例如：
+      #   BUDDY_SWITCH_ALLOWED_HOSTS: "192.168.1.5:57890"
+      # 详见 docs/guides/DOCKER.md 的「安全」段。
+      # BUDDY_SWITCH_ALLOWED_HOSTS: ""
+    healthcheck:
+      # 用服务端自己的 API 路由做探活：SPA 兜底会让「任何路径都返回 200」，
+      # 因此不能拿 `/` 判断存活 —— 必须打一个真实的 API 路由。
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:57890/api/status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  buddy-switch-data:

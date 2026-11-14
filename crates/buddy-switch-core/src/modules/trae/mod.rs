@@ -91,6 +91,8 @@
 
 pub mod account;
 pub mod checkin;
+/// 客户端账本：读**用户自己导出的明文库**（不内置解密，见模块头）。
+pub mod client_import;
 pub mod credits;
 pub mod device;
 pub mod export_import;
@@ -100,6 +102,8 @@ pub mod jwt;
 pub mod logs;
 /// 客户端模型清单（读 `state.vscdb` 里上游下发的 `model_list_map`，见模块头）。
 pub mod model_list;
+/// 直连上游取清单（issue #173）：headless 部署的第二来源，opt-in、失败回落客户端缓存。
+pub mod model_list_upstream;
 pub mod oauth;
 pub mod oauth_client;
 /// OAuth 回调结果页（浏览器里那一页的 HTML 渲染，见模块头）。
@@ -114,6 +118,9 @@ pub mod region;
 /// 旧「产品线」账号库 → 新「区域」账号库的一次性合并迁移（幂等、带备份、不动旧文件）。
 pub mod region_migrate;
 pub mod settings;
+/// 客户端**合并**（issue #20）后，把遗留程序线的登录态快照搬进合并版槽位
+/// （幂等、只增不改、由客户端自己的 `migration-job.json` 门控）。
+pub mod snapshot_migrate;
 pub mod store;
 /// 测试专用的环境隔离与 fixture 构造（`cfg(test)` 下才编译，生产代码零引用）。
 #[cfg(test)]
@@ -204,8 +211,7 @@ pub const TRAE_EXCHANGE_TOKEN_PATH: &str = "/trae/api/v3/oauth/ExchangeToken";
 /// 参考实现把它标注为「保留至固化协议验证期结束」；本项目按架构裁决保留为
 /// 兜底链的最后一环（见 `account::exchange_token_for` 的四步变体链），
 /// 但**不再作为主路径**。完整 URL = `${icube_base}${本常量}`。
-pub const TRAE_EXCHANGE_TOKEN_LEGACY_PATH: &str =
-    "/cloudide/api/v3/trae/oauth/ExchangeToken";
+pub const TRAE_EXCHANGE_TOKEN_LEGACY_PATH: &str = "/cloudide/api/v3/trae/oauth/ExchangeToken";
 
 /// **TRAE / IDE 产品线**的公开 ClientID（抓包固化 2026-09-16，非机密）。
 ///
@@ -252,8 +258,15 @@ pub const TRAE_HISTORY_KEEP_DAYS: i64 = 90;
 /// JWT 剩余有效期低于该值时告警（小时）。
 pub const TRAE_JWT_WARN_HOURS: f64 = 24.0;
 
-/// 账号池 / 网关默认端口（与 WorkBuddy 网关默认端口错开，避免同时监听冲突）。
-pub const TRAE_DEFAULT_API_PORT: u16 = 7864;
+/// 账号池 / 网关默认端口。
+///
+/// ★ 2026-10-17 由 `7864` 改为 `57894`：四条网关统一落在 `5789x` 一段
+/// （界面 57890 · WB 网关 57891 · 统一网关 57892 · hook 57893 · **Trae 57894** · Qoder 57895），
+/// 不再出现「WB 是 5789x、Trae/Qoder 是 78xx」这种看不出规律的混编。
+///
+/// ⚠️ 只改**默认值**：已落盘的 `trae/api_gateway.json` 里写着 `port` 的用户保持原端口不变；
+/// 想跟着迁移的，在「Trae 设置 → 网关」把端口改成新值即可（旧值不失效，只是不再是默认）。
+pub const TRAE_DEFAULT_API_PORT: u16 = 57894;
 
 /// 本地代理默认端口（与 WorkBuddy 侧无冲突；参考实现用 8899）。
 pub const TRAE_DEFAULT_PROXY_PORT: u16 = 8899;
@@ -310,7 +323,11 @@ mod tests {
     /// 签到侧常量与变体表**逐字相同**（本轮零改动的证据）。
     #[test]
     fn checkin_constants_stay_aligned_with_variant_table() {
-        for variant in variant::TraeVariant::all() {
+        // ★ 只校验**国内区域**的可选变体（收敛后 `all()` 覆盖两个区域）。
+        for variant in variant::TraeVariant::all()
+            .into_iter()
+            .filter(|v| v.region() == region::TraeRegion::Cn)
+        {
             assert_eq!(
                 endpoints_for(variant).account_base,
                 TRAE_API_BASE_CN,

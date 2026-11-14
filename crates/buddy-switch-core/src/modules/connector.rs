@@ -216,7 +216,10 @@ fn count_keys(value: &Value) -> usize {
 /// 合并单个 JSON 配置文件（纯文本进出，便于单测）。
 ///
 /// 目标文本为空 / 非法 JSON → 直接采用源内容。返回 `(合并后文本, 计数)`。
-pub fn merge_json_text(target_text: &str, source_text: &str) -> Result<(String, FileMergeResult), String> {
+pub fn merge_json_text(
+    target_text: &str,
+    source_text: &str,
+) -> Result<(String, FileMergeResult), String> {
     let source: Value =
         serde_json::from_str(source_text).map_err(|e| format!("源配置不是合法 JSON：{e}"))?;
     let target: Value = serde_json::from_str(target_text).unwrap_or(Value::Null);
@@ -358,7 +361,10 @@ mod tests {
         let (merged, result) = merge_json(&target, &source);
         assert_eq!(merged["scopes"], json!(["read", "write", "admin"]));
         assert_eq!(result.added_keys, 1, "只有 admin 是新增");
-        assert_eq!(result.dropped_duplicate_elements, 2, "write / read 各去重一次");
+        assert_eq!(
+            result.dropped_duplicate_elements, 2,
+            "write / read 各去重一次"
+        );
         assert!(result.changed);
     }
 
@@ -378,7 +384,11 @@ mod tests {
         let target = json!({ "items": [{ "a": 1, "b": 2 }] });
         let source = json!({ "items": [{ "b": 2, "a": 1 }] });
         let (merged, result) = merge_json(&target, &source);
-        assert_eq!(merged["items"].as_array().unwrap().len(), 1, "键序不同应视为同一元素");
+        assert_eq!(
+            merged["items"].as_array().unwrap().len(),
+            1,
+            "键序不同应视为同一元素"
+        );
         assert_eq!(result.dropped_duplicate_elements, 1);
         assert_eq!(result.added_keys, 0);
         assert!(!result.changed);

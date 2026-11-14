@@ -13,16 +13,21 @@
  *
  * ## 版本形态 `<YYYY>.<M>.<DHHMM>`
  *
- * 例：2026-09-20 18:45 → `2026.9.201845`
+ * 例：2026-09-20 18:45 → `2026.9.201845`；2026-10-01 10:19 → `2026.10.11019`
  *
  *   - **必须 3 段数字**：Cargo 严格 semver，`2026.9.20.1845` 会被直接拒绝
  *     （`error: unexpected character '.' after patch version number`）。
  *     本脚本**前置拦下**，免得编了十几分钟才在 cargo 那里报一句难读的错。
  *   - 第三段 `DHHMM` 让**同一天多次打包版本号不同**。只写日期（`2026.9.20`）时，
  *     自动更新会把当天的新包误判成「已是最新」→ 修复推不出去，NSIS 产物还会同名覆盖。
- *   - 月/日不补零（沿用仓库既有 CalVer 观感；`update::version_tuple()` 按 `.` 切分取整数，
- *     补不补零都一样）；但**日与时必须补零**，否则跨月比较会错乱。
- *   - 与 `update::version_tuple()` 严格单调递增语义兼容：同日内 DHHMM 递增，
+ *   - **★ 年 / 月 / 日一律不补零，时 / 分必须补零**（两个方向都不能反）：
+ *     第三段是 semver 的 **patch**，而 patch **禁止前导零** —— 日补零会让每月 1–9 号
+ *     生成 `2026.10.011019`，cargo / npm / tauri 三家全部拒收。2026-10-01 真踩到：
+ *     四个平台的 CI 全在 `Build server binary` 挂掉，只报一句
+ *     `error: invalid leading zero in patch version number`。
+ *     反过来 **HH/MM 必须补零**，第三段的数值才等于 `日 × 10000 + 时 × 100 + 分`，
+ *     跨日比较才单调（不补零时 `1`+`0`+`19` = `1019` < 前一天的 `11019`）。
+ *   - 与 `update::version_tuple()` 严格单调递增语义兼容：同日内第三段递增，
  *     跨日/跨月因前两段递增而递增。
  *
  * ## 用法
@@ -62,11 +67,16 @@ for (let i = 2; i < process.argv.length; i++) {
   }
 }
 
-/** 从系统时间推导 `<YYYY>.<M>.<DHHMM>`。 */
+/**
+ * 从系统时间推导 `<YYYY>.<M>.<DHHMM>`。
+ *
+ * ⚠️ **日不补零**（补了会让每月 1–9 号生成 `…011019`，patch 段前导零 ⇒ semver 拒收，
+ * 见文件头「版本形态」一节）；**时 / 分必须补零**（否则第三段的数值语义垮掉、跨日不单调）。
+ */
 function versionFromClock(now = new Date()) {
   const y = now.getFullYear();
   const m = now.getMonth() + 1; // 不补零
-  const dd = String(now.getDate()).padStart(2, '0');
+  const dd = String(now.getDate()); // ★ 不补零（patch 段最高位）
   const hh = String(now.getHours()).padStart(2, '0');
   const mi = String(now.getMinutes()).padStart(2, '0');
   return `${y}.${m}.${dd}${hh}${mi}`;
@@ -77,6 +87,20 @@ const version = explicit ? explicit.replace(/^v/, '') : versionFromClock();
 if (!/^\d+\.\d+\.\d+$/.test(version)) {
   console.error(
     `[stamp-version] 版本号必须是 3 段数字 <YYYY>.<M>.<DHHMM>（Cargo 拒绝 4 段 semver），收到: ${version}`,
+  );
+  process.exit(2);
+}
+
+// ★ 段内不得有前导零。与上一条是**两类**不同的错：段数错是本脚本自己拼错，
+//   前导零是**日期取值**触发的（每月 1–9 号必踩，2026-10-01 CI 四平台全红就是它）。
+//   放在这里而不是只在 `versionFromClock` 里改，是因为 `--tag` 是**外部输入**
+//   （CI 传 `GITHUB_REF_NAME`）—— 打错 tag 也要在本地就被拦下。
+const leadingZero = version
+  .split('.')
+  .find((segment) => segment.length > 1 && segment.startsWith('0'));
+if (leadingZero !== undefined) {
+  console.error(
+    `[stamp-version] 版本号不允许前导零段（semver 禁止）：段 "${leadingZero}" 以 0 开头，收到: ${version}`,
   );
   process.exit(2);
 }
@@ -228,14 +252,96 @@ for (const dir of sortedDirs('npm/platform')) {
 }
 // 四个 crate 都要同步：漏掉任何一个，`env!("CARGO_PKG_VERSION")` 都会让
 // 「API 服务」页显示成旧版本号（该值会被透出到网关 /status）。
+/**
+ * workspace 成员的 crate 名（**动态扫描**，不写死清单）。
+ *
+ * ## 为什么不能写死
+ * 写死的清单每加一个 crate 就会漏一次 —— 漏掉的后果不是「版本号不统一」，
+ * 而是 `Cargo.lock` 与 `Cargo.toml` 对不上，CI 的 `cargo check --locked` 直接红
+ * （2026-10-29 现场：新增 `buddy-switch-vault` 后没进清单 ⇒ lock 过期 ⇒ 门禁失败）。
+ */
+function workspaceCrateNames() {
+  const names = new Set();
+  const dirs = [];
+  const cratesDir = path.join(ROOT, 'crates');
+  if (fs.existsSync(cratesDir)) {
+    for (const entry of fs.readdirSync(cratesDir, { withFileTypes: true })) {
+      if (entry.isDirectory()) dirs.push(path.join('crates', entry.name, 'Cargo.toml'));
+    }
+  }
+  dirs.push(path.join('src-tauri', 'Cargo.toml'));
+  for (const rel of dirs) {
+    const abs = path.join(ROOT, rel);
+    if (!fs.existsSync(abs)) continue;
+    const raw = fs.readFileSync(abs, 'utf8');
+    const m = raw.match(/^name = "([^"]+)"/m);
+    if (m) names.add(m[1]);
+  }
+  return names;
+}
+
+const WORKSPACE_CRATES = workspaceCrateNames();
+
 for (const rel of [
   'src-tauri/Cargo.toml',
-  'crates/buddy-switch-core/Cargo.toml',
-  'crates/buddy-switch-server/Cargo.toml',
-  'crates/buddy-switch-gateway/Cargo.toml',
+  ...fs
+    .readdirSync(path.join(ROOT, 'crates'), { withFileTypes: true })
+    .filter((d) => d.isDirectory())
+    .map((d) => path.join('crates', d.name, 'Cargo.toml')),
 ]) {
   addCargoTarget(rel);
 }
+
+/**
+ * `Cargo.lock` 也要跟着走（**workspace 成员的版本**）。
+ *
+ * ## 为什么必须在这里
+ * CI 跑的是 `cargo check --workspace --all-targets --locked` —— `--locked` 禁止
+ * 自动改 lock。lock 里 workspace 成员的版本与各 `Cargo.toml` 不一致时，
+ * cargo 会直接报错退出（而不是「顺手修好」）⇒ 门禁红。
+ * （2026-10-29 现场：新增 `buddy-switch-vault` 没进载体清单 ⇒ lock 过期 ⇒ CI 红。）
+ *
+ * ## 为什么逐行处理而不是正则
+ * lock 的条目形如 `name = "x"` 紧跟 `version = "y"`，但**换行符可能是 CRLF**
+ * （Windows 上 checkout 出来的就是），正则里 `
+` 与 `
+` 的差异会让匹配静默失败 ——
+ * 而「静默没改」正是这里最坏的失败方式（看起来成功了，lock 其实还是旧的）。
+ * 逐行匹配对行尾不敏感。
+ */
+targets.push({
+  rel: 'Cargo.lock',
+  read() {
+    const abs = path.join(ROOT, 'Cargo.lock');
+    if (!fs.existsSync(abs)) return [];
+    const out = [];
+    const lines = fs.readFileSync(abs, 'utf8').split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+      const m = lines[i].match(/^name = "(.+)"$/);
+      if (!m || !WORKSPACE_CRATES.has(m[1])) continue;
+      const vm = (lines[i + 1] || '').match(/^version = "(.+)"$/);
+      if (vm) out.push({ key: m[1], value: vm[1] });
+    }
+    return out;
+  },
+  write(v) {
+    const abs = path.join(ROOT, 'Cargo.lock');
+    if (!fs.existsSync(abs)) return false;
+    const lines = fs.readFileSync(abs, 'utf8').split(/\r?\n/);
+    let changed = false;
+    for (let i = 0; i < lines.length; i++) {
+      const m = lines[i].match(/^name = "(.+)"$/);
+      if (!m || !WORKSPACE_CRATES.has(m[1])) continue;
+      const vm = (lines[i + 1] || '').match(/^version = "(.+)"$/);
+      if (!vm || vm[1] === v) continue;
+      lines[i + 1] = `version = "${v}"`;
+      changed = true;
+    }
+    if (!changed) return false;
+    fs.writeFileSync(abs, lines.join('\n'));
+    return true;
+  },
+});
 
 function sortedDirs(rel) {
   const abs = path.join(ROOT, rel);

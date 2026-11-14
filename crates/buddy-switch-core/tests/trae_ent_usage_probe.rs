@@ -78,7 +78,9 @@ async fn post_with_body(body: &str, jwt: &str, device: &DeviceEntry) -> (u16, St
         "{}{TRAE_ENTITLEMENT_PATH}",
         endpoints_for(TraeVariant::default()).account_base
     );
-    let mut request = credits::trae_http_client().post(&url).body(body.to_string());
+    let mut request = credits::trae_http_client()
+        .post(&url)
+        .body(body.to_string());
     for (key, value) in credits::build_headers(jwt, device) {
         request = request.header(key, value);
     }
@@ -166,7 +168,10 @@ async fn probe_ent_usage_request_body() {
     println!("  状态码          : {}", cur.status);
     println!("  含 pack_list    : {}", cur.has_pack_list);
     println!("  pack 数量       : {:?}", cur.pack_count);
-    println!("  顶层字段        : {:?}", cur.top_keys.iter().collect::<Vec<_>>());
+    println!(
+        "  顶层字段        : {:?}",
+        cur.top_keys.iter().collect::<Vec<_>>()
+    );
     if !cur.note.is_empty() {
         println!("  备注            : {}", cur.note);
     }
@@ -175,7 +180,10 @@ async fn probe_ent_usage_request_body() {
     println!("  状态码          : {}", new.status);
     println!("  含 pack_list    : {}", new.has_pack_list);
     println!("  pack 数量       : {:?}", new.pack_count);
-    println!("  顶层字段        : {:?}", new.top_keys.iter().collect::<Vec<_>>());
+    println!(
+        "  顶层字段        : {:?}",
+        new.top_keys.iter().collect::<Vec<_>>()
+    );
     if !new.note.is_empty() {
         println!("  备注            : {}", new.note);
     }
@@ -193,11 +201,14 @@ async fn probe_ent_usage_request_body() {
             "  两者都拿不到 pack_list → 不是请求体的问题。看状态码：\n  \
              401/403 说明凭据失效；其他看上面的备注与顶层字段。"
         ),
-        (true, false) => println!(
-            "  当前实现能拿到、客户端那套反而拿不到 → 保持现状，并把客户端那套排除掉。"
-        ),
+        (true, false) => {
+            println!("  当前实现能拿到、客户端那套反而拿不到 → 保持现状，并把客户端那套排除掉。")
+        }
     }
     if cur.status != new.status {
-        println!("  注意：两次状态码不同（{} vs {}），以各自的实际响应为准。", cur.status, new.status);
+        println!(
+            "  注意：两次状态码不同（{} vs {}），以各自的实际响应为准。",
+            cur.status, new.status
+        );
     }
 }

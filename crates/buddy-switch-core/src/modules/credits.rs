@@ -8,9 +8,7 @@ use chrono::{Local, NaiveDate, NaiveDateTime};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
-use crate::modules::account::{
-    account_display_name, build_auth_headers, envelope_token_error,
-};
+use crate::modules::account::{account_display_name, build_auth_headers, envelope_token_error};
 use crate::modules::config::{http_request, load_checkin_config, now_ms, workbuddy_api_base};
 use crate::modules::credit_usage;
 use crate::modules::refresh::{ensure_fresh_token_for, refresh_account_token_for};
@@ -55,8 +53,7 @@ fn parse_number(value: Option<&Value>) -> Option<f64> {
 }
 
 fn first_number(value: &Value, keys: &[&str]) -> Option<f64> {
-    keys.iter()
-        .find_map(|key| parse_number(value.get(*key)))
+    keys.iter().find_map(|key| parse_number(value.get(*key)))
 }
 
 /// 腾讯 billing 接口返回的**墙钟**时区：固定 UTC+8，**与运行机器的时区无关**。
@@ -111,6 +108,26 @@ fn parse_timestamp_ms(value: Option<&Value>) -> Option<i64> {
         .map(cn_wallclock_to_epoch_ms)
 }
 
+/// 到期时刻：取所有候选时间字段里**最早的非空值**。
+///
+/// 不能按字段优先级取「第一个存在的时间字段」（issue #51 的根因）：这些字段语义不同，
+///
+/// - `DeductionEndTime` 是**扣减窗口结束**，即包体层面的长期失效时刻
+///   （实测恒等于 `CreateTime` + 8 年 3 个月）；
+/// - `CycleEndTime` 才是**本周期额度的到期时刻**（额度每月重发，落在当月月底 23:59:59）；
+/// - `ExpiredTime` 是包体显式失效时间，空串表示未设。
+///
+/// 按优先级取值会把 `CodeBuddy个人体验版` 判成 2034/2035 年才过期，界面上显示成
+/// 「01-13 02:33」这种与当月月底无关的读数。裂变包 / 权益包两类恰好两个字段逐条相等，
+/// 所以缺陷只在个人体验版上暴露 —— 也因此「取最早」对那两类是零影响。
+///
+/// 取最早值的语义：剩余额度在**最早**那个时刻之后都不再可用，它就是真实到期点。
+fn earliest_timestamp_ms(raw: &Value, keys: &[&str]) -> Option<i64> {
+    keys.iter()
+        .filter_map(|key| parse_timestamp_ms(raw.get(*key)))
+        .min()
+}
+
 fn value_at_path<'a>(mut current: &'a Value, path: &[&str]) -> Option<&'a Value> {
     for key in path {
         current = current.get(*key)?;
@@ -163,9 +180,11 @@ fn has_resource_accounts(response: &Value) -> bool {
         &["data", "accounts"],
         &["data", "data", "accounts"],
     ];
-    paths
-        .iter()
-        .any(|path| value_at_path(response, path).and_then(Value::as_array).is_some())
+    paths.iter().any(|path| {
+        value_at_path(response, path)
+            .and_then(Value::as_array)
+            .is_some()
+    })
 }
 
 fn has_resource_packages(response: &Value) -> bool {
@@ -177,9 +196,11 @@ fn has_resource_packages(response: &Value) -> bool {
         &["data", "packages"],
         &["data", "data", "packages"],
     ];
-    paths
-        .iter()
-        .any(|path| value_at_path(response, path).and_then(Value::as_array).is_some())
+    paths.iter().any(|path| {
+        value_at_path(response, path)
+            .and_then(Value::as_array)
+            .is_some()
+    })
 }
 
 fn resource_summary(raw: &Value, now: i64) -> Value {
@@ -220,7 +241,11 @@ fn resource_summary(raw: &Value, now: i64) -> Value {
     let raw_used = first_number(raw, &used_keys)
         .or_else(|| slice.and_then(|value| first_number(value, &used_keys)));
     let total = raw_total
-        .or_else(|| raw_remaining.zip(raw_used).map(|(remaining, used)| remaining + used))
+        .or_else(|| {
+            raw_remaining
+                .zip(raw_used)
+                .map(|(remaining, used)| remaining + used)
+        })
         .or(raw_remaining)
         .or(raw_used)
         .unwrap_or(0.0)
@@ -231,7 +256,7 @@ fn resource_summary(raw: &Value, now: i64) -> Value {
     let used = raw_used
         .unwrap_or_else(|| (total - remaining).max(0.0))
         .max(0.0);
-    let expire_at = parse_timestamp_ms(first_value(
+    let expire_at = earliest_timestamp_ms(
         raw,
         &[
             "DeductionEndTime",
@@ -241,7 +266,7 @@ fn resource_summary(raw: &Value, now: i64) -> Value {
             "CycleEndTime",
             "cycleEndTime",
         ],
-    ));
+    );
     let expired = expire_at.map(|value| value <= now).unwrap_or(false);
     let expiring_soon = expire_at
         .map(|value| value > now && value - now <= EXPIRING_SOON_DAYS * 24 * 3600 * 1000)
@@ -328,6 +353,7 @@ fn is_unauthorized(response: &Value) -> bool {
         .any(|keyword| message.contains(keyword))
 }
 
+#[cfg(test)]
 fn is_transport_error(response: &Value) -> bool {
     response_code(response) == Some(-1)
         && response
@@ -368,31 +394,40 @@ pub async fn authenticated_post_for(
         return json!({"code": -2, "message": err});
     }
     let config = load_checkin_config();
-    let mut working_account = ensure_fresh_token_for(region, account.clone(), &config).await;
-    let mut response = post_with_account(&working_account, url, body.clone()).await;
-
-    if is_unauthorized(&response)
-        && !working_account
-            .get("refresh_token")
-            .and_then(|value| value.as_str())
-            .unwrap_or("")
-            .is_empty()
-    {
-        working_account = refresh_account_token_for(region, working_account).await;
-        response = post_with_account(&working_account, url, body).await;
-    }
-
-    response
+    let working_account = ensure_fresh_token_for(region, account.clone(), &config).await;
+    post_with_account(region, &working_account, url, body).await
 }
 
-async fn post_with_account(account: &Value, url: &str, body: Value) -> Value {
+async fn post_with_account(region: Region, account: &Value, url: &str, body: Value) -> Value {
+    let uid = account.get("uid").and_then(Value::as_str).unwrap_or("");
+    let _risk_permit = match crate::modules::risk_control::admit_platform_request(
+        "workbuddy",
+        region.as_str(),
+        uid,
+    )
+    .await
+    {
+        Ok(permit) => permit,
+        Err(error) => return json!({"code": -3, "message": format!("风控准入拦截：{error}")}),
+    };
     let headers = resource_auth_headers(account, request_origin(url));
-    let response = http_request(url, "POST", Some(body.clone()), Some(&headers)).await;
-    if is_transport_error(&response) {
-        http_request(url, "POST", Some(body), Some(&headers)).await
-    } else {
-        response
-    }
+    // POST 结果不确定时不自动重放；账号共用网关出口，不读取旧账号代理映射。
+    let response = http_request(url, "POST", Some(body), Some(&headers)).await;
+    let code = response.get("code").and_then(Value::as_i64).unwrap_or(-1);
+    let reason = response
+        .get("message")
+        .or_else(|| response.get("msg"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let _ = crate::modules::risk_control::record_platform_response(
+        "workbuddy",
+        region.as_str(),
+        uid,
+        code,
+        reason,
+    );
+    response
 }
 
 fn request_origin(url: &str) -> &'static str {
@@ -435,7 +470,10 @@ fn paid_packages_body() -> Value {
 
 fn free_packages_body() -> Value {
     let now = Local::now();
-    let start = now.date_naive().and_hms_opt(0, 0, 0).unwrap_or(now.naive_local());
+    let start = now
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .unwrap_or(now.naive_local());
     let end = now
         .date_naive()
         .and_hms_opt(23, 59, 59)
@@ -497,13 +535,14 @@ struct NewResourceResponses {
 }
 
 async fn retry_new_response_if_unauthorized(
+    region: Region,
     account: &Value,
     response: Value,
     url: &str,
     body: Value,
 ) -> Value {
     if is_unauthorized(&response) {
-        post_with_account(account, url, body).await
+        post_with_account(region, account, url, body).await
     } else {
         response
     }
@@ -520,11 +559,10 @@ async fn fetch_new_resource_responses(region: Region, account: &Value) -> NewRes
     let summary_body = json!({});
     let paid_body = paid_packages_body();
     let free_body = free_packages_body();
-    let (summary, paid, free) = tokio::join!(
-        post_with_account(&working_account, &summary_url, summary_body.clone()),
-        post_with_account(&working_account, &paid_url, paid_body.clone()),
-        post_with_account(&working_account, &free_url, free_body.clone()),
-    );
+    let summary =
+        post_with_account(region, &working_account, &summary_url, summary_body.clone()).await;
+    let paid = post_with_account(region, &working_account, &paid_url, paid_body.clone()).await;
+    let free = post_with_account(region, &working_account, &free_url, free_body.clone()).await;
 
     if !(is_unauthorized(&summary) || is_unauthorized(&paid) || is_unauthorized(&free)) {
         return NewResourceResponses {
@@ -551,9 +589,9 @@ async fn fetch_new_resource_responses(region: Region, account: &Value) -> NewRes
     }
     let refreshed = refresh_account_token_for(region, working_account).await;
     let (summary, paid, free) = tokio::join!(
-        retry_new_response_if_unauthorized(&refreshed, summary, &summary_url, summary_body),
-        retry_new_response_if_unauthorized(&refreshed, paid, &paid_url, paid_body),
-        retry_new_response_if_unauthorized(&refreshed, free, &free_url, free_body),
+        retry_new_response_if_unauthorized(region, &refreshed, summary, &summary_url, summary_body),
+        retry_new_response_if_unauthorized(region, &refreshed, paid, &paid_url, paid_body),
+        retry_new_response_if_unauthorized(region, &refreshed, free, &free_url, free_body),
     );
     NewResourceResponses {
         account: refreshed,
@@ -582,7 +620,7 @@ async fn fetch_legacy_user_resource_for(region: Region, account: &Value) -> Valu
     // 新接口编排已经统一执行过惰性刷新，并在任一路未授权时只刷新一次。
     // 旧接口回退必须直接复用该账号，不能重新进入 authenticated_post，
     // 否则可能重复刷新并用旧 refresh token 覆盖刚落盘的新 token。
-    post_with_account(account, &url, body).await
+    post_with_account(region, account, &url, body).await
 }
 
 fn merge_resources(summary_resources: Vec<Value>, detail_resources: Vec<Value>) -> Vec<Value> {
@@ -644,11 +682,22 @@ fn normalized_new_resources(
 }
 
 fn credit_result(account: &Value, resources: Vec<Value>, now: i64) -> Value {
-    let total_remaining: f64 = resources
+    /* ★ 可用口径：已过期包的额度**不再计入** `totalRemaining` / `totalCapacity`。
+    过期积分不能再用，计进去会让「还剩多少」偏大，也会与逐包明细（前端剔掉过期包）
+    对不上 —— 同一屏的「共剩」和明细合计必须是同一个数。浪费掉的量仍单独由
+    `expiredRemaining` 报告，两者相加才是「原始总量」。
+
+    ⚠️ 快照落盘（下方 `record_snapshot`）用的是这两个值 ⇒ 2026-11-09 之前的历史快照
+    是旧口径（含过期）。跨这条边界时余额曲线会出现一个台阶，属于已知的预期代价。 */
+    let live_resources: Vec<&Value> = resources
+        .iter()
+        .filter(|resource| resource.get("expired").and_then(Value::as_bool) != Some(true))
+        .collect();
+    let total_remaining: f64 = live_resources
         .iter()
         .filter_map(|resource| resource.get("remaining").and_then(|value| value.as_f64()))
         .sum();
-    let total_capacity: f64 = resources
+    let total_capacity: f64 = live_resources
         .iter()
         .filter_map(|resource| resource.get("total").and_then(|value| value.as_f64()))
         .sum();
@@ -765,12 +814,9 @@ pub async fn get_credit_expiry_for(region: Region, account: &Value) -> Value {
     let account_id = account.get("id").cloned().unwrap_or(Value::Null);
     let now = now_ms();
     let responses = fetch_new_resource_responses(region, account).await;
-    if let Some(resources) = normalized_new_resources(
-        &responses.summary,
-        &responses.paid,
-        &responses.free,
-        now,
-    ) {
+    if let Some(resources) =
+        normalized_new_resources(&responses.summary, &responses.paid, &responses.free, now)
+    {
         return credit_result(account, resources, now);
     }
 
@@ -822,9 +868,13 @@ mod tests {
             "access_token": {"$wbEncrypted": 1, "envelope": "…"},
             "refresh_token": {"$wbEncrypted": 1, "envelope": "…"},
         });
-        let resp =
-            authenticated_post_for(Region::Cn, &account, "https://example.invalid/api", json!({}))
-                .await;
+        let resp = authenticated_post_for(
+            Region::Cn,
+            &account,
+            "https://example.invalid/api",
+            json!({}),
+        )
+        .await;
         assert_eq!(resp["code"], -2, "应在发请求之前短路：{resp}");
         let message = resp["message"].as_str().expect("message 应为字符串");
         assert!(message.contains("加密信封"), "文案应可读：{message}");
@@ -872,7 +922,8 @@ mod tests {
         // 为什么必须钉住：判据一旦退化成「解析 `error` 文案里含某几个字」，
         // 文案一改按钮就**静默消失**（不会变红）—— 本仓已有同类事故的纪律记录。
         assert_eq!(
-            result["reason"], json!(ENCRYPTED_CREDENTIAL_REASON),
+            result["reason"],
+            json!(ENCRYPTED_CREDENTIAL_REASON),
             "信封凭据必须带回契约常量 reason，前端不能靠解析中文文案判断：{result}"
         );
         assert_eq!(result["accountId"], json!("envelope-only"));
@@ -950,6 +1001,81 @@ mod tests {
         assert_eq!(resource["used"], 25.25);
         assert_eq!(resource["expiringSoon"], true);
         assert_eq!(resource["expired"], false);
+    }
+
+    /// ★★ 可用口径：已过期包的额度**不计入** `totalRemaining` / `totalCapacity`，
+    /// 但仍计入 `expiredRemaining`。
+    ///
+    /// 变异：把 `live_resources` 的 `expired` 过滤器去掉 ⇒ 前两条断言变红（回到旧口径，
+    /// 「共剩」比逐包明细合计多出过期那部分）；把 `expired_remaining` 也一起滤掉 ⇒
+    /// 第三条变红（浪费量就没人报告了）。
+    #[test]
+    fn expired_packs_count_only_toward_expired_remaining() {
+        // `account` 不带 `id` ⇒ `record_snapshot` 不落盘，测试无副作用。
+        let result = credit_result(
+            &json!({}),
+            vec![
+                json!({"total": 100.0, "remaining": 80.0, "expired": false}),
+                json!({"total": 60.0, "remaining": 40.0, "expired": true}),
+            ],
+            1_800_000_000_000,
+        );
+
+        assert_eq!(result["totalRemaining"], json!(80.0));
+        assert_eq!(result["totalCapacity"], json!(100.0));
+        assert_eq!(result["expiredRemaining"], json!(40.0));
+    }
+
+    /// issue #51：`DeductionEndTime` 是包体生命周期（创建 + 8 年 3 个月），
+    /// `CycleEndTime` 才是本周期额度到期。按字段优先级取值会把「个人体验版」
+    /// 判成 2035 年才过期，界面显示 `01-13 02:33`。
+    #[test]
+    fn expiry_takes_the_earliest_candidate_not_the_first_present_one() {
+        // 2026-10-31 23:59:59 (+08:00)
+        const CYCLE_END: i64 = 1_793_462_399_000;
+        // 2035-01-13 02:33:49 (+08:00)：问题报告里被误取的扣减窗口结束时刻
+        const DEDUCTION_END: i64 = 2_052_239_629_000;
+
+        let resource = resource_summary(
+            &json!({
+                "PackageCode": "TCACA_code_008_cfWoLwvjU4",
+                "PackageName": "CodeBuddy个人体验版",
+                "CycleCapacitySizePrecise": "500",
+                "CycleCapacityRemainPrecise": "236.79",
+                "CycleCapacityUsedPrecise": "263.21",
+                "CycleStartTime": "2026-10-01 00:00:00",
+                "CycleEndTime": "2026-10-31 23:59:59",
+                "DeductionEndTime": DEDUCTION_END,
+                "ExpiredTime": "",
+            }),
+            CYCLE_END - 24 * 3600 * 1000,
+        );
+
+        assert_eq!(resource["expireAt"], CYCLE_END);
+        assert_eq!(resource["expired"], false);
+        // 还剩不到 2 天 ⇒ 落在「即将到期」窗口内（这也是用户真正想看到的提示）。
+        assert_eq!(resource["expiringSoon"], true);
+
+        // 反向：扣减窗口**早于**周期结束时，扣减窗口才是真实失效点。
+        let short = resource_summary(
+            &json!({
+                "CycleEndTime": "2026-10-31 23:59:59",
+                "DeductionEndTime": CYCLE_END - 10 * 24 * 3600 * 1000,
+            }),
+            CYCLE_END - 30 * 24 * 3600 * 1000,
+        );
+        assert_eq!(short["expireAt"], CYCLE_END - 10 * 24 * 3600 * 1000);
+
+        // 空串 / 缺失一律跳过，不得把包判成「没有到期时间」。
+        let only_cycle = resource_summary(
+            &json!({
+                "ExpiredTime": "",
+                "DeductionEndTime": "",
+                "CycleEndTime": "2026-10-31 23:59:59",
+            }),
+            CYCLE_END - 24 * 3600 * 1000,
+        );
+        assert_eq!(only_cycle["expireAt"], CYCLE_END);
     }
 
     #[test]
@@ -1196,7 +1322,10 @@ mod tests {
         );
 
         let headers = resource_auth_headers(&codebuddy, new_resource_endpoint(&codebuddy));
-        assert_eq!(headers.get("X-Client-Platform").map(String::as_str), Some("web"));
+        assert_eq!(
+            headers.get("X-Client-Platform").map(String::as_str),
+            Some("web")
+        );
         assert_eq!(
             headers.get("Accept").map(String::as_str),
             Some("application/json, text/plain, */*")
@@ -1275,7 +1404,9 @@ mod tests {
             "code": 10085,
             "msg": "请求不合法，如有疑问请联系客服"
         })));
-        assert!(!is_transport_error(&json!({"code": 401, "message": "unauthorized"})));
+        assert!(!is_transport_error(
+            &json!({"code": 401, "message": "unauthorized"})
+        ));
         assert!(!is_transport_error(&json!({"code": 0, "data": {}})));
         assert!(!is_unauthorized(&json!({
             "code": 10085,
@@ -1299,7 +1430,7 @@ mod tests {
     #[test]
     fn sums_only_resources_that_are_expiring_soon() {
         let now = 1_800_000_000_000_i64;
-        let resources = vec![
+        let resources = [
             resource_summary(
                 &json!({
                     "CycleCapacityRemainPrecise": 80,

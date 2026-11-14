@@ -111,9 +111,9 @@ impl CatIo for RealCatIo {
         account: &'a Value,
         extra: &'a HashMap<String, String>,
     ) -> Pin<Box<dyn Future<Output = CatResponse> + Send + 'a>> {
-        Box::pin(async move {
-            authed_json_request_for(region, url, method, body, account, extra).await
-        })
+        Box::pin(
+            async move { authed_json_request_for(region, url, method, body, account, extra).await },
+        )
     }
 }
 
@@ -126,7 +126,8 @@ async fn chat_request(
     account: &Value,
 ) -> CatResponse {
     let url = format!("{}{path}", region_spec(region).chat_base);
-    io.request(region, &url, method, body, account, &cat_extra()).await
+    io.request(region, &url, method, body, account, &cat_extra())
+        .await
 }
 
 async fn billing_report(
@@ -136,7 +137,8 @@ async fn billing_report(
     account: &Value,
 ) -> CatResponse {
     let url = format!("{}{REPORT_PATH}", region_spec(region).billing_base);
-    io.request(region, &url, "POST", Some(body), account, &HashMap::new()).await
+    io.request(region, &url, "POST", Some(body), account, &HashMap::new())
+        .await
 }
 
 /// 领奖：chat 域 400 时降级 web 域（带 Origin/Referer/x-client-platform: web）。
@@ -153,7 +155,8 @@ async fn claim_cat(io: &dyn CatIo, region: Region, account: &Value) -> CatRespon
         format!("{CLAIM_WEB_BASE}/profile/growth-center"),
     );
     extra.insert("x-client-platform".to_string(), "web".to_string());
-    io.request(region, &web_url, "POST", None, account, &extra).await
+    io.request(region, &web_url, "POST", None, account, &extra)
+        .await
 }
 
 /// 成功判据：HTTP 200 且业务 `code` 为 0（或缺失）。
@@ -171,7 +174,10 @@ fn find_black_cat(tasks: &[Value]) -> Option<&Value> {
 /// 任务进度 `(current, target)`（缺失 target 时回落 [`CAT_TARGET`]）。
 fn progress_of(task: &Value) -> (i64, i64) {
     let progress = task.get("progress");
-    let cur = progress.and_then(|p| p.get("current")).and_then(Value::as_i64).unwrap_or(0);
+    let cur = progress
+        .and_then(|p| p.get("current"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
     let target = progress
         .and_then(|p| p.get("target"))
         .and_then(Value::as_i64)
@@ -377,7 +383,10 @@ mod tests {
         for hour in 0u32..24 {
             let got = in_night_window(cst_ms(2026, 9, 16, hour, 0));
             let want = window_hours.contains(&hour);
-            assert_eq!(got, want, "CST {hour}:00 窗口判定不符（非窗口须跳过，不是失败）");
+            assert_eq!(
+                got, want,
+                "CST {hour}:00 窗口判定不符（非窗口须跳过，不是失败）"
+            );
         }
     }
 
@@ -385,10 +394,20 @@ mod tests {
     // D17 / D19：可注入 CatIo + 时钟缝驱动真实入口 run_cat_cycle_for_with（绝不发网络）。
     // -----------------------------------------------------------------------
 
+    /// 记录的一次 IO 调用：(url, method, body, extra)。
+    /// 抽别名是为了让 `RecordingIo` 的字段与 `calls()` 的返回类型读起来是「一串调用记录」，
+    /// 而不是一坨嵌套泛型（clippy::type_complexity 也在说同一件事）。
+    type RecordedCall = (
+        String,
+        String,
+        Option<Value>,
+        std::collections::HashMap<String, String>,
+    );
+
     /// 记录型桩 IO：按调用次序记录 `(url, method, body, extra)`，并按预设序列返回响应。
     struct RecordingIo {
         responses: Vec<CatResponse>,
-        calls: std::sync::Mutex<Vec<(String, String, Option<Value>, std::collections::HashMap<String, String>)>>,
+        calls: std::sync::Mutex<Vec<RecordedCall>>,
     }
 
     impl RecordingIo {
@@ -398,7 +417,7 @@ mod tests {
                 calls: std::sync::Mutex::new(Vec::new()),
             }
         }
-        fn calls(&self) -> Vec<(String, String, Option<Value>, std::collections::HashMap<String, String>)> {
+        fn calls(&self) -> Vec<RecordedCall> {
             self.calls.lock().unwrap().clone()
         }
         fn urls(&self) -> Vec<String> {
@@ -420,7 +439,12 @@ mod tests {
                 let idx = {
                     let mut calls = self.calls.lock().unwrap();
                     let idx = calls.len();
-                    calls.push((url.to_string(), method.to_string(), body.clone(), extra.clone()));
+                    calls.push((
+                        url.to_string(),
+                        method.to_string(),
+                        body.clone(),
+                        extra.clone(),
+                    ));
                     idx
                 };
                 self.responses
@@ -447,7 +471,8 @@ mod tests {
         )
     }
 
-    const CAT_CHAT_CLAIM: &str = "https://copilot.tencent.com/activity/growth/tasks/black_cat/claim";
+    const CAT_CHAT_CLAIM: &str =
+        "https://copilot.tencent.com/activity/growth/tasks/black_cat/claim";
     const CAT_WEB_CLAIM: &str = "https://www.workbuddy.cn/activity/growth/tasks/black_cat/claim";
 
     /// D19：chat 域 claim 返回 **400** → 必须降级改打 web 域，且三个头齐全。
@@ -456,7 +481,10 @@ mod tests {
         let night = cst_ms(2026, 9, 16, 23, 0);
         let io = RecordingIo::new(vec![
             black_cat_completed_listing(), // 0: GET tasks
-            (400, json!({"code": 40001, "message": "chat claim not allowed"})), // 1: chat 域 claim
+            (
+                400,
+                json!({"code": 40001, "message": "chat claim not allowed"}),
+            ), // 1: chat 域 claim
             (200, json!({"code": 0})),     // 2: web 域 claim
         ]);
         let out = run_cat_cycle_for_with(Region::Cn, night, one_cat_account(), &io).await;
@@ -478,7 +506,10 @@ mod tests {
             extra.get("Referer").map(String::as_str),
             Some("https://www.workbuddy.cn/profile/growth-center")
         );
-        assert_eq!(extra.get("x-client-platform").map(String::as_str), Some("web"));
+        assert_eq!(
+            extra.get("x-client-platform").map(String::as_str),
+            Some("web")
+        );
         assert_eq!(out["accounts"][0]["result"], "claimed", "{out}");
     }
 

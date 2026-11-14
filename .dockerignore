@@ -1,0 +1,54 @@
+# 构建上下文裁剪。
+#
+# 目标：**只**让 Dockerfile 看到源码与清单。下面这些要么是构建产物（会在镜像里重新生成）、
+# 要么是宿主机专有的重物，进上下文只会拖慢构建、并制造「用了宿主机旧产物」的隐患。
+
+# ---- 依赖与构建产物（镜像里重新生成）----
+node_modules
+target
+
+# ★ 前端产物：**必须**排除。
+#   镜像里的 dist/ 由 Dockerfile 阶段 1 生成、阶段 2 显式 `COPY --from=frontend`。
+#   若宿主机那份 dist/ 进了上下文，就可能出现「编进二进制的是宿主机的旧前端」——
+#   而构建全绿、页面看着也正常，只是内容是旧的。这是本仓踩过的同类坑
+#   （见 AGENTS/记忆里「核验别 grep 源码字符串，要 grep 构建产物」那条）。
+dist
+dist-demo
+dist-stale-*
+
+# ---- 仓库里的大件 / 与本镜像无关 ----
+deliverables
+backups
+logs
+pic
+docs/images
+.workbuddy-ai
+.trellis
+.agents
+.codex
+
+# ---- 版本控制与编辑器 ----
+.git
+.gitignore
+.vscode
+.idea
+
+# ⚠️ **不要**排除 `.github`：`npm run build` 里有两个门禁要读它 ——
+#   `check:npm-platforms` 比对 `workflows/build.yml` 的平台矩阵，
+#   `check:pages-base`  校验 `workflows/pages.yml` 的 base 派生；
+#   本仓的 `check:docker`（镜像名契约）也要读 `workflows/docker.yml`。
+#   排掉它 ⇒ 镜像构建必然红在 `npm run build`，而 Dockerfile 本身没有任何问题
+#   （2026-10-19 实测踩过：`ENOENT ... /src/.github/workflows/build.yml`）。
+#   这几份 YAML 里只有 `${{ secrets.X }}` 引用，不含任何凭据。
+
+# ---- 杂项 ----
+*.log
+*.md
+!README.md
+# ★ 英文版 README 必须一起进上下文：`check:docker` 在**镜像内**也会跑一遍，它要
+#   逐字比对 `README.md` / `README.en.md` / `docs/guides/DOCKER.md` 里的镜像名。
+#   只放行 `README.md` 时，容器里 `npm run build` 会红在「缺少文件：README.en.md」，
+#   而本机 `npm run check:docker` 是绿的（本地这两份文件都在）—— 2026-10-27 实测踩过。
+!README.en.md
+# 部署指南是 `check:docker` 的镜像名契约来源之一，必须留在上下文里。
+!docs/guides/DOCKER.md

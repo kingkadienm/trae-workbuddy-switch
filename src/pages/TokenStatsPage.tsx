@@ -1,1298 +1,695 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { ComponentProps, ReactNode } from "react";
+/**
+ * 「用量」工作台 · **Token 三视图**（趋势 / 模型 / 会话）—— P3 重做。
+ *
+ * ## 为什么重写
+ *
+ * 改造前本页是**旧实现**：4 组视图参数散在页内（来源切片 / 范围 / 区域 / 合并）、
+ * 图表张数与图注口径都不是原型的四视图（COVERAGE-REPORT §2.12，12 条 ⚠️）。
+ * 本版改为「**装配数据 → 渲染四视图组件**」：视图参数收敛为**一条** `ViewParamBar`
+ * （范围 + 合并），图表逻辑全部下沉到 `components/usage/*` 与纯函数 `lib/usage-charts.ts`。
+ *
+ * ## 数据装配（关键决策）
+ *
+ * 原型「一个作用域 = 一份用量」⇒ 本页把当前范围下的**全部来源**
+ * （workbuddy / codebuddy-cli / codebuddy-ide / workbuddy-ai）用 `mergeSources` 聚合成**一份**。
+ * 合并作用域（`region === "all"`）时后端同时下发两版来源，一并求和 —— 因此
+ * **图表数据（模型 / 热力图）真的跟着变多**（契约 12），不是只换 days。
+ *
+ * ## 网关逐日图（2026-10-15 新增，独立小图）
+ *
+ * 主堆叠柱的数据源是 `token_stats`（扫客户端日志）；**网关用量走另一条源**：
+ * `get_gateway_token_trend`（读 `token_daily` 的 90 天落库历史）。它渲染成趋势视图里的
+ * **独立小图**而不是并进主柱，两条理由（详见 `TrendView` 内注释）：
+ * ① 主柱的「末柱 = 概览统计块 = 账号卡今日合计」是**跨视图一致性契约**，并进去会静默改口径；
+ * ② 客户端与网关是**两条独立记录**（配置重叠时同一请求两处各记一次），求和会把重复计数藏起来。
+ * 小图图注**恒披露覆盖率** —— 历史只覆盖「App 运行过」的日子，未记录日**不是 0**。
+ *
+ * ## 平台
+ *
+ * 本页只服务 WorkBuddy（`useScope("workbuddy")`）。Trae 侧的 Token 统计数据源形状不同
+ * （`TraeTokenStatistics`），由 `TraeTokenStatsPage` 承担 —— 见 UsagePage 的平台映射。
+ *
+ * ## 契约（详见 `docs/specs/P3-ARCH.md`）
+ *
+ * - ★ **视图参数是受控的**（`range` / `combineAll` / `onRangeChange` 由 `UsagePage` 传入）：
+ *   本页**不持有**范围与合并态 —— 原型 `viewUsage` 的 `state.range` / `state.merge`
+ *   是页面级的，切子 Tab 不重置（见 `UsagePage` 文件头）。参数条也由 `UsagePage` 渲染一次。
+ * - 空数组**不渲染**该图；整视图空 ⇒ 区块级 `EmptyState`（含出口）；
+ * - 区分「真的没有」与「被视图参数筛没」；
+ * - 所有展示字段过 `displayText`（白屏防线）；
+ * - ★ **四个视图都必须消费 `viewWindow`**（趋势 / 模型 / 积分接口不变，会话是
+ *   2026-10-15 补的口径）：会话此前吃全时数据、切时间纹丝不动（用户报障），
+ *   现在按 `sessions[].daily`（后端逐日拆分）在 `sessionPoints` 里按窗口求和；
+ * - ★ **会话视图只渲染前 `SESSION_RENDER_LIMIT` 个**（**有意偏离** P3 契约 8
+ *   「排行条数 = 气泡数 = 会话数」—— 会话数可达 1.5 万，全量渲染要等数秒；
+ *   截断由渲染层显式说明「共 M 个」，统计 tile 仍按全量算。理由见该常量注释）。
+ */
+
+import { useEffect, useMemo, useState } from "react";
 import {
   CircleAlert,
-  ArrowDownToLine,
-  ArrowUpFromLine,
-  Check,
+  DatabaseZap,
   Gauge,
+  Info,
   Loader2,
   MessagesSquare,
   RefreshCw,
-  SlidersHorizontal,
-  type LucideIcon,
+  Server,
+  TrendingUp,
+  Users,
 } from "lucide-react";
-import {
-  Bar,
-  CartesianGrid,
-  ComposedChart,
-  Line,
-  Rectangle,
-  XAxis,
-  YAxis,
-} from "recharts";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader } from "@/components/ui/card";
-import {
-  ChartContainer,
-  ChartTooltip,
-  type ChartConfig,
-} from "@/components/ui/chart";
-import { DemoAction } from "@/components/demo-action";
-import { RegionBar } from "@/components/region-bar";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { EmptyState } from "@/components/ui/empty-state";
 import { Skeleton } from "@/components/ui/skeleton";
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
-import { useT } from "@/lib/i18n";
-import type { TranslationKey } from "@/locales/zh";
+import { SlowLoadHint } from "@/components/slow-load-hint";
+import { ChartFrame } from "@/components/usage/chart-frame";
+import { CumulativeArea } from "@/components/usage/cumulative-area";
+import { compactTokens, exactTokens } from "@/components/usage/format";
+import { CoverageStrip, GatewaySourceTables, LEDGER_CLIENT_COLOR, LEDGER_GATEWAY_COLOR, LedgerModelTable } from "@/components/usage/ledger-parts";
+import { ModelDonut } from "@/components/usage/model-donut";
+import { ModelRanking } from "@/components/usage/model-ranking";
+import { ReconcileSheet } from "@/components/usage/reconcile-sheet";
+import { SessionRanking } from "@/components/usage/session-ranking";
+import { KeysView } from "@/components/usage/key-ranking";
+import { SessionScatter } from "@/components/usage/session-scatter";
+import { StackedDailyBar } from "@/components/usage/stacked-daily-bar";
+import { StatTiles, type StatTile } from "@/components/usage/stat-tiles";
+import { UsageHeatmap } from "@/components/usage/usage-heatmap";
+import { useUsageWindowLabel, type UsageViewProps } from "@/components/usage/view-param-bar";
 import * as api from "@/lib/api";
-import { regionFilterLabel } from "@/lib/region";
-import { getStackedSegmentVisualLayout } from "@/lib/stacked-bar-visuals";
+import { cumulativeCaption, scatterAxisCaption } from "@/lib/chart-caption";
+import { useT } from "@/lib/i18n";
 import type {
+  GatewayTokenTrend,
+  GatewayUsageDim,
+  GatewayUsageRecon,
+  Region,
   RegionFilter,
   TokenStatistics,
-  TokenStatsGroup,
   TokenStatsSource,
-  TokenStatsTotals,
+  ApiKeyRecord,
 } from "@/lib/types";
+import { useRefreshAction } from "@/lib/use-refresh-action";
+import { useSlowLoading } from "@/lib/use-slow-loading";
+import { useScope } from "@/lib/use-scope";
+import {
+  SESSION_RENDER_LIMIT,
+  calendarWindowKeys,
+  heatmapMatrix,
+  mergeGatewayTrends,
+  mergeSources,
+  workbuddyClientSources,
+  modelSlices,
+  sessionPoints,
+} from "@/lib/usage-charts";
+import {
+  accountKey,
+  clientModelTotals,
+  combinedFormula,
+  combinedTotal,
+  dailyTotalsMap,
+  dimCoverage,
+  dimTotals,
+  endpointKey,
+  gatewayCacheHit,
+  gatewayDailyInWindow,
+  ledgerDailySeries,
+  mergeDims,
+  mergeRecons,
+  modelKey,
+  overlapInWindow,
+  type UsageLedger,
+} from "@/lib/usage-ledger";
+import { usageWindowDays, type UsageWindow } from "@/lib/usage-window";
 
-type SourceKey = TokenStatsSource["source"];
-type RangeKey = "30d" | "today" | "7d" | "month";
-type OverviewRangeKey = "today" | "7d" | "30d" | "total";
-type DistributionKey = "projects" | "models";
-
-const TOKEN_SOURCE_STORAGE_KEY = "buddy-switch:token-stats:source";
-const TOKEN_REGION_STORAGE_KEY = "buddy-switch:token-stats:region";
-const RANKING_LIMIT = 10;
-
-/** 各来源展示名（与 SourceKey 一一对应）。 */
-const SOURCE_LABELS: Record<SourceKey, string> = {
-  workbuddy: "WorkBuddy",
-  "codebuddy-cli": "CodeBuddy CLI",
-  "codebuddy-ide": "CodeBuddy IDE",
-  "workbuddy-ai": "WorkBuddy AI",
-  "workbuddy-gateway": "WorkBuddy 网关",
-};
-
-/** 各来源的展示顺序（合并视图下按此顺序排列）。 */
-const SOURCE_ORDER: SourceKey[] = [
-  "workbuddy",
-  "codebuddy-cli",
-  "codebuddy-ide",
-  "workbuddy-ai",
-  "workbuddy-gateway",
-];
-
-function isSourceKey(value: unknown): value is SourceKey {
-  return (
-    value === "workbuddy" ||
-    value === "codebuddy-cli" ||
-    value === "codebuddy-ide" ||
-    value === "workbuddy-ai" ||
-    value === "workbuddy-gateway"
-  );
-}
-
-function readPreferredTokenSource(): SourceKey {
-  if (typeof window === "undefined") return "workbuddy";
-  try {
-    const stored = window.localStorage.getItem(TOKEN_SOURCE_STORAGE_KEY);
-    return isSourceKey(stored) ? stored : "workbuddy";
-  } catch {
-    return "workbuddy";
-  }
-}
-
-function persistPreferredTokenSource(source: SourceKey): void {
-  if (typeof window === "undefined") return;
-  try {
-    window.localStorage.setItem(TOKEN_SOURCE_STORAGE_KEY, source);
-  } catch {
-    // localStorage 在受限 WebView/隐私模式下可能不可写，不影响页面切换。
-  }
-}
-
-function isRegionFilter(value: unknown): value is RegionFilter {
-  return value === "cn" || value === "global" || value === "all";
-}
-
-/** 统计范围默认「国内版」；各页独立记忆，不与账号管理页联动。 */
-function readPreferredRegion(): RegionFilter {
-  if (typeof window === "undefined") return "cn";
-  try {
-    const stored = window.localStorage.getItem(TOKEN_REGION_STORAGE_KEY);
-    return isRegionFilter(stored) ? stored : "cn";
-  } catch {
-    return "cn";
-  }
-}
-
-function persistPreferredRegion(region: RegionFilter): void {
-  if (typeof window === "undefined") return;
-  try {
-    window.localStorage.setItem(TOKEN_REGION_STORAGE_KEY, region);
-  } catch {
-    // 同上：不可写时仅丢失记忆，不影响本次会话内的切换。
-  }
-}
-
-const RANGE_OPTIONS: { key: RangeKey; label: TranslationKey }[] = [
-  { key: "30d", label: "wbStats.token.range.30d" },
-  { key: "today", label: "wbStats.token.range.today" },
-  { key: "7d", label: "wbStats.token.range.7d" },
-  { key: "month", label: "wbStats.token.range.month" },
-];
-
-const OVERVIEW_RANGE_OPTIONS: { key: OverviewRangeKey; label: TranslationKey }[] = [
-  { key: "today", label: "wbStats.token.range.today" },
-  { key: "7d", label: "wbStats.token.range.7d" },
-  { key: "30d", label: "wbStats.token.range.30d" },
-  { key: "total", label: "wbStats.token.overviewTotal" },
-];
-
-const chartConfig = {
-  cacheRead: { label: "wbStats.token.cacheRead", color: "var(--data-series-emerald)" },
-  uncachedInput: { label: "wbStats.token.uncachedInput", color: "var(--data-series-teal)" },
-  output: { label: "wbStats.token.output", color: "var(--data-series-violet)" },
-  cacheWrite: { label: "wbStats.token.cacheWrite", color: "var(--data-series-amber)" },
-  records: { label: "wbStats.token.records", color: "var(--data-series-indigo)" },
-} satisfies ChartConfig;
-
-const compactTokenFormatter = new Intl.NumberFormat("en-US", {
-  notation: "compact",
-  compactDisplay: "short",
-  maximumFractionDigits: 1,
-});
-const exact = new Intl.NumberFormat("zh-CN");
-const exactTokenFormatter = new Intl.NumberFormat("en-US");
-
-function formatTokenCompact(value: number): string {
-  return compactTokenFormatter
-    .format(value)
-    .replace(/([kmb])$/i, (unit) => unit.toUpperCase());
-}
-
-function formatTokenExact(value: number): string {
-  return exactTokenFormatter.format(value);
-}
-
-/** 展示总量：input 已包含 cacheRead，因此不能再次加上 cacheRead。 */
-const tokenTotal = (value: TokenStatsTotals) =>
-  value.input + value.output + value.cacheWrite;
-
-const percentage = (value: number, sum: number) =>
-  sum > 0 ? `${((value / sum) * 100).toFixed(1)}%` : "—";
-
-function dateKey(date: Date): string {
-  const pad = (value: number) => String(value).padStart(2, "0");
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
-}
-
-function dateDaysAgo(days: number): string {
-  const date = new Date();
-  date.setHours(12, 0, 0, 0);
-  date.setDate(date.getDate() - days);
-  return dateKey(date);
-}
-
-function formatDateTime(timestamp?: number | null): string {
-  if (!timestamp) return "—";
-  return new Date(timestamp).toLocaleString("zh-CN", {
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
-function formatChartDate(date: string): string {
-  return date.slice(5).replace("-", "/");
-}
-
-function formatHeatmapDate(date: Date): string {
-  return date.toLocaleDateString("zh-CN", {
-    month: "long",
-    day: "numeric",
-  });
-}
-
-function rangeLabel(range: RangeKey): TranslationKey {
-  return RANGE_OPTIONS.find((option) => option.key === range)?.label ?? "wbStats.token.range.30d";
-}
-
-function rangePoints(daily: TokenStatsGroup[], range: RangeKey): TokenStatsGroup[] {
-  const today = dateKey(new Date());
-  const firstDate =
-    range === "today" ? today : range === "7d" ? dateDaysAgo(6) : dateDaysAgo(29);
-
-  return daily
-    .filter((point) => {
-      if (range === "month") {
-        return point.key.startsWith(`${today.slice(0, 7)}-`);
-      }
-      return point.key >= firstDate && point.key <= today;
-    })
-    .sort((left, right) => left.key.localeCompare(right.key));
-}
-
-function rangeBounds(range: RangeKey): { start: string; end: string } {
-  const today = dateKey(new Date());
-  if (range === "today") return { start: today, end: today };
-  if (range === "7d") return { start: dateDaysAgo(6), end: today };
-  if (range === "30d") return { start: dateDaysAgo(29), end: today };
-  const monthStart = new Date();
-  monthStart.setHours(12, 0, 0, 0);
-  monthStart.setDate(1);
-  return { start: dateKey(monthStart), end: today };
-}
-
-function fillRangePoints(points: TokenStatsGroup[], range: RangeKey): TokenStatsGroup[] {
-  if (points.length === 0) return [];
-  const { start, end } = rangeBounds(range);
-  const byDate = new Map(points.map((point) => [point.key, point]));
-  const cursor = new Date(`${start}T12:00:00`);
-  const endDate = new Date(`${end}T12:00:00`);
-  const filled: TokenStatsGroup[] = [];
-  while (cursor <= endDate) {
-    const key = dateKey(cursor);
-    const point = byDate.get(key);
-    filled.push(
-      point ?? {
-        key,
-        total: 0,
-        input: 0,
-        output: 0,
-        cacheRead: 0,
-        cacheWrite: 0,
-        uncachedInput: 0,
-        records: 0,
-        cacheHitRate: null,
-      },
-    );
-    cursor.setDate(cursor.getDate() + 1);
-  }
-  return filled;
-}
-
-function rangeTotals(points: TokenStatsGroup[]): TokenStatsTotals {
-  const totals = points.reduce(
-    (sum, point) => ({
-      total: sum.total + tokenTotal(point),
-      input: sum.input + point.input,
-      output: sum.output + point.output,
-      cacheRead: sum.cacheRead + point.cacheRead,
-      cacheWrite: sum.cacheWrite + point.cacheWrite,
-      uncachedInput: sum.uncachedInput + point.uncachedInput,
-      records: sum.records + point.records,
-      cacheHitRate: null,
-    }),
-    {
-      total: 0,
-      input: 0,
-      output: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-      uncachedInput: 0,
-      records: 0,
-      cacheHitRate: null,
-    } satisfies TokenStatsTotals,
-  );
-
-  return {
-    ...totals,
-    cacheHitRate: totals.input > 0 ? totals.cacheRead / totals.input : null,
-  };
-}
-
-function overviewTotals(source: TokenStatsSource, range: OverviewRangeKey): TokenStatsTotals {
-  if (range === "total") return source.summary;
-  return rangeTotals(rangePoints(source.daily, range));
-}
-
-function SectionTitle({ id, children }: { id: string; children: ReactNode }) {
-  return (
-    <div className="px-1">
-      <h2 id={id} className="text-[13px] font-medium leading-5">
-        {children}
-      </h2>
-    </div>
-  );
-}
-
-function StatMetric({
-  icon: Icon,
-  label,
-  value,
-  divided = false,
-}: {
-  icon: LucideIcon;
-  label: string;
-  value: string;
-  divided?: boolean;
-}) {
-  return (
-    <div
-      className={`flex min-w-0 flex-col items-center justify-center px-4 py-5 text-center sm:py-3 ${
-        divided ? "sm:border-l sm:border-border/60" : ""
-      }`}
-    >
-      <div className="flex max-w-full items-center justify-center gap-2 text-[13px] font-medium leading-5 text-muted-foreground">
-        <Icon className="size-4 shrink-0 stroke-[1.75]" aria-hidden="true" />
-        <span className="truncate">{label}</span>
-      </div>
-      <div
-        className="mt-3 max-w-full truncate text-[26px] font-semibold leading-8 tracking-[-0.025em] text-foreground tabular-nums"
-        style={{
-          fontFamily:
-            '"Bricolage Grotesque Variable", "SF Pro Display", ui-sans-serif, sans-serif',
-        }}
-      >
-        {value}
-      </div>
-    </div>
-  );
-}
-
-function CompactComposition({ value }: { value: TokenStatsTotals }) {
-  const t = useT();
-  const total = tokenTotal(value);
-  const rows: { labelKey: TranslationKey; value: number; color: string }[] = [
-    { labelKey: "wbStats.token.compCache", value: value.cacheRead, color: "bg-primary" },
-    { labelKey: "wbStats.token.compNew", value: value.uncachedInput, color: "bg-sky-500" },
-    { labelKey: "wbStats.token.compOutput", value: value.output, color: "bg-violet-500" },
-    { labelKey: "wbStats.token.compWrite", value: value.cacheWrite, color: "bg-amber-500" },
-  ];
-
-  return (
-    <div className="min-w-0 flex-1">
-      <div className="min-w-0">
-        <div
-          className="flex h-2 w-full max-w-[360px] overflow-hidden rounded-full bg-muted"
-          role="img"
-          aria-label={rows
-            .map((row) => `${t(row.labelKey)} ${percentage(row.value, total)}`)
-            .join(t("shared.punct.comma"))}
-        >
-          {rows.map((row) => (
-            <span
-              key={row.labelKey}
-              className={`h-full min-w-0 ${row.color}`}
-              style={{ width: total > 0 ? `${(row.value / total) * 100}%` : "0%" }}
-              title={`${t(row.labelKey)} ${formatTokenCompact(row.value)} · ${percentage(row.value, total)}`}
-              aria-label={`${t(row.labelKey)} ${formatTokenExact(row.value)} Token${t("shared.punct.comma")}${percentage(row.value, total)}`}
-            />
-          ))}
-        </div>
-        <div className="mt-1 flex flex-wrap gap-x-2.5 gap-y-0.5 text-[10px] text-muted-foreground">
-          {rows.map((row) => (
-            <span key={row.labelKey} className="inline-flex items-center gap-1 whitespace-nowrap">
-              <span className={`size-1.5 rounded-full ${row.color}`} aria-hidden="true" />
-              {t(row.labelKey)} {percentage(row.value, total)}
-            </span>
-          ))}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function Overview({ source }: { source: TokenStatsSource }) {
-  const t = useT();
-  const [range, setRange] = useState<OverviewRangeKey>("today");
-  const summary = useMemo(() => overviewTotals(source, range), [range, source]);
-  const cacheRate = summary.cacheHitRate;
-
-  return (
-    <section className="min-w-0 space-y-2.5" aria-labelledby="token-overview-title">
-      <SectionTitle id="token-overview-title">{t("wbStats.token.overviewTitle")}</SectionTitle>
-      <Card
-        className="min-w-0 gap-0 overflow-hidden rounded-2xl bg-card/70 py-0 shadow-none"
-        aria-label={t("wbStats.token.overviewTitle")}
-      >
-        <CardHeader className="gap-0 px-4 pt-3 pb-0 sm:px-5">
-          <div className="flex min-w-0 flex-wrap items-center justify-between gap-3">
-            <CompactComposition value={summary} />
-            <Tabs
-              className="min-w-0 shrink-0 gap-0"
-              value={range}
-              onValueChange={(value) => setRange(value as OverviewRangeKey)}
-            >
-              <TabsList
-                className="grid h-auto w-full grid-cols-2 sm:inline-flex sm:w-fit sm:flex-wrap"
-                aria-label={t("wbStats.token.overviewRangeAria")}
-              >
-                {OVERVIEW_RANGE_OPTIONS.map((option) => (
-                  <TabsTrigger key={option.key} value={option.key} className="px-2">
-                    {t(option.label)}
-                  </TabsTrigger>
-                ))}
-              </TabsList>
-            </Tabs>
-          </div>
-        </CardHeader>
-        <CardContent className="grid min-w-0 grid-cols-1 divide-y divide-border/60 p-0 sm:grid-cols-4 sm:divide-y-0 sm:py-5">
-          <StatMetric icon={MessagesSquare} label={t("wbStats.token.metricTotal")} value={formatTokenCompact(tokenTotal(summary))} />
-          <StatMetric icon={ArrowDownToLine} label={t("wbStats.token.metricInput")} value={formatTokenCompact(summary.input)} divided />
-          <StatMetric
-            icon={ArrowUpFromLine}
-            label={t("wbStats.token.metricOutput")}
-            value={formatTokenCompact(summary.output)}
-            divided
-          />
-          <StatMetric
-            icon={Gauge}
-            label={t("wbStats.token.metricCacheRate")}
-            value={cacheRate == null ? "—" : `${(cacheRate * 100).toFixed(1)}%`}
-            divided
-          />
-        </CardContent>
-      </Card>
-    </section>
-  );
-}
-
-type TrendChartPoint = TokenStatsGroup & { date: string };
-type TokenSeriesKey = "cacheRead" | "uncachedInput" | "output" | "cacheWrite";
-type TokenBarShapeProps = ComponentProps<typeof Rectangle> & {
-  segmentKey: TokenSeriesKey;
-  payload?: TrendChartPoint;
-  value?: number | [number, number];
-};
-
-const TOKEN_SERIES: TokenSeriesKey[] = [
-  "cacheRead",
-  "uncachedInput",
-  "output",
-  "cacheWrite",
-];
+/** 本页承载的视图（积分视图在 `CreditStatsPage`）。 */
+export type TokenUsageView = "trend" | "models" | "sessions" | "keys";
 
 /**
- * 使用真实 Rectangle 形状绘制每个堆叠段：整柱约束分配小段的 5px 视觉保底，
- * 但不修改 data 值；每个日期实际顶部的非零段才使用顶部圆角。
+ * 「按密钥」视图**只取展示名**：用量来自网关账本（本页已取的 `dim`），
+ * 不再读请求日志 —— 那是环形缓冲，窗口对齐不了（见 `src/lib/key-usage.ts`）。
+ * 模块级函数 ⇒ 引用稳定（`KeysView` 的 `useEffect` 依赖它）。
  */
-function TokenBarShape({
-  segmentKey,
-  payload,
-  x = 0,
-  y = 0,
-  width = 0,
-  height = 0,
-  value,
-  fill,
-  stroke,
-  strokeWidth,
-  ...rest
-}: TokenBarShapeProps) {
-  if (width <= 0 || height <= 0) return null;
-  const segmentIndex = TOKEN_SERIES.indexOf(segmentKey);
-  const stackStart = Array.isArray(value) ? Number(value[0]) : 0;
-  const layout = payload
-    ? getStackedSegmentVisualLayout({
-        values: TOKEN_SERIES.map((key) => payload[key]),
-        segmentIndex,
-        segmentHeight: height,
-        segmentY: y,
-        stackStart,
-      })
-    : null;
-  if (!layout) {
-    return (
-      <Rectangle
-        {...rest}
-        x={x}
-        y={y}
-        width={width}
-        height={height}
-        fill={fill}
-        radius={0}
-        stroke={stroke ?? "var(--background)"}
-        strokeWidth={strokeWidth ?? 1}
-      />
-    );
-  }
+async function loadWbKeyNames() {
+  const keys = await api.listApiKeys().catch(() => ({ keys: [] as ApiKeyRecord[] }));
+  return new Map((keys.keys ?? []).map((key) => [key.id, key.name] as const));
+}
 
+/** 会话级缓存：切走再切回不重取（与 `CreditStatsPage` 同一约定）。 */
+const statisticsCache: Partial<Record<RegionFilter, TokenStatistics>> = {};
+
+/**
+ * 网关逐日趋势的**分 region 缓存**（与 `statisticsCache` 同约定）。
+ *
+ * 值可以是 `null`（该 region 没有落库历史 / 读取失败）—— 缓存 `null` 与「没取过」
+ * 用 `has` 区分，避免每次切回都重发一次注定失败的请求。
+ */
+const gatewayTrendCache = new Map<RegionFilter, GatewayTokenTrend | null>();
+
+/** 视图为空时的统一空态（四要素：icon + title + description + 出口）。 */
+function ViewEmpty({
+  icon,
+  title,
+  description,
+  actionLabel,
+  onAction,
+}: {
+  icon: typeof MessagesSquare;
+  title: string;
+  description: string;
+  actionLabel: string;
+  onAction: () => void;
+}) {
   return (
-    <Rectangle
-      {...rest}
-      x={x}
-      y={layout.y}
-      width={width}
-      height={layout.height}
-      fill={fill}
-      radius={layout.isTop ? [6, 6, 0, 0] : 0}
-      stroke={stroke ?? "var(--background)"}
-      strokeWidth={strokeWidth ?? 1}
+    <EmptyState
+      icon={icon}
+      title={title}
+      description={description}
+      action={
+        <Button size="sm" variant="outline" onClick={onAction}>
+          {actionLabel}
+        </Button>
+      }
     />
   );
 }
 
-function TrendLegend() {
-  const t = useT();
-  const items: { key: string; labelKey: TranslationKey; color: string; kind: string }[] = [
-    { key: "cacheRead", labelKey: "wbStats.token.cacheRead", color: "var(--data-series-emerald)", kind: "area" },
-    { key: "uncachedInput", labelKey: "wbStats.token.uncachedInput", color: "var(--data-series-teal)", kind: "area" },
-    { key: "output", labelKey: "wbStats.token.output", color: "var(--data-series-violet)", kind: "area" },
-    { key: "cacheWrite", labelKey: "wbStats.token.cacheWrite", color: "var(--data-series-amber)", kind: "area" },
-    { key: "records", labelKey: "wbStats.token.records", color: "var(--data-series-indigo)", kind: "line" },
-  ];
+/* ────────────────────────────── 趋势 ────────────────────────────── */
 
-  return (
-    <div
-      className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-1.5 text-xs text-muted-foreground"
-      aria-label={t("wbStats.token.legendAria")}
-    >
-      {items.map((item) => (
-        <span key={item.key} className="inline-flex items-center gap-1.5 whitespace-nowrap">
-          {item.kind === "line" ? (
-            <span
-              className="relative inline-flex h-2 w-4 shrink-0 items-center"
-              aria-hidden="true"
-            >
-              <span
-                className="absolute inset-x-0 top-1/2 border-t-2 border-dashed"
-                style={{ borderColor: item.color }}
-              />
-              <span
-                className="relative z-10 mx-auto size-1.5 rounded-full border border-background"
-                style={{ backgroundColor: item.color }}
-              />
-            </span>
-          ) : (
-            <span
-              className="size-2.5 shrink-0 rounded-[3px]"
-              style={{ backgroundColor: item.color }}
-              aria-hidden="true"
-            />
-          )}
-          {t(item.labelKey)}
-        </span>
-      ))}
-    </div>
-  );
-}
-
-function TrendTooltipContent({
-  active,
-  payload,
+function TrendView({
+  source,
+  viewWindow,
+  onViewWindowChange,
+  gatewayTrend,
+  dim,
+  recon,
+  ledger,
+  onReconcile,
 }: {
-  active?: boolean;
-  payload?: Array<{ payload?: TrendChartPoint }>;
+  source: TokenStatsSource;
+  viewWindow: UsageWindow;
+  onViewWindowChange: (next: UsageWindow) => void;
+  gatewayTrend: GatewayTokenTrend | null;
+  dim: GatewayUsageDim | null;
+  recon: GatewayUsageRecon | null;
+  ledger: UsageLedger;
+  onReconcile: () => void;
 }) {
   const t = useT();
-  if (!active || !payload?.length) return null;
-  const point = payload[0]?.payload;
-  if (!point) return null;
-  const rows: { key: string; labelKey: TranslationKey; value: number; color: string }[] = [
-    { key: "cacheRead", labelKey: "wbStats.token.cacheRead", value: point.cacheRead, color: "var(--data-series-emerald)" },
-    {
-      key: "uncachedInput",
-      labelKey: "wbStats.token.uncachedInput",
-      value: point.uncachedInput,
-      color: "var(--data-series-teal)",
-    },
-    { key: "output", labelKey: "wbStats.token.output", value: point.output, color: "var(--data-series-violet)" },
-    { key: "cacheWrite", labelKey: "wbStats.token.cacheWrite", value: point.cacheWrite, color: "var(--data-series-amber)" },
-    { key: "records", labelKey: "wbStats.token.records", value: point.records, color: "var(--data-series-indigo)" },
-  ];
-  const total = tokenTotal(point);
+  const windowLabel = useUsageWindowLabel();
+  const keys = useMemo(() => calendarWindowKeys(viewWindow), [viewWindow]);
+  const matrix = useMemo(() => heatmapMatrix(source.hours), [source]);
 
-  return (
-    <div className="grid min-w-[13rem] gap-2 rounded-lg border border-border/50 bg-background px-3 py-2.5 text-xs shadow-xl">
-      <div className="font-medium text-foreground">{formatChartDate(point.date)}</div>
-      <div className="flex items-center justify-between border-b border-border/60 pb-1.5">
-        <span className="text-muted-foreground">{t("wbStats.token.totalLabel")}</span>
-        <span
-          className="whitespace-nowrap font-mono font-semibold tabular-nums text-foreground"
-          title={`${formatTokenExact(total)} Token`}
-          aria-label={`${formatTokenExact(total)} Token`}
-        >
-          {formatTokenCompact(total)} Token
-        </span>
-      </div>
-      <div className="grid gap-1.5">
-        {rows.map((row) => (
-          <div key={row.key} className="flex items-center gap-2">
-            <span
-              className={`shrink-0 ${row.key === "records" ? "h-0 w-3 border-t-2 border-dashed" : "size-2.5 rounded-[3px]"}`}
-              style={
-                row.key === "records"
-                  ? { borderColor: row.color }
-                  : { backgroundColor: row.color }
-              }
-              aria-hidden="true"
-            />
-            <span className="flex-1 text-muted-foreground">{t(row.labelKey)}</span>
-            <span
-              className="whitespace-nowrap font-mono font-medium tabular-nums text-foreground"
-              title={row.key === "records" ? undefined : `${formatTokenExact(row.value)} Token`}
-              aria-label={row.key === "records" ? undefined : `${formatTokenExact(row.value)} Token`}
-            >
-              {row.key === "records" ? exact.format(row.value) : formatTokenCompact(row.value)} {row.key === "records" ? t("wbStats.token.unitCalls") : "Token"}
-              {row.key !== "records" ? (
-                <span className="ml-1 font-sans text-[11px] font-normal text-muted-foreground">
-                  ({percentage(row.value, total)})
-                </span>
-              ) : null}
-            </span>
-          </div>
-        ))}
-      </div>
-    </div>
+  /* 两本账的逐日值：客户端来自 `source.daily`，网关来自 `get_gateway_token_trend`。 */
+  const clientDaily = useMemo(() => dailyTotalsMap(source.daily), [source.daily]);
+  const gatewayDaily = useMemo(
+    () => new Map(gatewayDailyInWindow(gatewayTrend, viewWindow).map((day) => [day.key, day.total])),
+    [gatewayTrend, viewWindow],
   );
-}
+  const columns = useMemo(
+    () =>
+      ledgerDailySeries({
+        days: keys.map((key) => ({ key, total: 0 })),
+        clientTotals: clientDaily,
+        gatewayTotals: gatewayDaily,
+        ledger,
+        labelOf: (key) => key.slice(5).replace("-", "/"),
+      }),
+    [keys, clientDaily, gatewayDaily, ledger],
+  );
 
-function TrendChart({ source }: { source: TokenStatsSource }) {
-  const t = useT();
-  const [range, setRange] = useState<RangeKey>("30d");
-  const [modelFilter, setModelFilter] = useState("all");
-  const modelOptions = useMemo(
-    () => (source.dailyByModel ? source.models.map((model) => model.key).filter(Boolean) : []),
-    [source.dailyByModel, source.models],
-  );
-  useEffect(() => {
-    if (modelFilter !== "all" && !modelOptions.includes(modelFilter)) setModelFilter("all");
-  }, [modelFilter, modelOptions]);
-  const dailySeries = modelFilter === "all"
-    ? source.daily
-    : source.dailyByModel?.[modelFilter] ?? [];
-  const points = useMemo(
-    () => fillRangePoints(rangePoints(dailySeries, range), range),
-    [range, dailySeries],
-  );
-  const totals = useMemo(() => rangeTotals(points), [points]);
-  const chartData: TrendChartPoint[] = points.map((point) => ({
-    ...point,
-    date: point.key,
-  }));
-
-  return (
-    <section className="min-w-0 space-y-2.5" aria-labelledby="token-trend-title">
-      <SectionTitle id="token-trend-title">{t("wbStats.token.trendTitle")}</SectionTitle>
-      <Card className="min-w-0 gap-0 overflow-hidden rounded-xl py-0 shadow-none">
-        <CardHeader className="gap-0 px-4 pt-3 pb-0 sm:px-5">
-          <div className="flex min-w-0 flex-wrap items-center justify-between gap-3">
-            <CardDescription className="min-w-0 text-xs">
-              {t("wbStats.token.trendDesc")}
-            </CardDescription>
-            <div className="flex max-w-full flex-wrap items-center gap-2">
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="h-8 max-w-[190px] gap-1.5 px-2.5 text-xs text-muted-foreground hover:text-foreground"
-                    aria-label={t("wbStats.token.filterByModel")}
-                  >
-                    <SlidersHorizontal className="size-3.5 shrink-0" />
-                    <span className="truncate">{modelFilter === "all" ? t("wbStats.token.allModels") : modelFilter}</span>
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" className="max-h-80 w-56 overflow-y-auto">
-                  <DropdownMenuItem onSelect={() => setModelFilter("all")}>
-                    <SlidersHorizontal className="size-3.5 shrink-0" />
-                    {t("wbStats.token.allModels")}
-                    {modelFilter === "all" && <Check className="ml-auto size-3.5 shrink-0" />}
-                  </DropdownMenuItem>
-                  {modelOptions.length > 0 && <DropdownMenuSeparator />}
-                  {modelOptions.map((model) => (
-                    <DropdownMenuItem key={model} onSelect={() => setModelFilter(model)}>
-                      <span className="min-w-0 flex-1 truncate">{model}</span>
-                      {modelFilter === model && <Check className="ml-auto size-3.5 shrink-0" />}
-                    </DropdownMenuItem>
-                  ))}
-                </DropdownMenuContent>
-              </DropdownMenu>
-              <div className="flex max-w-full flex-wrap gap-1 rounded-lg bg-muted p-1" aria-label={t("wbStats.token.trendRangeAria")}>
-              {RANGE_OPTIONS.map((option) => (
-                <button
-                  key={option.key}
-                  type="button"
-                  className={`cursor-pointer rounded-md px-2.5 py-1.5 text-xs transition-colors ${
-                    range === option.key
-                      ? "bg-background font-medium text-foreground shadow-sm"
-                      : "text-muted-foreground hover:text-foreground"
-                  }`}
-                  onClick={() => setRange(option.key)}
-                  aria-pressed={range === option.key}
-                >
-                  {t(option.label)}
-                </button>
-              ))}
-              </div>
-            </div>
-          </div>
-        </CardHeader>
-        <CardContent className="min-w-0 px-4 pt-3 pb-4 sm:px-5">
-          {chartData.length === 0 ? (
-            <div className="rounded-lg border border-dashed px-4 py-10 text-center text-sm text-muted-foreground">
-              {t("wbStats.token.emptyRange")}
-            </div>
-          ) : (
-            <>
-              <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-                <TrendLegend />
-              </div>
-              <div className="mb-1 flex items-center justify-end px-1 text-[11px] font-medium text-muted-foreground">
-                <span className="font-normal">{t("wbStats.token.axisNote")}</span>
-              </div>
-              <ChartContainer config={chartConfig} className="h-64 w-full sm:h-72">
-                <ComposedChart
-                  data={chartData}
-                  margin={{ top: 8, right: 8, left: 0, bottom: 0 }}
-                  barCategoryGap="18%"
-                >
-                  <CartesianGrid vertical={false} strokeDasharray="3 3" />
-                  <XAxis
-                    dataKey="date"
-                    tickLine={false}
-                    axisLine={false}
-                    tickMargin={8}
-                    minTickGap={24}
-                    tickFormatter={(value) => formatChartDate(String(value))}
-                  />
-                  <YAxis
-                    yAxisId="tokens"
-                    tickLine={false}
-                    axisLine={false}
-                    width={48}
-                    tickFormatter={(value) => formatTokenCompact(Number(value))}
-                  />
-                  <YAxis
-                    yAxisId="calls"
-                    orientation="right"
-                    tickLine={false}
-                    axisLine={false}
-                    width={46}
-                    allowDecimals={false}
-                    tickFormatter={(value) => exact.format(Number(value))}
-                  />
-                  <ChartTooltip
-                    cursor={{ fill: "var(--muted)", opacity: 0.4 }}
-                    content={<TrendTooltipContent />}
-                  />
-                  {TOKEN_SERIES.map((key) => (
-                    <Bar
-                      key={key}
-                      yAxisId="tokens"
-                      dataKey={key}
-                      stackId="token"
-                      fill={`var(--color-${key})`}
-                      stroke="var(--background)"
-                      strokeWidth={2}
-                      maxBarSize={28}
-                      shape={<TokenBarShape segmentKey={key} />}
-                      isAnimationActive={false}
-                    >
-                    </Bar>
-                  ))}
-                  <Line
-                    yAxisId="calls"
-                    type="monotone"
-                    dataKey="records"
-                    stroke="var(--color-records)"
-                    strokeWidth={2}
-                    strokeDasharray="7 4"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    dot={false}
-                    activeDot={{ r: 4, fill: "var(--color-records)", stroke: "var(--background)", strokeWidth: 2 }}
-                    isAnimationActive={false}
-                  />
-                </ComposedChart>
-              </ChartContainer>
-              <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
-                <span>
-                  {t(rangeLabel(range))} {t("wbStats.token.trendSummary", { total: formatTokenCompact(tokenTotal(totals)), calls: exact.format(totals.records) })}
-                </span>
-                <span>{t("wbStats.token.coverage", { date: formatDateTime(source.coverageEndAt) })}</span>
-              </div>
-              <p className="sr-only">
-                {chartData
-                  .map(
-                    (point) =>
-                      t("wbStats.token.srSummary", { date: point.date, total: formatTokenCompact(tokenTotal(point)), calls: exact.format(point.records) }),
-                  )
-                  .join(t("shared.punct.semicolon"))}
-              </p>
-            </>
-          )}
-        </CardContent>
-      </Card>
-    </section>
-  );
-}
-
-const HEATMAP_LEVEL_CLASS = [
-  "bg-muted/70",
-  "bg-primary/20",
-  "bg-primary/40",
-  "bg-primary/65",
-  "bg-primary",
-] as const;
-
-function Heatmap({ groups }: { groups: TokenStatsGroup[] }) {
-  const t = useT();
-  const scrollerRef = useRef<HTMLDivElement>(null);
-  const valueByDate = new Map(groups.map((group) => [group.key, tokenTotal(group)]));
-  const recordByDate = new Map(groups.map((group) => [group.key, group.records]));
-  const today = new Date();
-  today.setHours(12, 0, 0, 0);
-  const todayKey = dateKey(today);
-  const start = new Date(today);
-  start.setDate(start.getDate() - start.getDay() - 52 * 7);
-
-  const weeks = Array.from({ length: 53 }, (_, weekIndex) =>
-    Array.from({ length: 7 }, (_, dayIndex) => {
-      const date = new Date(start);
-      date.setDate(start.getDate() + weekIndex * 7 + dayIndex);
-      const key = dateKey(date);
-      return {
-        date,
-        key,
-        value: valueByDate.get(key) ?? 0,
-        records: recordByDate.get(key) ?? 0,
-        future: key > todayKey,
-      };
-    }),
-  );
-  const max = Math.max(
-    1,
-    ...weeks.flatMap((week) => week.filter((day) => !day.future).map((day) => day.value)),
-  );
-  const monthLabels = weeks.map((week, weekIndex) => {
-    const firstOfMonth = week.find((day) => day.date.getDate() === 1);
-    let labelDate: Date | null = null;
-    if (firstOfMonth && firstOfMonth.key <= todayKey) {
-      labelDate = firstOfMonth.date;
-    } else if (weekIndex === 0) {
-      labelDate = week[0].date;
-    }
-    if (!labelDate || dateKey(labelDate) > todayKey) return null;
-    return labelDate.toLocaleDateString("zh-CN", {
-      month: "short",
+  const sumOf = (map: Map<string, number>) => keys.reduce((sum, key) => sum + (map.get(key) ?? 0), 0);
+  const clientTokens = sumOf(clientDaily);
+  const gatewayTokens = sumOf(gatewayDaily);
+  const overlap = useMemo(() => overlapInWindow(recon, clientTokens), [recon, clientTokens]);
+  const combined = combinedTotal(clientTokens, gatewayTokens, overlap);
+  const formula = useMemo(() => {
+    const parts = combinedFormula({
+      clientTokens,
+      gatewayTokens,
+      overlapTokens: overlap,
+      verdict: recon?.verdict ?? null,
     });
-  });
-  const activeDays = weeks
-    .flat()
-    .filter((day) => !day.future && day.value > 0).length;
+    return parts.kind === "subset"
+      ? t("wbStats.usage.trend.formulaSubset", {
+          gateway: compactTokens(gatewayTokens),
+          direct: compactTokens(parts.directClientTokens),
+        })
+      : t("wbStats.usage.trend.formulaAdditive", {
+          client: compactTokens(clientTokens),
+          gateway: compactTokens(gatewayTokens),
+          overlap: compactTokens(parts.overlapTokens),
+        });
+  }, [clientTokens, gatewayTokens, overlap, recon?.verdict, t]);
 
-  useLayoutEffect(() => {
-    const scroller = scrollerRef.current;
-    if (!scroller) return;
-    scroller.scrollLeft = scroller.scrollWidth - scroller.clientWidth;
-  }, [groups]);
+  const visibleTotal = ledger === "client" ? clientTokens : ledger === "gateway" ? gatewayTokens : combined;
+  const total = visibleTotal;
+  const dailyTotals = columns.map((column) => column.total);
+  const peak = Math.max(0, ...dailyTotals);
+  /* ★ A1-3：日均的分母是**窗口天数**，不是「有数据的天数」——
+     后者在稀疏数据下会把 5 天用量显示成「日均 300」，而真实 30 天日均是 50。 */
+  const average = Math.round(total / usageWindowDays(viewWindow));
+
+  const rangeRecords = useMemo(() => {
+    const inWindow = new Set(keys);
+    return source.daily.reduce((sum, point) => (inWindow.has(point.key) ? sum + point.records : sum), 0);
+  }, [source.daily, keys]);
+  const filtered = source.summary.records > 0 && rangeRecords === 0 && gatewayTokens === 0;
+
+  /* 模型占比：**按单本账各画一个环**（跨账本合并占比的分母含重复计数，是假的）。 */
+  const clientSlices = useMemo(
+    () =>
+      clientModelTotals(source, viewWindow).map((model) => ({
+        name: model.name,
+        value: model.tokens,
+        spark: [],
+      })),
+    [source, viewWindow],
+  );
+  const gatewaySlices = useMemo(
+    () =>
+      dimTotals(dim, viewWindow, modelKey)
+        .filter((model) => model.tokens > 0)
+        .map((model) => ({ name: model.key || t("wbStats.usage.models.unknown"), value: model.tokens, spark: [] })),
+    [dim, viewWindow, t],
+  );
+
+  const coverage = useMemo(() => dimCoverage(dim, viewWindow), [dim, viewWindow]);
+  const heatmapHasData = useMemo(() => matrix.cells.some((row) => row.some((value) => value > 0)), [matrix]);
+  /* ★ 累计曲线必须在本函数**所有** hook 之后才能算 —— 但它自己就是 hook，
+     所以只能放在早退**之前**。放在 `if (filtered) return` 之后会让 hook 数量随
+     `filtered` 变化：点击「今天」从「有数据」切到「本窗口无数据」时 React 抛
+     #300（Rendered more hooks than during the previous render），整页白屏（issue #131）。 */
+  const cumulative = useMemo(() => {
+    let running = 0;
+    return columns.map((column) => {
+      running += column.total;
+      return { label: column.label, value: running };
+    });
+  }, [columns]);
+
+  if (filtered) {
+    return (
+      <ViewEmpty
+        icon={MessagesSquare}
+        title={t("wbStats.usage.empty.filtered")}
+        description={t("wbStats.usage.empty.filteredHint")}
+        actionLabel={t("wbStats.usage.empty.viewAll")}
+        onAction={() => onViewWindowChange({ kind: "preset", days: 30 })}
+      />
+    );
+  }
+
+  const totalTile: StatTile =
+    ledger === "gateway"
+      ? {
+          icon: Server,
+          label: t("wbStats.usage.trend.totalGateway"),
+          value: compactTokens(gatewayTokens),
+          hint: windowLabel(viewWindow),
+          title: t("wbStats.usage.trend.totalGatewayTitle"),
+        }
+      : ledger === "client"
+        ? {
+            icon: MessagesSquare,
+            label: t("wbStats.usage.trend.totalClient"),
+            value: compactTokens(clientTokens),
+            hint: windowLabel(viewWindow),
+            title: t("wbStats.usage.trend.totalClientTitle"),
+          }
+        : {
+            icon: MessagesSquare,
+            label: t("wbStats.usage.trend.totalCombined"),
+            value: `≈ ${compactTokens(combined)}`,
+            hint: formula,
+            title: t("wbStats.usage.trend.totalCombinedTitle"),
+          };
+
+  const modelCount =
+    ledger === "gateway" ? gatewaySlices.length : ledger === "client" ? clientSlices.length : clientSlices.length + gatewaySlices.length;
+  /* ★ issue #154：网关账本下的「缓存命中」—— 命中只在网关侧可观测，所以这张卡
+     只随 `ledger === "gateway"` 出现（合计 / 客户端两档都没有这份数据）。
+     分母是**输入侧**，不是 `gatewayTokens`（含输出）—— 后者会随输出变长系统性低估。 */
+  const cacheHit = gatewayCacheHit(dim, viewWindow);
+  const cacheTile: StatTile | null =
+    ledger === "gateway"
+      ? {
+          icon: DatabaseZap,
+          label: t("wbStats.usage.trend.cacheHit"),
+          value: cacheHit.observed ? compactTokens(cacheHit.cached) : "—",
+          hint: cacheHit.observed
+            ? t("wbStats.usage.trend.cacheHitHint", {
+                rate: `${Math.round((cacheHit.hitRate ?? 0) * 100)}%`,
+                input: compactTokens(cacheHit.input),
+              })
+            : t("wbStats.usage.trend.cacheHitUnobserved"),
+          title: t("wbStats.usage.trend.cacheHitTitle"),
+        }
+      : null;
+  const tiles: StatTile[] = [
+    totalTile,
+    ...(cacheTile ? [cacheTile] : []),
+    { icon: TrendingUp, label: t("wbStats.usage.trend.avg"), value: compactTokens(average), hint: t("wbStats.usage.trend.avgHint") },
+    { icon: Gauge, label: t("wbStats.usage.trend.peak"), value: compactTokens(peak) },
+    /* 决策 #4：WB 的第四张卡是「模型数」，不是「活跃账号」—— 账号维度在账号页，
+       这里放模型数才能回答「这段时间动了几个模型」。 */
+    { icon: Server, label: t("wbStats.usage.trend.models"), value: exactTokens(modelCount) },
+    {
+      icon: MessagesSquare,
+      label: t("wbStats.usage.trend.requests"),
+      value: exactTokens(
+        ledger === "gateway"
+          ? dimTotals(dim, viewWindow, endpointKey).reduce((sum, row) => sum + row.requests, 0)
+          : rangeRecords,
+      ),
+      hint: t("wbStats.usage.trend.requestsHint"),
+    },
+  ];
 
   return (
-    <section className="min-w-0 space-y-2.5" aria-labelledby="token-heatmap-title">
-      <SectionTitle id="token-heatmap-title">{t("wbStats.token.heatmapTitle")}</SectionTitle>
-      <Card className="min-w-0 gap-0 rounded-xl py-0 shadow-none">
-        <CardHeader className="px-4 pt-4 pb-0 sm:px-5">
-          <div className="flex items-center justify-between gap-3">
-            <CardDescription className="text-xs">{t("wbStats.token.heatmapDesc")}</CardDescription>
-            <span className="shrink-0 text-xs font-medium text-foreground">{t("wbStats.token.heatmapDaily")}</span>
-          </div>
-        </CardHeader>
-        <CardContent className="min-w-0 px-4 pt-5 pb-5 sm:px-5">
-          <div ref={scrollerRef} className="overflow-x-auto pb-1">
-            <div
-              className="min-w-[760px]"
-              role="img"
-              aria-label={t("wbStats.token.heatmapAria", { activeDays })}
-            >
-              <div
-                className="grid gap-1"
-                style={{ gridTemplateColumns: "repeat(53, minmax(10px, 1fr))" }}
-                aria-hidden="true"
-              >
-                {weeks.flatMap((week, weekIndex) =>
-                  week.map((day, dayIndex) => {
-                    const level = day.value
-                      ? Math.max(1, Math.ceil(Math.sqrt(day.value / max) * 4))
-                      : 0;
-                    const cell = (
-                      <span
-                        key={day.key}
-                        className={`aspect-square min-w-0 rounded-[3px] ${
-                          day.future ? "opacity-0" : HEATMAP_LEVEL_CLASS[level]
-                        }`}
-                        style={{ gridColumn: weekIndex + 1, gridRow: dayIndex + 1 }}
-                        aria-label={t("wbStats.token.heatmapCell", { date: formatHeatmapDate(day.date), count: formatTokenExact(day.value) })}
-                      />
-                    );
-
-                    if (day.future) return cell;
-
-                    return (
-                      <Tooltip key={day.key} disableHoverableContent>
-                        <TooltipTrigger asChild>{cell}</TooltipTrigger>
-                        <TooltipContent
-                          side="top"
-                          sideOffset={7}
-                          className="pointer-events-none rounded-lg bg-foreground px-2.5 py-1.5 text-xs leading-4 text-background shadow-md"
-                        >
-                          {t("wbStats.token.heatmapTip", { date: formatHeatmapDate(day.date), count: formatTokenCompact(day.value) })}
-                          {day.records > 0 ? ` · ${t("wbStats.token.heatmapCalls", { calls: exact.format(day.records) })}` : ""}
-                        </TooltipContent>
-                      </Tooltip>
-                    );
-                  }),
-                )}
-              </div>
-              <div
-                className="mt-3 grid gap-1 text-[11px] text-muted-foreground"
-                style={{ gridTemplateColumns: "repeat(53, minmax(10px, 1fr))" }}
-                aria-hidden="true"
-              >
-                {monthLabels.map((label, index) => (
-                  <span key={`${index}-${label ?? "empty"}`} className="whitespace-nowrap">
-                    {label}
-                  </span>
-                ))}
-              </div>
-            </div>
-          </div>
-        </CardContent>
-      </Card>
-    </section>
+    <div className="min-w-0 space-y-6">
+      <StatTiles tiles={tiles} ariaLabel={t("wbStats.usage.view.trend")} />
+      <CoverageStrip
+        clientTokens={clientTokens}
+        clientRequests={recon?.clientRows ?? rangeRecords}
+        gatewayTokens={gatewayTokens}
+        gatewayRequests={recon?.gatewayRows ?? 0}
+        gatewayFailed={dimTotals(dim, viewWindow, endpointKey).reduce((sum, row) => sum + row.failed, 0)}
+        recorded={coverage.recorded}
+        windowDays={coverage.total}
+        overlapRows={recon?.matched ?? 0}
+        overlapTokens={overlap}
+        onReconcile={recon ? onReconcile : undefined}
+      />
+      {columns.some((column) => column.total > 0) ? (
+        <ChartFrame
+          title={t("wbStats.usage.trend.stackedTitle")}
+          caption={t("wbStats.usage.trend.ledgerCaption")}
+          ariaLabel={t("wbStats.usage.trend.stackedAria")}
+        >
+          <StackedDailyBar columns={columns} palette={[LEDGER_CLIENT_COLOR, LEDGER_GATEWAY_COLOR]} />
+        </ChartFrame>
+      ) : null}
+      <div className="grid min-w-0 gap-6 lg:grid-cols-2">
+        {cumulative.length > 0 ? (
+          <ChartFrame
+            title={t("wbStats.usage.trend.cumulativeTitle")}
+            caption={cumulativeCaption(t, cumulative[cumulative.length - 1].value, peak)}
+            ariaLabel={t("wbStats.usage.trend.cumulativeTitle")}
+          >
+            <CumulativeArea points={cumulative} />
+          </ChartFrame>
+        ) : null}
+        {ledger !== "gateway" && clientSlices.length > 0 ? (
+          <ChartFrame
+            title={t("wbStats.usage.trend.donutTitle")}
+            caption={`${exactTokens(clientSlices.length)} · ${compactTokens(clientTokens)}`}
+            ariaLabel={t("wbStats.usage.trend.donutTitle")}
+            exportable={false}
+          >
+            <ModelDonut slices={clientSlices} size={150} />
+          </ChartFrame>
+        ) : null}
+        {ledger !== "client" && gatewaySlices.length > 0 ? (
+          <ChartFrame
+            title={t("wbStats.usage.models.gatewayBook")}
+            caption={`${exactTokens(gatewaySlices.length)} · ${compactTokens(gatewayTokens)}`}
+            ariaLabel={t("wbStats.usage.models.gatewayBook")}
+            exportable={false}
+          >
+            <ModelDonut slices={gatewaySlices} size={150} />
+          </ChartFrame>
+        ) : null}
+      </div>
+      {ledger !== "gateway" && heatmapHasData ? (
+        <ChartFrame
+          title={t("wbStats.usage.trend.heatmapTitle")}
+          caption={t("wbStats.usage.trend.heatmapDesc")}
+          ariaLabel={t("wbStats.usage.trend.heatmapAria")}
+          exportable={false}
+        >
+          <UsageHeatmap matrix={matrix} />
+        </ChartFrame>
+      ) : null}
+      {ledger === "gateway" ? (
+        <p className="text-[11.5px] text-muted-foreground">{t("wbStats.usage.trend.gatewayNoHours")}</p>
+      ) : null}
+    </div>
   );
 }
 
-function Ranking({
-  groups,
-  denominator,
-  description,
-  controls,
+/* ────────────────────────────── 模型 ────────────────────────────── */
+
+function ModelsView({
+  source,
+  viewWindow,
+  dim,
+  ledger,
+  onRefresh,
 }: {
-  groups: TokenStatsGroup[];
-  denominator: number;
-  description: string;
-  controls?: ReactNode;
+  source: TokenStatsSource;
+  viewWindow: UsageWindow;
+  dim: GatewayUsageDim | null;
+  ledger: UsageLedger;
+  onRefresh: () => void | Promise<void>;
 }) {
   const t = useT();
-  const rows = groups.slice(0, RANKING_LIMIT);
-
-  return (
-    <Card className="min-w-0 gap-0 rounded-xl py-0 shadow-none">
-      <CardHeader className="gap-0 px-4 pt-3 pb-0 sm:px-5">
-        <div className="flex min-w-0 flex-wrap items-center justify-between gap-3">
-          <CardDescription className="min-w-0 text-xs">{description}</CardDescription>
-          {controls}
-        </div>
-      </CardHeader>
-      <CardContent className="space-y-3 px-4 pt-3 pb-5 sm:px-5">
-        {rows.map((row, index) => {
-          const amount = tokenTotal(row);
-          const share = percentage(amount, denominator);
-          return (
-            <div key={row.key}>
-              <div className="mb-1.5 flex min-w-0 items-center gap-3 text-xs">
-                <span className="w-5 shrink-0 font-mono text-muted-foreground">
-                  {String(index + 1).padStart(2, "0")}
-                </span>
-                <span className="min-w-0 flex-1 truncate font-medium" title={row.key}>
-                  {row.key}
-                </span>
-                <span
-                  className="shrink-0 tabular-nums"
-                  title={`${formatTokenExact(amount)} Token`}
-                  aria-label={`${formatTokenExact(amount)} Token`}
-                >
-                  {formatTokenCompact(amount)}
-                </span>
-                <span className="w-12 shrink-0 text-right text-muted-foreground tabular-nums">
-                  {share}
-                </span>
-              </div>
-              <div className="ml-8 h-1.5 overflow-hidden rounded-full bg-muted">
-                <div
-                  className="h-full rounded-full bg-primary"
-                  style={{ width: share === "—" ? "0%" : share }}
-                />
-              </div>
-            </div>
-          );
-        })}
-        {rows.length === 0 && (
-          <div className="rounded-lg border border-dashed px-4 py-10 text-center text-sm text-muted-foreground">
-            {t("wbStats.token.emptyRank")}
-          </div>
-        )}
-      </CardContent>
-    </Card>
+  const { busy, run } = useRefreshAction();
+  const coverage = useMemo(() => dimCoverage(dim, viewWindow), [dim, viewWindow]);
+  const clientRows = useMemo(
+    () =>
+      clientModelTotals(source, viewWindow).map((model) => ({
+        name: model.name,
+        tokens: model.tokens,
+        requests: model.requests,
+      })),
+    [source, viewWindow],
   );
-}
-
-function SessionRanking({ groups, denominator }: { groups: TokenStatsGroup[]; denominator: number }) {
-  const t = useT();
-  const rows = groups.slice(0, RANKING_LIMIT);
-
-  return (
-    <section className="min-w-0 space-y-2.5" aria-labelledby="token-sessions-title">
-      <SectionTitle id="token-sessions-title">{t("wbStats.token.sessionsTitle")}</SectionTitle>
-      <Card className="min-w-0 gap-0 rounded-xl py-0 shadow-none">
-        <CardHeader className="px-4 pt-3 pb-0 sm:px-5">
-          <CardDescription className="text-xs">{t("wbStats.token.sessionsDesc")}</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-3 px-4 pt-3 pb-5 sm:px-5">
-          {rows.map((row, index) => {
-            const amount = tokenTotal(row);
-            const share = percentage(amount, denominator);
-            const label = row.title?.trim() || t("wbStats.token.unnamedSession");
-            const detail = [row.project, row.title ? undefined : row.sessionId]
-              .filter(Boolean)
-              .join(" · ");
-            return (
-              <div key={row.key}>
-                <div className="mb-1.5 flex min-w-0 items-start gap-3 text-xs">
-                  <span className="mt-0.5 w-5 shrink-0 font-mono text-muted-foreground">
-                    {String(index + 1).padStart(2, "0")}
-                  </span>
-                  <div className="min-w-0 flex-1">
-                    <div className="truncate font-medium" title={label} aria-label={label}>
-                      {label}
-                    </div>
-                    {detail && (
-                      <div className="mt-0.5 truncate text-[11px] text-muted-foreground" title={detail}>
-                        {detail}
-                      </div>
-                    )}
-                  </div>
-                  <span
-                    className="mt-0.5 shrink-0 tabular-nums"
-                    title={`${formatTokenExact(amount)} Token`}
-                    aria-label={`${formatTokenExact(amount)} Token`}
-                  >
-                    {formatTokenCompact(amount)}
-                  </span>
-                  <span className="mt-0.5 w-12 shrink-0 text-right text-muted-foreground tabular-nums">
-                    {share}
-                  </span>
-                </div>
-                <div className="ml-8 h-1.5 overflow-hidden rounded-full bg-muted">
-                  <div
-                    className="h-full rounded-full bg-primary"
-                    style={{ width: share === "—" ? "0%" : share }}
-                  />
-                </div>
-              </div>
-            );
-          })}
-          {rows.length === 0 && (
-            <div className="rounded-lg border border-dashed px-4 py-10 text-center text-sm text-muted-foreground">
-              {t("wbStats.token.emptyRank")}
-            </div>
-          )}
-        </CardContent>
-      </Card>
-    </section>
+  const gatewayRows = useMemo(
+    () =>
+      dimTotals(dim, viewWindow, modelKey).map((model) => ({
+        name: model.key || t("wbStats.usage.models.unknown"),
+        tokens: model.tokens,
+        requests: model.requests,
+        failed: model.failed,
+        /* ★ issue #154：命中率 = `cached / input`（分母是**输入侧**，不含输出）。
+           `cached === 0 && input === 0` ⇒ null（没观测到），别写成 0%。 */
+        hitRate: model.input > 0 && model.cached > 0 ? model.cached / model.input : null,
+      })),
+    [dim, viewWindow, t],
   );
-}
+  const clientTotal = clientRows.reduce((sum, row) => sum + row.tokens, 0);
+  const gatewayTotal = gatewayRows.reduce((sum, row) => sum + row.tokens, 0);
+  const gatewayFailed = gatewayRows.reduce((sum, row) => sum + (row.failed ?? 0), 0);
 
-function Distribution({ source }: { source: TokenStatsSource }) {
-  const t = useT();
-  const [distribution, setDistribution] = useState<DistributionKey>("projects");
-  const groups = source[distribution];
-
-  return (
-    <section className="min-w-0 space-y-2.5" aria-labelledby="token-distribution-title">
-      <SectionTitle id="token-distribution-title">{t("wbStats.token.distTitle")}</SectionTitle>
-      <Ranking
-        groups={groups}
-        denominator={tokenTotal(source.summary)}
-        description={
-          distribution === "projects"
-            ? t("wbStats.token.rankProjectsDesc")
-            : t("wbStats.token.rankModelsDesc")
-        }
-        controls={
-          <div className="flex rounded-lg bg-muted p-1" role="group" aria-label={t("wbStats.token.distAria")}>
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className={`h-7 px-2.5 text-xs ${
-                distribution === "projects"
-                  ? "bg-background font-medium text-foreground shadow-sm hover:bg-background"
-                  : "text-muted-foreground"
-              }`}
-              aria-pressed={distribution === "projects"}
-              onClick={() => setDistribution("projects")}
-            >
-              {t("wbStats.token.byProject")}
-            </Button>
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className={`h-7 px-2.5 text-xs ${
-                distribution === "models"
-                  ? "bg-background font-medium text-foreground shadow-sm hover:bg-background"
-                  : "text-muted-foreground"
-              }`}
-              aria-pressed={distribution === "models"}
-              onClick={() => setDistribution("models")}
-            >
-              {t("wbStats.token.byModel")}
-            </Button>
-          </div>
+  if (clientRows.length === 0 && gatewayRows.length === 0) {
+    return (
+      <EmptyState
+        icon={Server}
+        title={t("wbStats.usage.empty.models")}
+        description={t("wbStats.usage.empty.modelsHint")}
+        action={
+          <Button size="sm" variant="outline" disabled={busy} onClick={() => void run(() => onRefresh())}>
+            {busy ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+            {t("wbStats.usage.empty.refresh")}
+          </Button>
         }
       />
-    </section>
-  );
-}
-
-function Dashboard({ source }: { source: TokenStatsSource }) {
-  const t = useT();
-  const denominator = tokenTotal(source.summary);
-
-  if (source.summary.records === 0) {
-    return (
-      <div className="rounded-xl border border-dashed px-4 py-16 text-center text-sm text-muted-foreground">
-        <div>
-          {source.filesScanned > 0
-            ? t("wbStats.token.scannedFiles", { count: exact.format(source.filesScanned) })
-            : t("wbStats.token.noLogs")}
-        </div>
-        {source.parseErrors > 0 && (
-          <div className="mt-2 text-xs text-amber-600">
-            {t("wbStats.token.skippedRecords", { count: exact.format(source.parseErrors) })}
-          </div>
-        )}
-      </div>
     );
   }
 
   return (
-    <div className="min-w-0 space-y-12">
-      <Overview source={source} />
-      <TrendChart source={source} />
-      <Heatmap groups={source.daily} />
-      <Distribution source={source} />
-      <SessionRanking groups={source.sessions} denominator={denominator} />
-      {source.parseErrors > 0 && (
-        <p className="flex items-center gap-1.5 px-1 text-xs text-amber-600">
-          <CircleAlert className="size-3.5" aria-hidden="true" />
-          {t("wbStats.token.skippedRecords", { count: exact.format(source.parseErrors) })}
-        </p>
-      )}
+    <div className="min-w-0 space-y-4">
+      {ledger === "all" ? (
+        <div className="flex items-center gap-2.5 rounded-[10px] border border-[color:var(--data-series-indigo)]/25 bg-[color:var(--data-series-indigo)]/10 px-3.5 py-2.5 text-xs text-muted-foreground">
+          <Info className="size-3.5 shrink-0 text-[color:var(--data-series-indigo)]" />
+          <span>
+            <b className="font-medium text-foreground">{t("wbStats.usage.models.noMerge")}</b>
+            {t("wbStats.usage.models.noMergeBody")}
+          </span>
+        </div>
+      ) : null}
+      {/* 客户端账本用**排行条 + 迷你趋势线**：它有 `dailyByModel`，能画出「每个模型这段
+          时间怎么走」；网关账本用表（要 `请求 / 失败` 两列，那是网关才有的事实）。 */}
+      {ledger !== "gateway" ? (
+        <ChartFrame
+          title={t("wbStats.usage.models.clientBook")}
+          caption={`${t("wbStats.usage.models.clientBookHint")} · ${compactTokens(clientTotal)}`}
+          ariaLabel={t("wbStats.usage.models.clientBook")}
+          exportable={false}
+        >
+          <ModelRanking slices={modelSlices(source, viewWindow)} />
+        </ChartFrame>
+      ) : null}
+      {ledger !== "client" ? (
+        <LedgerModelTable
+          book="gateway"
+          rows={gatewayRows}
+          total={gatewayTotal}
+          caption={t("wbStats.usage.models.gatewayBookHint", {
+            recorded: coverage.recorded,
+            total: coverage.total,
+          })}
+          failed={gatewayFailed}
+        />
+      ) : null}
     </div>
   );
 }
 
-function TokenStatsLoadingSkeleton() {
+/* ────────────────────────────── 会话 ────────────────────────────── */
+
+function SessionsView({
+  source,
+  viewWindow,
+  dim,
+  ledger,
+  onViewWindowChange,
+  onRefresh,
+  onSwitchLedger,
+}: {
+  source: TokenStatsSource;
+  viewWindow: UsageWindow;
+  dim: GatewayUsageDim | null;
+  ledger: UsageLedger;
+  onViewWindowChange: (next: UsageWindow) => void;
+  onRefresh: () => void | Promise<void>;
+  onSwitchLedger: (next: UsageLedger) => void;
+}) {
   const t = useT();
+  const windowLabel = useUsageWindowLabel();
+  const { busy, run } = useRefreshAction();
+  const points = useMemo(() => sessionPoints(source, viewWindow), [source, viewWindow]);
+  const visible = useMemo(() => points.slice(0, SESSION_RENDER_LIMIT), [points]);
+  const total = points.reduce((sum, point) => sum + point.value, 0);
+  const capNote =
+    points.length > visible.length
+      ? t("wbStats.usage.sessions.shownOf", { shown: visible.length, total: points.length })
+      : null;
+
+  /* 网关账本：**换维度**（网关没有 sessionId，但有账号与端点）。 */
+  if (ledger === "gateway") {
+    const accounts = dimTotals(dim, viewWindow, accountKey);
+    const endpoints = dimTotals(dim, viewWindow, endpointKey);
+    return (
+      <GatewaySourceTables
+        accounts={accounts.map((row) => ({ key: row.key, tokens: row.tokens, requests: row.requests }))}
+        endpoints={endpoints.map((row) => ({ key: row.key, requests: row.requests }))}
+        gatewayTokens={accounts.reduce((sum, row) => sum + row.tokens, 0)}
+        gatewayRequests={endpoints.reduce((sum, row) => sum + row.requests, 0)}
+      />
+    );
+  }
+
+  if (points.length === 0) {
+    const hasAnySession = source.sessions.some((session) => session.total > 0 || session.records > 0);
+    if (hasAnySession) {
+      return (
+        <ViewEmpty
+          icon={Users}
+          title={t("wbStats.usage.empty.filtered")}
+          description={t("wbStats.usage.empty.filteredHint")}
+          actionLabel={t("wbStats.usage.empty.viewAll")}
+          onAction={() => onViewWindowChange({ kind: "preset", days: 30 })}
+        />
+      );
+    }
+    return (
+      <EmptyState
+        icon={Users}
+        title={t("wbStats.usage.empty.sessions")}
+        description={t("wbStats.usage.empty.sessionsHint")}
+        action={
+          <Button size="sm" variant="outline" disabled={busy} onClick={() => void run(() => onRefresh())}>
+            {busy ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+            {t("wbStats.usage.empty.refresh")}
+          </Button>
+        }
+      />
+    );
+  }
+
+  const tiles: StatTile[] = [
+    { icon: Users, label: t("wbStats.usage.sessions.count"), value: exactTokens(points.length), hint: windowLabel(viewWindow) },
+    { icon: MessagesSquare, label: t("wbStats.usage.sessions.total"), value: compactTokens(total), hint: windowLabel(viewWindow) },
+    { icon: Gauge, label: t("wbStats.usage.sessions.avg"), value: compactTokens(Math.round(total / points.length)) },
+    { icon: TrendingUp, label: t("wbStats.usage.sessions.max"), value: compactTokens(points[0].value), hint: points[0].title },
+  ];
+
   return (
-    <div
-      className="min-w-0 space-y-12"
-      role="status"
-      aria-label={t("wbStats.token.scanning")}
-    >
-      <span className="sr-only">{t("wbStats.token.scanning")}</span>
-      <p className="flex items-center gap-2 text-sm text-muted-foreground" aria-hidden="true">
-        <span className="size-1.5 rounded-full bg-primary/70" />
-        {t("wbStats.token.scanning")}
-      </p>
-
-      <section className="min-w-0 space-y-2.5" aria-hidden="true">
-        <Skeleton className="h-4 w-20" />
-        <Card className="min-w-0 gap-0 overflow-hidden rounded-2xl bg-card/70 py-0 shadow-none">
-          <CardContent className="grid min-w-0 grid-cols-1 divide-y divide-border/60 p-0 sm:grid-cols-4 sm:divide-y-0 sm:py-5">
-            {Array.from({ length: 4 }, (_, index) => (
-              <div
-                key={index}
-                className={`flex min-w-0 flex-col items-center justify-center px-4 py-5 sm:py-3 ${
-                  index > 0 ? "sm:border-l sm:border-border/60" : ""
-                }`}
-              >
-                <Skeleton className="h-4 w-24" />
-                <Skeleton className="mt-3 h-8 w-28" />
-              </div>
-            ))}
-          </CardContent>
-        </Card>
-      </section>
-
-      <section className="min-w-0 space-y-2.5" aria-hidden="true">
-        <Skeleton className="h-4 w-36" />
-        <Card className="min-w-0 gap-0 overflow-hidden rounded-xl py-0 shadow-none">
-          <CardHeader className="gap-0 px-4 pt-3 pb-0 sm:px-5">
-            <div className="flex min-w-0 flex-wrap items-center justify-between gap-3">
-              <Skeleton className="h-4 w-64 max-w-full" />
-              <Skeleton className="h-8 w-40 rounded-lg" />
-            </div>
-          </CardHeader>
-          <CardContent className="min-w-0 px-4 pt-3 pb-4 sm:px-5">
-            <div className="mb-3 flex flex-wrap items-center gap-4">
-              {Array.from({ length: 5 }, (_, index) => (
-                <Skeleton key={index} className="h-4 w-16" />
-              ))}
-            </div>
-            <Skeleton className="h-64 w-full rounded-lg sm:h-72" />
-          </CardContent>
-        </Card>
-      </section>
-
-      <section className="min-w-0 space-y-2.5" aria-hidden="true">
-        <Skeleton className="h-4 w-24" />
-        <Card className="min-w-0 gap-0 overflow-hidden rounded-xl py-0 shadow-none">
-          <CardHeader className="px-4 pt-4 pb-0 sm:px-5">
-            <Skeleton className="h-4 w-56 max-w-full" />
-          </CardHeader>
-          <CardContent className="px-4 pt-5 pb-5 sm:px-5">
-            <Skeleton className="h-44 w-full rounded-lg" />
-          </CardContent>
-        </Card>
-      </section>
-
-      <section className="min-w-0 space-y-2.5" aria-hidden="true">
-        <Skeleton className="h-4 w-24" />
-        <Card className="min-w-0 gap-0 overflow-hidden rounded-xl py-0 shadow-none">
-          <CardHeader className="gap-0 px-4 pt-3 pb-0 sm:px-5">
-            <div className="flex items-center justify-between gap-3">
-              <Skeleton className="h-4 w-56 max-w-full" />
-              <Skeleton className="h-8 w-32 rounded-lg" />
-            </div>
-          </CardHeader>
-          <CardContent className="space-y-3 px-4 pt-3 pb-5 sm:px-5">
-            {Array.from({ length: RANKING_LIMIT }, (_, index) => (
-              <div key={index} className="space-y-1.5">
-                <div className="flex items-center gap-3">
-                  <Skeleton className="h-4 w-5" />
-                  <Skeleton className="h-4 flex-1" />
-                  <Skeleton className="h-4 w-16" />
-                </div>
-                <Skeleton className="ml-8 h-1.5 w-[70%] rounded-full" />
-              </div>
-            ))}
-          </CardContent>
-        </Card>
-      </section>
-
-      <section className="min-w-0 space-y-2.5" aria-hidden="true">
-        <Skeleton className="h-4 w-36" />
-        <Card className="min-w-0 gap-0 overflow-hidden rounded-xl py-0 shadow-none">
-          <CardHeader className="px-4 pt-3 pb-0 sm:px-5">
-            <Skeleton className="h-4 w-56 max-w-full" />
-          </CardHeader>
-          <CardContent className="space-y-3 px-4 pt-3 pb-5 sm:px-5">
-            {Array.from({ length: RANKING_LIMIT }, (_, index) => (
-              <div key={index} className="space-y-1.5">
-                <div className="flex items-start gap-3">
-                  <Skeleton className="mt-0.5 h-4 w-5" />
-                  <Skeleton className="h-8 flex-1" />
-                  <Skeleton className="h-4 w-16" />
-                </div>
-                <Skeleton className="ml-8 h-1.5 w-[70%] rounded-full" />
-              </div>
-            ))}
-          </CardContent>
-        </Card>
-      </section>
+    <div className="min-w-0 space-y-6">
+      {ledger === "all" ? (
+        <div className="flex items-center gap-2.5 rounded-[10px] border border-[color:var(--data-series-indigo)]/25 bg-[color:var(--data-series-indigo)]/10 px-3.5 py-2.5 text-xs text-muted-foreground">
+          <Info className="size-3.5 shrink-0 text-[color:var(--data-series-indigo)]" />
+          <span>
+            {t("wbStats.usage.sessions.gatewayMissing")}
+            {" · "}
+            <button
+              type="button"
+              onClick={() => onSwitchLedger("gateway")}
+              className="cursor-pointer border-b border-dotted border-current text-[color:var(--data-series-indigo)] hover:text-foreground"
+            >
+              {t("wbStats.usage.sessions.jumpGateway")}
+            </button>
+          </span>
+        </div>
+      ) : null}
+      <StatTiles tiles={tiles} ariaLabel={t("wbStats.usage.view.sessions")} />
+      <div className="grid min-w-0 gap-6 lg:grid-cols-2">
+        <ChartFrame
+          title={t("wbStats.usage.sessions.rankTitle")}
+          caption={capNote ?? `${exactTokens(points.length)} · ${compactTokens(total)}`}
+          ariaLabel={t("wbStats.usage.sessions.rankTitle")}
+          exportable={false}
+        >
+          <SessionRanking points={visible} />
+        </ChartFrame>
+        <ChartFrame
+          title={t("wbStats.usage.sessions.scatterTitle")}
+          caption={`${scatterAxisCaption(t)} · ${t("wbStats.usage.sessions.scatterDesc")}${capNote ? ` · ${capNote}` : ""}`}
+          ariaLabel={t("wbStats.usage.sessions.scatterAria")}
+        >
+          <SessionScatter points={visible} />
+        </ChartFrame>
+      </div>
     </div>
   );
 }
 
-export default function TokenStatsPage() {
-  const [stats, setStats] = useState<TokenStatistics | null>(null);
-  const [region, setRegion] = useState<RegionFilter>(readPreferredRegion);
-  const [active, setActive] = useState<SourceKey>(readPreferredTokenSource);
-  const [loading, setLoading] = useState(true);
+/* ────────────────────────────── 页面 ────────────────────────────── */
+
+export default function TokenStatsPage({
+  view = "trend",
+  viewWindow,
+  combineAll,
+  onViewWindowChange,
+  ledger = "all",
+  onLedgerChange,
+}: { view?: TokenUsageView; ledger?: UsageLedger; onLedgerChange?: (next: UsageLedger) => void } & UsageViewProps) {
+  const t = useT();
+  /* P1：`cn` / `global` 统一走 `useScope`（URL 优先 + localStorage 记忆）。
+     ⚠️ 只取值、不取 setter —— 切区域的动作在**侧栏**（`ScopeSwitch`），页内不再有区域选择器。 */
+  const [scopeRegion] = useScope("workbuddy");
+  const region: RegionFilter = combineAll ? "all" : scopeRegion;
+  const [stats, setStats] = useState<TokenStatistics | null>(() => statisticsCache[region] ?? null);
+  const [loading, setLoading] = useState(() => !statisticsCache[region]);
   const [error, setError] = useState<string | null>(null);
   const [reload, setReload] = useState(0);
-  const t = useT();
+  /* 三处「重试 / 刷新」出口（错误 Alert、两种空态）共用同一个 reload 触发 ⇒ 共用一个实例。 */
+  const { busy: reloadBusy, run: runReload } = useRefreshAction();
+  /* ★ 慢加载提示（issue #188）：统计页一次拉整本流水，是最容易「等很久又看不出在等」的一页。
+     8s 仍在骨架态就加一行提示 + 重试（复用错误分支的 reload 出口，不另造一套）。 */
+  const slowLoading = useSlowLoading(loading);
+  const [gatewayTrend, setGatewayTrend] = useState<GatewayTokenTrend | null>(
+    () => gatewayTrendCache.get(region) ?? null,
+  );
+  /* 账本（issue #63）：三维度历史 + 今日对账。两者都与统计**并行**取，
+     单区失败只让该区缺席（渐进增强，不弹错噪屏）。 */
+  const [dim, setDim] = useState<GatewayUsageDim | null>(null);
+  const [recon, setRecon] = useState<GatewayUsageRecon | null>(null);
+  const [reconOpen, setReconOpen] = useState(false);
 
   // region 是页面级数据源：切换即重新取数；旧结果保留到新结果返回，避免闪白。
   useEffect(() => {
@@ -1302,7 +699,9 @@ export default function TokenStatsPage() {
     api
       .getTokenStatistics(undefined, region)
       .then((result) => {
-        if (!disposed) setStats(result);
+        if (disposed) return;
+        statisticsCache[region] = result;
+        setStats(result);
       })
       .catch((cause) => {
         if (!disposed) setError(api.asError(cause));
@@ -1310,94 +709,92 @@ export default function TokenStatsPage() {
       .finally(() => {
         if (!disposed) setLoading(false);
       });
+    /* 网关逐日趋势与统计**并行**取（互不依赖）：单 region 命令，`all` 时前端分区取再合并
+       （与 `mergeSources` 同哲学）。单区失败只让该区缺席（`.catch(() => null)`）——
+       整条失败 ⇒  trend 为 null ⇒ 网关小图不渲染（渐进增强，不弹错噪屏）。
+       ⚠️ 老服务端没有这条路由时会 404：同样按「不出图」处理，不影响主统计。 */
+    const gatewayRegions: Region[] = region === "all" ? ["cn", "global"] : [region];
+    Promise.all(
+      gatewayRegions.map((gatewayRegion) =>
+        api.getGatewayTokenTrend(gatewayRegion).catch(() => null),
+      ),
+    )
+      .then((results) => {
+        if (disposed) return;
+        const merged = mergeGatewayTrends(results);
+        gatewayTrendCache.set(region, merged);
+        setGatewayTrend(merged);
+      })
+      .catch(() => {
+        if (!disposed) setGatewayTrend(null);
+      });
+    /* 三维度历史：与趋势同源（`token_daily`），但它是**模型 / 账号 / 端点**的拆分。
+       `all` 时分区取再合并（与 `mergeGatewayTrends` 同哲学）。 */
+    Promise.all(
+      gatewayRegions.map((gatewayRegion) => api.getGatewayUsageDim(gatewayRegion).catch(() => null)),
+    )
+      .then((results) => {
+        if (!disposed) setDim(mergeDims(results));
+      })
+      .catch(() => {
+        if (!disposed) setDim(null);
+      });
+    /* 对账：只覆盖今日（网关日志是环形窗口）。`all` 时两区各对一次再合并。 */
+    Promise.all(
+      gatewayRegions.map((gatewayRegion) => api.getUsageReconcile(gatewayRegion).catch(() => null)),
+    )
+      .then((results) => {
+        if (!disposed) setRecon(mergeRecons(results));
+      })
+      .catch(() => {
+        if (!disposed) setRecon(null);
+      });
     return () => {
       disposed = true;
     };
   }, [region, reload]);
 
-  useEffect(() => {
-    persistPreferredRegion(region);
-  }, [region]);
-
-  // 当前 region 下可见的来源（按固定展示顺序）。后端已按范围返回对应 sources，
-  // 这里再兜底，保证旧后端 / 异常响应下也不会超出该范围的来源集合。
-  const visibleSources = useMemo(() => {
-    const present = new Set((stats?.sources ?? []).map((item) => item.source));
-    // 网关桶跨两版共用一份文件（桶自带 realm），在任一 region 视图下都可见。
-    const allowed =
-      region === "global"
-        ? SOURCE_ORDER.filter((key) => key === "workbuddy-ai" || key === "workbuddy-gateway")
-        : region === "cn"
-          ? SOURCE_ORDER.filter((key) => key !== "workbuddy-ai")
-          : SOURCE_ORDER;
-    return allowed.filter((key) => present.has(key));
-  }, [region, stats]);
-
-  // 选中的来源在新 region 下不可见时自动回退到该 region 的首个合法来源，避免空白页。
-  useEffect(() => {
-    if (visibleSources.length === 0) return;
-    const next = visibleSources.includes(active)
-      ? active
-      : visibleSources.includes("workbuddy")
-        ? "workbuddy"
-        : visibleSources[0];
-    if (next !== active) setActive(next);
-  }, [active, visibleSources]);
-
-  const source = stats?.sources.find((item) => item.source === active);
+  const source = useMemo(() => (stats ? mergeSources(workbuddyClientSources(stats.sources)) : null), [stats]);
+  const hasSource = (stats?.sources.length ?? 0) > 0;
+  /* 网关用量（`gatewayTrend`，扫 `gateway_logs`）是客户端（扫 `projects/*.jsonl`）
+     之外的另一条记录源，按窗口取。 */
+  const gatewayInWindow = useMemo(() => {
+    const keys = new Set(calendarWindowKeys(viewWindow));
+    return (gatewayTrend?.days ?? []).reduce(
+      (sum, day) => (keys.has(day.key) ? sum + day.total : sum),
+      0,
+    );
+  }, [gatewayTrend, viewWindow]);
+  /**
+   * 有来源但**两个数据源都翻不出用量** ⇒ 整页空态（区分于「被视图参数筛没」，后者在视图内处理）。
+   *
+   * ⚠️ 两侧口径**故意不对称**，勿强行统一：
+   * - 网关侧按窗口判：`gatewayTrend` 含 90 天落库历史，不筛窗会把窗外历史算成
+   *   「有数据」，而当前窗口其实为空。
+   * - 客户端侧按全量判：`getTokenStatistics` 未按窗口传参（`days` 缺省 ⇒ 后端
+   *   不加 cutoff），窗口内被筛没的由各视图自行展示 ⇒ 这里只需「有没有任何来源
+   *   记录」来决定是否渲染页面，避免空态把可能有值的视图整片吞掉。 */
+  const clientHasRecords = (source?.summary.records ?? 0) > 0;
+  const trulyEmpty = Boolean(source) && !clientHasRecords && gatewayInWindow === 0;
 
   return (
-    <div className="mx-auto w-full max-w-[1180px] min-w-0 px-4 py-6 sm:px-8 sm:py-9">
-      <header className="mb-4 flex min-w-0 flex-wrap items-start justify-between gap-4 sm:mb-5">
-        <div className="min-w-0">
-          {loading && !stats ? (
-            <div aria-hidden="true">
-              <Skeleton className="h-8 w-40" />
-              <Skeleton className="mt-2 h-5 w-64 max-w-full" />
-            </div>
-          ) : (
-            <>
-              <h1 className="text-[28px] font-semibold tracking-tight">{t("wbStats.token.pageTitle")}</h1>
-              <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
-                {t("wbStats.token.updatedPrefix")} {stats ? formatDateTime(stats.generatedAt) : "—"}
-                {region === "all" && t("wbStats.token.bothRegions")}
-              </p>
-            </>
-          )}
-        </div>
-        <div className="flex max-w-full flex-wrap items-center justify-end gap-2">
-          <DemoAction>
-            <Button
-              className="shrink-0"
-              variant="outline"
-              size="sm"
-              onClick={() => setReload((value) => value + 1)}
-              disabled={loading}
-            >
-              {loading ? <Loader2 className="animate-spin" /> : <RefreshCw />}
-              {t("wbStats.token.refresh")}
-            </Button>
-          </DemoAction>
-        </div>
-      </header>
-
-      {/* 层级 1：统计范围（决定数据源，全页共享） */}
-      <div className="mb-9 border-b pb-4 sm:mb-11">
-        <RegionBar
-          value={region}
-          onChange={setRegion}
-          disabled={loading}
-          ariaLabel={t("wbStats.token.scopeAria")}
-        />
-      </div>
-
+    /* ⚠️ 页头 / 子 Tab / **视图参数条**都由**上层** `UsagePage` 统一渲染
+       （原型 `viewUsage` 只有一个「用量」页头、一条参数条）⇒ 本页只渲染视图内容。
+       `view` 决定画趋势 / 模型 / 会话哪一个。 */
+    <div className="min-w-0">
       {error && (
         <Alert variant="destructive" className="mb-5">
           <CircleAlert />
           <AlertTitle>{t("wbStats.token.loadFailed")}</AlertTitle>
           <AlertDescription className="flex flex-wrap items-center gap-3">
             <span>{error}</span>
-            <Button size="sm" variant="outline" onClick={() => setReload((value) => value + 1)}>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={reloadBusy}
+              onClick={() => void runReload(() => setReload((value) => value + 1))}
+            >
+              {reloadBusy ? <Loader2 className="animate-spin" /> : <RefreshCw />}
               {t("wbStats.token.retry")}
             </Button>
           </AlertDescription>
@@ -1405,45 +802,89 @@ export default function TokenStatsPage() {
       )}
 
       {loading && !stats ? (
-        <TokenStatsLoadingSkeleton />
-      ) : stats ? (
-        <div className="min-w-0 space-y-5">
-          {/* 层级 2：来源切片（作用于当前范围已选定的数据） */}
-          {visibleSources.length > 0 && (
-            <Tabs
-              className="min-w-0 gap-0"
-              value={active}
-              onValueChange={(value) => {
-                if (!isSourceKey(value)) return;
-                if (!visibleSources.includes(value)) return;
-                setActive(value);
-                persistPreferredTokenSource(value);
-              }}
-            >
-              <TabsList className="h-auto max-w-full flex-wrap" aria-label={t("wbStats.token.sourceAria")}>
-                {visibleSources.map((key) => (
-                  <TabsTrigger key={key} className="max-w-full whitespace-normal" value={key}>
-                    {SOURCE_LABELS[key]}
-                  </TabsTrigger>
-                ))}
-              </TabsList>
-            </Tabs>
-          )}
-          {source ? (
-            <Dashboard source={source} />
-          ) : (
-            <div className="rounded-xl border border-dashed px-4 py-16 text-center text-sm text-muted-foreground">
-              {t("wbStats.token.noSource", { scope: regionFilterLabel(region) })}
-            </div>
-          )}
+        <div className="space-y-4" aria-busy="true">
+          {slowLoading ? (
+            <SlowLoadHint
+              onRetry={() => void runReload(() => setReload((value) => value + 1))}
+              retrying={reloadBusy}
+            />
+          ) : null}
+          <Skeleton className="h-24 w-full" />
+          <Skeleton className="h-64 w-full" />
+          <Skeleton className="h-40 w-full" />
         </div>
+      ) : !hasSource || !source ? (
+        <EmptyState
+          icon={CircleAlert}
+          title={t("wbStats.usage.empty.noSource")}
+          description={t("wbStats.usage.empty.noSourceHint")}
+          action={
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={reloadBusy}
+              onClick={() => void runReload(() => setReload((value) => value + 1))}
+            >
+              {reloadBusy ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+              {t("wbStats.usage.empty.refresh")}
+            </Button>
+          }
+        />
+      ) : trulyEmpty ? (
+        <EmptyState
+          icon={MessagesSquare}
+          title={t("wbStats.usage.empty.noData")}
+          description={t("wbStats.usage.empty.noDataHint")}
+          action={
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={reloadBusy}
+              onClick={() => void runReload(() => setReload((value) => value + 1))}
+            >
+              {reloadBusy ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+              {t("wbStats.usage.empty.refresh")}
+            </Button>
+          }
+        />
+      ) : view === "models" ? (
+        <ModelsView
+          source={source}
+          viewWindow={viewWindow}
+          dim={dim}
+          ledger={ledger}
+          onRefresh={() => setReload((value) => value + 1)}
+        />
+      ) : view === "keys" ? (
+        <KeysView
+          dim={dim}
+          window={viewWindow}
+          selfScope="wb"
+          loadNames={loadWbKeyNames}
+        />
+      ) : view === "sessions" ? (
+        <SessionsView
+          source={source}
+          viewWindow={viewWindow}
+          dim={dim}
+          ledger={ledger}
+          onViewWindowChange={onViewWindowChange}
+          onRefresh={() => setReload((value) => value + 1)}
+          onSwitchLedger={() => onLedgerChange?.("gateway")}
+        />
       ) : (
-        !error && (
-          <div className="rounded-xl border border-dashed px-4 py-16 text-center text-sm text-muted-foreground">
-            {t("wbStats.token.noStats")}
-          </div>
-        )
+        <TrendView
+          source={source}
+          viewWindow={viewWindow}
+          onViewWindowChange={onViewWindowChange}
+          gatewayTrend={gatewayTrend}
+          dim={dim}
+          recon={recon}
+          ledger={ledger}
+          onReconcile={() => setReconOpen(true)}
+        />
       )}
+      <ReconcileSheet open={reconOpen} onOpenChange={setReconOpen} recon={recon} />
     </div>
   );
 }

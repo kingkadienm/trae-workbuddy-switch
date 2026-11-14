@@ -54,9 +54,9 @@ pub fn valid_app_version(value: &str) -> bool {
     if parts.len() < 2 || parts.len() > 4 {
         return false;
     }
-    parts.iter().all(|part| {
-        !part.is_empty() && part.len() <= 6 && part.bytes().all(|b| b.is_ascii_digit())
-    })
+    parts
+        .iter()
+        .all(|part| !part.is_empty() && part.len() <= 6 && part.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// 校验 CLI 版本是否可安全拼进 header（允许 `-rc.1` 之类预发布后缀）。
@@ -130,16 +130,33 @@ pub fn app_version_cache_file(region: Region) -> std::path::PathBuf {
     store_dir().join(format!("app_version.{}.json", region.as_str()))
 }
 
-/// 从 `Info.plist` 读 `CFBundleShortVersionString`（macOS）。
-pub fn read_bundle_version(plist_path: &Path) -> Option<String> {
+/// 从 `Info.plist` 读 `<key>…</key>` 后面紧跟的 `<string>…</string>` 值（macOS）。
+///
+/// [`read_bundle_version`] 与 [`read_bundle_executable`] 共用这一份，避免两处 plist 读法漂移。
+fn read_plist_string(plist_path: &Path, key: &str) -> Option<String> {
     let text = std::fs::read_to_string(plist_path).ok()?;
-    let key = "<key>CFBundleShortVersionString</key>";
-    let start = text.find(key)? + key.len();
+    let needle = format!("<key>{key}</key>");
+    let start = text.find(&needle)? + needle.len();
     let rest = &text[start..];
     let open = rest.find("<string>")? + "<string>".len();
     let close = rest[open..].find("</string>")? + open;
-    let version = rest[open..close].trim();
-    valid_app_version(version).then(|| version.to_string())
+    Some(rest[open..close].trim().to_string())
+}
+
+/// 从 `Info.plist` 读 `CFBundleShortVersionString`（macOS）。
+pub fn read_bundle_version(plist_path: &Path) -> Option<String> {
+    let version = read_plist_string(plist_path, "CFBundleShortVersionString")?;
+    valid_app_version(&version).then_some(version)
+}
+
+/// 从 `Info.plist` 读 `CFBundleExecutable` —— `.app` 内可执行体的名称（macOS）。
+///
+/// 该键与包名**不同**：Electron 的可执行体名由 plist 声明。实测两个 WorkBuddy
+/// bundle 均为 `Electron`，按包名拼接得到的路径不存在，且该错误表现为
+/// 「客户端未安装」而非「启动失败」。见 [`crate::modules::at_rest::client_executable_for`]。
+pub fn read_bundle_executable(plist_path: &Path) -> Option<String> {
+    let name = read_plist_string(plist_path, "CFBundleExecutable")?;
+    (!name.is_empty()).then_some(name)
 }
 
 /// macOS App bundle 根目录（系统级优先，其次用户级）。
@@ -350,6 +367,105 @@ mod tests {
     fn resolve_chat_identity_never_panics_and_is_valid() {
         let identity = resolve_chat_identity(Region::Cn);
         assert!(valid_app_version(&identity.client_version));
-        assert!(chat_user_agent(Region::Cn, &identity.client_version, identity.cli_version.as_deref()).is_ok());
+        assert!(chat_user_agent(
+            Region::Cn,
+            &identity.client_version,
+            identity.cli_version.as_deref()
+        )
+        .is_ok());
+    }
+
+    /// 构造仅含 plist 的临时 `.app`，返回 `(临时根目录, bundle 路径, plist 路径)`。
+    fn fake_bundle(
+        plist_body: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "buddy-switch-plist-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let bundle = root.join("WorkBuddy AI.app");
+        let plist = bundle.join("Contents").join("Info.plist");
+        std::fs::create_dir_all(plist.parent().expect("parent")).expect("create bundle");
+        std::fs::write(&plist, plist_body).expect("write plist");
+        (root, bundle, plist)
+    }
+
+    /// 真实 `Info.plist` 的最小形态。Electron 客户端的可执行体名与包名不同。
+    const REAL_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+	<key>CFBundleExecutable</key>
+	<string>Electron</string>
+	<key>CFBundleShortVersionString</key>
+	<string>5.8.4</string>
+	<key>CFBundleName</key>
+	<string>WorkBuddy AI</string>
+</dict>
+</plist>
+"#;
+
+    #[test]
+    fn read_plist_string_reads_the_value_right_after_its_key() {
+        let (root, _bundle, plist) = fake_bundle(REAL_PLIST);
+        assert_eq!(
+            read_plist_string(&plist, "CFBundleExecutable").as_deref(),
+            Some("Electron")
+        );
+        assert_eq!(
+            read_plist_string(&plist, "CFBundleShortVersionString").as_deref(),
+            Some("5.8.4")
+        );
+        // 键缺失与文件缺失均返回 None，不 panic。
+        assert!(read_plist_string(&plist, "CFBundleIdentifier").is_none());
+        assert!(
+            read_plist_string(&plist.with_extension("missing"), "CFBundleExecutable").is_none()
+        );
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// 回归：可执行体名取自 plist，不按包名推断。
+    ///
+    /// 可证伪：`read_bundle_executable` 改为返回包名时，第一条断言得到 `WorkBuddy AI`。
+    #[test]
+    fn read_bundle_executable_does_not_assume_the_bundle_name() {
+        let (root, bundle, plist) = fake_bundle(REAL_PLIST);
+        let name = read_bundle_executable(&plist).expect("应能读出可执行体名");
+        assert_eq!(name, "Electron");
+        assert_ne!(
+            name,
+            bundle.file_stem().expect("stem").to_string_lossy(),
+            "可执行体名与包名不同，按包名拼会得到一个不存在的路径"
+        );
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn read_bundle_executable_rejects_blank_and_missing_key() {
+        let (root, _bundle, plist) = fake_bundle(
+            "<plist><dict><key>CFBundleExecutable</key><string>  </string></dict></plist>",
+        );
+        assert!(
+            read_bundle_executable(&plist).is_none(),
+            "空白名不得当成有效值"
+        );
+        let (root2, _bundle2, plist2) = fake_bundle("<plist><dict></dict></plist>");
+        assert!(read_bundle_executable(&plist2).is_none());
+        std::fs::remove_dir_all(root).expect("cleanup");
+        std::fs::remove_dir_all(root2).expect("cleanup");
+    }
+
+    /// `read_bundle_version` 改成走共用解析后，行为必须与改动前逐字一致。
+    #[test]
+    fn read_bundle_version_keeps_its_validation_after_sharing_the_parser() {
+        let (root, _bundle, plist) = fake_bundle(REAL_PLIST);
+        assert_eq!(read_bundle_version(&plist).as_deref(), Some("5.8.4"));
+        std::fs::remove_dir_all(root).expect("cleanup");
+
+        // 非法版本仍由 `valid_app_version` 拦截，共用解析不得放行。
+        let (root2, _bundle2, plist2) = fake_bundle(
+            "<plist><dict><key>CFBundleShortVersionString</key><string>not-a-version</string></dict></plist>",
+        );
+        assert!(read_bundle_version(&plist2).is_none());
+        std::fs::remove_dir_all(root2).expect("cleanup");
     }
 }

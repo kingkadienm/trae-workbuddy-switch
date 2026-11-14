@@ -22,7 +22,7 @@
  * 用法：
  *   node scripts/gen-icons.mjs [源图路径]
  *   node scripts/gen-icons.mjs D:/path/to/logo.png
- *   （默认源图：pic/logo.png）
+ *   （默认源图：docs/images/brand/logo.png）
  *
  * 依赖：Node（本项目自带）+ Pillow（`python -m pip install Pillow`）。
  * 可用 BUDDY_SWITCH_PYTHON 指定解释器路径。
@@ -107,7 +107,7 @@ function resolvePython() {
 
 function main() {
   // ---------- 1. 校验输入 ----------
-  const input = path.resolve(process.argv[2] ?? path.join(ROOT, "pic", "logo.png"));
+  const input = path.resolve(process.argv[2] ?? path.join(ROOT, "docs", "images", "brand", "logo.png"));
   if (!existsSync(input)) fail(`源图不存在：${input}`);
 
   const size = readPngSize(input);

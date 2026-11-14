@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { ExternalLink, Rocket } from "lucide-react";
+import { Check, Copy, Loader2, Rocket, TriangleAlert } from "lucide-react";
 
+import { AuthLinkPanel } from "@/components/auth-link-panel";
 import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -12,6 +14,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import * as api from "@/lib/api";
+import { closeAuthPage, openAuthPage } from "@/lib/auth-open";
 import { useT } from "@/lib/i18n";
 import { traeVariantLabel, type TraeAccount } from "@/lib/trae-types";
 import { useTraeVariant } from "@/lib/use-trae-variant";
@@ -27,12 +30,6 @@ import { useTraeVariant } from "@/lib/use-trae-variant";
 const TRAE_OAUTH_FRONTEND_TIMEOUT_SECONDS = 310;
 
 /** 把剩余秒数格式化为 `M:SS`（如 272 → `4:32`）。 */
-function formatRemaining(totalSeconds: number): string {
-  const safe = Math.max(0, Math.floor(totalSeconds));
-  const minutes = Math.floor(safe / 60);
-  const seconds = safe % 60;
-  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
-}
 
 /**
  * Trae OAuth 登录（浏览器授权 + 本地回调监听）。
@@ -56,9 +53,16 @@ interface Props {
   onOpenChange: (open: boolean) => void;
   /** 登录成功后的回调（父级据此刷新账号列表）。 */
   onSuccess?: (account: TraeAccount) => void;
+  /**
+   * 本机没有该产品线的客户端（issue #62）。
+   *
+   * 有客户端时只需「端口转发」；没有客户端时还缺 icube 设备私钥，
+   * 必须额外说清「把 storage.json 拷过来」这条路 —— 少这句用户会以为是网络问题。
+   */
+  clientless?: boolean;
 }
 
-export function TraeOAuthLoginDialog({ open, onOpenChange, onSuccess }: Props) {
+export function TraeOAuthLoginDialog({ open, onOpenChange, onSuccess, clientless }: Props) {
   /**
    * 当前产品线 —— **与页面同源**（`?line=` 承载，见 `useTraeVariant`）。
    *
@@ -72,6 +76,10 @@ export function TraeOAuthLoginDialog({ open, onOpenChange, onSuccess }: Props) {
    */
   const [variant] = useTraeVariant();
   const variantLabel = traeVariantLabel(variant);
+  /** 授权窗的命名键（仅用于 label / 诊断）：每次点「登录」都会开一个新窗口。 */
+  const authKey = `trae-${variant}`;
+  /** 本次授权窗的 label（关窗凭据）；不能用 authKey 关窗。 */
+  const authLabelRef = useRef<string | null>(null);
   const t = useT();
   const [busy, setBusy] = useState(false);
   const [loginId, setLoginId] = useState<string | null>(null);
@@ -83,10 +91,13 @@ export function TraeOAuthLoginDialog({ open, onOpenChange, onSuccess }: Props) {
   const [launching, setLaunching] = useState(false);
   /** 启动客户端的结果提示（成功说清「还要再点一次登录」，失败说清原因）。 */
   const [launchNote, setLaunchNote] = useState("");
-  /** 剩余等待秒数（`null` 表示尚未进入等待态）。 */
-  const [remaining, setRemaining] = useState<number | null>(null);
-  /** 本次登录是否走了合成设备身份（本机无客户端 → 纯网页模式，见 `webMode`）。 */
+  /** 授权链接有效期（后端 `expiresIn`）—— 倒计时由 `AuthLinkPanel` 统一显示。 */
   const [webMode, setWebMode] = useState(false);
+  const [expiresIn, setExpiresIn] = useState<number | null>(null);
+  /** 手工粘贴的回调链接（远程部署：回调打不回本机 17388 时用）。 */
+  const [callbackUrl, setCallbackUrl] = useState("");
+  const [callbackBusy, setCallbackBusy] = useState(false);
+  const [callbackError, setCallbackError] = useState("");
   /**
    * 是否已到前端超时。
    *
@@ -138,10 +149,20 @@ export function TraeOAuthLoginDialog({ open, onOpenChange, onSuccess }: Props) {
       setPort(null);
       setError("");
       setResult(null);
-      setRemaining(null);
+      setExpiresIn(null);
       setWebMode(false);
+      setCallbackUrl("");
+      setCallbackError("");
+      setCallbackBusy(false);
       timedOutRef.current = false;
     }
+  }, [open]);
+
+  /* 用户关掉弹窗 = 放弃这次登录 ⇒ 把授权窗一起收掉，别留孤儿窗口。 */
+  useEffect(() => {
+    if (open) return;
+    void closeAuthPage(authLabelRef.current);
+    authLabelRef.current = null;
   }, [open]);
 
   // 轮询登录结果
@@ -168,6 +189,10 @@ export function TraeOAuthLoginDialog({ open, onOpenChange, onSuccess }: Props) {
           // **先落定、再改界面**：此后任何 effect 重跑都会在入口处直接返回，
           // 不会再发第二次轮询（终端态只能被读一次）。
           settledRef.current = true;
+          /* 令牌已经由后端回调/轮询取回 ⇒ 授权窗的使命结束（不关会挡住主窗口，
+             也会让用户以为「还在等」）。 */
+          void closeAuthPage(authLabelRef.current);
+          authLabelRef.current = null;
           if (res.account) {
             // 同时校 `!timedOutRef.current`：若后端耗时超过前端 310s 才成功
             // （慢换 token / 时钟偏移），此时界面**已经**因超时置了 error。
@@ -201,37 +226,26 @@ export function TraeOAuthLoginDialog({ open, onOpenChange, onSuccess }: Props) {
     };
     // 依赖里**只有**决定会话身份的两个值。`onSuccess` 走 ref（见 `onSuccessRef`），
     // 放进依赖会让父级每次重渲染都重跑本 effect —— 那正是本次修掉的缺陷。
-  }, [open, loginId]);
+  }, [authKey, open, loginId]);
 
-  // 前端独立倒计时与超时：会话开始时起算，超时后给明确文案并停轮询。
+  // 前端独立超时：会话开始时起算，到点给明确文案并停轮询。
+  //
+  // ★ 只留一个 `setTimeout`，不再维护「每秒 tick 的剩余秒数」：
+  //   倒计时现在由 `AuthLinkPanel` 按后端 `expiresIn` 显示，
+  //   两个倒计时会各走各的（面板说还剩 3 分钟、这里已经超时），
+  //   而这里真正需要的只是「到点判定一次」。
   useEffect(() => {
-    // 同轮询 effect：关闭弹窗后 `loginId` 仍非空，若不校 `open`，
-    // 倒计时会一直 tick 到组件真正卸载。关闭即停。
+    // 同轮询 effect：关闭弹窗后 `loginId` 仍非空，若不校 `open`，定时器会活到组件卸载。
     if (!open || !loginId || result) return undefined;
-    // 起点：会话刚创建时。`timedOutRef` 保证超时只触发一次。
-    const startedAt = Date.now();
-    const deadline = startedAt + TRAE_OAUTH_FRONTEND_TIMEOUT_SECONDS * 1000;
-    setRemaining(TRAE_OAUTH_FRONTEND_TIMEOUT_SECONDS);
-
-    const tick = () => {
-      const left = Math.ceil((deadline - Date.now()) / 1000);
-      if (left <= 0) {
-        setRemaining(0);
-        if (!timedOutRef.current) {
-          timedOutRef.current = true;
-          // 超时同样是终态：一并落下"已落定"，让轮询的语义只有一个判据。
-          settledRef.current = true;
-          setError(t("trae.comp.oauth.error.timeout", { seconds: TRAE_OAUTH_FRONTEND_TIMEOUT_SECONDS - 10 }));
-        }
-        return;
-      }
-      setRemaining(left);
-    };
-
-    tick();
-    const interval = window.setInterval(tick, 1000);
-    return () => window.clearInterval(interval);
-  }, [open, loginId, result]);
+    const timer = window.setTimeout(() => {
+      if (timedOutRef.current) return;
+      timedOutRef.current = true;
+      // 超时同样是终态：一并落下「已落定」，让轮询的语义只有一个判据。
+      settledRef.current = true;
+      setError(t("trae.comp.oauth.error.timeout", { seconds: TRAE_OAUTH_FRONTEND_TIMEOUT_SECONDS - 10 }));
+    }, TRAE_OAUTH_FRONTEND_TIMEOUT_SECONDS * 1000);
+    return () => window.clearTimeout(timer);
+  }, [open, loginId, result, t]);
 
   /**
    * 关闭对话框：先取消会话再交给父级。
@@ -282,15 +296,23 @@ export function TraeOAuthLoginDialog({ open, onOpenChange, onSuccess }: Props) {
     // 直接跳过轮询，新会话永远等不到结果。
     timedOutRef.current = false;
     settledRef.current = false;
-    setRemaining(null);
     try {
       const res = await api.traeOAuthStart(variant);
       setLoginId(res.loginId);
       setUri(res.verificationUri);
       setPort(res.port);
+      setExpiresIn(res.expiresIn ?? null);
       setWebMode(res.webMode === true);
-      // 按当前宿主能力打开验证页
-      await openInBrowser(res.verificationUri);
+      // 按公共设置打开验证页：桌面端默认内嵌授权窗，失败自动退回系统浏览器。
+      // 打开失败**不是登录失败**（链接与二维码在弹窗里，远程部署照常可用）。
+      // ★ 每次发起都开新窗：先关掉上一轮残留的那个。
+      void closeAuthPage(authLabelRef.current);
+      authLabelRef.current = null;
+      void openAuthPage(authKey, res.verificationUri)
+        .then((label) => {
+          authLabelRef.current = label;
+        })
+        .catch(() => {});
     } catch (e) {
       setError(api.asError(e));
     } finally {
@@ -317,6 +339,33 @@ export function TraeOAuthLoginDialog({ open, onOpenChange, onSuccess }: Props) {
     setPort(null);
     setResult(null);
     await start();
+  }
+
+  /**
+   * 手工提交回调链接（远程部署，issue #62）。
+   *
+   * 与轮询不同：失败**必须**显示出来（`api.traeOAuthSubmitCallback` 会抛错），
+   * 用户此刻正盯着这个动作，静默等待只会被当成「卡住」。
+   */
+  async function submitCallback() {
+    if (!loginId) return;
+    const url = callbackUrl.trim();
+    if (!url) {
+      setCallbackError(t("trae.comp.oauth.pasteCallback.placeholder", { port: port ?? 17388 }));
+      return;
+    }
+    setCallbackBusy(true);
+    setCallbackError("");
+    try {
+      const account = await api.traeOAuthSubmitCallback(loginId, url);
+      settledRef.current = true;
+      setResult(account);
+      onSuccessRef.current?.(account);
+    } catch (e) {
+      setCallbackError(api.asError(e));
+    } finally {
+      setCallbackBusy(false);
+    }
   }
 
   return (
@@ -354,47 +403,42 @@ export function TraeOAuthLoginDialog({ open, onOpenChange, onSuccess }: Props) {
         )}
 
         {loginId && !result && !error && (
-          <div className="space-y-3">
-            <Alert>
-              <ExternalLink className="size-4" />
-              <AlertDescription className="break-all">
-                <a
-                  href={uri}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="text-primary underline-offset-2 hover:underline"
-                  onClick={(e) => {
-                    // WebUI 直接使用浏览器默认链接行为，确保即使自动弹窗被拦截
-                    // 也能通过用户点击打开验证页。
-                    if (api.isWebui()) return;
-                    e.preventDefault();
-                    void openInBrowser(uri);
-                  }}
-                >
-                  {uri}
-                </a>
-              </AlertDescription>
-            </Alert>
-            <p className="text-sm text-muted-foreground">
-              {t("trae.comp.oauth.waiting")}
-              {remaining !== null && (
-                <span className="ml-1 text-xs">{t("trae.comp.oauth.remaining", { time: formatRemaining(remaining) })}</span>
-              )}
-            </p>
-            {/* 显式展示回调地址与端口。
-                端口是**固定的 17388**（见 Rust 侧 `oauth::CALLBACK_PORT`）：Trae 授权页
-                在「认证中」阶段会探测这个固定端口判断客户端在线，随机端口会让它永远探不到。
-                把地址摆出来是因为「授权页探得到、但没把回调打回来」这种情况只能靠它排查。 */}
-            {port !== null && (
-              <p className="text-xs text-muted-foreground break-all">
-                {t("trae.comp.oauth.callback")}
-                <code>http://127.0.0.1:{port}/authorize</code>
+          <AuthLinkPanel url={uri} expiresIn={expiresIn} status="waiting">
+            <TraeRemoteNote port={port} clientless={clientless} />
+            {/* 端口转发之外的第二条路：把地址栏整串贴回来，由服务端补完兑换。 */}
+            <div className="flex flex-col gap-2 rounded-[11px] border border-border bg-card-2 p-3">
+              <b className="text-[12px] font-semibold">{t("trae.comp.oauth.pasteCallback.title")}</b>
+              <p className="text-[11px] leading-relaxed text-muted-foreground">
+                {t("trae.comp.oauth.pasteCallback.hint", { port: port ?? 17388 })}
               </p>
-            )}
-            {webMode && (
-              <p className="text-xs text-muted-foreground">{t("trae.comp.oauth.webMode")}</p>
-            )}
-          </div>
+              <div className="flex items-center gap-2">
+                <Input
+                  value={callbackUrl}
+                  onChange={(e) => setCallbackUrl(e.target.value)}
+                  placeholder={t("trae.comp.oauth.pasteCallback.placeholder", { port: port ?? 17388 })}
+                  spellCheck={false}
+                  autoComplete="off"
+                  className="h-8 min-w-0 flex-1 font-mono text-[11px]"
+                />
+                <Button
+                  type="button"
+                  size="sm"
+                  className="h-8 shrink-0 px-2.5 text-[11px]"
+                  disabled={callbackBusy}
+                  onClick={() => void submitCallback()}
+                >
+                  {callbackBusy ? <Loader2 className="size-3.5 animate-spin" /> : null}
+                  {callbackBusy
+                    ? t("trae.comp.oauth.pasteCallback.busy")
+                    : t("trae.comp.oauth.pasteCallback.submit")}
+                </Button>
+              </div>
+              {callbackError ? (
+                <p className="break-all text-[11px] leading-relaxed text-destructive">{callbackError}</p>
+              ) : null}
+            </div>
+            {webMode && <p className="text-xs text-muted-foreground">{t("trae.comp.oauth.webMode")}</p>}
+          </AuthLinkPanel>
         )}
 
         {result && (
@@ -467,19 +511,54 @@ export function TraeOAuthLoginDialog({ open, onOpenChange, onSuccess }: Props) {
   );
 }
 
-/** WebUI 使用浏览器新标签页，Tauri 使用系统 opener。 */
-async function openInBrowser(url: string): Promise<void> {
-  if (api.isWebui()) {
-    // 浏览器环境没有 Tauri 注入的 invoke；window.open 被拦截时由弹窗中的
-    // 原生链接作为兜底，因此这里不把拦截视为 OAuth 失败。
+/**
+ * 远程部署提示块（issue #62）—— 只在「没有客户端 / 浏览器不在本机」时才有意义。
+ *
+ * 两件事必须说清，少一件用户就会卡在「认证中」：
+ *   ① 授权页会探 `127.0.0.1:<port>`（固定 17388，见 Rust 侧 `oauth::CALLBACK_PORT`），
+ *      服务器上没有这个端口 ⇒ 给一条可直接复制的 `ssh -L`；
+ *   ② 换 token 与续期都要客户端里的 icube **设备私钥**，本机没有客户端就没有这把钥匙
+ *      ⇒ 只能把 `storage.json` 拷过来，或改用「导入备份」（备份不含私钥，续期会失败）。
+ */
+function TraeRemoteNote({ port, clientless }: { port: number | null; clientless?: boolean }) {
+  const t = useT();
+  const [copied, setCopied] = useState(false);
+  const listenPort = port ?? 17388;
+  const cmd = `ssh -L ${listenPort}:127.0.0.1:${listenPort} user@your-server`;
+
+  async function copy() {
     try {
-      window.open(url, "_blank", "noopener,noreferrer");
+      await navigator.clipboard.writeText(cmd);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1600);
     } catch {
-      // 忽略自动弹窗失败；弹窗中已展示的原生链接仍可点击。
+      // 非安全上下文里剪贴板会被拒；命令本身可选中复制。
     }
-    return;
   }
 
-  const { openUrl } = await import("@tauri-apps/plugin-opener");
-  return openUrl(url);
+  return (
+    <div className="flex flex-col gap-2 rounded-[11px] border border-dashed border-warning/45 bg-warning/5 p-3">
+      <div className="flex items-center gap-2 text-[12px] font-semibold">
+        <TriangleAlert className="size-3.5 shrink-0 text-warning" aria-hidden="true" />
+        <span>{t("trae.comp.oauth.tunnel.title", { port: listenPort })}</span>
+      </div>
+      <p className="text-[11.5px] leading-relaxed text-muted-foreground">
+        {t("trae.comp.oauth.tunnel.desc", { port: listenPort })}
+      </p>
+      <div className="flex items-center gap-2 rounded-[9px] border border-border bg-background px-2.5 py-2">
+        <code className="min-w-0 flex-1 overflow-x-auto whitespace-pre font-mono text-[11px]">{cmd}</code>
+        <Button type="button" size="sm" variant="ghost" className="h-6 shrink-0 px-2 text-[11px]" onClick={() => void copy()}>
+          {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
+          {copied ? t("trae.comp.oauth.tunnel.copied") : t("trae.comp.oauth.tunnel.copy")}
+        </Button>
+      </div>
+      {clientless ? (
+        <p className="text-[11.5px] leading-relaxed text-muted-foreground">{t("trae.comp.oauth.keyNote")}</p>
+      ) : null}
+      <p className="break-all text-[11px] text-muted-foreground">
+        {t("trae.comp.oauth.callback")}
+        <code>http://127.0.0.1:{listenPort}/authorize</code>
+      </p>
+    </div>
+  );
 }

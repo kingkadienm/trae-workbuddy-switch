@@ -15,7 +15,8 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use crate::modules::account;
 use crate::modules::codebuddy_cli;
 use crate::modules::config::{
-    add_rotate_log, load_auto_rotate_config, load_rotate_logs, now_ms, RunFlagGuard,
+    add_rotate_log, load_auto_rotate_config, load_rotate_logs, now_ms, save_auto_rotate_config,
+    RunFlagGuard,
 };
 use crate::modules::credits;
 
@@ -97,6 +98,9 @@ pub enum Decision {
 /// - `cli_recent_activity_ms`：CLI 会话最近写入时间，None 视为无会话。
 /// - `active_guard_ms`：活跃保护窗口——最近活动距今 < 该值则不切（正在用）。
 /// - `min_remaining`：目标最小剩余积分，低于则不切（默认 0 关闭）。
+#[allow(clippy::too_many_arguments)]
+// 9 个入参全是「这一次轮换决策的输入」（候选、冷却、阈值、当前时刻…），
+// 拆成结构体只会把同一批字段再抄一遍、并让调用点变长；保持扁平签名更好读。
 pub fn decide_target(
     candidates: &[Candidate],
     current_account_id: Option<&str>,
@@ -122,7 +126,7 @@ pub fn decide_target(
         if remaining_ms > min_urgency_ms {
             return Decision::Skip(format!(
                 "所有账号到期都还早（最紧迫的还剩 {} 天），无需切换",
-                remaining_ms / (24 * 3600_000)
+                remaining_ms / (24 * 3_600_000)
             ));
         }
     }
@@ -160,8 +164,8 @@ pub fn decide_target(
             if cur_ts > 0 && target_ts < cur_ts && cur_ts - target_ts < min_gap_ms {
                 return Decision::Skip(format!(
                     "目标到期仅早 {} 小时，未达切换阈值（{} 小时）",
-                    (cur_ts - target_ts) / 3600_000,
-                    min_gap_ms / 3600_000
+                    (cur_ts - target_ts) / 3_600_000,
+                    min_gap_ms / 3_600_000
                 ));
             }
         }
@@ -203,6 +207,23 @@ pub fn cli_recent_activity() -> Option<i64> {
     newest
 }
 
+/// 关掉自动轮换（issue #109 §PR-2）。
+///
+/// 切到「CLI 走本机网关」模式时必须调它：轮换的存在意义是「按积分到期择优换号」，
+/// 而网关模式下选号已经交给网关 ⇒ 轮换不但没用，每轮还会把 `settings.json` 里的
+/// **网关 Key** 覆盖成上游 token（就是 PR-1 拦的那个故障）。
+///
+/// 已经是关的 ⇒ 直接返回 `Ok(())`（幂等，不写盘）。写盘失败才报错 ——
+/// 调用方据此告诉用户「网关模式已生效，但轮换没关掉，请手动关」。
+pub fn disable_auto_rotate() -> Result<(), String> {
+    let mut cfg = load_auto_rotate_config();
+    if cfg.get("enabled").and_then(Value::as_bool) == Some(false) {
+        return Ok(());
+    }
+    cfg["enabled"] = json!(false);
+    save_auto_rotate_config(&cfg).map_err(|error| format!("关闭自动轮换失败：{error}"))
+}
+
 /// 一次轮换周期（后台定时任务 / 手动触发共用）。
 pub async fn run_rotate_cycle() -> Value {
     let Some(_guard) = RunFlagGuard::try_acquire(&ROTATE_RUNNING) else {
@@ -212,6 +233,21 @@ pub async fn run_rotate_cycle() -> Value {
     let cfg = load_auto_rotate_config();
     if cfg.get("enabled").and_then(|v| v.as_bool()) != Some(true) {
         return json!({"status": "disabled"});
+    }
+
+    // ★★ issue #109 §PR-1：CLI 已被指向**本机网关**时，选号由网关按模型决定 ——
+    // 轮换必须跳过，否则每轮都会把 `settings.json` 里的**网关 Key** 覆盖成上游 token，
+    // 于是 CLI 把上游 token 发到本机网关 ⇒ 401，且下一轮又改回去 ⇒ **时好时坏**。
+    //
+    // 放在这里（`enabled` 之后、拉积分之前）：禁用的优先级最高，而拉积分是网络请求，
+    // 既然注定跳过就不该发出去。
+    if let Some(endpoint) = codebuddy_cli::local_gateway_endpoint() {
+        return json!({
+            "status": "skipped",
+            "reason": "cli_points_to_local_gateway",
+            "endpoint": endpoint,
+            "message": "CodeBuddy CLI 已指向本机网关：选号由网关按模型决定，自动轮换已跳过（否则每轮都会覆盖网关 Key）",
+        });
     }
 
     let cooldown_minutes = cfg
@@ -262,8 +298,8 @@ pub async fn run_rotate_cycle() -> Value {
         current_id.as_deref(),
         last_switch_opt,
         cooldown_minutes * 60_000,
-        min_gap_hours * 3600_000,
-        min_urgency_hours * 3600_000,
+        min_gap_hours * 3_600_000,
+        min_urgency_hours * 3_600_000,
         cli_recent_activity(),
         active_guard_minutes * 60_000,
         min_remaining_credits,
@@ -290,7 +326,7 @@ pub async fn run_rotate_cycle() -> Value {
         }))
         .collect::<Vec<_>>());
     if let Some(id) = &current_id {
-        log["from"] = json!({"id": id, "name": cli_status.get("activeAccountName").cloned().unwrap_or_else(|| json!(null))});
+        log["from"] = json!({"id": id, "name": cli_status.get("activeAccountName").cloned().unwrap_or(json!(null))});
     }
 
     let result = match decision {
@@ -327,9 +363,9 @@ pub fn rotate_status() -> Value {
     let last_switch = LAST_SWITCH_AT.load(Ordering::SeqCst);
     json!({
         "config": cfg,
-        "cliConfigured": cli_status.get("configured").cloned().unwrap_or_else(|| json!(false)),
-        "activeAccountId": cli_status.get("activeAccountId").cloned().unwrap_or_else(|| json!(null)),
-        "activeAccountName": cli_status.get("activeAccountName").cloned().unwrap_or_else(|| json!(null)),
+        "cliConfigured": cli_status.get("configured").cloned().unwrap_or(json!(false)),
+        "activeAccountId": cli_status.get("activeAccountId").cloned().unwrap_or(json!(null)),
+        "activeAccountName": cli_status.get("activeAccountName").cloned().unwrap_or(json!(null)),
         "lastCheckAt": (last_check > 0).then_some(last_check),
         "lastSwitchAt": (last_switch > 0).then_some(last_switch),
     })
@@ -346,8 +382,8 @@ pub fn rotate_logs() -> Vec<Value> {
 mod tests {
     use super::*;
 
-    const GAP: i64 = 24 * 3600_000; // 防抖动差异阈值
-    const URG: i64 = 72 * 3600_000; // 紧迫度阈值
+    const GAP: i64 = 24 * 3_600_000; // 防抖动差异阈值
+    const URG: i64 = 72 * 3_600_000; // 紧迫度阈值
     const GUARD: i64 = 30 * 60_000; // 活跃保护窗口
 
     fn cand(id: &str, expire_at: Option<i64>, remaining: f64, valid: bool) -> Candidate {
@@ -370,8 +406,8 @@ mod tests {
     fn switches_to_most_urgent_account() {
         let now = now_ms();
         let candidates = vec![
-            cand("a", Some(now + 30 * 24 * 3600_000), 100.0, true),
-            cand("b", Some(now + 1 * 24 * 3600_000), 50.0, true),
+            cand("a", Some(now + 30 * 24 * 3_600_000), 100.0, true),
+            cand("b", Some(now + 24 * 3_600_000), 50.0, true),
         ];
         assert_eq!(
             dt(&candidates, Some("a")),
@@ -383,8 +419,8 @@ mod tests {
     fn noop_when_current_is_most_urgent() {
         let now = now_ms();
         let candidates = vec![
-            cand("a", Some(now + 1 * 24 * 3600_000), 50.0, true),
-            cand("b", Some(now + 30 * 24 * 3600_000), 100.0, true),
+            cand("a", Some(now + 24 * 3_600_000), 50.0, true),
+            cand("b", Some(now + 30 * 24 * 3_600_000), 100.0, true),
         ];
         assert_eq!(
             dt(&candidates, Some("a")),
@@ -397,9 +433,9 @@ mod tests {
         // 目标 c 比当前 a 早到期，但差异 < 24h → 不切（防抖动）
         let now = now_ms();
         let candidates = vec![
-            cand("a", Some(now + 24 * 3600_000), 50.0, true),
-            cand("b", Some(now + 22 * 3600_000), 60.0, true),
-            cand("c", Some(now + 21 * 3600_000), 70.0, true),
+            cand("a", Some(now + 24 * 3_600_000), 50.0, true),
+            cand("b", Some(now + 22 * 3_600_000), 60.0, true),
+            cand("c", Some(now + 21 * 3_600_000), 70.0, true),
         ];
         assert_eq!(
             dt(&candidates, Some("a")),
@@ -411,8 +447,8 @@ mod tests {
     fn switches_when_gap_above_threshold() {
         let now = now_ms();
         let candidates = vec![
-            cand("a", Some(now + 30 * 24 * 3600_000), 100.0, true),
-            cand("b", Some(now + 1 * 24 * 3600_000), 50.0, true),
+            cand("a", Some(now + 30 * 24 * 3_600_000), 100.0, true),
+            cand("b", Some(now + 24 * 3_600_000), 50.0, true),
         ];
         assert_eq!(
             dt(&candidates, Some("a")),
@@ -424,8 +460,8 @@ mod tests {
     fn respects_cooldown() {
         let now = now_ms();
         let candidates = vec![
-            cand("a", Some(now + 30 * 24 * 3600_000), 100.0, true),
-            cand("b", Some(now + 1 * 24 * 3600_000), 50.0, true),
+            cand("a", Some(now + 30 * 24 * 3_600_000), 100.0, true),
+            cand("b", Some(now + 24 * 3_600_000), 50.0, true),
         ];
         // 刚切过（10 分钟前），冷却 30 分钟 → 不切
         assert_eq!(
@@ -463,8 +499,8 @@ mod tests {
     fn expired_and_failed_accounts_excluded() {
         let now = now_ms();
         let candidates = vec![
-            cand("a", Some(now + 2 * 24 * 3600_000), 100.0, true),
-            cand("expired", Some(now - 1 * 3600_000), 0.0, false),
+            cand("a", Some(now + 2 * 24 * 3_600_000), 100.0, true),
+            cand("expired", Some(now - 3_600_000), 0.0, false),
             cand("failed", None, 0.0, false),
         ];
         assert_eq!(
@@ -492,8 +528,8 @@ mod tests {
         // 5 天会因毫秒级时延被 floor 成 4 天（历史 flaky 根因）。留余量后结果确定。
         let now = now_ms();
         let candidates = vec![
-            cand("a", Some(now + 6 * 24 * 3600_000 + 3600_000), 100.0, true),
-            cand("b", Some(now + 5 * 24 * 3600_000 + 3600_000), 50.0, true),
+            cand("a", Some(now + 6 * 24 * 3_600_000 + 3_600_000), 100.0, true),
+            cand("b", Some(now + 5 * 24 * 3_600_000 + 3_600_000), 50.0, true),
         ];
         assert_eq!(
             dt(&candidates, Some("a")),
@@ -505,8 +541,8 @@ mod tests {
     fn skips_when_cli_active() {
         let now = now_ms();
         let candidates = vec![
-            cand("a", Some(now + 30 * 24 * 3600_000), 100.0, true),
-            cand("b", Some(now + 1 * 24 * 3600_000), 50.0, true),
+            cand("a", Some(now + 30 * 24 * 3_600_000), 100.0, true),
+            cand("b", Some(now + 24 * 3_600_000), 50.0, true),
         ];
         // 10 分钟前有会话写入 → 活跃保护，不切
         assert_eq!(
@@ -549,8 +585,8 @@ mod tests {
     fn skips_when_target_low_remaining() {
         let now = now_ms();
         let candidates = vec![
-            cand("a", Some(now + 30 * 24 * 3600_000), 100.0, true),
-            cand("b", Some(now + 1 * 24 * 3600_000), 10.0, true),
+            cand("a", Some(now + 30 * 24 * 3_600_000), 100.0, true),
+            cand("b", Some(now + 24 * 3_600_000), 10.0, true),
         ];
         // 目标剩余 10 < 阈值 30 → 不值得切
         assert_eq!(
@@ -562,5 +598,43 @@ mod tests {
             decide_target(&candidates, Some("a"), None, 0, GAP, URG, None, GUARD, 5.0),
             Decision::Switch("b".to_string())
         );
+    }
+
+    /// ★★ issue #109 §PR-1：CLI 指向本机网关时，自动轮换必须**跳过**。
+    ///
+    /// 否则每轮都会把 `settings.json` 里的**网关 Key** 覆盖成上游 token ⇒ CLI 把上游
+    /// token 发到本机网关 ⇒ 401；下一轮又改回去 ⇒ 用户看到的是「时好时坏」，
+    /// 而且很像「API 密钥无效」。
+    ///
+    /// 变异验证：删掉 `run_rotate_cycle` 开头那段判断 ⇒ 本用例会真的去拉积分
+    /// （`credits::get_credit_expiry` 发网络请求），在离线环境里变红或超时。
+    #[tokio::test]
+    async fn rotate_skips_when_cli_points_to_the_local_gateway() {
+        let dir =
+            std::env::temp_dir().join(format!("buddy-switch-rotate-gw-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join(".buddy-switch")).unwrap();
+        std::fs::create_dir_all(dir.join(".codebuddy")).unwrap();
+        let _guard = crate::modules::config::HomeOverrideGuard::set(&dir);
+
+        std::fs::write(
+            dir.join(".buddy-switch").join("auto_rotate_config.json"),
+            json!({ "enabled": true }).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(".codebuddy").join("settings.json"),
+            json!({ "env": { "CODEBUDDY_BASE_URL": "http://127.0.0.1:57891" } }).to_string(),
+        )
+        .unwrap();
+
+        let out = run_rotate_cycle().await;
+        assert_eq!(out["status"], "skipped", "{out}");
+        assert_eq!(out["reason"], "cli_points_to_local_gateway", "{out}");
+        assert!(
+            out["endpoint"].as_str().unwrap_or("").contains("57891"),
+            "跳过时要带上命中的地址，否则用户不知道该改哪一处：{out}"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

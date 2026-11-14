@@ -1,0 +1,373 @@
+name: pr-check
+
+# PR /主干推送的**门禁**：只做「合得进main 吗」的判定，不产出任何发布物。
+# 与 `build.yml` 的职责边界必须清楚：
+#   · build.yml —— tag 触发，产出安装包 / updater 清单 / Release 资产，需要签名密钥。
+#   · pr-check.yml —— PR 触发，只需要能编过、测过、lint 过。**不碰任何 secrets**。
+# 别把两者合并：合并后 PR 上没有 updater 签名密钥，`Build desktop app` 会在
+# 编完 ~5 分钟 Rust 之后才抛「找不到私钥」，把一次格式问题的评审拖成 5 分钟等待。
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# 同一分支的新 push 取消旧 run —— 否则连推 5 次会排 5 轮完整编译。
+concurrency:
+  group: pr-check-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend typecheck + contract checks
+    runs-on: ubuntu-latest
+    # ★ 原型的**浏览器依赖**动态检查必须真的执行：ubuntu runner 自带 Chrome，
+    #   缺了就以退出码 1 判红（`verify-cc-switch-bridge.cjs` 的动态检查）。
+    #   没有这个变量时，套件在**无浏览器**的环境（镜像构建 / 无浏览器的开发机）
+    #   只会「跳过」—— 那是环境事实，不该把整条构建拖垮（2026-11-10 实测：
+    #   Dockerfile 里的 `npm run build` 因该套件退出码 1 而失败，镜像发不出去）。
+    env:
+      REQUIRE_BROWSER_CHECKS: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # 用 `npm ci` 不用 `npm install`：PR 校验的前提是**锁文件与本次变更一致**。
+      # `npm install` 会在 lock 与 package.json 不一致时静默改写锁文件，
+      # 于是本地能过、CI 才炸的「幽灵失败」和本地复现不了的通过都会出现。
+      - run: npm ci
+
+      # `npm run build` = tsc --noEmit + 7 个契约检查（check:api / check:docker /
+      # check:store-selectors / check:hooks / check:scope / check:npm-platforms /
+      # check:agent-sources）+ check:proto（12 个 jsdom 行为校验套件）+ vite build。
+      # ⚠️ 不要拆成 `tsc` + `vite build` 两条：那些检查会静默消失，而它们才是
+      # 这仓真正的「架构契约」门禁（API 契约、store 选择器、hook 顺序、
+      # scope 注册表…）。check:proto 是 2026-10-30 补的：此前 jsdom 没进依赖、
+      # CI 也没跑过一次，`demo-app.js` 里一个同名函数重复声明（整份脚本不执行）
+      # 活到了 main —— 「有校验」和「校验真的在跑」必须合成一件。
+      - name: Build (tsc + contract checks + vite)
+        run: npm run build
+
+  rust:
+    name: Rust fmt / clippy / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tauri 需要 webkit2gtk；`cargo test --workspace` 会编 src-tauri，
+      # 少了这些系统包会在链接期报一堆看不懂的 undefined symbol。
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev
+
+      # ⚠️ **必须先生成 `dist/`，否则 rust job 在编译期就挂，与 fmt/clippy/test 无关。**
+      #
+      # `crates/buddy-switch-server/src/api.rs` 里有 `#[derive(RustEmbed)] folder = "../../dist/"`。
+      # `dist/` 被 `.gitignore` 忽略、本 job 又不产出前端，于是 derive 展开时直接报
+      #   `folder '.../dist/' does not exist`
+      # 并连带把 `Assets::{get,iter}` 全部判成「不存在的方法」——一次报十几条，全是假象。
+      # 这是本 job 长期红的**第二个**原因（第一个是历史 clippy 提示，已在上面的 Clippy step 处理）。
+      #
+      # 只跑 `build:fast`（= `vite build`）而不是 `npm run build`：`tsc` 与 6 个契约检查
+      # 已由 frontend job 负责，这里重复跑只会把同一条失败信息印两遍、把 job 拖长一分钟。
+      # 不加 `needs: frontend` + 产物传递，是为了保住两个 job 的并行（见文件头 concurrency 说明）。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Build webui assets (RustEmbed 需要 dist/)
+        run: |
+          npm ci
+          npm run build:fast
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt, clippy
+          # ★ 关掉它自带的缓存：它的 key **不含仓库名**，而 `target/` 里的 build-script
+          # 产物记录的是**绝对路径**。仓库改名后它会把旧路径的缓存恢复回来，tauri 的
+          # build script 于是去找一个只存在于旧目录下的文件（2026-10-17 实测：
+          # `failed to read plugin permissions: .../app_hide.toml`，路径里旧名新名并存）。
+          # 缓存统一走下面那个 key 含 `github.repository` 的步骤。
+          cache: false
+          # ⚠️ 这个 action 的 `rustflags` 默认就是 `-D warnings`（构造日志里逐字输出）。
+          # 也就是说**不做任何配置，CI 就会把警告当错误**。这是好事，但必须知道：
+          # 本机 Windows 上看不到的 linux/mac 目标代码，其警告只有这里会暴露。
+          # 别再往里加 `build-warnings: deny` —— `@v1` tag 没有这个输入（会报
+          # Unexpected input），详见 build.yml 里同一处的长注释。
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # ★ key 里带仓库名：`target/` 里的 build-script 产物会**记录绝对路径**。
+          # 2026-10-17 仓库改名（trae-workbuddy-switch → qoder-trae-workbuddy-switch）后，
+          # 恢复出来的缓存里那些路径全部指向旧目录，tauri 的 build script 于是报
+          #   failed to read plugin permissions: .../target/.../app_hide.toml: No such file or directory
+          # 带仓库名之后，再改名会自动换 key，不必手工清缓存。
+          key: ${{ runner.os }}-${{ github.repository }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ github.repository }}-cargo-
+
+      # ⚠️ **fmt 现在是真门禁**（2026-10-16 起）。此前它必然失败：仓库基线
+      # 173/201 个 .rs 文件不符合 rustfmt，共 1675 处违规。已用一次独立的纯格式
+      # 提交（`style: 全量 rustfmt 落地`）还清，并新增 `rustfmt.toml` 钉住配置。
+      #
+      # ★ 本地复现失败时**不要**手改：直接 `cargo fmt --all`，它就是唯一的真相。
+      #   ⚠️ 本机 `cargo` 若指向非 rustup 的副本，`cargo fmt` 会报
+      #     `%1 不是有效的 Win32 应用程序`（os error 193）—— 那是 cargo-fmt.exe
+      #     架构不匹配，不是代码问题。绕过：`& "$(rustc --print sysroot)\bin\cargo-fmt.exe" fmt --all`。
+      #
+      # fmt 单独成step 而不是与 clippy 合并：它是秒级的纯文本 diff，
+      # 不该让评审者等两分钟 clippy 跑完才看到格式错。
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      # ⚠️ **关于 Clippy 与 RUSTFLAGS**：
+      # `setup-rust-toolchain@v1` 默认全局注入 `RUSTFLAGS="-D warnings"`。
+      # 目前仓库整体已做到 `cargo test` 零编译警告，但历史遗留约 280+ 处 clippy 提示（分布在 core/server 等历史模块）。
+      # 在全量落地单独的 clippy 清理 PR 前，Clippy step 显式覆盖 `RUSTFLAGS: ""`，
+      # 既能在 CI 日志中完整输出 clippy 诊断建议供参考，又避免历史 lints 将整轮 PR 门禁误判为阻断失败。
+      # 后续 `Test` 步骤仍会使用 `-D warnings` 严格把关真正的编译器级别警告。
+      - name: Clippy
+        env:
+          RUSTFLAGS: ""
+        run: |
+          # ⚠️ GitHub 的 bash 默认是 `-e -o pipefail`：`cargo | tee` 一失败，
+          # **整段脚本立刻中止**，下面抬注解的代码根本不会执行（2026-10-17 实测：
+          # 注解里始终只有一句 exit code 101）。所以这里必须先 `set +e`。
+          set +e
+          # `--message-format=short` 把每条诊断压成一行，便于下面抬成注解。
+          cargo clippy --workspace --all-targets --message-format=short 2>&1 | tee clippy.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then
+            # ★ 失败时把诊断抬成 `::error::` 注解。
+            #
+            # 判据：job 日志的下载接口要**仓库管理员权限**（匿名 API 返回 403），
+            # 而 check-run 注解是**公开可读**的。没有这一步，「clippy 挂了」在仓库外
+            # 只能看到一句 exit code 1 —— 2026-10-17 就是这样盲猜了两轮。
+            #
+            # 顺序有讲究：注解有条数上限，**先抬尾部**。真正的原因常在
+            # `Caused by:` 之后，而且**不含** `error:` 字样（build script 失败、
+            # feature 冲突就是这样），只按关键字 grep 会把它整段漏掉。
+            tail_part=$(tail -14 clippy.log)
+            diag=$(grep -E "(error|warning)(\[|:)" clippy.log | head -8)
+            printf '%s\n%s\n' "$tail_part" "$diag" | while IFS= read -r line; do
+              [ -n "$line" ] && printf '::error::%s\n' "${line:0:900}"
+            done
+            exit "$status"
+          fi
+
+      # 单元 + 集成测试（crates/*/tests 下的 e2e / 迁移 / 网关契约用例都在这里跑）。
+      # `--workspace` 会带上 src-tauri —— 它没有测试 target 也不影响。
+      #
+      # ## 为什么 `--test-threads=1`（★ 2026-10-17）
+      #
+      # 测试进程里有两个**进程级**环境变量当隔离开关：`BUDDY_SWITCH_HOME` 与 `APPDATA`
+      # （见 `trae::test_support::TempEnv`）。并行跑时，A 用例把 home 指向自己的临时目录、
+      # B 用例同时读 —— 「写的时候是 A 目录、读的时候是 B 目录」，随机红。
+      # 实测并行 1422 项里约每轮挂 1~2 条（`qoder::paths` / `proxy_kpi_view` /
+      # `session::paths` / `vscode_session` 都中过），串行 33s 稳定全绿。
+      #
+      # 不逐个用例加锁的原因：`env_lock()` 只保护**加锁的那一侧**，而读取侧散落在
+      # 1400+ 个用例里（凡是算路径的都要锁），漏一个就继续抖。串行是唯一确定性的解。
+      #
+      # `--no-fail-fast`：一次跑完所有 target，不要撞到第一条失败就停 ——
+      # 否则修一条、推一次、再发现下一条，一轮一轮地耗。
+      # 输出同时落盘给下一个 step 抛注解（见 `Test failure summary`）。
+      - name: Test
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --workspace --no-fail-fast -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/test-output.log"
+
+      # ★ 失败摘要抛成**注解**，而不是留在日志里。
+      #
+      # 原因很实际：Actions 的原始日志要登录才能看，而**注解在运行页面上是公开可见的**。
+      # 门禁红的时候，评审者（和外部贡献者）第一眼就该看到「哪条用例挂了 / 哪处编译错误」，
+      # 而不是去翻三兆日志、或者干脆因为看不到而放弃提 PR。
+      # 本仓为此浪费过整轮排查：只知道 exit 101，不知道挂在哪。
+      - name: Test failure summary
+        if: failure()
+        shell: bash
+        run: |
+          LOG="$RUNNER_TEMP/test-output.log"
+          if [ ! -f "$LOG" ]; then
+            echo "::error::没有测试日志（Test step 未产出，可能是更早的 step 失败）"
+            exit 0
+          fi
+          # 1) 失败用例名：`test <path> ... FAILED`
+          grep -E '^test .* \.\.\. FAILED$' "$LOG" | head -20 | while IFS= read -r line; do
+            echo "::error title=失败用例::${line#test }"
+          done
+          # 2) panic 现场 / 编译错误 / 汇总行
+          grep -nE 'panicked at|^error(\[E[0-9]+\])?:|^test result: FAILED' "$LOG" \
+            | head -20 | while IFS= read -r line; do
+            echo "::error title=失败现场::${line}"
+          done
+
+  # ★ issue #37：macOS 侧的回归此前**无法由 CI 证明** ——
+  # `rust` job 只在 ubuntu 上跑，而 `build.yml` 的 mac 打包 job 只产出 bundle、不跑
+  # `cargo test`。于是「Windows 全绿、macOS 仍有 6 条失败」只能靠人工在 mac 机器上
+  # 复跑（那一条修复：`data_dir_base()` 不认 `home` 覆盖）才敢确认。
+  #
+  # 本 job 的存在意义就是**把那 6 条变成 CI 可复跑的**：
+  # - 只跑 `-p buddy-switch-core --lib`：这 6 条全在 core，且 lib target 免去 Tauri
+  #   链接（macOS runner 上 `cargo test --workspace` 会编 src-tauri，慢且脆）；
+  # - **不需要**先构建 `dist/`：`RustEmbed` 只在 server 里用，core 不依赖它；
+  # - `--test-threads=1` 与 `rust` job 同款理由（进程级 `HOME` / `APPDATA` 隔离闸门，
+  #   并行会随机红，见 `rust` job 里那段注释）；
+  # - 失败时抛**注解**而不是把结论留在需登录才能看的日志里（与 `rust` job 一致的取舍）。
+  rust-macos:
+    name: Rust tests on macOS (core)
+    # ★ `macos-14` 已于 2026-11-02 被 GitHub 全量退役（actions/runner-images#15226），
+    #   继续写它 ⇒ job 0 step 直接 `cancelled`，注解只有一句
+    #   "The configuration 'macos-14-arm64-us-default' is not supported"。
+    #   写 `macos-15` 而不是 `macos-latest`：后者会随 GitHub 把 latest 推到 macOS 26
+    #   而静默换系统（本项目桌面端的构建 OS 由 build.yml 钉死，这里保持同一代）。
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        # 缓存键不含仓库名的问题与 `rust` job 相同 ⇒ 这里也关掉自带缓存。
+        with:
+          cache: false
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ github.repository }}-cargo-macos-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ github.repository }}-cargo-macos-
+
+      # ★ 安全审计 P1-8：**PR 此前只在 macOS 上跑 core 的 lib 测试**。
+      #   `buddy-switch-gateway` 里的 `cfg(target_os = "macos")` 代码、以及 core 的
+      #   **测试目标**（`--all-targets`）在 PR 里从不编译 —— 类型错误可以一路绿着合入。
+      #
+      #   这里只 `check`（不跑测试）：编一遍就能捉住这类问题，而完整的 macOS 测试矩阵
+      #   成本高（macOS runner 按分钟计费且慢），交给 build.yml 的打包流程兜底。
+      #   **不含** `buddy-switch-server` / `src-tauri`：它们要 `dist/`（`RustEmbed`
+      #   编译期读目录），为 check 目的去构建前端不划算。
+      - name: Check (core + gateway, all targets)
+        run: cargo check -p buddy-switch-core -p buddy-switch-gateway --all-targets --locked
+
+      - name: Test (buddy-switch-core)
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p buddy-switch-core --lib --no-fail-fast -- --test-threads=1 2>&1 \
+            | tee "$RUNNER_TEMP/test-macos.log"
+
+      - name: Test failure summary
+        if: failure()
+        shell: bash
+        run: |
+          LOG="$RUNNER_TEMP/test-macos.log"
+          if [ ! -f "$LOG" ]; then
+            echo "::error::没有测试日志（Test step 未产出，可能是更早的 step 失败）"
+            exit 0
+          fi
+          grep -E '^test .* \.\.\. FAILED$' "$LOG" | head -20 | while IFS= read -r line; do
+            echo "::error title=macOS 失败用例::${line#test }"
+          done
+          grep -nE 'panicked at|^error(\[E[0-9]+\])?:|^test result: FAILED' "$LOG" \
+            | head -20 | while IFS= read -r line; do
+            echo "::error title=macOS 失败现场::${line}"
+          done
+
+  # ★★ 安全审计 P1-8：**Windows 专有代码此前在 PR 里从不编译**。
+  #
+  # 仓里 `cfg(target_os = ...)` 共 253 处，其中 `cfg(target_os = "windows")` **81 处**
+  # （`process.rs` 一个文件就 19 个 fn）。这些代码只有 windows runner 才会展开 ——
+  # 类型错误、API 误用、`CommandExt` 用错位置，都能在 ubuntu + macos 双绿的情况下合入。
+  #
+  # 这是一个 **Windows 为主平台**的产品，而 Windows 恰好是 CI 覆盖最差的平台
+  # （`build.yml` 里 `cargo test` 零命中，且不在 PR 上触发）。
+  #
+  # 只做 `cargo check --workspace --all-targets`（不跑测试）：成本约 3~5 分钟，
+  # 换「任何平台专有代码都不会静默编译失败」。
+  rust-windows:
+    name: Rust check on Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 与 `rust` job 同因：`RustEmbed` 的 `folder = "../../dist/"` 在 derive 展开时
+      # 就会检查目录存在，缺了会报十几条「方法不存在」的假象。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Build webui assets (RustEmbed needs dist/)
+        run: |
+          npm ci
+          npm run build:fast
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ github.repository }}-cargo-win-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ github.repository }}-cargo-win-
+
+      # `--locked`：CI 只校验，不该顺手改 `Cargo.lock`（否则「本地能过、CI 才炸」
+      # 会因为锁文件被自动解析而变成另一种形态）。
+      - name: Check (workspace, all targets)
+        run: cargo check --workspace --all-targets --locked
+
+  pr-summary:
+    name: PR summary
+    runs-on: ubuntu-latest
+    # 汇总门禁：任一 job 失败 ⇒ 整体红。放在最后而不是让前端/Rust 互相 `needs`，
+    # 是为了让两个 job 并行跑完、失败信息一次性看全。
+    if: always()
+    needs: [frontend, rust, rust-macos, rust-windows]
+    steps:
+      # `skipped` 视为通过：某个 job 因条件未触发而跳过时，不该把整轮门禁判成红。
+      # `failure` 一律算不通过；`cancelled` 也一律算不通过 —— **除了 macOS**：
+      # 平台侧的 runner 取消（0 step、conclusion=cancelled，与代码无关）在这个仓库上
+      # 反复出现过：先是 `macos-14` 镜像退役（2026-11-02，根因已修，标签换成
+      # `macos-15` / `macos-15-intel`），再往前还有容量不足导致的取消。
+      # 把它算红会让整轮 PR 校验在无人改代码时无故变红（run 42175748365 / job 127754927803）。
+      # 这里只豁免 `rust-macos` 的 cancelled，真实的 `failure`（编译 / 测试失败）仍打红。
+      # ⚠️ 豁免**必须留 warning**：`0 step + cancelled` 就是「一条 mac 代码都没验」，
+      #   不是通过。连续几轮看到这条 warning ⇒ 去查 runner 标签是否又被退役。
+      - name: Verdict
+        run: |
+          FAIL=""
+          for r in "${{ needs.frontend.result }}" "${{ needs.rust.result }}" "${{ needs.rust-windows.result }}"; do
+            if [ "$r" = "failure" ] || [ "$r" = "cancelled" ]; then FAIL=1; fi
+          done
+          if [ "${{ needs.rust-macos.result }}" = "failure" ]; then FAIL=1; fi
+          if [ "${{ needs.rust-macos.result }}" = "cancelled" ]; then
+            echo "::warning::macOS runner 被平台侧取消，本轮跳过 macOS 校验（其余平台结果仍严格判定）"
+          fi
+          if [ -n "$FAIL" ]; then
+            echo "::error::PR 校验未通过（frontend=${{ needs.frontend.result }}, rust=${{ needs.rust.result }}, rust-macos=${{ needs.rust-macos.result }}, rust-windows=${{ needs.rust-windows.result }}）"
+            exit 1
+          fi
+          echo "PR 校验通过"

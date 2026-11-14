@@ -18,29 +18,54 @@ use buddy_switch_core::modules::config as core_config;
 use buddy_switch_core::modules::credits;
 use buddy_switch_core::modules::region::{self, Region, RegionMismatch};
 
-use crate::error::GatewayError;
+use crate::error::{GatewayError, NoCredentialCause};
 use crate::pool::{Pool, PoolEntry};
 use crate::timeutil;
 
 /// 账号选择策略（按 region 各自独立配置）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AccountStrategy {
     /// 默认：读该 region 认证文件指向的账号（跟随桌面端登录态）。
+    ///
+    /// `#[default]` 钉住「不配置时跟随登录态」—— 改成别的变体会静默改变选号行为。
+    #[default]
     Current,
     /// 固定账号：账号库按 id 选择。
     Pinned { account_id: String },
     /// 积分最多：在账号库中选剩余积分最高者。
     MaxCredits,
-    /// 积分最先到期：在账号库中选「有效积分到期时间最早」者，
-    /// 优先把快过期的积分用掉，减少浪费。
+    /// 随机：在**合格候选**内均匀抽签（不看权重）。
+    ///
+    /// ## 与「自动择优」的区别（为什么这不是重复功能）
+    ///
+    /// 自动择优 = 六因子权重 + 加权抽签 —— 它是**有偏**的：积分多、闲置久的号更容易被选中，
+    /// 长期跑下来会把某几个号抽干，而其它号几乎不动。
+    /// 用户要「把额度平均分摊到几个号」时，只有**均匀**抽签满足得了。
+    ///
+    /// ## 硬约束一条不少
+    ///
+    /// 排除 / 禁用 / 冷却 / 模型冷却 / 在途满 / 成本分层**照样生效** ——
+    /// 「随机」只影响「在合格候选里挑谁」，不改变「谁合格」。
+    Random,
+    /// 顺序：**粘住当前账号**，只有它不可用时才换下一个（issue #102）。
+    ///
+    /// ## 为什么需要它（与 `Random` 的目的正好相反）
+    ///
+    /// `Random` 每轮都可能换号 ⇒ 同一段对话的上下文落在不同账号上，上游侧的
+    /// 前缀缓存（KV cache）命中率归零，**同样的上下文被反复按输入计价**。
+    /// 用户体感就是「token 消耗快得离谱」。
+    ///
+    /// 本档把「一个号用到不能再用」显式表达出来：健康就一直用它，被限流 / 冷却 /
+    /// 排除 / 占满在途才换下一个。语义与「指定账号」的区别是**它自己会换**，
+    /// 与「自动择优」的区别是**它不按权重重新抽签**。
+    ///
+    /// ## 硬约束同样一条不少
+    ///
+    /// 与 `Random` 一致：本档只决定「在合格候选里挑谁」，不改变「谁合格」。
+    Sequential,
+    /// 优先使用有效积分最早到期的账号。
     EarliestExpiry,
-}
-
-impl Default for AccountStrategy {
-    fn default() -> Self {
-        AccountStrategy::Current
-    }
 }
 
 /// 以严格大于选择积分最高账号；并列时保留先出现者。
@@ -135,25 +160,61 @@ impl AccountSelector {
         region: Region,
         strategy: &AccountStrategy,
     ) -> Result<Value, GatewayError> {
-                let account = match strategy {
-            AccountStrategy::Current => {
+        let account = match strategy {
+            AccountStrategy::Current | AccountStrategy::Sequential => {
                 // 安全红线 F：先用 core 的校验读取（region 不符 → RegionMismatch，
                 // 且不发起任何上游请求），再导入账号并二次防御校验。
                 auth_file::read_auth_file_checked_for(region)
                     .map_err(GatewayError::RegionMismatch)?;
-                let account = auth_file::import_from_auth_file_for(region)
-                    .ok_or(GatewayError::NoCredential { region })?;
+                // 认证文件缺失 / 存在但读不出凭据 ⇒ 这一档**确实**该让人去登录，
+                // 文案保留桌面端指引（并补 headless 的替代做法）。
+                let account = auth_file::import_from_auth_file_for(region).ok_or(
+                    GatewayError::NoCredential {
+                        region,
+                        cause: NoCredentialCause::AuthFileMissing,
+                    },
+                )?;
                 ensure_region(&account, region)?;
                 account
             }
             AccountStrategy::Pinned { account_id } => {
-                let account = account::find_account_for(region, account_id)
-                    .ok_or(GatewayError::NoCredential { region })?;
+                // 「指定的账号不在库里」与「没登录」是两回事：登录救不了被删的账号，
+                // 该做的是重新指定或改回自动择优。
+                let account = account::find_account_for(region, account_id).ok_or(
+                    GatewayError::NoCredential {
+                        region,
+                        cause: NoCredentialCause::PinnedMissing,
+                    },
+                )?;
                 ensure_region(&account, region)?;
                 account
             }
             AccountStrategy::MaxCredits => select_max_credits(pool, region).await?,
             AccountStrategy::EarliestExpiry => select_earliest_expiry(pool, region).await?,
+            AccountStrategy::Random => {
+                // 兜底路径（池为空时才会走到）：从账号库里**均匀**抽一个。
+                //
+                // 为什么这里用系统时间做种子而不是可复现的种子：兜底路径没有任何
+                // 「本轮已试过」的上下文，抽重了也只影响一次请求；而可复现的种子
+                // 会让「随机」在每次重启后都抽到同一个号 —— 与功能意图相反。
+                let accounts: Vec<_> = account::load_accounts_for(region)
+                    .into_iter()
+                    .filter(|a| !is_deactivated(a))
+                    .collect();
+                if accounts.is_empty() {
+                    return Err(GatewayError::NoCredential {
+                        region,
+                        cause: NoCredentialCause::StoreEmpty,
+                    });
+                }
+                let seed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos() as usize)
+                    .unwrap_or(0);
+                let account = accounts[seed % accounts.len()].clone();
+                ensure_region(&account, region)?;
+                account
+            }
         };
 
         // 加密信封凭据不得送进网关：`build_chat_headers` 会把信封折成**空 `Bearer`**，
@@ -240,13 +301,18 @@ async fn select_max_credits(pool: Option<&Pool>, region: Region) -> Result<Value
     }
 
     // 过滤禁用/停用/已删后可能为空（全库停用），不得 `expect` 直接 panic。
-    select_max_credit_candidate(candidates.into_iter())
-        .ok_or(GatewayError::NoCredential { region })
+    select_max_credit_candidate(candidates.into_iter()).ok_or(GatewayError::NoCredential {
+        region,
+        cause: NoCredentialCause::StoreEmpty,
+    })
 }
 
 /// `earliest_expiry`：池缓存优先（含 `credits_expire_at_ms` 到期时刻），
 /// 过期条目才实时查。池为 `None` 时同 [`select_max_credits`] 走全库实时查。
-async fn select_earliest_expiry(pool: Option<&Pool>, region: Region) -> Result<Value, GatewayError> {
+async fn select_earliest_expiry(
+    pool: Option<&Pool>,
+    region: Region,
+) -> Result<Value, GatewayError> {
     let now_ms = timeutil::now_ms();
     let mut candidates: Vec<(Option<i64>, f64, Value)> = Vec::new();
 
@@ -276,9 +342,7 @@ async fn select_earliest_expiry(pool: Option<&Pool>, region: Region) -> Result<V
                     .get("totalRemaining")
                     .and_then(Value::as_f64)
                     .unwrap_or(0.0);
-                let expire_at = credits_value
-                    .get("soonestExpireAt")
-                    .and_then(Value::as_i64);
+                let expire_at = credits_value.get("soonestExpireAt").and_then(Value::as_i64);
                 candidates.push((expire_at, remaining, account));
             }
         }
@@ -293,16 +357,16 @@ async fn select_earliest_expiry(pool: Option<&Pool>, region: Region) -> Result<V
                     .get("totalRemaining")
                     .and_then(Value::as_f64)
                     .unwrap_or(0.0);
-                let expire_at = credits_value
-                    .get("soonestExpireAt")
-                    .and_then(Value::as_i64);
+                let expire_at = credits_value.get("soonestExpireAt").and_then(Value::as_i64);
                 candidates.push((expire_at, remaining, account));
             }
         }
     }
 
-    select_earliest_expiry_candidate(candidates.into_iter())
-        .ok_or(GatewayError::NoCredential { region })
+    select_earliest_expiry_candidate(candidates.into_iter()).ok_or(GatewayError::NoCredential {
+        region,
+        cause: NoCredentialCause::StoreEmpty,
+    })
 }
 
 /// 构造某 region 的策略展示对象：`{ region, strategy, selected, error?, note? }`。
@@ -319,8 +383,9 @@ pub async fn describe_strategy(region: Region, strategy: &AccountStrategy) -> Va
     });
     match strategy {
         AccountStrategy::MaxCredits => {
-            described["note"] =
-                serde_json::json!("max_credits 在每次请求时择优（池缓存新鲜时零网络，过期才实时查），此处不预取");
+            described["note"] = serde_json::json!(
+                "max_credits 在每次请求时择优（池缓存新鲜时零网络，过期才实时查），此处不预取"
+            );
         }
         AccountStrategy::EarliestExpiry => {
             described["note"] = serde_json::json!(
@@ -398,11 +463,17 @@ mod tests {
         let now = 1_700_000_000_000i64;
         let mut entry = crate::pool::PoolEntry::new("u1");
         entry.credits_refreshed_ms = 0;
-        assert!(!is_credit_cache_fresh(&entry, now, 60_000), "从未取过（0）不新鲜");
+        assert!(
+            !is_credit_cache_fresh(&entry, now, 60_000),
+            "从未取过（0）不新鲜"
+        );
         entry.credits_refreshed_ms = now - 30_000;
         assert!(is_credit_cache_fresh(&entry, now, 60_000), "间隔内新鲜");
         entry.credits_refreshed_ms = now - 60_000;
-        assert!(!is_credit_cache_fresh(&entry, now, 60_000), "恰达阈值即过期");
+        assert!(
+            !is_credit_cache_fresh(&entry, now, 60_000),
+            "恰达阈值即过期"
+        );
     }
 
     #[test]
@@ -412,7 +483,7 @@ mod tests {
             (10.0, json!({"id": "tie"})),
             (0.0, json!({"id": "missing"})),
         ];
-        let selected = select_max_credit_candidate(candidates.into_iter()).unwrap();
+        let selected = select_max_credit_candidate(candidates).unwrap();
         assert_eq!(selected["id"], "first");
 
         let empty: Vec<(f64, Value)> = Vec::new();
@@ -473,7 +544,8 @@ mod tests {
             json!({"kind": "earliest_expiry"})
         );
 
-        let parsed: AccountStrategy = serde_json::from_value(json!({"kind": "pinned", "account_id": "x"})).unwrap();
+        let parsed: AccountStrategy =
+            serde_json::from_value(json!({"kind": "pinned", "account_id": "x"})).unwrap();
         assert!(matches!(parsed, AccountStrategy::Pinned { account_id } if account_id == "x"));
     }
 
@@ -508,6 +580,9 @@ mod tests {
             message.contains(region::region_display(Region::Cn)),
             "含期望 region 展示名: {message}"
         );
-        assert!(message.contains("WORKBUDDY_AUTH_FILE"), "含环境变量名: {message}");
+        assert!(
+            message.contains("WORKBUDDY_AUTH_FILE"),
+            "含环境变量名: {message}"
+        );
     }
 }

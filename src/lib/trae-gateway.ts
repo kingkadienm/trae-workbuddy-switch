@@ -10,7 +10,6 @@
  * camelCase 只作防御性兜底。
  */
 
-import { t } from "@/lib/i18n";
 import type {
   TraeGatewayAccountStatus,
   TraeGatewayConfig,
@@ -24,13 +23,24 @@ import type {
 export const DEFAULT_TRAE_GATEWAY_CONFIG: TraeGatewayConfig = {
   enabled: false,
   bindAddr: "127.0.0.1",
-  port: 7864,
+  port: 57894,
   allowNonLoopback: false,
   logKeep: 200,
   logBodies: false,
   maxBodyMb: 8,
-  defaultModel: "deepseek-v4-flash",
+  // 与 Rust 侧 `TRAE_DEFAULT_MODEL` 同源（换名要一起改，否则「配置没加载出来」时会显示旧名）。
+  defaultModel: "deepseek-v4.1-flash",
   maxRotate: 3,
+  // 空串 = 不指定账号（自动择优）。
+  preferredUid: "",
+  // 会话粘性：与 WorkBuddy 网关同默认值（30 分钟）。
+  stickyTtlMs: 30 * 60 * 1000,
+  // 抓取旁路默认关（会原样落盘对话正文，属敏感内容）。
+  captureEnabled: false,
+  // Max Mode 默认开（与 Rust `TraeGatewayConfig::default` 同值）。
+  maxMode: true,
+  // ★ issue #129：账号故障时自动切换，**默认关闭**（与 Rust 默认同口径）。
+  autoFailover: false,
 };
 
 function asString(value: unknown): string | undefined {
@@ -72,6 +82,26 @@ export function normalizeTraeGatewayConfig(raw: unknown): TraeGatewayConfig {
       DEFAULT_TRAE_GATEWAY_CONFIG.defaultModel,
     maxRotate:
       asNumber(read("maxRotate", "max_rotate")) ?? DEFAULT_TRAE_GATEWAY_CONFIG.maxRotate,
+    // 空串是**合法值**（= 不指定），因此 `asString` 对空串返回 undefined 时
+    // 这里必须回落到空串而不是某个「默认账号」—— 否则用户清空选择后会被写回一个
+    // 他并没有指定的账号。
+    preferredUid:
+      asString(read("preferredUid", "preferred_uid")) ??
+      DEFAULT_TRAE_GATEWAY_CONFIG.preferredUid,
+    stickyTtlMs:
+      asNumber(read("stickyTtlMs", "sticky_ttl_ms")) ??
+      DEFAULT_TRAE_GATEWAY_CONFIG.stickyTtlMs,
+    // 诊断开关没有界面入口，但必须完整往返：缺这一格 ⇒ 保存时整份覆盖
+    // 会把用户手开的抓取**静默打回 false**（配置缺键即回落默认）。
+    captureEnabled:
+      asBoolean(read("captureEnabled", "capture_enabled")) ??
+      DEFAULT_TRAE_GATEWAY_CONFIG.captureEnabled,
+    maxMode:
+      asBoolean(read("maxMode", "max_mode")) ?? DEFAULT_TRAE_GATEWAY_CONFIG.maxMode,
+    // ★ issue #129：缺键 ⇒ `false`（老配置文件 / 老后端），与「默认关闭」一致。
+    autoFailover:
+      asBoolean(read("autoFailover", "auto_failover")) ??
+      DEFAULT_TRAE_GATEWAY_CONFIG.autoFailover,
   };
 }
 
@@ -92,6 +122,12 @@ export function toTraeGatewayConfigRaw(config: TraeGatewayConfig): TraeGatewayCo
     max_body_mb: config.maxBodyMb,
     default_model: config.defaultModel,
     max_rotate: config.maxRotate,
+    preferred_uid: config.preferredUid,
+    sticky_ttl_ms: config.stickyTtlMs,
+    // ★ 必须写回：保存是整份覆盖，缺键 = 抓取被静默关闭（见 `captureEnabled` 注释）。
+    capture_enabled: config.captureEnabled,
+    max_mode: config.maxMode,
+    auto_failover: config.autoFailover,
   };
 }
 
@@ -105,6 +141,10 @@ function normalizePool(raw: unknown): TraeGatewayPoolSummary {
     expired: asNumber(record.expired) ?? 0,
     zeroCredits: asNumber(pick(record, "zeroCredits", "zero_credits")) ?? 0,
     totalCredits: asNumber(pick(record, "totalCredits", "total_credits")) ?? 0,
+    // 「用户显式排除」的账号数（互斥第六态）。
+    // 后端 `TraePool::summary` 已把它从 `available` 里扣掉 ⇒ 缺这一格就会出现
+    // 「3 可用」而实际只有 2 个能被选中（数字与事实不符）。
+    excluded: asNumber(record.excluded) ?? 0,
   };
 }
 
@@ -124,6 +164,16 @@ function normalizeAccount(raw: unknown): TraeGatewayAccountStatus | null {
     cooldownUntil: asNumber(pick(record, "cooldownUntil", "cooldown_until")) ?? null,
     cooldownReason: asString(pick(record, "cooldownReason", "cooldown_reason")) ?? null,
     disabled: asBoolean(record.disabled) ?? false,
+    // ★ 用户显式排除（互斥第六态）。**必须显式归一化**：本函数是白名单重建，
+    //   漏掉一个字段就等于前端永远看不到它 —— 而「排除 / 取消排除」按钮的文案与
+    //   提交值都依赖 `account.excluded`（`onExclude(uid, !account.excluded)`）。
+    //   漏了它的症状不是「不显示」，而是**按钮永远显示「排除」、点下去永远传 `true`**
+    //   ⇒ 已排除的账号再也取消不掉（2026-10-22 用户报障的根因，WorkBuddy 侧同源）。
+    excluded: record.excluded === true,
+    excludedNote:
+      typeof record.excludedNote === "string" && record.excludedNote
+        ? record.excludedNote
+        : null,
     deviceIdMasked: asString(pick(record, "deviceIdMasked", "device_id_masked")) ?? null,
   };
 }
@@ -189,51 +239,45 @@ export function normalizeTraeGatewayLogs(raw: unknown): TraeGatewayLogEntry[] {
           asNumber(pick(entry, "completionTokens", "completion_tokens")) ?? null,
         stream: asBoolean(entry.stream) ?? false,
         error: asString(entry.error) ?? null,
+        /* ★ issue #76：**必须保留「键不存在」与「值为 null」的区别** ——
+           `null` = 确实没有 Key 的调用，`undefined` = 升级前写入的老条目。
+           用 `hasOwnProperty` 判断而不是 `asString(...) ?? null`（那会把两者都变 null，
+           让「按密钥看用量」凭空多出一批匿名调用）。 */
+        keyId: Object.prototype.hasOwnProperty.call(entry, "keyId")
+          ? (asString(entry.keyId) ?? null)
+          : undefined,
+        /* 归属台账：同 `keyId` 的两种「没有」语义（`null` vs `undefined`）。 */
+        keyScope: Object.prototype.hasOwnProperty.call(entry, "keyScope")
+          ? (asString(entry.keyScope) ?? null)
+          : undefined,
       };
     })
     .filter((item): item is TraeGatewayLogEntry => item !== null);
 }
 
-/** 账号状态 → 展示标签与语气。 */
-export const TRAE_POOL_STATUS_LABELS: Record<
-  TraeGatewayAccountStatus["status"],
-  { label: string; tone: "ok" | "warn" | "danger" | "muted" }
-> = {
-  // 表在模块加载时就定型 ⇒ 只存文案键，标签在**读取时**现取（调用方照旧读 `meta.label`）。
-  available: {
-    get label() {
-      return t("shared.trae.poolStatus.available");
-    },
-    tone: "ok",
-  },
-  cooling: {
-    get label() {
-      return t("shared.trae.poolStatus.cooling");
-    },
-    tone: "warn",
-  },
-  disabled: {
-    get label() {
-      return t("shared.trae.poolStatus.disabled");
-    },
-    tone: "danger",
-  },
-  expired: {
-    get label() {
-      return t("shared.trae.poolStatus.expired");
-    },
-    tone: "warn",
-  },
-  no_credits: {
-    get label() {
-      return t("shared.trae.poolStatus.noCredits");
-    },
-    tone: "muted",
-  },
-  free_plan: {
-    get label() {
-      return t("shared.trae.poolStatus.freePlan");
-    },
-    tone: "ok",
-  },
-};
+// 账号状态标签原先在本文件（`TRAE_POOL_STATUS_LABELS`），账号池卡**两侧共用**后
+// 迁到 `@/lib/gateway` 的 `POOL_STATUS_LABELS`（文案键 `shared.poolStatus.*`）——
+// 别在这里再建第二份，两侧文案会各自漂移。
+
+/**
+ * 归一化 `get_trae_gateway_models` 的返回 → 降级链下拉要的 `{id, name}` 列表。
+ *
+ * Trae 的 `/v1/models` 只给 `id`（给人看的 `displayName` 在**客户端目录**
+ * `get_trae_client_models` 里，那张表本模块不解析），所以 `name` 回落成 id。
+ * 与 WB / Qoder 的清单同形，降级链抽屉不必按平台分叉。
+ */
+export function normalizeTraeGatewayModels(raw: unknown): { id: string; name: string }[] {
+  const record = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  if (!Array.isArray(record.data)) return [];
+  const seen = new Set<string>();
+  const out: { id: string; name: string }[] = [];
+  for (const item of record.data) {
+    if (!item || typeof item !== "object") continue;
+    const row = item as Record<string, unknown>;
+    const id = asString(row.id)?.trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push({ id, name: id });
+  }
+  return out;
+}

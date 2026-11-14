@@ -62,7 +62,10 @@ pub fn cn_effort_table() -> &'static HashMap<&'static str, EffortSpec> {
     static TABLE: OnceLock<HashMap<&'static str, EffortSpec>> = OnceLock::new();
     TABLE.get_or_init(|| {
         let mut table = HashMap::new();
-        table.insert("deepseek-v4-flash", EffortSpec::of(&["low", "high", "max"], None));
+        table.insert(
+            "deepseek-v4-flash",
+            EffortSpec::of(&["low", "high", "max"], None),
+        );
         table.insert(
             "deepseek-v4.1-flash",
             EffortSpec::of(&["low", "high", "max"], Some("high")),
@@ -75,7 +78,10 @@ pub fn cn_effort_table() -> &'static HashMap<&'static str, EffortSpec> {
         table.insert("hy4-preview-x", EffortSpec::of(&["high"], None));
         table.insert("hy3", EffortSpec::of(&["low", "high"], Some("high")));
         table.insert("hy3-x", EffortSpec::of(&["low", "high"], Some("high")));
-        table.insert("glm-5.3", EffortSpec::of(&["low", "high", "max"], Some("high")));
+        table.insert(
+            "glm-5.3",
+            EffortSpec::of(&["low", "high", "max"], Some("high")),
+        );
         table.insert(
             "glm-5.3-flash",
             EffortSpec::of(&["low", "high", "max"], Some("high")),
@@ -122,7 +128,10 @@ pub fn global_effort_table() -> &'static HashMap<&'static str, EffortSpec> {
         }
         table.insert("gpt-5.3-codex", EffortSpec::of(&["medium"], None));
         table.insert("gemini-3.5-flash", EffortSpec::of(&["medium"], None));
-        table.insert("glm-5.3", EffortSpec::of(&["low", "high", "max"], Some("high")));
+        table.insert(
+            "glm-5.3",
+            EffortSpec::of(&["low", "high", "max"], Some("high")),
+        );
         table.insert("glm-5.2", EffortSpec::of(&["high", "xhigh"], Some("high")));
         table.insert("kimi-k3", EffortSpec::of(&["medium"], None));
         table.insert("kimi-k2.6", EffortSpec::of(&["medium"], None));
@@ -163,11 +172,7 @@ pub struct EffortAdjustment {
 /// - 取「不高于请求档」中的最高支持档；
 /// - 若所有支持档都高于请求档，取最低支持档（floored）；
 /// - 与请求档相同则不改写。
-pub fn adjust_effort(
-    region: Region,
-    model: &str,
-    requested: &str,
-) -> Option<EffortAdjustment> {
+pub fn adjust_effort(region: Region, model: &str, requested: &str) -> Option<EffortAdjustment> {
     let spec = static_effort_cap(region).get(model.trim())?;
     if spec.efforts.is_empty() {
         return None;
@@ -207,7 +212,10 @@ pub fn adjust_effort(
     if chosen == requested {
         return None;
     }
-    Some(EffortAdjustment { effort: chosen, floored })
+    Some(EffortAdjustment {
+        effort: chosen,
+        floored,
+    })
 }
 
 #[cfg(test)]
@@ -227,9 +235,15 @@ mod tests {
 
     #[test]
     fn default_effort_uses_table_then_falls_back_to_high() {
-        assert_eq!(lookup_default_effort(Region::Cn, "deepseek-v4.1-flash"), "high");
+        assert_eq!(
+            lookup_default_effort(Region::Cn, "deepseek-v4.1-flash"),
+            "high"
+        );
         // 表中无 default 声明 → 回落 high
-        assert_eq!(lookup_default_effort(Region::Cn, "deepseek-v4-flash"), "high");
+        assert_eq!(
+            lookup_default_effort(Region::Cn, "deepseek-v4-flash"),
+            "high"
+        );
         // 模型不在表中 → 回落 high
         assert_eq!(lookup_default_effort(Region::Cn, "unknown-model"), "high");
     }
@@ -238,7 +252,10 @@ mod tests {
     fn region_tables_differ_for_same_model() {
         // deepseek-v4.1-flash: CN 三档 / Global 仅 high —— 双域隔离的证据
         assert_eq!(cn_effort_table()["deepseek-v4.1-flash"].efforts.len(), 3);
-        assert_eq!(global_effort_table()["deepseek-v4.1-flash"].efforts.len(), 1);
+        assert_eq!(
+            global_effort_table()["deepseek-v4.1-flash"].efforts.len(),
+            1
+        );
         assert_eq!(lookup_default_effort(Region::Global, "glm-5.2"), "high");
         assert_eq!(lookup_default_effort(Region::Cn, "glm-5.1"), "high");
     }
@@ -295,7 +312,10 @@ mod tests {
     #[test]
     fn global_single_effort_model_never_downgrades_silently() {
         // Global 的 deepseek-v4.1-flash 仅 high：请求 high 不改写
-        assert_eq!(adjust_effort(Region::Global, "deepseek-v4.1-flash", "high"), None);
+        assert_eq!(
+            adjust_effort(Region::Global, "deepseek-v4.1-flash", "high"),
+            None
+        );
         // 请求 low → 全高于 → floored 到 high
         let adjustment = adjust_effort(Region::Global, "deepseek-v4.1-flash", "low").unwrap();
         assert_eq!(adjustment.effort, "high");

@@ -1,6 +1,6 @@
 [package]
 name = "buddy-switch-server"
-version = "2026.9.291555"
+version = "2026.11.131828"
 edition = "2021"
 description = "buddy-switch HTTP server + CLI（npm 安装形态：buddy-switch 命令启动本地 webui）"
 
@@ -11,6 +11,8 @@ path = "src/main.rs"
 [dependencies]
 buddy-switch-core = { path = "../buddy-switch-core" }
 buddy-switch-gateway = { path = "../buddy-switch-gateway" }
+# SQLCipher 通道（与桌面端同一份实现；feature 并集，见 src-tauri/Cargo.toml 的说明）。
+buddy-switch-vault = { path = "../buddy-switch-vault" }
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 serde_json = "1"
@@ -22,3 +24,6 @@ tower = { version = "0.5", features = ["util"] }
 # `rusqlite` 已在依赖树中（buddy-switch-core 以同版本同 feature 使用），零网络。
 # 仅用于路由级测试构造 `workbuddy.db` 夹具。
 rusqlite = { version = "0.32", features = ["bundled"] }
+
+# TOTP 集成路由回归使用固定测试密钥生成口令（复用 core 已锁定版本）。
+totp-rs = { version = "6", features = ["otpauth", "gen_secret"] }

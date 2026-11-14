@@ -1,3 +1,4 @@
+import { accountDisplayName } from "@/components/account-card";
 import { useState } from "react";
 import { Loader2 } from "lucide-react";
 import { toast } from "sonner";
@@ -19,10 +20,12 @@ const STRATEGY_OPTIONS: { value: string; labelKey: TranslationKey }[] = [
   { value: "pinned", labelKey: "wbStats.gateway.strategyPinned" },
   { value: "max_credits", labelKey: "wbStats.gateway.strategyMaxCredits" },
   { value: "earliest_expiry", labelKey: "wbStats.gateway.strategyEarliestExpiry" },
+  { value: "random", labelKey: "shared.gateway.pool.strategyRandom" },
+  { value: "sequential", labelKey: "shared.gateway.pool.strategySequential" },
 ];
 
 function accountLabel(account: AccountMeta): string {
-  return account.nickname || account.email || account.uid || account.id;
+  return accountDisplayName(account);
 }
 
 
@@ -82,7 +85,7 @@ function RegionStrategyRow({ region }: { region: Region }) {
       void persist({ kind: "pinned", account_id: pinnedId });
       return;
     }
-    if (next === "max_credits" || next === "earliest_expiry") {
+    if (next === "max_credits" || next === "earliest_expiry" || next === "random" || next === "sequential") {
       void persist({ kind: next });
       return;
     }
@@ -91,7 +94,7 @@ function RegionStrategyRow({ region }: { region: Region }) {
 
   const selected = view.selected;
   const selectedText = selected
-    ? selected.nickname || selected.email || selected.uid || selected.id
+    ? accountDisplayName(selected)
     : view.note || t("wbStats.gateway.noAvailableAccount");
 
   return (

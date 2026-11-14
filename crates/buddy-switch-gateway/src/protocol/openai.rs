@@ -12,7 +12,9 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || haystack.len() < needle.len() {
         return false;
     }
-    haystack.windows(needle.len()).any(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 /// 从 SSE 文本中提取所有 `data:` 负载（按行）。
@@ -40,11 +42,35 @@ pub fn sse_event(event: &str, data: &Value) -> Bytes {
 /// 补发一条 `data: [DONE]`，绝不悬挂连接（P0-5 / A-4.1）。
 ///
 /// 内部用 `Pin<Box<S>>` 存放上游流，因此**不要求上游流实现 `Unpin`**。
+///
+/// # 账号故障自动切换（issue #129）
+///
+/// 开关开启时，`[DONE]` 之前会先发一条**可重试**的 `error` 帧（见 [`crate::failover`]）——
+/// 否则「上游断流」与「模型正常说完」在客户端看来是同一个字节序列（都是 `[DONE]`），
+/// 用户只会看到半句话，且客户端连重试的机会都没有。工具调用场景下更糟：
+/// 参数残缺的 tool-call 会被当成正常结果**真的执行**。
+///
+/// 开关关闭（默认）时本结构的行为与改造前**逐字一致**。
 pub struct SsePassthrough<S> {
     inner: Pin<Box<S>>,
     saw_done: bool,
+    /// 上游已结束（`Ready(None)` / `Err`）：不再 poll inner，只把尾部发完。
     finished: bool,
+    /// 待发字节（错误帧 → `[DONE]`），一次 `poll_next` 只交一块。
+    pending: std::collections::VecDeque<Bytes>,
     done_probe: Vec<u8>,
+    /// 失败信号的读端（`None` = 开关关闭 / 未接入 ⇒ 收尾与改造前逐字一致）。
+    failover: Option<FailoverTail>,
+    /// 错误帧是否已发（同一路流只发一条）。
+    error_emitted: bool,
+}
+
+/// 收尾时构造对外错误帧所需的上下文。
+struct FailoverTail {
+    signal: std::sync::Arc<crate::failover::StreamFailure>,
+    /// 命中账号的展示名（写进对外文案，便于用户自己看出是哪个号的问题）。
+    account: String,
+    model: String,
 }
 
 impl<S> SsePassthrough<S> {
@@ -53,7 +79,49 @@ impl<S> SsePassthrough<S> {
             inner: Box::pin(inner),
             saw_done: false,
             finished: false,
+            pending: std::collections::VecDeque::new(),
             done_probe: Vec::new(),
+            failover: None,
+            error_emitted: false,
+        }
+    }
+
+    /// ★ issue #129：接入失败信号（`None` = 保持原行为）。
+    ///
+    /// 传 `Some` 时**是否真的改变收尾**仍由信号自己的 `is_enabled()` 决定 ——
+    /// 关闭态由 [`crate::failover::StreamFailure::record`] 丢弃记录，这里读到 `None`
+    /// 就照旧补 `[DONE]`。
+    pub fn with_failover(
+        mut self,
+        signal: Option<std::sync::Arc<crate::failover::StreamFailure>>,
+        account: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        self.failover = signal.map(|signal| FailoverTail {
+            signal,
+            account: account.into(),
+            model: model.into(),
+        });
+        self
+    }
+
+    /// 上游结束后的收尾：先补错误帧（若判定失败），再补 `[DONE]`。
+    fn schedule_tail(&mut self) {
+        if !self.error_emitted {
+            if let Some(tail) = self.failover.as_ref() {
+                if let Some(failure) = tail.signal.peek() {
+                    let error =
+                        crate::failover::client_error(&failure.event, &tail.account, &tail.model);
+                    self.pending
+                        .push_back(crate::failover::openai_error_frame(&error));
+                    self.error_emitted = true;
+                }
+            }
+        }
+        if !self.saw_done {
+            self.pending
+                .push_back(Bytes::from_static(b"data: [DONE]\n\n"));
+            self.saw_done = true;
         }
     }
 }
@@ -67,44 +135,41 @@ where
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        if this.finished {
-            return Poll::Ready(None);
-        }
-        match this.inner.as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok(chunk))) => {
-                if !this.saw_done {
-                    this.done_probe.extend_from_slice(&chunk);
-                    if contains(&this.done_probe, b"[DONE]") {
-                        this.saw_done = true;
+        loop {
+            if let Some(chunk) = this.pending.pop_front() {
+                return Poll::Ready(Some(Ok(chunk)));
+            }
+            if this.finished {
+                return Poll::Ready(None);
+            }
+            match this.inner.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(chunk))) => {
+                    if !this.saw_done {
+                        this.done_probe.extend_from_slice(&chunk);
+                        if contains(&this.done_probe, b"[DONE]") {
+                            this.saw_done = true;
+                        }
+                        // Keep only enough suffix to match a marker split across chunks;
+                        // never retain the full response stream.
+                        const DONE_MARKER_LEN: usize = 6;
+                        if this.done_probe.len() > DONE_MARKER_LEN {
+                            let keep_from = this.done_probe.len() - (DONE_MARKER_LEN - 1);
+                            this.done_probe.drain(..keep_from);
+                        }
                     }
-                    // Keep only enough suffix to match a marker split across chunks;
-                    // never retain the full response stream.
-                    const DONE_MARKER_LEN: usize = 6;
-                    if this.done_probe.len() > DONE_MARKER_LEN {
-                        let keep_from = this.done_probe.len() - (DONE_MARKER_LEN - 1);
-                        this.done_probe.drain(..keep_from);
-                    }
+                    return Poll::Ready(Some(Ok(chunk)));
                 }
-                Poll::Ready(Some(Ok(chunk)))
-            }
-            Poll::Ready(Some(Err(error))) => {
-                this.finished = true;
-                eprintln!("[gateway] 上游 SSE 流中途异常: {error:?}");
-                if this.saw_done {
-                    Poll::Ready(None)
-                } else {
-                    Poll::Ready(Some(Ok(Bytes::from_static(b"data: [DONE]\n\n"))))
+                Poll::Ready(Some(Err(error))) => {
+                    this.finished = true;
+                    eprintln!("[gateway] 上游 SSE 流中途异常: {error:?}");
+                    this.schedule_tail();
                 }
-            }
-            Poll::Ready(None) => {
-                this.finished = true;
-                if this.saw_done {
-                    Poll::Ready(None)
-                } else {
-                    Poll::Ready(Some(Ok(Bytes::from_static(b"data: [DONE]\n\n"))))
+                Poll::Ready(None) => {
+                    this.finished = true;
+                    this.schedule_tail();
                 }
+                Poll::Pending => return Poll::Pending,
             }
-            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -125,6 +190,7 @@ pub struct CompletionAccumulator {
     pub created: Option<i64>,
     pub role: Option<String>,
     pub content: String,
+    pub reasoning: String,
     pub tool_calls: Vec<ToolCallAccum>,
     pub finish_reason: Option<String>,
     pub prompt_tokens: Option<u64>,
@@ -134,6 +200,8 @@ pub struct CompletionAccumulator {
     /// 单独保存是必要的：账号池的「实测成本账本」以 `credit / tokens` 折算单价，
     /// 若拿不到 `credit` 就写入样本，会把账号误标为「免费」，比不写更糟。
     pub credit: Option<f64>,
+    /// 上游返回的原始 usage 对象，供下游协议提取 prompt_tokens_details / cached_tokens 等详情。
+    pub raw_usage: Option<Value>,
 }
 
 impl CompletionAccumulator {
@@ -155,6 +223,9 @@ impl CompletionAccumulator {
             }
         }
         if let Some(usage) = chunk.get("usage") {
+            if !usage.is_null() {
+                self.raw_usage = Some(usage.clone());
+            }
             if let Some(prompt) = usage.get("prompt_tokens").and_then(Value::as_u64) {
                 self.prompt_tokens = Some(prompt);
             }
@@ -179,6 +250,11 @@ impl CompletionAccumulator {
                 if let Some(role) = delta.get("role").and_then(Value::as_str) {
                     self.role = Some(role.to_string());
                 }
+            }
+            if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
+                let delta_text =
+                    crate::protocol::reasoning::reasoning_delta(&self.reasoning, reasoning);
+                self.reasoning.push_str(delta_text);
             }
             if let Some(content) = delta.get("content").and_then(Value::as_str) {
                 self.content.push_str(content);
@@ -232,6 +308,64 @@ impl CompletionAccumulator {
         accumulator
     }
 
+    /// 由**完整响应体**构造聚合器（非流式上游：`choices[0].message`）。
+    ///
+    /// 与 [`Self::from_sse`] 的分工：`from_sse` 吃**流式 chunk 序列**（`delta`，
+    /// 需按 `index` 归并分片），本函数吃**一次性响应**（`message`，各字段已是完整值）。
+    /// 两者产出**同一结构**，因此下游（Anthropic 转换、用量统计）只认聚合器，
+    /// 不关心上游是流式还是非流式 —— 这正是 `/v1/messages` 能复用同一套转换的前提。
+    pub fn from_response(response: &Value) -> Self {
+        let mut accumulator = Self::default();
+        // 顶层 `id` / `model` / `usage` 与 chunk 同形，直接复用现有解析。
+        accumulator.ingest_chunk(response);
+
+        let Some(choice) = response
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+        else {
+            return accumulator;
+        };
+        let Some(message) = choice.get("message") else {
+            return accumulator;
+        };
+
+        if accumulator.role.is_none() {
+            if let Some(role) = message.get("role").and_then(Value::as_str) {
+                accumulator.role = Some(role.to_string());
+            }
+        }
+        if let Some(content) = message.get("content").and_then(Value::as_str) {
+            accumulator.content.push_str(content);
+        }
+        if let Some(reasoning) = message.get("reasoning_content").and_then(Value::as_str) {
+            accumulator.reasoning.push_str(reasoning);
+        }
+        if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+            for tool_call in tool_calls {
+                let function = tool_call.get("function");
+                let text_of = |key: &str| {
+                    function
+                        .and_then(|f| f.get(key))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                // 完整响应没有 `index`（不是增量分片），按数组顺序落位。
+                accumulator.tool_calls.push(ToolCallAccum {
+                    id: tool_call
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    name: text_of("name"),
+                    arguments: text_of("arguments"),
+                });
+            }
+        }
+        accumulator
+    }
+
     /// 聚合为 OpenAI `chat.completion` 对象。
     pub fn to_openai_completion(&self, fallback_model: &str) -> Value {
         let id = self
@@ -251,6 +385,9 @@ impl CompletionAccumulator {
             "role".to_string(),
             json!(self.role.clone().unwrap_or_else(|| "assistant".to_string())),
         );
+        if !self.reasoning.is_empty() {
+            message.insert("reasoning_content".to_string(), json!(self.reasoning));
+        }
         if self.tool_calls.is_empty() {
             message.insert("content".to_string(), json!(self.content));
         } else {
@@ -275,6 +412,19 @@ impl CompletionAccumulator {
 
         let prompt = self.prompt_tokens.unwrap_or(0);
         let completion = self.completion_tokens.unwrap_or(0);
+        let mut usage = json!({
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": prompt + completion,
+        });
+        if let Some(raw) = &self.raw_usage {
+            if let Some(ptd) = raw.get("prompt_tokens_details") {
+                usage["prompt_tokens_details"] = ptd.clone();
+            }
+            if let Some(ctd) = raw.get("completion_tokens_details") {
+                usage["completion_tokens_details"] = ctd.clone();
+            }
+        }
         json!({
             "id": id,
             "object": "chat.completion",
@@ -285,11 +435,7 @@ impl CompletionAccumulator {
                 "message": Value::Object(message),
                 "finish_reason": self.finish_reason.clone().unwrap_or_else(|| "stop".to_string()),
             }],
-            "usage": {
-                "prompt_tokens": prompt,
-                "completion_tokens": completion,
-                "total_tokens": prompt + completion,
-            },
+            "usage": usage,
         })
     }
 }
@@ -338,7 +484,7 @@ mod tests {
     async fn passthrough_appends_done_on_midstream_error() {
         let chunks = vec![
             Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: {\"a\":1}\n\n")),
-            Err(std::io::Error::new(std::io::ErrorKind::Other, "boom")),
+            Err(std::io::Error::other("boom")),
         ];
         let stream = SsePassthrough::new(futures_util::stream::iter(chunks));
         let collected: Vec<Bytes> = stream.map(|item| item.unwrap()).collect().await;
@@ -347,7 +493,10 @@ mod tests {
             .map(|chunk| String::from_utf8_lossy(chunk).to_string())
             .collect();
         assert!(text.contains("data: {\"a\":1}"));
-        assert!(text.ends_with("data: [DONE]\n\n"), "流中断必须补发 [DONE]: {text}");
+        assert!(
+            text.ends_with("data: [DONE]\n\n"),
+            "流中断必须补发 [DONE]: {text}"
+        );
     }
 
     #[tokio::test]
@@ -391,5 +540,178 @@ mod tests {
             .map(|chunk| String::from_utf8_lossy(chunk).to_string())
             .collect();
         assert!(text.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn from_sse_dedupes_snapshot_reasoning() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"AB\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"AB\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"ABC\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let accum = CompletionAccumulator::from_sse(sse);
+        assert_eq!(
+            accum.reasoning, "ABC",
+            "快照序列聚合后只保留全文，不重复拼接"
+        );
+
+        let completion = accum.to_openai_completion("m");
+        assert_eq!(
+            completion["choices"][0]["message"]["reasoning_content"],
+            "ABC"
+        );
+    }
+
+    #[test]
+    fn from_sse_concatenates_incremental_reasoning() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"A\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"B\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"C\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let accum = CompletionAccumulator::from_sse(sse);
+        assert_eq!(accum.reasoning, "ABC", "真增量序列完整拼接");
+    }
+
+    /// ★★ issue #129 改动 1：**开关关闭时收尾字节与改造前逐字一致**。
+    ///
+    /// 这是「默认关闭」的**唯一**可证伪证据：断流 / 无 `[DONE]` 两种情况下都只补
+    /// `data: [DONE]\n\n`，一条错误帧都不多发。
+    #[tokio::test]
+    async fn passthrough_without_failover_keeps_the_legacy_tail_bytes() {
+        use futures_util::StreamExt;
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            )),
+            Err(std::io::Error::other("connection reset")),
+        ];
+        let signal = crate::failover::StreamFailure::new(false);
+        let mut stream = SsePassthrough::new(futures_util::stream::iter(chunks)).with_failover(
+            Some(signal.clone()),
+            "一号",
+            "hy4",
+        );
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            out.push(String::from_utf8_lossy(&item.expect("透传不报错")).to_string());
+        }
+        assert_eq!(out.len(), 2, "正常帧 + 补的 [DONE]，不多不少：{out:?}");
+        assert_eq!(out[1], "data: [DONE]\n\n");
+        assert!(
+            !out.iter().any(|chunk| chunk.contains("\"error\"")),
+            "开关关闭时不得发任何错误帧：{out:?}"
+        );
+    }
+
+    /// ★★ issue #129 改动 1/2：开关开启 + 上游断流 ⇒ **先发可重试错误帧，再发 [DONE]**。
+    ///
+    /// 三条断言分别防三种退化：
+    /// 1. 只补 `[DONE]`（= 改造前的「伪装成功」，客户端不重试）；
+    /// 2. 顺序反了（`[DONE]` 在前，客户端直接判成功、忽略后面的错误帧）；
+    /// 3. 文案没有等价状态码（客户端走文本正则，认不出 `502`）。
+    #[tokio::test]
+    async fn passthrough_with_failover_emits_a_retryable_error_before_done() {
+        use futures_util::StreamExt;
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            )),
+            Err(std::io::Error::other("connection reset")),
+        ];
+        // 上游断流由 `UsageTap` 写进信号槽；这里直接模拟那一步的产物。
+        let signal = crate::failover::StreamFailure::new(true);
+        signal.record(crate::pool::UpstreamEvent::Server, "上游连接中断");
+        let mut stream = SsePassthrough::new(futures_util::stream::iter(chunks)).with_failover(
+            Some(signal),
+            "一号",
+            "hy4",
+        );
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            out.push(String::from_utf8_lossy(&item.expect("透传不报错")).to_string());
+        }
+        assert_eq!(out.len(), 3, "正常帧 + 错误帧 + [DONE]：{out:?}");
+        assert!(out[1].contains("\"error\""), "错误帧必须在前：{out:?}");
+        assert!(
+            out[1].contains("HTTP 502"),
+            "文案必须含等价状态码（客户端靠文本正则归类）：{out:?}"
+        );
+        assert_eq!(
+            out[2], "data: [DONE]\n\n",
+            "收尾仍要发 [DONE]，否则连接悬挂"
+        );
+    }
+
+    /// ★ 开关开启 + 流内**错误信封**（`{"code":6004}`）⇒ 收尾发 `429`（可重试）。
+    ///
+    /// 模型级限流对客户端就是「稍后重试」，不是「参数错」。
+    #[tokio::test]
+    async fn passthrough_with_failover_emits_429_for_envelope_errors() {
+        use futures_util::StreamExt;
+        let signal = crate::failover::StreamFailure::new(true);
+        signal.record(
+            crate::pool::UpstreamEvent::SoftRate {
+                reset_at_ms: None,
+                model_scoped: true,
+            },
+            "6004 model rate limited",
+        );
+        let chunks: Vec<Result<Bytes, std::io::Error>> =
+            vec![Ok(Bytes::from_static(b"data: {\"code\":6004}\n\n"))];
+        let mut stream = SsePassthrough::new(futures_util::stream::iter(chunks)).with_failover(
+            Some(signal),
+            "一号",
+            "hy4",
+        );
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            out.push(String::from_utf8_lossy(&item.expect("透传不报错")).to_string());
+        }
+        let tail = out.last().expect("至少一条");
+        assert_eq!(tail, "data: [DONE]\n\n");
+        assert!(
+            out.iter()
+                .any(|chunk| chunk.contains("\"type\":\"rate_limit_error\"")),
+            "必须发标准错误类别：{out:?}"
+        );
+    }
+
+    /// 上游**正常结束**（见过 `[DONE]`）时，即使开关开启也不得多发错误帧。
+    #[tokio::test]
+    async fn passthrough_with_failover_keeps_a_clean_stream_clean() {
+        use futures_util::StreamExt;
+        let signal = crate::failover::StreamFailure::new(true);
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+            )),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+        let mut stream = SsePassthrough::new(futures_util::stream::iter(chunks)).with_failover(
+            Some(signal),
+            "一号",
+            "hy4",
+        );
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            out.push(String::from_utf8_lossy(&item.expect("透传不报错")).to_string());
+        }
+        assert_eq!(out.len(), 2, "干净流不得被加料：{out:?}");
+        assert!(!out.iter().any(|chunk| chunk.contains("\"error\"")));
+    }
+
+    #[test]
+    fn to_openai_completion_omits_reasoning_when_empty() {
+        let accum = CompletionAccumulator {
+            content: "hello".to_string(),
+            ..Default::default()
+        };
+        let completion = accum.to_openai_completion("m");
+        assert!(completion["choices"][0]["message"]
+            .get("reasoning_content")
+            .is_none());
     }
 }

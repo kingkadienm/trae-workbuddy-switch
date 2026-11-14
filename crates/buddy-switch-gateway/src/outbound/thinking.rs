@@ -147,16 +147,16 @@ mod tests {
 
     #[test]
     fn disabled_thinking_removes_effort_and_does_not_inject() {
-        let mut obj = object(
-            r#"{"thinking":{"type":"disabled"},"reasoning_effort":"low","messages":[]}"#,
-        );
+        let mut obj =
+            object(r#"{"thinking":{"type":"disabled"},"reasoning_effort":"low","messages":[]}"#);
         inject_thinking(&mut obj, "high");
-        assert_eq!(obj["thinking"], json!({"type": "disabled"}), "不得覆写 disabled");
-        assert!(obj.get("reasoning_effort").is_none(), "必须删除 snake 拼写");
-        assert!(
-            !obj.contains_key("reasoningEffort"),
-            "不得新写 camel 拼写"
+        assert_eq!(
+            obj["thinking"],
+            json!({"type": "disabled"}),
+            "不得覆写 disabled"
         );
+        assert!(obj.get("reasoning_effort").is_none(), "必须删除 snake 拼写");
+        assert!(!obj.contains_key("reasoningEffort"), "不得新写 camel 拼写");
     }
 
     #[test]
@@ -214,7 +214,10 @@ mod tests {
         let mut obj = object(
             r#"{"messages":[{"role":"assistant","content":"hi"},{"role":"user","content":"yo"}]}"#,
         );
-        assert!(!backfill_reasoning_content(&mut obj), "无思维链痕迹不得改动");
+        assert!(
+            !backfill_reasoning_content(&mut obj),
+            "无思维链痕迹不得改动"
+        );
         assert!(obj["messages"][0].get("reasoning_content").is_none());
     }
 
@@ -229,7 +232,11 @@ mod tests {
         );
         assert!(backfill_reasoning_content(&mut obj));
         assert_eq!(obj["messages"][0]["reasoning_content"], json!("thought A"));
-        assert_eq!(obj["messages"][2]["reasoning_content"], json!(""), "未带思维链的 assistant 补空串");
+        assert_eq!(
+            obj["messages"][2]["reasoning_content"],
+            json!(""),
+            "未带思维链的 assistant 补空串"
+        );
         assert!(
             obj["messages"][1].get("reasoning_content").is_none(),
             "非 assistant 消息不得被写入"

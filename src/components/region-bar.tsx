@@ -1,52 +1,64 @@
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Seg } from "@/components/ui/seg";
 import { useT } from "@/lib/i18n";
-import { REGION_FILTERS, regionFilterLabel } from "@/lib/region";
-import type { RegionFilter } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 interface RegionBarProps {
-  /** 当前查询范围（cn / global / all）。 */
-  value: RegionFilter;
-  onChange: (next: RegionFilter) => void;
+  /**
+   * 是否**合并**两个区域查看。
+   *
+   * ⚠️ 这是**布尔**而不是 `RegionFilter` —— 见下方说明：区域不在这里选。
+   */
+  value: boolean;
+  onChange: (next: boolean) => void;
   /** 重新取数中：控件保持可点，仅禁用并给出无障碍提示。 */
   disabled?: boolean;
-  /** 无障碍标签，便于区分多个页面上的同款控件。 */
-  ariaLabel?: string;
   className?: string;
 }
 
-function isRegionFilter(value: string): value is RegionFilter {
-  return value === "cn" || value === "global" || value === "all";
-}
-
 /**
- * 页面级范围切换条（层级 1）：决定「数据源是什么」，全页共享。
- * 文案统一走 `regionFilterLabel`（cn→国内版 / global→国际版 / all→合并）。
+ * 合并态切换（**视图参数**，不是作用域）—— `.seg` 双按钮形态（同原型 `viewUsage` 的 params 段）。
+ *
+ * ## 为什么这里是「仅本作用域 / 合并全部作用域」两个按钮，而不是一个开关
+ *
+ * 原型 `viewUsage` 的合并控件就是一个 `.seg`：
+ * `<button>仅本作用域</button><button>合并全部作用域</button>`。
+ * 用两段式分段控件把「当前是哪一档」直接显出来，比「开关 + 标签」更一目了然。
+ *
+ * ## 为什么区域不在这里选
+ *
+ * 区域（`cn` ↔ `global`）**已经上移到侧栏**（`ScopeSwitch`，P2）—— 页面里再放一个区域选择器，
+ * 就有了**两个「看起来能切」的控件**，用户不确定哪个生效（§3.1 的纪律）。
+ *
+ * ## 为什么 `all` 留下
+ *
+ * 因为它**不是作用域**。判据（VOCABULARY 第 1 节）：
+ *
+ * > 换一个值，会不会导致「取的是**另一份数据**」？会 ⇒ 作用域；不会 ⇒ 视图参数。
+ *
+ * `cn → global` 换的是**数据源**（作用域，归侧栏）；
+ * `单区 → all` 换的是**同一份数据的呈现方式**（把两个区域合起来看）⇒ **视图参数**，留在页内。
+ *
+ * 这也与 `useScope` 的分工一致：它只管 `cn` / `global`，**不管 `all`**。
+ *
+ * ## 两平台同一控件
+ *
+ * Trae 侧的「作用域」就是**区域**（`/s/trae-cn` ↔ `/s/trae-global`，见 `useScope("trae")`），
+ * 与 WorkBuddy 同一根轴 ⇒ 同一枚控件、同一套文案，**不是** Trae 专属的「版本范围」四档
+ * （那枚四档控件已被删除：它既是页内区域选择器、又与 WB 长得不一样）。
  */
-export function RegionBar({ value, onChange, disabled, ariaLabel, className }: RegionBarProps) {
+export function RegionBar({ value, onChange, disabled, className }: RegionBarProps) {
   const t = useT();
   return (
-    <Tabs
-      className={cn("min-w-0 gap-0", className)}
-      value={value}
-      onValueChange={(next) => {
-        if (!isRegionFilter(next)) return;
-        onChange(next);
-      }}
-    >
-      <TabsList className="h-auto max-w-full flex-wrap" aria-label={ariaLabel ?? t("shared.region.scope.aria")}>
-        {REGION_FILTERS.map((filter) => (
-          <TabsTrigger
-            key={filter}
-            className="max-w-full whitespace-normal"
-            value={filter}
-            disabled={disabled}
-            aria-busy={disabled && value === filter}
-          >
-            {regionFilterLabel(filter)}
-          </TabsTrigger>
-        ))}
-      </TabsList>
-    </Tabs>
+    <Seg
+      className={cn("shrink-0", className)}
+      value={value ? "all" : "only"}
+      onChange={(next) => onChange(next === "all")}
+      disabled={disabled}
+      ariaLabel={t("shared.region.combine.aria")}
+      options={[
+        { value: "only", label: t("shared.region.combine.only") },
+        { value: "all", label: t("shared.region.combine.all") },
+      ]}
+    />
   );
 }

@@ -14,16 +14,23 @@ import {
 } from "@/components/ui/dialog";
 import * as api from "@/lib/api";
 import { displayText } from "@/lib/display-text";
-import type { ImportPreviewAccount, Region } from "@/lib/types";
+import type { ImportPreviewAccount } from "@/lib/types";
 import { useT, type Translate } from "@/lib/i18n";
+import type { Scope } from "@/lib/scope";
 
 interface Props {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   /** 导入完成后回调（参数为导入结果计数）。 */
   onImported?: (result: { imported: number; skipped: number; overwritten: number }) => void;
-  /** 目标版本；缺省为国内版。 */
-  region?: Region;
+  /**
+   * 目标作用域（`wb-cn` / `trae-cn` / `qoder-global` …）；缺省 `wb-cn`。
+   *
+   * ⚠️ 2026-10-15 由 `region` 升级而来：三个平台的账号库互不相通，`region` 只能表达
+   * WB / Trae 的区域轴 —— Qoder 的 `qoder-cn` 与 WB 的 `cn` 会撞车（把 Qoder 的
+   * 预览做成 WB 的，且**不会报错**）。
+   */
+  scope?: Scope;
 }
 
 /** 导入预览账号展示名（脱敏展示：昵称/邮箱/uid）。 */
@@ -39,7 +46,7 @@ function previewLabel(a: ImportPreviewAccount, t: Translate): string {
 }
 
 /** 导入账号弹框：选 JSON 文件 → 后端解析预览 → 勾选账号 → 导入合并。 */
-export function ImportAccountsDialog({ open, onOpenChange, onImported, region }: Props) {
+export function ImportAccountsDialog({ open, onOpenChange, onImported, scope }: Props) {
   const t = useT();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [fileName, setFileName] = useState("");
@@ -79,7 +86,7 @@ export function ImportAccountsDialog({ open, onOpenChange, onImported, region }:
       setParsing(true);
       setError("");
       api
-        .previewImportAccounts(text, region)
+        .previewImportAccounts(text, scope)
         .then((res) => {
           setPreview(res.accounts);
           setSelected(new Set(res.accounts.map((a) => a.index)));
@@ -114,7 +121,7 @@ export function ImportAccountsDialog({ open, onOpenChange, onImported, region }:
     setBusy(true);
     setError("");
     try {
-      const res = await api.importAccounts(fileText, [...selected], region);
+      const res = await api.importAccounts(fileText, [...selected], scope);
       onImported?.(res);
       onOpenChange(false);
     } catch (e) {

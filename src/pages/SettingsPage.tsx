@@ -1,13 +1,18 @@
 import { useEffect, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import {
   CircleCheck,
   Copy,
   FolderOpen,
+  Info,
   Loader2,
   Play,
   RefreshCw,
   Save,
   Shield,
+  ShieldAlert,
+  Stethoscope,
+  Trash2,
 } from "lucide-react";
 import QRCode from "qrcode";
 import { toast } from "sonner";
@@ -23,29 +28,50 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { ScopeChip, scopeLabel } from "@/components/scope-chip";
+import { SettingsFieldRow, SettingsGroup, SettingsRow } from "@/components/settings-primitives";
+// P7 T03：设置页子导航（9 项）+「备份与恢复」分区 + 通用设置分组（与侧栏弹层共用）。
+import {
+  parseSettingsSubnav,
+  SETTINGS_SCOPE,
+  SettingsSubnav,
+  type SettingsSubnavId,
+} from "@/components/settings/settings-subnav";
+import { BackupSection } from "@/components/settings/backup-section";
+import { CodebuddyCliCard } from "@/components/settings/codebuddy-cli-card";
+import { CacheSection } from "@/components/settings/cache-section";
+import { RuntimeLogCard } from "@/components/settings/runtime-log-card";
+import { AppSettingsGroups } from "@/components/app-settings";
+import { RiskControlsForm } from "@/components/gateway/risk-controls-form";
+// 时点表编辑器与 Trae 设置页**共用同一份实现**（校验规则属于规则，不属于版式）。
+import { TimesEditor } from "@/components/schedule-times-editor";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { SettingsFieldRow, SettingsGroup, SettingsRow } from "@/components/settings-primitives";
-// 小时表编辑器与 Trae 设置页**共用同一份实现**（校验规则属于规则，不属于版式）。
-import { HoursEditor } from "@/components/schedule-hours-editor";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import * as api from "@/lib/api";
 import { copyText } from "@/lib/clipboard";
 import { useT } from "@/lib/i18n";
 import { regionDescriptor } from "@/lib/region";
+import { DEFAULT_RISK_CONTROL_SETTINGS } from "@/lib/risk-controls";
+import { scopeOf } from "@/lib/scope";
+import { useScope } from "@/lib/use-scope";
 import type { TranslationKey } from "@/locales/zh";
 import type {
   AutoRotateConfig,
   CheckinConfig,
   CheckinLog,
+  CodeBuddyCliStatus,
+  CodeBuddyCnIdeStatus,
   GatewayConfig,
   Region,
   RotateLog,
   RotateStatus,
+  RiskControlSettings,
   ScheduleConfig,
   ScheduleRunResult,
   SwitchConfig,
+  TravelConfig,
 } from "@/lib/types";
 import { DemoAction } from "@/components/demo-action";
 import { useAccountsStore } from "@/stores/accounts";
@@ -210,7 +236,7 @@ function AutoCheckinCard() {
               />
             </SettingsFieldRow>
 
-            <div className="flex flex-wrap gap-2 border-b-0 border-border/60 px-4 py-3 sm:px-5">
+            <div className="flex flex-wrap gap-2 border-b-0 border-border/60 px-4 py-3">
               <DemoAction><Button size="sm" onClick={save} disabled={saving}>
                 {saving ? <Loader2 className="animate-spin" /> : <Save />}{t("wbSettings.common.saveConfig")}
               </Button></DemoAction>
@@ -220,7 +246,7 @@ function AutoCheckinCard() {
             </div>
           </>
         ) : (
-          <p className="px-4 py-3 text-sm text-muted-foreground sm:px-5">{t("wbSettings.common.loading")}</p>
+          <p className="px-4 py-3 text-sm text-muted-foreground">{t("wbSettings.common.loading")}</p>
         )}
 
         {msg && (
@@ -232,7 +258,7 @@ function AutoCheckinCard() {
           </Alert>
         )}
 
-        <div className="px-4 py-3 sm:px-5">
+        <div className="px-4 py-3">
           <p className="mb-2 text-[13px] font-medium">{t("wbSettings.checkin.logTitle")}</p>
           {logs.length === 0 ? (
             <p className="py-3 text-center text-sm text-muted-foreground">{t("wbSettings.checkin.logEmpty")}</p>
@@ -255,8 +281,8 @@ function AutoCheckinCard() {
                           tone.tone === "error"
                             ? "text-destructive"
                             : tone.tone === "warning"
-                              ? "text-amber-600"
-                              : "text-emerald-600"
+                              ? "text-warning"
+                              : "text-success"
                         }
                       >
                         {t(tone.textKey)}
@@ -367,7 +393,7 @@ function AutoRotateCard() {
     >
       <CardContent className="space-y-0 p-0">
         {status && (
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-border/60 bg-muted/25 px-4 py-3 text-xs text-muted-foreground sm:px-5">
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-border/60 bg-muted/25 px-4 py-3 text-xs text-muted-foreground">
             <span>
               {t("wbSettings.rotate.currentAccountLabel")}
               <b className="text-foreground">{status.activeAccountName ?? t("wbSettings.rotate.notConfigured")}</b>
@@ -494,11 +520,11 @@ function AutoRotateCard() {
                 onChange={(e) => setNum("min_remaining_credits", e.target.value)}
               />
             </SettingsFieldRow>
-            <p className="border-b border-border/60 px-4 py-3 text-[13px] leading-5 text-muted-foreground sm:px-5">
+            <p className="border-b border-border/60 px-4 py-3 text-[13px] leading-5 text-muted-foreground">
               {t("wbSettings.rotate.timingHint")}
             </p>
 
-            <div className="flex flex-wrap gap-2 border-b-0 border-border/60 px-4 py-3 sm:px-5">
+            <div className="flex flex-wrap gap-2 border-b-0 border-border/60 px-4 py-3">
               <DemoAction><Button size="sm" onClick={save} disabled={saving}>
                 {saving ? <Loader2 className="animate-spin" /> : <Save />}{t("wbSettings.common.saveConfig")}
               </Button></DemoAction>
@@ -508,7 +534,7 @@ function AutoRotateCard() {
             </div>
           </>
         ) : (
-          <p className="px-4 py-3 text-sm text-muted-foreground sm:px-5">{t("wbSettings.common.loading")}</p>
+          <p className="px-4 py-3 text-sm text-muted-foreground">{t("wbSettings.common.loading")}</p>
         )}
 
         {msg && (
@@ -520,7 +546,7 @@ function AutoRotateCard() {
           </Alert>
         )}
 
-        <div className="px-4 py-3 sm:px-5">
+        <div className="px-4 py-3">
           <p className="mb-2 text-[13px] font-medium">{t("wbSettings.rotate.logTitle")}</p>
           {logs.length === 0 ? (
             <p className="py-3 text-center text-sm text-muted-foreground">{t("wbSettings.rotate.logEmpty")}</p>
@@ -547,8 +573,8 @@ function AutoRotateCard() {
                           tone.tone === "error"
                             ? "text-destructive"
                             : tone.tone === "success"
-                              ? "text-emerald-600"
-                              : "text-amber-600"
+                              ? "text-success"
+                              : "text-warning"
                         }
                       >
                         {tone.text}
@@ -840,10 +866,10 @@ function PermissionCheckCard() {
       title={t("wbSettings.permission.groupTitle")}
     >
       <CardContent className="space-y-0 p-0">
-        <div className="break-all border-b border-border/60 bg-muted/25 px-4 py-3 font-mono text-[11px] leading-5 text-muted-foreground sm:px-5">
+        <div className="break-all border-b border-border/60 bg-muted/25 px-4 py-3 font-mono text-[11px] leading-5 text-muted-foreground">
           {authFile || t("wbSettings.permission.authFileMissing")}
         </div>
-        <div className="flex flex-wrap gap-2 border-b-0 border-border/60 px-4 py-3 sm:px-5">
+        <div className="flex flex-wrap gap-2 border-b-0 border-border/60 px-4 py-3">
           <DemoAction><Button size="sm" onClick={runCheck} disabled={checking}>
             {checking ? t("wbSettings.permission.checking") : t("wbSettings.permission.checkBtn")}
           </Button></DemoAction>
@@ -887,6 +913,122 @@ function PermissionCheckCard() {
           </div>
         )}
       </CardContent>
+    </SettingsGroup>
+  );
+}
+
+/**
+ * ★ Q1「危险操作」分区（WorkBuddy 侧）。
+ *
+ * ## 为什么 WB 是这两项，而不是 Trae 的「重置设备标识」
+ *
+ * Trae 的「重置设备标识」改的是 **Trae 客户端自己的** 6 层文件（`machineid` /
+ * `aha/TinyStorage` / `trae-webview` …，`trae/platform.rs::reset_device_identity_for`）。
+ * WorkBuddy 客户端**没有**这套结构，且本工具在网关侧的身份是
+ * `sha256("wb2a:<purpose>:<uid>")` 的**纯函数派生**（`gateway/session_headers.rs`）——
+ * **不落盘、无状态，没有可「重置」的对象**。给它加一个按钮只能重置空气，
+ * 那是本仓最忌的「假控件」。故此处只放**WB 真实存在**的危险面。
+ */
+function DangerZoneCard() {
+  const t = useT();
+  const [exporting, setExporting] = useState(false);
+  const [clearing, setClearing] = useState(false);
+  const [clearOpen, setClearOpen] = useState(false);
+
+  /** 导出诊断包：后端已剥离凭据并做纯文本闸门，这里只落盘。 */
+  async function runExportDiagnostic() {
+    if (exporting) return;
+    setExporting(true);
+    try {
+      const { name, text } = await api.exportDiagnostic();
+      const blob = new Blob([text], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = name;
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+      URL.revokeObjectURL(url);
+      toast.success(t("wbSettings.danger.diagSaved", { name }));
+    } catch (e) {
+      toast.error(t("wbSettings.danger.diagFailed"), { description: api.asError(e) });
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  /** 清空网关请求日志（不可撤销 ⇒ 必须二次确认）。 */
+  async function runClearGatewayLogs() {
+    if (clearing) return;
+    setClearing(true);
+    try {
+      await api.clearGatewayLogs();
+      toast.success(t("wbSettings.danger.logsCleared"));
+      await useGatewayStore.getState().loadLogs();
+    } catch (e) {
+      toast.error(t("wbSettings.danger.logsClearFailed"), { description: api.asError(e) });
+    } finally {
+      setClearing(false);
+      setClearOpen(false);
+    }
+  }
+
+  return (
+    <SettingsGroup id="settings-danger" title={t("wbSettings.danger.groupTitle")}>
+      <CardContent className="space-y-0 p-0">
+        <p className="border-b border-border/60 bg-muted/25 px-4 py-3 text-xs leading-5 text-muted-foreground">
+          {t("wbSettings.danger.intro")}
+        </p>
+
+        <SettingsFieldRow
+          label={t("wbSettings.danger.diagLabel")}
+          description={t("wbSettings.danger.diagDesc")}
+          operational
+        >
+          <Button size="sm" variant="outline" onClick={() => void runExportDiagnostic()} disabled={exporting}>
+            {exporting ? <Loader2 className="animate-spin" /> : <Stethoscope />}
+            {exporting ? t("wbSettings.danger.exporting") : t("wbSettings.danger.diag")}
+          </Button>
+        </SettingsFieldRow>
+
+        <SettingsFieldRow
+          label={t("wbSettings.danger.logsLabel")}
+          description={t("wbSettings.danger.logsDesc")}
+          operational
+        >
+          <Button size="sm" variant="destructive" onClick={() => setClearOpen(true)} disabled={clearing}>
+            {clearing ? <Loader2 className="animate-spin" /> : <Trash2 />}
+            {t("wbSettings.danger.logsClear")}
+          </Button>
+        </SettingsFieldRow>
+      </CardContent>
+
+      <Dialog open={clearOpen} onOpenChange={setClearOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <ShieldAlert className="size-4 text-destructive" />
+              {t("wbSettings.danger.logsConfirmTitle")}
+            </DialogTitle>
+            <DialogDescription>{t("wbSettings.danger.logsConfirmDesc")}</DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setClearOpen(false)}>
+              {t("shared.batch.cancel")}
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={() => {
+                setClearOpen(false);
+                void runClearGatewayLogs();
+              }}
+            >
+              {t("wbSettings.danger.logsConfirmBtn")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </SettingsGroup>
   );
 }
@@ -974,6 +1116,249 @@ function SwitchBehaviorCard() {
           />
         </SettingsFieldRow>
       </CardContent>
+    </SettingsGroup>
+  );
+}
+
+/**
+ * 自动旅行：**单一真实键** `enabled`（`~/.buddy-switch/auto_travel_config.json`）。
+ *
+ * 与账号页工具栏的开关读写**同一份**配置（`get/save_auto_travel_config`）；原型把该行
+ * 放在「签到与积分」的「积分与轮换」分组下（:1706-1708），此处对齐。
+ */
+function TravelSettingsCard() {
+  const t = useT();
+  const [cfg, setCfg] = useState<TravelConfig | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .getAutoTravelConfig()
+      .then((value) => {
+        if (!cancelled) setCfg(value);
+      })
+      .catch((e) => {
+        if (!cancelled) toast.error(t("wbSettings.common.saveFailed"), { description: api.asError(e) });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function patch(enabled: boolean) {
+    if (!cfg || saving) return;
+    const previous = cfg;
+    setCfg({ ...cfg, enabled });
+    setSaving(true);
+    try {
+      setCfg(await api.saveAutoTravelConfig({ ...cfg, enabled }));
+      toast.success(enabled ? t("wbSettings.checkin.travelOn") : t("wbSettings.checkin.travelOff"));
+    } catch (e) {
+      setCfg(previous);
+      toast.error(t("wbSettings.common.saveFailed"), { description: api.asError(e) });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <SettingsGroup id="settings-travel" title={t("wbSettings.schedule.task.travel.label")}>
+      <CardContent className="space-y-0 p-0">
+        <SettingsFieldRow
+          className="border-b-0"
+          label={t("wbSettings.checkin.travelLabel")}
+          description={t("wbSettings.checkin.travelDesc")}
+          htmlFor="travel-enabled"
+          operational
+        >
+          <Switch
+            id="travel-enabled"
+            checked={cfg?.enabled ?? false}
+            disabled={saving || cfg === null}
+            onCheckedChange={(value) => void patch(value)}
+            aria-label={t("wbSettings.checkin.travelLabel")}
+          />
+        </SettingsFieldRow>
+      </CardContent>
+    </SettingsGroup>
+  );
+}
+
+/**
+ * 客户端检测（**只读**）：三行数据来自真实探测命令，缺数据渲染「未检测到」，绝不写死。
+ *
+ * - WorkBuddy Desktop：`AppStatus.installed` / `version`（当前作用域那一版）；
+ * - CodeBuddy CLI：`get_codebuddy_cli_status` 的 `configured`；
+ * - CodeBuddy CN IDE：`get_codebuddy_cn_ide_status` 的 `installed`。
+ */
+function ClientDetectCard() {
+  const t = useT();
+  const [region] = useScope("workbuddy");
+  const status = useAccountsStore((s) => (region === "global" ? s.global.status : s.status));
+  const fetchAllRegions = useAccountsStore((s) => s.fetchAllRegions);
+  const [cli, setCli] = useState<CodeBuddyCliStatus | null>(null);
+  const [cnIde, setCnIde] = useState<CodeBuddyCnIdeStatus | null>(null);
+
+  useEffect(() => {
+    void fetchAllRegions();
+  }, [fetchAllRegions]);
+
+  useEffect(() => {
+    let cancelled = false;
+    // 两个探测各自失败都不影响另一个：失败即保持 null ⇒ 该行显示「未检测到」。
+    void api.getCodebuddyCliStatus().then((value) => {
+      if (!cancelled) setCli(value);
+    }).catch(() => {});
+    void api.getCodebuddyCnIdeStatus().then((value) => {
+      if (!cancelled) setCnIde(value);
+    }).catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const desktopInstalled = status?.installed ?? Boolean(status?.version);
+  const desktopValue = !desktopInstalled
+    ? t("wbSettings.client.notDetected")
+    : status?.version
+      ? t("wbSettings.client.detectedVersion", { version: status.version })
+      : t("wbSettings.client.detected");
+
+  const rows: { id: string; label: string; desc: string; value: string }[] = [
+    {
+      id: "detect-workbuddy",
+      label: t("wbSettings.client.detectWorkbuddy"),
+      desc: t("wbSettings.client.detectWorkbuddyDesc"),
+      value: desktopValue,
+    },
+    {
+      id: "detect-cli",
+      label: t("wbSettings.client.detectCli"),
+      desc: t("wbSettings.client.detectCliDesc"),
+      value: cli?.configured ? t("wbSettings.client.configured") : t("wbSettings.client.notConfigured"),
+    },
+    {
+      id: "detect-cn-ide",
+      label: t("wbSettings.client.detectCnIde"),
+      desc: t("wbSettings.client.detectCnIdeDesc"),
+      value: cnIde?.installed ? t("wbSettings.client.detected") : t("wbSettings.client.notDetected"),
+    },
+  ];
+
+  return (
+    <SettingsGroup id="settings-client-detect" title={t("wbSettings.client.detectTitle")}>
+      <CardContent className="space-y-0 p-0">
+        {rows.map((row, index) => (
+          <SettingsFieldRow
+            key={row.id}
+            className={index === rows.length - 1 ? "border-b-0" : undefined}
+            label={row.label}
+            description={row.desc}
+          >
+            <span className="text-sm text-muted-foreground">{row.value}</span>
+          </SettingsFieldRow>
+        ))}
+      </CardContent>
+    </SettingsGroup>
+  );
+}
+
+/**
+ * P15 · 外部 Agent 会话监听：往客户端 `settings.json` 装 / 卸 hook。
+ *
+ * ## 为什么需要用户显式同意（默认关）
+ *
+ * 开启这一步会**改写别的客户端（WorkBuddy 两版）的配置文件** ——
+ * 本仓对此的动作纪律是「默认关 + 用户点了才做 + 可一键还原」
+ * （`app_prefs.watch_agent_sessions` 是唯一事实来源，见其默认值注释）。
+ *
+ * ## 为什么逐槽位显示状态，而不是一个总开关的「已开启」
+ *
+ * 用户很可能**只装了国内版**、或**某个客户端正开着**（开着时改不了它的配置，
+ * 会被它的内存态覆盖 —— 那是 `client_settings` 的进程守卫）。
+ * 把这种情况显示成一句「已开启」等于骗人：那个客户端里其实一条 hook 都没有。
+ */
+function AgentWatchCard() {
+  const t = useT();
+  const [status, setStatus] = useState<api.AgentHookStatus | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [feedback, setFeedback] = useState<string | null>(null);
+  // 刷新用「递增 key」触发（与 `ClientDetectCard` 同款写法）：把拉取放在 effect 内，
+  // 免得为了 `useCallback` 把一段一次性逻辑抬到组件顶层。
+  const [reloadKey, setReloadKey] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .getAgentHookStatus()
+      .then((value) => {
+        if (!cancelled) setStatus(value);
+      })
+      .catch(() => {
+        // 读不到就保持 null ⇒ 开关置灰，**不假装「关着」**（那会让人以为可以点）。
+        if (!cancelled) setStatus(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [reloadKey]);
+
+  async function toggle(next: boolean) {
+    setBusy(true);
+    setFeedback(null);
+    try {
+      const result = await api.setAgentHookEnabled(next);
+      // ★ 部分成功是常态（只装了一个版本 / 某个客户端正在运行）⇒ `errors` 如实呈现。
+      setFeedback(result.errors.length > 0 ? result.errors.join("；") : null);
+    } catch (cause) {
+      setFeedback(api.asError(cause));
+    } finally {
+      setBusy(false);
+      setReloadKey((key) => key + 1);
+    }
+  }
+
+  const slots = status?.slots ?? [];
+
+  return (
+    <SettingsGroup id="settings-agent-watch" title={t("wbSettings.agentWatch.title")}>
+      <CardContent className="space-y-0 p-0">
+        <SettingsFieldRow
+          label={t("wbSettings.agentWatch.enable")}
+          description={t("wbSettings.agentWatch.enableDesc")}
+        >
+          <Switch
+            checked={status?.enabled ?? false}
+            disabled={busy || status === null}
+            onCheckedChange={(next) => void toggle(next)}
+            aria-label={t("wbSettings.agentWatch.enable")}
+          />
+        </SettingsFieldRow>
+        {slots.map((slot, index) => (
+          <SettingsFieldRow
+            key={slot.slot}
+            className={index === slots.length - 1 ? "border-b-0" : undefined}
+            label={t(`wbSettings.agentWatch.slot.${slot.slot}` as TranslationKey)}
+            description={slot.command ?? ""}
+          >
+            <span className="text-sm text-muted-foreground">
+              {slot.clientRunning
+                ? t("wbSettings.agentWatch.state.running")
+                : slot.installed
+                  ? t("wbSettings.agentWatch.state.installed", { count: slot.events.length })
+                  : slot.clientInstalled
+                    ? t("wbSettings.agentWatch.state.off")
+                    : t("wbSettings.agentWatch.state.missing")}
+            </span>
+          </SettingsFieldRow>
+        ))}
+      </CardContent>
+      {feedback ? (
+        <p role="alert" className="px-4 pb-3 text-[11px] leading-4 text-destructive">
+          {feedback}
+        </p>
+      ) : null}
     </SettingsGroup>
   );
 }
@@ -1116,6 +1501,21 @@ function GatewaySettingsCard() {
     <SettingsGroup id="settings-gateway" title={t("wbSettings.gateway.groupTitle")}>
       <CardContent className="space-y-0 p-0">
         <SettingsFieldRow
+          label={t("wbSettings.gateway.enabledLabel")}
+          description={t("wbSettings.gateway.enabledDesc")}
+          htmlFor="gw-enabled"
+          operational
+        >
+          <Switch
+            id="gw-enabled"
+            checked={config.enabled}
+            disabled={saving}
+            onCheckedChange={(checked) => void persist({ enabled: checked })}
+            aria-label={t("wbSettings.gateway.enabledLabel")}
+          />
+        </SettingsFieldRow>
+
+        <SettingsFieldRow
           label={t("wbSettings.gateway.bindLabel")}
           description={t("wbSettings.gateway.bindDesc")}
           htmlFor="gw-addr"
@@ -1193,18 +1593,56 @@ function GatewaySettingsCard() {
   );
 }
 
+function GlobalRiskControlsCard() {
+  const [settings, setSettings] = useState<RiskControlSettings>(DEFAULT_RISK_CONTROL_SETTINGS);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    void api.getRiskControlSettings()
+      .then((value) => { if (active) setSettings(value); })
+      .catch((error) => toast.error("读取风控设置失败", { description: api.asError(error) }))
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, []);
+
+  async function persist(value: RiskControlSettings) {
+    setSaving(true);
+    try {
+      setSettings(await api.saveRiskControlSettings(value));
+      toast.success("公共风控设置已保存");
+    } catch (error) {
+      toast.error("公共风控设置保存失败", { description: api.asError(error) });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return <RiskControlsForm value={settings} saving={loading || saving} onSave={persist} />;
+}
+
 // ---------------------------------------------------------------------------
-// 定时任务排程（七类任务：各自独立开关 + 独立小时表）
+// 定时任务排程（六类任务：各自独立开关 + 独立时点表）
 // ---------------------------------------------------------------------------
 
-type ScheduleHoursField =
-  | "checkin_hours"
-  | "travel_hours"
-  | "activity_hours"
-  | "keepalive_hours"
-  | "school_hours"
-  | "cat_hours"
-  | "growth_hours";
+type ScheduleTimesField =
+  | "checkin_times"
+  | "travel_times"
+  | "activity_times"
+  | "keepalive_times"
+  | "school_times"
+  | "cat_times"
+  | "growth_times";
+
+type ScheduleJitterField =
+  | "checkin_jitter_minutes"
+  | "travel_jitter_minutes"
+  | "activity_jitter_minutes"
+  | "keepalive_jitter_minutes"
+  | "school_jitter_minutes"
+  | "cat_jitter_minutes"
+  | "growth_jitter_minutes";
 
 type ScheduleEnabledField =
   | "checkin_enabled"
@@ -1220,7 +1658,8 @@ interface ScheduleTaskDef {
   /** 任务名文案键（模块级常量只存键，渲染处再 `t(labelKey)`）。 */
   labelKey: TranslationKey;
   descKey: TranslationKey;
-  hoursField: ScheduleHoursField;
+  timesField: ScheduleTimesField;
+  jitterField: ScheduleJitterField;
   enabledField: ScheduleEnabledField;
 }
 
@@ -1233,14 +1672,17 @@ interface ScheduleTaskDef {
  * （排程是全局单份，与 region / 产品无关）。
  */
 const SCHEDULE_TASKS: ScheduleTaskDef[] = [
-  { key: "checkin", labelKey: "wbSettings.schedule.task.checkin.label", descKey: "wbSettings.schedule.task.checkin.desc", hoursField: "checkin_hours", enabledField: "checkin_enabled" },
-  { key: "travel", labelKey: "wbSettings.schedule.task.travel.label", descKey: "wbSettings.schedule.task.travel.desc", hoursField: "travel_hours", enabledField: "travel_enabled" },
-  { key: "activity", labelKey: "wbSettings.schedule.task.activity.label", descKey: "wbSettings.schedule.task.activity.desc", hoursField: "activity_hours", enabledField: "activity_enabled" },
-  { key: "keepalive", labelKey: "wbSettings.schedule.task.keepalive.label", descKey: "wbSettings.schedule.task.keepalive.desc", hoursField: "keepalive_hours", enabledField: "keepalive_enabled" },
-  { key: "school", labelKey: "wbSettings.schedule.task.school.label", descKey: "wbSettings.schedule.task.school.desc", hoursField: "school_hours", enabledField: "school_enabled" },
-  { key: "cat", labelKey: "wbSettings.schedule.task.cat.label", descKey: "wbSettings.schedule.task.cat.desc", hoursField: "cat_hours", enabledField: "cat_enabled" },
-  { key: "growth", labelKey: "wbSettings.schedule.task.growth.label", descKey: "wbSettings.schedule.task.growth.desc", hoursField: "growth_hours", enabledField: "growth_enabled" },
+  { key: "checkin", labelKey: "wbSettings.schedule.task.checkin.label", descKey: "wbSettings.schedule.task.checkin.desc", timesField: "checkin_times", jitterField: "checkin_jitter_minutes", enabledField: "checkin_enabled" },
+  { key: "travel", labelKey: "wbSettings.schedule.task.travel.label", descKey: "wbSettings.schedule.task.travel.desc", timesField: "travel_times", jitterField: "travel_jitter_minutes", enabledField: "travel_enabled" },
+  { key: "activity", labelKey: "wbSettings.schedule.task.activity.label", descKey: "wbSettings.schedule.task.activity.desc", timesField: "activity_times", jitterField: "activity_jitter_minutes", enabledField: "activity_enabled" },
+  { key: "keepalive", labelKey: "wbSettings.schedule.task.keepalive.label", descKey: "wbSettings.schedule.task.keepalive.desc", timesField: "keepalive_times", jitterField: "keepalive_jitter_minutes", enabledField: "keepalive_enabled" },
+  { key: "school", labelKey: "wbSettings.schedule.task.school.label", descKey: "wbSettings.schedule.task.school.desc", timesField: "school_times", jitterField: "school_jitter_minutes", enabledField: "school_enabled" },
+  { key: "cat", labelKey: "wbSettings.schedule.task.cat.label", descKey: "wbSettings.schedule.task.cat.desc", timesField: "cat_times", jitterField: "cat_jitter_minutes", enabledField: "cat_enabled" },
+  { key: "growth", labelKey: "wbSettings.schedule.task.growth.label", descKey: "wbSettings.schedule.task.growth.desc", timesField: "growth_times", jitterField: "growth_jitter_minutes", enabledField: "growth_enabled" },
 ];
+
+/** `HH:MM`（00:00–23:59）—— 与后端 `schedule::TimeOfDay` 的线上格式逐字一致。 */
+const SCHEDULE_TIME_PATTERN = /^([01]\d|2[0-3]):[0-5]\d$/;
 
 /**
  * 把「立即执行」的返回压成一句可读摘要。
@@ -1272,7 +1714,7 @@ function summarizeScheduleRun(
     : { key: "wbSettings.schedule.summaryStreak", params: { reported, streak } };
 }
 
-/** 定时任务排程配置：七类任务各自独立开关与小时表 + 活跃上报次数。 */
+/** 定时任务排程配置：六类任务各自独立开关与时点表 + 活跃上报次数。 */
 function ScheduleCard() {
   const t = useT();
   const [cfg, setCfg] = useState<ScheduleConfig | null>(null);
@@ -1296,9 +1738,14 @@ function ScheduleCard() {
     };
   }, []);
 
-  function patch(task: ScheduleTaskDef, hours: number[]) {
+  function patch(task: ScheduleTaskDef, times: string[]) {
     if (!cfg) return;
-    setCfg({ ...cfg, [task.hoursField]: hours });
+    setCfg({ ...cfg, [task.timesField]: times });
+  }
+
+  function patchJitter(task: ScheduleTaskDef, minutes: number) {
+    if (!cfg) return;
+    setCfg({ ...cfg, [task.jitterField]: minutes });
   }
 
   function toggle(task: ScheduleTaskDef, enabled: boolean) {
@@ -1306,16 +1753,16 @@ function ScheduleCard() {
     setCfg({ ...cfg, [task.enabledField]: enabled });
   }
 
-  /** 前端基本范围校验：小时必须为 0-23 的整数；已启用任务至少需一个小时点。 */
+  /** 前端基本范围校验：时点必须是 `HH:MM`（00:00–23:59）；已启用任务至少需一个时点。 */
   function validate(config: ScheduleConfig): string | null {
     for (const task of SCHEDULE_TASKS) {
-      const hours = config[task.hoursField];
-      const bad = hours.find((hour) => !Number.isInteger(hour) || hour < 0 || hour > 23);
+      const times = config[task.timesField];
+      const bad = times.find((time) => !SCHEDULE_TIME_PATTERN.test(time));
       if (bad !== undefined) {
-        return t("wbSettings.schedule.invalidHour", { label: t(task.labelKey), hour: bad });
+        return t("wbSettings.schedule.invalidTime", { label: t(task.labelKey), time: bad });
       }
-      if (config[task.enabledField] && hours.length === 0) {
-        return t("wbSettings.schedule.emptyHours", { label: t(task.labelKey) });
+      if (config[task.enabledField] && times.length === 0) {
+        return t("wbSettings.schedule.emptyTimes", { label: t(task.labelKey) });
       }
     }
     if (!Number.isInteger(config.activity_report_count) || config.activity_report_count < 1) {
@@ -1369,7 +1816,7 @@ function ScheduleCard() {
   return (
     <SettingsGroup id="settings-schedule" title={t("wbSettings.schedule.groupTitle")}>
       <CardContent className="space-y-0 p-0">
-        <p className="border-b border-border/60 bg-muted/25 px-4 py-3 text-xs leading-5 text-muted-foreground sm:px-5">
+        <p className="border-b border-border/60 bg-muted/25 px-4 py-3 text-xs leading-5 text-muted-foreground">
           {t("wbSettings.schedule.intro")}
         </p>
 
@@ -1388,10 +1835,10 @@ function ScheduleCard() {
                     aria-label={t("wbSettings.schedule.enableAria", { label: t(task.labelKey) })}
                   />
                   <div className="min-w-0">
-                    <Label htmlFor={`schedule-${task.key}-enabled`} className="text-[13px] leading-4">
+                    <Label htmlFor={`schedule-${task.key}-enabled`} className="text-[12.5px] font-[550] leading-4">
                       {t(task.labelKey)}
                     </Label>
-                    <p className="mt-0.5 text-xs leading-4 text-muted-foreground/75">{t(task.descKey)}</p>
+                    <p className="mt-0.5 text-[11.5px] leading-4 text-muted-foreground">{t(task.descKey)}</p>
                     <DemoAction>
                       <Button
                         type="button"
@@ -1407,10 +1854,12 @@ function ScheduleCard() {
                     </DemoAction>
                   </div>
                 </div>
-                <HoursEditor
-                  id={`schedule-${task.key}-hour`}
-                  hours={cfg[task.hoursField]}
-                  onChange={(hours) => patch(task, hours)}
+                <TimesEditor
+                  id={`schedule-${task.key}-time`}
+                  times={cfg[task.timesField]}
+                  jitter={cfg[task.jitterField]}
+                  onChange={(times) => patch(task, times)}
+                  onJitterChange={(minutes) => patchJitter(task, minutes)}
                 />
               </SettingsRow>
             ))}
@@ -1430,7 +1879,7 @@ function ScheduleCard() {
               />
             </SettingsFieldRow>
 
-            <div className="flex flex-wrap gap-2 border-b-0 border-border/60 px-4 py-3 sm:px-5">
+            <div className="flex flex-wrap gap-2 border-b-0 border-border/60 px-4 py-3">
               <DemoAction>
                 <Button size="sm" onClick={save} disabled={saving}>
                   {saving ? <Loader2 className="animate-spin" /> : <Save />}{t("wbSettings.schedule.saveBtn")}
@@ -1439,7 +1888,7 @@ function ScheduleCard() {
             </div>
           </>
         ) : (
-          <p className="px-4 py-3 text-sm text-muted-foreground sm:px-5">{t("wbSettings.common.loading")}</p>
+          <p className="px-4 py-3 text-sm text-muted-foreground">{t("wbSettings.common.loading")}</p>
         )}
 
         {msg && (
@@ -1456,33 +1905,159 @@ function ScheduleCard() {
 }
 
 /**
- * 设置页：**产品级**设置。
+ * 设置页：**产品级**设置（P7 起改为 **9 项子导航**，§3.9）。
  *
- * 只放依赖本产品上下文的块（版本与账号库、权限检测、网关、签到、排程、CLI 轮换）。
+ * ## 为什么从「一屏长滚动」改成子导航
  *
- * 应用级的三块（外观 / 开机自启 / 自动更新）已抽到 `@/components/app-settings`，
- * 入口固定在侧栏底部、**版本号上方** —— 那是两个产品分区唯一共用的位置。
+ * 现状是 7 张卡纵向堆叠（Trae 侧 10 组），用户找一项设置要滚很久、且看不出「还有哪些类」。
+ * 子导航先把**有哪几类**摆出来，再按类展示 —— 与 Trae 设置页共用同一套分区名。
+ *
+ * ## 9 项与内容的对应（WB 侧）
+ *
+ * | 子导航 | 内容 |
+ * |:---|:---|
+ * | 通用 | 应用级设置（外观 / 语言 / 快捷键 / 启动 / 更新，与侧栏弹层同一份实现） |
+ * | 账号与登录 | 版本与账号库路径、切换行为 |
+ * | 签到与积分 | 自动签到 + 日志 |
+ * | 网关 | 网关配置 |
+ * | 计划任务 | 六类定时任务排程 |
+ * | 客户端 | CodeBuddy CLI 自动轮换 |
+ * | 权限与诊断 | 认证文件写权限自检 |
+ * | 日志 | WorkBuddy 无独立运行日志 ⇒ **空态 + 出口**（§3.6 四要素） |
+ * | 备份与恢复 | 全局备份（P7 新增，第 9 项） |
+ *
+ * ⚠️ 「客户端 / 日志」是 **Trae 侧**的子项（PLAN §3.9）；WB 侧没有对应内容时**不硬塞**
+ * （§3.4 规则 1：无数据不渲染），而是给一个**说明原因 + 有出口**的空态。
  */
 export default function SettingsPage() {
   const t = useT();
+  /* 本页是 **WorkBuddy 侧**设置（Trae 侧是 `TraeSettingsPage`）⇒ 平台固定 workbuddy，
+     区域（国内版 / 国际版）仍由作用域承载 —— 与页头只读 `scope-chip` 的来源一致。 */
+  const [region] = useScope("workbuddy");
+  const scope = scopeOf("workbuddy", region);
+  /* ★ P0-4a：`section` 的**初始值从 URL 读**（`?section=diagnostics`）——
+     否则「未检测到程序位 → 去设置」只能落到设置页**首页**，到不了「权限与诊断」子项
+     （原型断言 `P0-4a` 要求点了之后能跳到「权限与诊断」）。
+     ⚠️ 必须**校验合法性**：非法值 fail-closed 回 "general"，不把任意串塞进 state。
+     解析走 `parseSettingsSubnav`（与网关页的 `parseGatewaySubnav` 同一形状），
+     Trae 设置页接的是同一个函数 —— 两平台同一件事只有一份实现。 */
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [section, setSection] = useState<SettingsSubnavId>(() =>
+    parseSettingsSubnav(searchParams.get("section")),
+  );
+
+  /**
+   * 切换分区：**同时写 URL**（与网关页同构 —— 位置真值在 URL，刷新 / 前进后退行为一致）。
+   * 用「保留式」写回：只覆盖 `section`，不动 `region` 之类的其他查询参数。
+   */
+  function goSection(id: SettingsSubnavId) {
+    setSection(id);
+    const next = new URLSearchParams(searchParams);
+    next.set("section", id);
+    setSearchParams(next, { replace: true });
+  }
+
   return (
-    <div className="mx-auto min-w-0 w-full max-w-3xl px-4 py-6 sm:px-6 sm:py-8">
-      <header className="mb-10 sm:mb-12">
-        <h1 className="text-2xl font-semibold tracking-tight">{t("wbSettings.page.title")}</h1>
-        <p className="mt-2 text-sm leading-6 text-muted-foreground">
-          {t("wbSettings.page.subtitle")}
-        </p>
+    <div className="mx-auto min-w-0 w-full max-w-[1240px] px-7 pt-[26px] pb-[60px]">
+      {/* 页头（原型 `viewSettings`，`demo.css:177-180`）：作用域副标题 + 只读 scope-chip。
+          容器与其余 12 个页面同为 `.page`（1240px / 26·28·60）——
+          此前这里是 `max-w-5xl`(1024px) + `px-4 py-6`，比原型窄 216px、留白也更紧。*/}
+      <header className="mb-5 flex items-start gap-4">
+        <div className="min-w-0">
+          <h1 className="text-[28px] font-[640] tracking-[-0.02em]">{t("wbSettings.page.title")}</h1>
+          <p className="mt-1.5 text-[12.5px] text-muted-foreground">
+            {t("pageHead.settings", { scope: scopeLabel(t, scope) })}
+          </p>
+        </div>
+        <div className="grow" />
+        <ScopeChip scope={scope} />
       </header>
 
-      <div className="min-w-0 space-y-12">
-        <VersionAccountsCard />
-        <TotpSettingsCard />
-        <SwitchBehaviorCard />
-        <PermissionCheckCard />
-        <GatewaySettingsCard />
-        <AutoCheckinCard />
-        <ScheduleCard />
-        <AutoRotateCard />
+      {/* 两栏容器 `.split`（原型 `:369`）：方向 / 对齐 / 间距整组在 `index.css` 的
+          `[data-split-layout]` 里（含 900px 转纵向），故这里不再写 `flex-col` /
+          `lg:flex-row` / `gap-*` —— utilities 会盖过 base 层，导致断点失效。 */}
+      <div data-split-layout className="min-w-0">
+        <SettingsSubnav active={section} onSelect={goSection} />
+
+        {/* 主区 `.split-main`：分区之间 16px（原型 `:378`）。 */}
+        <div className="min-w-0 flex-1 space-y-4">
+          {/* issue #122：说清「这一页的设置影响谁」。
+              用户原话：「现在修改设置，看起来不清楚哪些是改了影响所有作用域的」。
+              判据在 `SETTINGS_SCOPE`（按读写命令是否带 scope/region 归类），这里只负责显性化。 */}
+          <div
+            data-settings-scope={SETTINGS_SCOPE[section]}
+            className="flex items-start gap-2 rounded-[10px] bg-muted px-3 py-2 text-[12px] leading-[1.5] text-muted-foreground"
+          >
+            <Info className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+            <span>
+              {SETTINGS_SCOPE[section] === "global"
+                ? t("settings.scope.global")
+                : t("settings.scope.scoped", { scope: scopeLabel(t, scope) })}
+            </span>
+          </div>
+
+          {section === "general" && (
+            <>
+              <AppSettingsGroups />
+              {!api.isDemoMode() && <TotpSettingsCard />}
+              <GlobalRiskControlsCard />
+            </>
+          )}
+
+          {section === "account" && (
+            <>
+              <VersionAccountsCard />
+              <SwitchBehaviorCard />
+            </>
+          )}
+
+          {section === "checkin" && (
+            <>
+              <AutoCheckinCard />
+              {/* 「积分与轮换」组：轮换卡原本挂在「客户端」，与原型 :1701-1708 的分组不符
+                  （原型把轮换归在「签到与积分」⇒ 客户端只留检测）。 */}
+              <TravelSettingsCard />
+              <AutoRotateCard />
+            </>
+          )}
+
+          {section === "gateway" && <GatewaySettingsCard />}
+
+          {/* CodeBuddy CLI 的**接入方式**（issue #109）：状态条 + 两张模式卡 + 切换向导。
+              它是全局一次性配置（CLI 的凭据只有一份），与账号卡上的「切到 CLI」是两个层次。 */}
+          {section === "cli" && <CodebuddyCliCard />}
+
+          {section === "schedule" && <ScheduleCard />}
+
+          {section === "client" && (
+            <>
+              <ClientDetectCard />
+              {/* P15 · 会话监听开关（会写客户端配置，默认关）。 */}
+              <AgentWatchCard />
+            </>
+          )}
+
+          {section === "diagnostics" && (
+            <>
+              <PermissionCheckCard />
+              <DangerZoneCard />
+            </>
+          )}
+
+          {section === "logs" && (
+            /* 运行日志（本工具自身）：此前这里只是个「本分区暂无运行日志」空占位，
+               而宿主是 release GUI（无控制台）⇒ 用户拿不到任何可粘贴的诊断输出。
+               现在直接读写 `~/.buddy-switch/logs/runtime-*.log`。 */
+            <RuntimeLogCard />
+          )}
+
+          {section === "backup" && (
+            <>
+              <BackupSection />
+              <CacheSection />
+            </>
+          )}
+        </div>
       </div>
     </div>
   );

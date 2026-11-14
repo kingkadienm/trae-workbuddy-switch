@@ -1,0 +1,841 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>客户端限流 × 模型限流探测 · 联动设计稿</title>
+<!--
+  设计稿（非生产代码）。需求原话：
+    「账号中的客户端限流要和网关中的模型限流探测关联起来，数据要同步。
+      账号中的客户端限流也可以加入限流探测的入口。」
+
+  ## 这份稿子要回答的三个问题
+
+  1. **数据怎么同步** —— 不新增第三份数据：两侧读**同一个探测作业**（`model_probe` 的作业槽）
+     + 同一份客户端台账（`client_limits`）+ 同一份池冷却（`status.modelCoolings`）。
+     账号页把「台账条目」与「实测格」按 `(uid, model)` 对齐后渲染；网关页照旧渲染矩阵。
+     任何一侧发起探测，另一侧下一次读到的就是同一份结果。
+  2. **入口长什么样** —— 两处，都不离开当前上下文：
+     · 卡头「实测 N 格」＝ 把台账里**仍受限 / 状态未知**的 (账号, 模型) 去重后一次实测；
+     · 行尾「实测」＝ 只实测这一格（`uids:[uid] models:[model]`）。
+     两处都**强制 `adopt: false`** —— 账号页是「查证」，不是「治理」，绝不悄悄改池冷却。
+  3. **冲突怎么显示** —— 台账（日志反推）与实测（真发请求）可以不一致。
+     ★ **不篡改台账**：台账状态徽章照旧显示它自己的结论，实测只作为**并列的第二结论**，
+     并在不一致时显式写「实测可用 / 实测仍受限」，不替用户下结论。
+
+  ## 约定
+  - 令牌取自 Rhea 主题（与 `docs/prototype/demo.css`、`src/index.css` 同一套）。
+  - 形态与真实应用同构：账号页 = 列表下方一张卡；网关页 = 模型分区里一张卡（**不是弹层**）。
+  - 只有「模型限流 / 账号限流 / 模型封禁」算限流；402 积分不足与登录失效**分列**
+    （`client_limits` 与 `model_probe` 两个模块都踩过「把没积分报成限流 ⇒ 用户去傻等解锁」）。
+-->
+<style>
+:root{
+  --bg: oklch(0.208 0.042 265.755);
+  --card: oklch(0.279 0.041 260.031);
+  --card2: oklch(0.245 0.041 262);
+  --fg: oklch(0.929 0.013 255.508);
+  --muted: oklch(0.704 0.04 256.788);
+  --faint: oklch(0.58 0.03 258);
+  --border: oklch(1 0 0 / 10%);
+  --border-strong: oklch(1 0 0 / 18%);
+  --primary: oklch(0.696 0.17 162.48);
+  --primary-soft: oklch(0.696 0.17 162.48 / .16);
+  --warning: oklch(0.79 0.14 78);
+  --warning-soft: oklch(0.79 0.14 78 / .14);
+  --danger: oklch(0.704 0.191 22.216);
+  --danger-soft: oklch(0.704 0.191 22.216 / .14);
+  --success: oklch(0.72 0.15 155);
+  --success-soft: oklch(0.72 0.15 155 / .16);
+  --r: 12px;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--fg);
+  font-family:ui-sans-serif,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  font-size:13.5px;line-height:1.55;-webkit-font-smoothing:antialiased}
+body{padding:26px 28px 60px}
+.app{max-width:1320px;margin:0 auto}
+h1{margin:0;font-size:21px;font-weight:600;letter-spacing:-.01em}
+h2{margin:0;font-size:14px;font-weight:600}
+p{margin:0}
+svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:1.8;flex:none}
+
+/* 位置指示条：一眼看出这块 UI 挂在哪儿（评审第一个问题）。 */
+.where{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:14px;
+  padding:8px 12px;border:1px solid var(--border);border-radius:10px;background:var(--card2);
+  font-size:12px;color:var(--muted)}
+.where .crumb{padding:2px 8px;border-radius:6px;background:oklch(1 0 0 / 5%);color:var(--muted)}
+.where .crumb.on{background:var(--primary-soft);color:oklch(0.88 0.10 163)}
+.where .sep{color:var(--faint)}
+.where .tip{margin-left:auto;color:var(--faint);font-size:11.5px}
+
+.page-head{display:flex;align-items:flex-start;gap:16px;margin-bottom:18px}
+.page-head p{margin:5px 0 0;color:var(--muted);font-size:12.5px;max-width:900px}
+.tag{display:inline-flex;align-items:center;height:20px;padding:0 7px;border-radius:6px;
+  background:var(--primary-soft);color:oklch(0.88 0.10 163);font-size:11px;font-weight:500;white-space:nowrap}
+
+.btn{display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 11px;border-radius:8px;
+  border:1px solid var(--border);background:var(--card2);color:var(--fg);font-size:12.5px;cursor:pointer;
+  font-family:inherit;white-space:nowrap}
+.btn:hover:not(:disabled){border-color:var(--border-strong)}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn.primary{background:var(--primary);border-color:transparent;color:oklch(0.16 0.03 162);font-weight:500}
+.btn.ghost{background:transparent;border-color:transparent;color:var(--muted)}
+.btn.ghost:hover:not(:disabled){background:oklch(1 0 0 / 5%);color:var(--fg)}
+.btn.sm{height:24px;padding:0 8px;font-size:11.5px;border-radius:6px}
+.link{color:var(--primary);cursor:pointer;font-size:11.5px;text-decoration:none;border-bottom:1px dashed oklch(0.696 0.17 162.48 / .5)}
+
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--r)}
+.card-head{display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap;padding:14px 18px}
+.card-head .titles{min-width:0;flex:1}
+.card-head .row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.card-head h2{display:flex;align-items:center;gap:7px}
+.card-head .sub{margin-top:4px;color:var(--muted);font-size:11.5px;line-height:1.6}
+.card-body{border-top:1px solid var(--border);padding:14px 18px}
+
+.seg{display:inline-flex;border:1px solid var(--border);border-radius:8px;overflow:hidden;background:oklch(1 0 0 / 3%)}
+.seg button{height:26px;padding:0 9px;border:0;background:transparent;color:var(--muted);
+  font:inherit;font-size:11.5px;cursor:pointer}
+.seg button.on{background:var(--primary-soft);color:oklch(0.90 0.09 163);font-weight:500}
+
+.badge{display:inline-flex;align-items:center;gap:4px;height:20px;padding:0 7px;border-radius:6px;
+  font-size:11px;line-height:1;white-space:nowrap;border:1px solid transparent}
+.badge.muted{background:oklch(1 0 0 / 5%);color:var(--muted);border-color:var(--border)}
+.badge.ok{background:var(--success-soft);color:var(--success);border-color:oklch(0.72 0.15 155 / .35)}
+.badge.warn{background:var(--warning-soft);color:var(--warning);border-color:oklch(0.79 0.14 78 / .35)}
+.badge.bad{background:var(--danger-soft);color:var(--danger);border-color:oklch(0.704 0.191 22.216 / .35)}
+.badge.probe{background:var(--primary-soft);color:oklch(0.90 0.09 163);border-color:oklch(0.696 0.17 162.48 / .4)}
+
+.empty{padding:18px 4px;color:var(--faint);font-size:12px}
+.num{font-variant-numeric:tabular-nums}
+.mono{font-family:ui-monospace,"SF Mono",Consolas,monospace;font-size:11px}
+
+/* ── 两栏：左账号页卡 / 右网关页卡（1440 下并排，便于看「同步」） ── */
+.two{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px;align-items:start}
+@media (max-width:1180px){.two{grid-template-columns:minmax(0,1fr)}}
+.panel{min-width:0}
+.panel > .plabel{display:flex;align-items:center;gap:7px;margin:0 0 7px 2px;
+  font-size:11.5px;color:var(--faint)}
+.panel > .plabel b{color:var(--muted);font-weight:500}
+
+/* ── 台账行 ── */
+.rows{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}
+.row{display:flex;align-items:flex-start;gap:12px;padding:10px 12px;border:1px solid var(--border);
+  border-radius:10px;min-width:0}
+.row.active{border-left:2px solid var(--warning);background:oklch(0.79 0.14 78 / .04)}
+.row.unknown{border-left:2px solid oklch(0.704 0.04 256.788 / .5)}
+.row.recovered{opacity:.62}
+.row .main{min-width:0;flex:1}
+.row .line1{display:flex;align-items:center;gap:7px;min-width:0;flex-wrap:wrap}
+.row .acct{font-size:13px;font-weight:500;max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.row .meta{margin-top:3px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  color:var(--muted);font-size:11px}
+.row .right{display:flex;flex-direction:column;align-items:flex-end;gap:6px;flex:none}
+.row .right .stack{display:flex;align-items:center;gap:6px}
+.row .verdict{font-size:11px;color:var(--muted);text-align:right;max-width:220px}
+.row .verdict b{font-weight:500;color:var(--fg)}
+.row.flash{animation:flash .55s ease-out}
+@keyframes flash{from{box-shadow:0 0 0 2px var(--primary) inset}to{box-shadow:0 0 0 0 transparent inset}}
+
+/* ── 进度条（探测中） ── */
+.progress{display:none;margin-bottom:10px;padding:9px 11px;border:1px solid var(--border);
+  border-radius:9px;background:var(--card2)}
+.progress.on{display:block}
+.progress .pl{display:flex;align-items:center;gap:9px;font-size:12px}
+.progress .pl b{font-variant-numeric:tabular-nums}
+.progress .track{height:5px;border-radius:99px;background:oklch(1 0 0 / 8%);margin-top:7px;overflow:hidden}
+.progress .track i{display:block;height:100%;width:0;background:var(--primary);transition:width .18s linear}
+.progress .hint{margin-top:6px;color:var(--faint);font-size:11px;line-height:1.5}
+
+/* ── 网关页矩阵 ── */
+.legend{display:flex;flex-wrap:wrap;gap:12px;color:var(--muted);font-size:11px;margin-bottom:9px}
+.legend span{display:inline-flex;align-items:center;gap:5px}
+.sw{width:10px;height:10px;border-radius:3px;border:1px solid var(--border);flex:none}
+.sw.ok{background:oklch(0.72 0.15 155 / .5)}
+.sw.rlm{background:oklch(0.79 0.14 78 / .6)}
+.sw.rla{background:oklch(0.704 0.191 22.216 / .55)}
+.sw.nc{background:oklch(0.79 0.14 78 / .32)}
+.sw.unknown{border-style:dashed}
+.sw.passive{box-shadow:inset 0 0 0 2px oklch(0.696 0.17 162.48 / .55)}
+
+table.matrix{border-collapse:separate;border-spacing:3px;font-size:11.5px;width:100%}
+table.matrix th{font-weight:400;color:var(--muted);padding:2px 4px;text-align:center;font-size:11px}
+table.matrix th.acc{text-align:left;white-space:nowrap}
+table.matrix td{padding:0}
+table.matrix td.acc{white-space:nowrap;padding:2px 4px;font-size:11.5px}
+.cell{display:flex;height:22px;min-width:48px;align-items:center;justify-content:center;
+  border:1px solid var(--border);border-radius:5px;font-size:11px;cursor:pointer;
+  transition:transform .12s ease, box-shadow .12s ease}
+.cell.ok{background:oklch(0.72 0.15 155 / .24);border-color:oklch(0.72 0.15 155 / .6)}
+.cell.rate_limited_model{background:oklch(0.79 0.14 78 / .28);border-color:oklch(0.79 0.14 78 / .6)}
+.cell.rate_limited_account,.cell.model_blocked{background:oklch(0.704 0.191 22.216 / .26);
+  border-color:oklch(0.704 0.191 22.216 / .58)}
+.cell.no_credits{background:oklch(0.79 0.14 78 / .16);border-color:oklch(0.79 0.14 78 / .4)}
+.cell.unknown{border-style:dashed;opacity:.55}
+.cell.passive{box-shadow:inset 0 0 0 2px oklch(0.696 0.17 162.48 / .5)}
+.cell.pop{animation:pop .4s ease-out}
+@keyframes pop{0%{transform:scale(.82)}60%{transform:scale(1.06)}100%{transform:scale(1)}}
+.sum{text-align:right;color:var(--muted);font-size:11px;padding:2px 6px;font-variant-numeric:tabular-nums}
+.sum.hot{color:var(--warning);font-weight:500}
+
+.detail{margin-top:10px;padding:9px 11px;border:1px solid var(--border);border-radius:9px;
+  background:var(--card2);font-size:11.5px;color:var(--muted);display:none}
+.detail.on{display:block}
+.detail b{color:var(--fg);font-weight:500}
+.detail .kv{display:flex;gap:6px;flex-wrap:wrap}
+.detail .raw{margin-top:6px;padding-top:6px;border-top:1px solid var(--border);
+  white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,Consolas,monospace;font-size:11px}
+
+.foot{display:flex;align-items:center;gap:8px;margin-top:12px;padding-top:12px;border-top:1px solid var(--border);
+  color:var(--muted);font-size:11.5px;flex-wrap:wrap}
+.foot .grow{flex:1}
+
+.notes{margin-top:18px;display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px}
+.note{padding:12px 14px;border:1px solid var(--border);border-radius:10px;background:var(--card2)}
+.note h3{margin:0 0 6px;font-size:12px;font-weight:600;display:flex;align-items:center;gap:6px}
+.note p,.note li{color:var(--muted);font-size:11.5px;line-height:1.65}
+.note ul{margin:0;padding-left:16px}
+.note code{padding:1px 4px;border-radius:4px;background:oklch(1 0 0 / 6%);font-size:11px;
+  font-family:ui-monospace,Consolas,monospace}
+kbd{padding:1px 5px;border-radius:4px;border:1px solid var(--border);background:oklch(1 0 0 / 5%);
+  font-family:ui-monospace,Consolas,monospace;font-size:11px;color:var(--fg)}
+.hl{color:var(--warning)}
+</style>
+</head>
+<body>
+<div class="app">
+
+  <div class="where">
+    <span class="crumb on">账号页 · 列表下方</span><span class="sep">›</span>
+    <span class="crumb">客户端限流卡</span>
+    <span class="sep">⇆ 同一份探测数据 ⇆</span>
+    <span class="crumb on">网关页 · 模型分区</span><span class="sep">›</span>
+    <span class="crumb">限流探测卡</span>
+    <span class="tip">两侧点任何「实测」都会同时改这两块（下面并排放，方便对照）</span>
+  </div>
+
+  <div class="page-head">
+    <div>
+      <h1>客户端限流 ⇄ 模型限流探测</h1>
+      <p>
+        账号页的「客户端限流」是<b>日志反推</b>（哪些格在客户端里报过 429、何时恢复）；
+        网关页的「限流探测」是<b>真发一次最小请求</b>的实判。
+        本稿把两者按 <code class="mono">(uid, model)</code> 对齐：
+        <b>同一份数据两处显示、两处都能发起实测</b>，且实测结论与台账结论<b>并列</b>而不是互相覆盖。
+      </p>
+    </div>
+    <span class="tag">设计稿 · 按此实现</span>
+  </div>
+
+  <div class="two">
+    <!-- ═══════════════ 左：账号页 ═══════════════ -->
+    <section class="panel">
+      <div class="plabel"><b>账号页</b> · WorkBuddy 账号列表下方</div>
+      <div class="card" id="ledger-card" data-act="ledger-card">
+        <div class="card-head">
+          <div class="titles">
+            <div class="row">
+              <h2>
+                <svg viewBox="0 0 24 24"><path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18Z"/><path d="M12 8v4l2.5 2.5"/></svg>
+                客户端限流
+              </h2>
+              <span class="badge muted" id="ledger-summary">共 4 条 · 仍受限 2 条</span>
+            </div>
+            <p class="sub">
+              从客户端本地数据自动汇总：哪个账号在哪个模型上被上游限流、何时恢复。
+              <span class="faint">实测结论与网关「限流探测」是同一份数据 ·</span>
+              <a class="link" href="#probe-card" id="to-matrix">查看探测矩阵 →</a>
+            </p>
+          </div>
+          <div class="row" style="align-items:center">
+            <div class="seg" id="ledger-window" aria-label="扫描范围">
+              <button class="on" data-act="window|7">近 7 天</button>
+              <button data-act="window|30">近 30 天</button>
+              <button data-act="window|all">全部</button>
+            </div>
+            <button class="btn primary sm" id="probe-all" data-act="probe-all">
+              <svg viewBox="0 0 24 24"><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/></svg>
+              <span>实测 3 格</span>
+            </button>
+            <button class="btn sm" data-act="refresh">刷新</button>
+          </div>
+        </div>
+
+        <div class="card-body">
+          <!-- 探测中（两侧共用同一个作业快照） -->
+          <div class="progress" id="ledger-progress" data-act="ledger-progress">
+            <div class="pl">
+              <span style="color:var(--primary)">▶</span>
+              <b id="pg-count">0 / 0</b>
+              <span class="faint" id="pg-current">正在实测：—</span>
+              <span class="grow" style="flex:1"></span>
+              <button class="btn sm" data-act="probe-cancel">取消剩余</button>
+            </div>
+            <div class="track"><i id="pg-fill"></i></div>
+            <div class="hint">账号内串行 · 格间 150ms · 零重试 · 本次<b>不回填</b>池冷却（账号页只查证）。</div>
+          </div>
+
+          <ul class="rows" id="ledger-rows"></ul>
+
+          <!-- 实测独有：台账里没有、但实测查出限流的格 -->
+          <div id="ledger-extra" style="margin-top:12px;display:none">
+            <div class="row" style="border-style:dashed;background:transparent;padding:8px 10px">
+              <div class="main">
+                <div class="row" style="gap:6px;align-items:center">
+                  <span class="badge probe">实测独有</span>
+                  <span style="font-size:12px">台账没有记录的格</span>
+                  <span class="faint" style="font-size:11px">只在实测里被发现的限流，不进台账（日志确实没记过）</span>
+                </div>
+                <ul class="rows" id="extra-rows" style="margin-top:8px"></ul>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════════ 右：网关页 ═══════════════ -->
+    <section class="panel">
+      <div class="plabel"><b>网关页</b> · 模型分区 · 限流探测卡（卡片，不是弹层）</div>
+      <div class="card" id="probe-card" data-act="probe-card">
+        <div class="card-head">
+          <div class="titles">
+            <div class="row">
+              <h2>限流探测</h2>
+              <span class="badge muted">账号 × 模型 实探</span>
+              <span class="badge probe" id="probe-origin" style="display:none">来源：账号页触发 · 未回填</span>
+            </div>
+            <p class="sub" id="probe-summary">3 账号 · 3 模型可测</p>
+          </div>
+          <div class="row">
+            <button class="btn sm ghost" data-act="probe-expand" id="probe-expand">收起 ▴</button>
+          </div>
+        </div>
+
+        <div class="card-body" id="probe-body">
+          <div class="legend">
+            <span><i class="sw ok"></i>可用</span>
+            <span><i class="sw rlm"></i>模型限流</span>
+            <span><i class="sw rla"></i>账号限流</span>
+            <span><i class="sw nc"></i>积分不足（非限流）</span>
+            <span><i class="sw unknown"></i>未实测</span>
+            <span><i class="sw passive"></i>被动已知（台账／真实流量）</span>
+          </div>
+
+          <table class="matrix" id="matrix"></table>
+
+          <div class="detail" id="cell-detail" data-act="cell-detail"></div>
+
+          <div class="foot">
+            <span id="probe-foot">实测是「真发一次最小请求」，会消耗极少积分并在上游留痕。</span>
+            <span class="grow"></span>
+            <span class="faint" id="probe-stamp">尚未运行</span>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <!-- ═══════════════ 口径说明 ═══════════════ -->
+  <div class="notes">
+    <div class="note">
+      <h3>① 数据怎么同步（没有第三份数据）</h3>
+      <ul>
+        <li>探测作业：<code>model_probe</code> 的**单作业槽**（`probe_status` 快照）。两处读同一份，按 <code>scope</code> 收窄。</li>
+        <li>客户端台账：<code>client_limits</code>（只读扫 jsonl）。账号页自己刷新；网关页只取其中 <code>active</code> 的格当「被动底色」。</li>
+        <li>池冷却：<code>status.modelCoolings</code>（真实流量打出来的）。网关页显示，账号页不重复展示。</li>
+        <li><b>任一侧发起 → 另一侧下次读到的就是它</b>；不存在「两处各自维护一份、必然漂移」。</li>
+      </ul>
+    </div>
+    <div class="note">
+      <h3>② 入口与代价</h3>
+      <ul>
+        <li>卡头「实测 N 格」= 台账里 <b>仍受限 + 状态未知</b> 的 <code>(uid, model)</code> <b>去重组合</b>（已恢复的不测 —— 日志已经证明它好了）。后端收 <code>cells</code> 显式清单（与 <code>uids × models</code> 的笛卡尔积互斥）⇒ 3 条台账就是 3 格，不白打。</li>
+        <li>行尾「实测」= 只打这一格；<b>关联不到账号/模型的行置灰</b>，`title` 写明原因。</li>
+        <li>两处都 <code>adopt:false</code>：账号页是查证，不写池冷却。要回填请到网关页（那里有明示开关）。</li>
+        <li>作业位单例 ⇒ 正在探测时按钮变进度条，重复点击不再起第二个作业。</li>
+      </ul>
+    </div>
+    <div class="note">
+      <h3>③ 冲突：并列，不覆盖</h3>
+      <ul>
+        <li>台账「仍受限」+ 实测「可用」⇒ 行内写 <span class="hl">实测可用（台账仍受限）</span>，<b>台账徽章不动</b>。</li>
+        <li>理由：台账是历史证据，实测是此刻证据；谁对不该由 UI 单方面裁定。</li>
+        <li>只有「模型限流 / 账号限流 / 模型封禁」算限流；<code>402 积分不足</code> 与 <code>登录失效</code> 分列（踩过的坑）。</li>
+        <li>实测独有（台账无记录）的格单列在卡尾，不伪装成台账条目。</li>
+      </ul>
+    </div>
+  </div>
+
+</div>
+
+<script>
+/* ══════════════════════════ 夹具（与真实数据同形状） ══════════════════════════ */
+const SCOPE = "wb-cn";
+const ACCOUNTS = [
+  { uid: "u-jackey", name: "jackey" },
+  { uid: "u-qa", name: "qa-bot" },
+  { uid: "u-team", name: "team-shared" },
+];
+const MODELS = ["deepseek-v4.1-flash", "glm-5.3", "claude-sonnet-4.5"];
+
+/** 台账条目 = `client_limits` 的下发形状（camelCase）。 */
+const LEDGER = [
+  {
+    accountUid: "u-jackey", account: "jackey", model: "glm-5.3", state: "active",
+    resetAt: Date.now() + 3 * 3600e3, occurredAt: Date.now() - 40 * 60e3,
+    occurrences: 3, code: 6004, status: 429, sessionId: "9b9f45ca-1f0e-4f39-8c8e-2c0f5b0a77aa",
+    message: "429 您的使用量已超出频率限制，将在 2026-10-23 02:31:07 UTC+8 重置 (req/9f21)",
+    evidenceAt: null,
+  },
+  {
+    accountUid: "u-qa", account: "qa-bot", model: "glm-5.3", state: "active",
+    resetAt: Date.now() + 5 * 3600e3, occurredAt: Date.now() - 12 * 60e3,
+    occurrences: 1, code: 6004, status: 429, sessionId: "d49456c2-8a41-4a6e-bd21-77e3c2a10f13",
+    message: "429 usage exceeds frequency limit, will reset at 2026-10-23 04:12:55 UTC+8",
+    evidenceAt: null,
+  },
+  {
+    accountUid: "u-team", account: "team-shared", model: "claude-sonnet-4.5", state: "unknown",
+    resetAt: null, occurredAt: Date.now() - 6 * 3600e3, occurrences: 2, code: 6020, status: 429,
+    sessionId: "8fe7b8b0-3c2a-4b90-9a11-1b2c3d4e5f60",
+    message: "429 queue.waiting.title", evidenceAt: null,
+  },
+  {
+    accountUid: "u-jackey", account: "jackey", model: "deepseek-v4.1-flash", state: "recovered",
+    resetAt: Date.now() - 2 * 3600e3, occurredAt: Date.now() - 9 * 3600e3, occurrences: 1,
+    code: 6004, status: 429, sessionId: "c1a2b3c4-d5e6-4f70-8a9b-0c1d2e3f4a5b",
+    message: "429 使用上限", evidenceAt: Date.now() - 8.7 * 3600e3,
+  },
+  /* join 失败（会话已删 / playground）：uid 为 null ⇒ 不能实测，按钮置灰并说明原因。 */
+  {
+    accountUid: null, account: null, model: null, state: "unknown",
+    resetAt: null, occurredAt: Date.now() - 30 * 60e3, occurrences: 1, code: 14003, status: 429,
+    sessionId: "ghost-session-77", message: "429 too many requests", evidenceAt: null,
+  },
+];
+
+/** 上游的真实答案（模拟）：决定「实测」返回什么。 */
+const ANSWER = {
+  "u-jackey|glm-5.3": "rate_limited_model",     // 与台账一致
+  "u-qa|glm-5.3": "ok",                          // ★ 冲突：台账仍受限，实测已恢复
+  "u-team|claude-sonnet-4.5": "no_credits",      // ★ 分列：402 不是限流
+  "u-team|glm-5.3": "rate_limited_model",        // 台账无记录 ⇒ 实测独有
+  "u-jackey|deepseek-v4.1-flash": "ok",
+  "u-jackey|claude-sonnet-4.5": "ok",
+  "u-qa|deepseek-v4.1-flash": "ok",
+  "u-qa|claude-sonnet-4.5": "ok",
+  "u-team|deepseek-v4.1-flash": "ok",
+};
+
+const LIMIT = new Set(["rate_limited_model", "rate_limited_account", "model_blocked"]);
+const LABEL = {
+  ok: "可用",
+  rate_limited_model: "模型限流",
+  rate_limited_account: "账号限流",
+  model_blocked: "模型封禁",
+  no_credits: "积分不足",
+  auth_dead: "登录失效",
+  model_unavailable: "模型不可见",
+  upstream_error: "上游异常",
+  upstream_queued: "上游排队",
+  transport_error: "传输失败",
+  skipped: "未探测",
+};
+const GLYPH = { ok: "✓", rate_limited_model: "▲", rate_limited_account: "✕", model_blocked: "✕",
+  no_credits: "!", upstream_error: "!", upstream_queued: "!", transport_error: "!" };
+const TONE = { rate_limited_model: "warn", rate_limited_account: "bad", model_blocked: "bad",
+  no_credits: "warn", upstream_error: "warn", upstream_queued: "warn", transport_error: "warn",
+  ok: "ok", skipped: "muted" };
+
+/* ══════════════════════════ 状态 ══════════════════════════ */
+const state = {
+  window: "7",
+  job: idleJob(),
+  /** ★ 跨作业累积的实测结论：`uid|model` → 最近一次实测格。
+   *
+   *  为什么需要它：后端作业是**单槽**，新作业从空 `cells` 开始（网关卡就是这么用的）。
+   *  账号页的「逐行实测」若直接读「本次作业」，探第二行就把第一行的结论冲掉了。
+   *  故前端按 `(uid, model)` 合并各次作业的结果 —— 两侧读的都是这份合并值。 */
+  seen: {},
+  detail: null,
+  timer: null,
+};
+
+function idleJob() {
+  return { phase: "idle", scope: SCOPE, cells: {}, done: 0, total: 0, current: "", plan: [],
+    adopt: false, origin: null, startedAt: 0, finishedAt: 0 };
+}
+const cellKey = (uid, model) => `${uid}|${model}`;
+const seenCell = (uid, model) => state.seen[cellKey(uid, model)] || null;
+
+/* ══════════════════════════ 渲染：左栏台账 ══════════════════════════ */
+function verdictOf(entry) {
+  if (!entry.accountUid || !entry.model) return null;
+  const cell = seenCell(entry.accountUid, entry.model);
+  if (!cell) return null;
+  return cell;
+}
+
+/** 冲突判据：台账说限流/未知，实测说可用；或台账已恢复，实测说限流。 */
+function conflictOf(entry, cell) {
+  const ledgerLimited = entry.state === "active" || entry.state === "unknown";
+  if (ledgerLimited && cell.state === "ok") return "recovered_by_probe";
+  if (entry.state === "recovered" && LIMIT.has(cell.state)) return "limited_after_recovery";
+  return null;
+}
+
+function renderLedger() {
+  const active = LEDGER.filter((e) => e.state === "active").length;
+  document.getElementById("ledger-summary").textContent =
+    `共 ${LEDGER.length} 条 · 仍受限 ${active} 条` + (state.window === "all" ? " · 全部" : "");
+
+  const list = document.getElementById("ledger-rows");
+  list.innerHTML = LEDGER.map((entry) => rowHtml(entry)).join("");
+
+  /* 卡头按钮 = 仍受限 + 未知、且能定位到账号与模型的行（去重）。 */
+  const targets = probeTargets();
+  const btn = document.getElementById("probe-all");
+  const running = state.job.phase === "running";
+  btn.disabled = targets.rows.length === 0 || running;
+  btn.querySelector("span").textContent = running
+    ? `实测中 ${state.job.done}/${state.job.total}`
+    : `实测 ${targets.cells} 格`;
+  btn.title = targets.rows.length === 0
+    ? "没有可实测的条目（需要「仍受限/未知」且能关联到账号与模型）"
+    : `只测台账里出现过的组合：${targets.cells} 格（${targets.uids.length} 个账号 / ${targets.models.length} 个模型），每格一次最小请求，不回填池冷却`;
+
+  renderExtra();
+  renderProgress();
+}
+
+function rowHtml(entry) {
+  const cell = verdictOf(entry);
+  const conflict = cell ? conflictOf(entry, cell) : null;
+  const canProbe = Boolean(entry.accountUid && entry.model);
+  const running = state.job.phase === "running";
+  const modelText = entry.model ? esc(entry.model) : "未知模型";
+  const acct = entry.account ? esc(entry.account) : "未知账号";
+
+  const stateBadge = {
+    active: `<span class="badge warn">仍受限</span>`,
+    unknown: `<span class="badge muted">状态未知</span>`,
+    recovered: `<span class="badge muted">已恢复</span>`,
+  }[entry.state];
+
+  let verdict = "";
+  if (cell) {
+    const tone = TONE[cell.state] || "muted";
+    verdict = `<div class="verdict" data-verdict="${esc(entry.accountUid || "")}|${esc(entry.model || "")}">
+        <span class="badge ${tone}">实测 · ${LABEL[cell.state] || cell.state}</span>`;
+    if (conflict === "recovered_by_probe") {
+      verdict += `<div style="margin-top:3px">实测可用，<b>台账仍受限</b>（历史证据，不改写）</div>`;
+    } else if (conflict === "limited_after_recovery") {
+      verdict += `<div style="margin-top:3px">台账已恢复，但<b>此刻实测受限</b></div>`;
+    } else if (cell.state === "no_credits") {
+      verdict += `<div style="margin-top:3px">不是限流：额度用尽，等解锁没用</div>`;
+    }
+    verdict += `</div>`;
+  }
+
+  const resetText = entry.state === "active" || entry.state === "unknown"
+    ? (entry.resetAt ? `恢复于 ${fmt(entry.resetAt)}` : "恢复时间未知")
+    : (entry.evidenceAt ? `已恢复（${fmt(entry.evidenceAt)} 实测有产出）` : "已恢复");
+
+  return `<li class="row ${entry.state}" data-row="${esc(entry.accountUid || "?")}|${esc(entry.model || "?")}">
+    <div class="main">
+      <div class="line1">
+        <span class="acct" title="${esc(entry.accountUid || "")}">${acct}</span>
+        <span class="badge muted">${modelText}</span>
+        ${stateBadge}
+        ${entry.occurrences > 1 ? `<span class="faint" style="font-size:11px">${entry.occurrences} 条记录</span>` : ""}
+      </div>
+      <div class="meta">
+        <span class="${entry.state === "active" ? "hl" : ""}" title="上游文案里的恢复时刻是配额窗口重置，不等于解锁时刻">${resetText}</span>
+        <span>最近 ${fmt(entry.occurredAt)}</span>
+        <span class="mono">${esc(String(entry.code ?? "—"))}</span>
+        <span class="mono" title="会话 ${esc(entry.sessionId)}">${esc(entry.sessionId.slice(0, 8))}</span>
+      </div>
+    </div>
+    <div class="right">
+      ${verdict}
+      <div class="stack">
+        <button class="btn sm ${canProbe ? "" : "ghost"}" data-act="probe-row|${esc(entry.accountUid || "")}|${esc(entry.model || "")}"
+          ${canProbe && !running ? "" : "disabled"}
+          title="${canProbe
+            ? "只实测这一格（uids:[uid] models:[model]，不回填）"
+            : "关联不到账号或模型（会话已删除 / playground），无法实测"}">
+          ${canProbe && !running ? "实测" : (running ? "探测中" : "无法实测")}
+        </button>
+      </div>
+    </div>
+  </li>`;
+}
+
+/** 台账里没有、但实测查出来的限流格。 */
+function renderExtra() {
+  const covered = new Set(LEDGER.filter((e) => e.accountUid && e.model).map((e) => cellKey(e.accountUid, e.model)));
+  const extras = Object.entries(state.seen)
+    .filter(([key, cell]) => LIMIT.has(cell.state) && !covered.has(key))
+    .map(([, cell]) => cell);
+  const box = document.getElementById("ledger-extra");
+  box.style.display = extras.length ? "block" : "none";
+  document.getElementById("extra-rows").innerHTML = extras.map((cell) => `
+    <li class="row" style="padding:8px 10px">
+      <div class="main">
+        <div class="line1">
+          <span class="acct">${esc(cell.nickname || cell.uid)}</span>
+          <span class="badge muted">${esc(cell.model)}</span>
+          <span class="badge probe">实测独有</span>
+        </div>
+        <div class="meta"><span>HTTP ${cell.http_status} · ${LABEL[cell.state]}</span></div>
+      </div>
+    </li>`).join("");
+}
+
+function renderProgress() {
+  const box = document.getElementById("ledger-progress");
+  const running = state.job.phase === "running";
+  box.classList.toggle("on", running);
+  if (!running) return;
+  const { done, total } = state.job;
+  document.getElementById("pg-count").textContent = `${done} / ${total}`;
+  document.getElementById("pg-current").textContent = `正在实测：${state.job.current || "…"}`;
+  document.getElementById("pg-fill").style.width = total ? `${Math.round((done / total) * 100)}%` : "0";
+}
+
+/* ══════════════════════════ 渲染：右栏矩阵 ══════════════════════════ */
+function passiveOf(uid, model) {
+  /* 被动底色 = 台账里 active 的格（真实实现里还有池冷却；本稿账号页场景只有台账）。 */
+  const hit = LEDGER.find((e) => e.accountUid === uid && e.model === model && e.state === "active");
+  return hit ? "rate_limited_model" : null;
+}
+
+function renderMatrix() {
+  const table = document.getElementById("matrix");
+  const head = `<thead><tr><th class="acc">账号 \\ 模型</th>${MODELS.map((m) =>
+    `<th title="${esc(m)}">${esc(m)}</th>`).join("")}<th>限流数</th></tr></thead>`;
+
+  const body = ACCOUNTS.map((acc) => {
+    let hot = 0;
+    const tds = MODELS.map((model) => {
+      const cell = seenCell(acc.uid, model);
+      const passive = passiveOf(acc.uid, model);
+      const stateName = cell ? cell.state : (passive || "unknown");
+      if (LIMIT.has(stateName)) hot += 1;
+      const kind = cell ? "probed" : (passive ? "passive" : "unknown");
+      const cls = ["cell", stateName, kind === "passive" ? "passive" : "", kind === "unknown" ? "unknown" : ""]
+        .filter(Boolean).join(" ");
+      const title = cell
+        ? `${acc.name} · ${model} · ${LABEL[cell.state]} · HTTP ${cell.http_status} · ${cell.latency_ms} ms`
+        : passive
+          ? `${acc.name} · ${model} · 被动已知（客户端日志）：仍受限，未实测`
+          : `${acc.name} · ${model} · 未实测`;
+      return `<td><span class="${cls}" data-act="cell|${esc(acc.uid)}|${esc(model)}" title="${esc(title)}">${
+        GLYPH[stateName] || ""}</span></td>`;
+    }).join("");
+    return `<tr><td class="acc">${esc(acc.name)}</td>${tds}
+      <td class="sum ${hot ? "hot" : ""}">${hot || "—"}</td></tr>`;
+  }).join("");
+
+  const totalRow = `<tr><td class="acc" style="color:var(--faint)">限流账号数</td>${MODELS.map((model) => {
+    const n = ACCOUNTS.filter((acc) => {
+      const cell = seenCell(acc.uid, model);
+      const name = cell ? cell.state : passiveOf(acc.uid, model);
+      return LIMIT.has(name);
+    }).length;
+    return `<td class="sum ${n ? "hot" : ""}">${n}</td>`;
+  }).join("")}<td></td></tr>`;
+
+  table.innerHTML = `${head}<tbody>${body}${totalRow}</tbody>`;
+
+  /* 头部摘要：运行中显示进度；结束后显示结论 + 来源。 */
+  const summary = document.getElementById("probe-summary");
+  const origin = document.getElementById("probe-origin");
+  const foot = document.getElementById("probe-foot");
+  const stamp = document.getElementById("probe-stamp");
+  const job = state.job;
+
+  if (job.phase === "running") {
+    summary.innerHTML = `▶ <b>${job.done} / ${job.total}</b> · 正在实测：${esc(job.current || "…")}`;
+  } else if (job.phase === "done") {
+    const cells = Object.values(job.cells);
+    const limited = cells.filter((c) => LIMIT.has(c.state)).length;
+    const ok = cells.filter((c) => c.state === "ok").length;
+    summary.innerHTML = `已实测 <b>${cells.length}</b> 格 · 限流 ${limited} · 可用 ${ok} · ${fmt(job.finishedAt)}`;
+  } else {
+    summary.textContent = `${ACCOUNTS.length} 账号 · ${MODELS.length} 模型可测`;
+  }
+  origin.style.display = job.origin === "account" ? "inline-flex" : "none";
+  foot.textContent = job.origin === "account"
+    ? "本次由账号页发起：只查证，不回填池冷却（回填请在本卡内用「回填」开关）。"
+    : "实测是「真发一次最小请求」，会消耗极少积分并在上游留痕。";
+  stamp.textContent = job.phase === "done" ? `上次 ${fmt(job.finishedAt)}` : "尚未运行";
+  document.getElementById("probe-expand").textContent = expanded ? "收起 ▴" : "展开 ▾";
+}
+
+let expanded = true;
+
+/* ══════════════════════════ 探测作业（模拟 @ 380ms/格） ══════════════════════════ */
+function probeTargets() {
+  /* ★ 目标 = 台账里「仍受限 / 未知」的 **(账号, 模型) 去重组合**。
+     后端 `probe_start` 收 `cells: [{uid, model}]` **显式格清单**（与 `uids × models`
+     的笛卡尔积互斥）⇒ 台账 3 条（3 账号 / 2 模型）就是 **3 格**，不白打另外 3 格。
+     想只打某一格 → 行尾「实测」（清单只有 1 项）。 */
+  const rows = LEDGER.filter((e) =>
+    e.accountUid && e.model && (e.state === "active" || e.state === "unknown"));
+  const seen = new Set();
+  const pairs = [];
+  for (const row of rows) {
+    const key = cellKey(row.accountUid, row.model);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    pairs.push({ uid: row.accountUid, model: row.model });
+  }
+  const uids = [...new Set(pairs.map((p) => p.uid))];
+  const models = [...new Set(pairs.map((p) => p.model))];
+  return { rows, pairs, uids, models, cells: pairs.length };
+}
+
+function startProbe(plan, origin) {
+  if (state.job.phase === "running") return;          /* 作业位单例：重复点击不再起第二个 */
+  if (!plan.length) return;
+  state.job = {
+    phase: "running", scope: SCOPE, cells: {}, done: 0, total: plan.length,
+    current: "", plan: plan.slice(), adopt: false, origin, startedAt: Date.now(), finishedAt: 0,
+  };
+  renderLedger();
+  renderMatrix();
+  tick();
+}
+
+function tick() {
+  const job = state.job;
+  if (!job.plan.length) { finish(); return; }
+  const next = job.plan.shift();
+  job.current = `${ACCOUNTS.find((a) => a.uid === next.uid)?.name || next.uid} · ${next.model}`;
+  renderProgress();
+  renderMatrix();
+
+  state.timer = setTimeout(() => {
+    if (state.job.phase !== "running") return;
+    const answer = ANSWER[cellKey(next.uid, next.model)] || "ok";
+    const cell = {
+      uid: next.uid,
+      nickname: ACCOUNTS.find((a) => a.uid === next.uid)?.name || next.uid,
+      model: next.model,
+      state: answer,
+      http_status: answer === "ok" ? 200 : (answer === "no_credits" ? 402 : 429),
+      reset_at_ms: LIMIT.has(answer) ? Date.now() + 4 * 3600e3 : null,
+      reason: answer === "ok" ? "" : `${answer === "no_credits" ? "402 Credits exhausted" : "429 usage exceeds frequency limit, will reset at 2026-10-23 04:12:55 UTC+8"}`,
+      latency_ms: 240 + Math.round(Math.random() * 260),
+      at: Date.now(),
+    };
+    /* 两处都写：本次作业（网关卡「本次 N 格」）+ 跨作业累积（账号页逐行结论）。
+       真实实现同款：store 收到快照时既更新 `probe`，也把 cells 合并进 `probeCells[scope]`。 */
+    state.job.cells[cellKey(next.uid, next.model)] = cell;
+    state.seen[cellKey(next.uid, next.model)] = cell;
+    state.job.done += 1;
+    /* 右栏格子落地时 pulse 一下，左栏对应行 flash —— 这就是「同步」的视觉表达。 */
+    renderLedger();
+    renderMatrix();
+    pulse();
+    tick();
+  }, 380);
+}
+
+function finish() {
+  state.job.phase = "done";
+  state.job.finishedAt = Date.now();
+  state.job.current = "";
+  renderLedger();
+  renderMatrix();
+}
+
+function pulse() {
+  const last = Object.keys(state.job.cells).pop();
+  if (!last) return;
+  const [uid, model] = last.split("|");
+  const cell = document.querySelector(`[data-act="cell|${CSS.escape(uid)}|${CSS.escape(model)}"]`);
+  if (cell) { cell.classList.add("pop"); setTimeout(() => cell.classList.remove("pop"), 420); }
+  const row = document.querySelector(`[data-row="${CSS.escape(uid)}|${CSS.escape(model)}"]`);
+  if (row) { row.classList.add("flash"); setTimeout(() => row.classList.remove("flash"), 600); }
+}
+
+/* ══════════════════════════ 交互 ══════════════════════════ */
+document.addEventListener("click", (ev) => {
+  const el = ev.target.closest("[data-act]");
+  if (!el) return;
+  const [act, a1, a2] = el.dataset.act.split("|");
+
+  if (act === "probe-all") {
+    startProbe(probeTargets().pairs, "account");
+    return;
+  }
+  if (act === "probe-row") {
+    if (!a1 || !a2) return;
+    startProbe([{ uid: a1, model: a2 }], "account");
+    return;
+  }
+  if (act === "probe-cancel") {
+    state.job.phase = "cancelled";
+    state.job.plan = [];
+    clearTimeout(state.timer);
+    finish();
+    return;
+  }
+  if (act === "window") {
+    state.window = a1;
+    [...document.querySelectorAll("#ledger-window button")].forEach((b) =>
+      b.classList.toggle("on", b.dataset.act === `window|${a1}`));
+    renderLedger();
+    return;
+  }
+  if (act === "refresh") { renderLedger(); renderMatrix(); return; }
+  if (act === "probe-expand") {
+    expanded = !expanded;
+    document.getElementById("probe-body").style.display = expanded ? "block" : "none";
+    document.getElementById("probe-expand").textContent = expanded ? "收起 ▴" : "展开 ▾";
+    return;
+  }
+  if (act === "cell") {
+    const cell = seenCell(a1, a2);
+    const box = document.getElementById("cell-detail");
+    const acc = ACCOUNTS.find((x) => x.uid === a1);
+    if (!cell) {
+      box.innerHTML = `<b>${esc(acc ? acc.name : a1)} · ${esc(a2)}</b> —— 未实测。<div class="raw">被动已知：${
+        passiveOf(a1, a2) ? "客户端台账里「仍受限」" : "无记录（台账里没有 ≠ 没被限流）"}</div>
+        <div style="margin-top:8px"><button class="btn sm" data-act="probe-cell|${esc(a1)}|${esc(a2)}">实测这一格</button></div>`;
+    } else {
+      box.innerHTML = `<div class="kv"><b>${esc(acc ? acc.name : a1)} · ${esc(a2)}</b>
+        <span>·</span><span>${LABEL[cell.state] || cell.state}</span><span>·</span>
+        <span>HTTP ${cell.http_status}</span><span>·</span><span>${cell.latency_ms} ms</span>
+        ${cell.reset_at_ms ? `<span>·</span><span>配额重置 ${fmt(cell.reset_at_ms)}</span>` : ""}</div>
+        ${cell.reason ? `<div class="raw">上游原文：${esc(cell.reason)}</div>` : ""}
+        <div style="margin-top:8px"><button class="btn sm" data-act="probe-cell|${esc(a1)}|${esc(a2)}">重测这一格</button></div>`;
+    }
+    box.classList.add("on");
+    return;
+  }
+  if (act === "probe-cell") {
+    if (!a1 || !a2) return;
+    startProbe([{ uid: a1, model: a2 }], "account");
+    return;
+  }
+});
+
+function esc(text) {
+  return String(text).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function fmt(ms) {
+  try {
+    return new Date(ms).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+  } catch { return "—"; }
+}
+
+/* 首屏 */
+renderLedger();
+renderMatrix();
+</script>
+</body>
+</html>

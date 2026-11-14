@@ -1,3 +1,34 @@
+/**
+ * 「用量」· **积分视图**（Trae 分区）—— 严格按原型实现（用户 2026-10-12 要求）。
+ *
+ * ## 原型块序（`docs/prototype/demo-app.js:916-996`）
+ *
+ * 1. 顶部说明条 + 「刷新积分」；
+ * 2. 4 统计卡：可用积分合计 / 区间入账 / 区间消耗 / 即将过期；
+ * 3. `每日积分收支`（双向柱）；
+ * 4. g2：`积分余额变化`（面积曲线）| `积分到期分布`（30 天柱）；
+ * 5. g2：`账号 Token 占比`（环形）| `网关状态码分布`（环形）；
+ * 6. `积分流水`表（时间 / 账号 / 变动 / 说明）。
+ *
+ * 改造前本页是 Trae 自建的一套（近 N 日折线 + 账号积分明细表）—— 与原型不符：
+ * 折线换成了双向柱，账号明细表换成了原型真正有的**积分流水**。
+ *
+ * ## 与 WorkBuddy 的差异**只在数据**
+ *
+ * | 维度 | WorkBuddy | Trae（本页） |
+ * |:--|:--|:--|
+ * | 每日收支柱 | **单向**（入账不可得 ⇒ 只画消耗侧） | **双向**（每日快照两侧都有） |
+ * | 两个环形（账号占比 / 状态码） | **无数据源** ⇒ 不渲染 | 有 `accounts` / `statuses` ⇒ 按原型渲染 |
+ * | 合并态 | 后端 `RegionFilter=all` | 前端跨区域聚合（`lib/trae-credits-merge.ts`） |
+ *
+ * 图表一律走共用原语（`CreditDivergingBar` / `CreditBalanceArea` / `CreditExpiryBars` /
+ * `ModelDonut`），单双向由**数据**决定（`CreditDivergingBar` 见 `inAmt > 0` 即画双向）。
+ *
+ * ## 白屏防线
+ *
+ * 账号名过 `displayText`（后端可能吐对象 ⇒ 对象当 React 子节点会卸载整棵树，issue #2）。
+ */
+
 import { useCallback, useMemo, useState } from "react";
 import {
   AlertTriangle,
@@ -7,212 +38,212 @@ import {
   RefreshCw,
   TrendingDown,
   TrendingUp,
-  User,
-  type LucideIcon,
 } from "lucide-react";
-import { CartesianGrid, Line, LineChart, XAxis, YAxis } from "recharts";
 import { toast } from "sonner";
 
-import { DemoAction } from "@/components/demo-action";
-import { TraeVariantSwitch } from "@/components/trae-variant-switch";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader } from "@/components/ui/card";
-import { ChartContainer, ChartTooltip, ChartTooltipContent, type ChartConfig } from "@/components/ui/chart";
+import { Card } from "@/components/ui/card";
+import { CardHead } from "@/components/ui/card-head";
+import { EmptyState } from "@/components/ui/empty-state";
 import { Skeleton } from "@/components/ui/skeleton";
+import { SlowLoadHint } from "@/components/slow-load-hint";
+import { ChartFrame } from "@/components/usage/chart-frame";
+import { CreditBalanceArea } from "@/components/usage/credit-balance-area";
+import { CreditDivergingBar } from "@/components/usage/credit-diverging-bar";
+import { CreditExpiryBars } from "@/components/usage/credit-expiry-bars";
+import { formatCredits, signedCredits } from "@/components/usage/format";
+import { ModelDonut } from "@/components/usage/model-donut";
+import { StatTiles, type StatTile } from "@/components/usage/stat-tiles";
+import type { UsageViewProps } from "@/components/usage/view-param-bar";
 import * as api from "@/lib/api";
+import { balanceCaption } from "@/lib/chart-caption";
+import { displayText } from "@/lib/display-text";
+import { formatDate } from "@/lib/format";
 import { useT } from "@/lib/i18n";
-import type { TranslationKey } from "@/locales/zh";
-import type { TraeAccountsOverview, TraeCreditsOverview } from "@/lib/trae-types";
-import { cn } from "@/lib/utils";
+import { mergeTraeCredits, type TraeRegionSlice } from "@/lib/trae-credits-merge";
+import {
+  traeAccountSlices,
+  traeCreditBars,
+  traeCreditExpiry,
+  traeStatusSlices,
+} from "@/lib/trae-usage-charts";
+import type { TraeRegionId, TraeTokenScope, TraeTokenStatistics } from "@/lib/trae-types";
 import { useCachedResource } from "@/lib/use-cached-resource";
+import { useAutoRefreshWhenVisible } from "@/lib/use-auto-refresh";
+import { CREDITS_LOCAL_REFRESH_INTERVAL_MS } from "@/lib/use-credit-auto-refresh";
 import { useTraeVariant } from "@/lib/use-trae-variant";
+import { balanceCurve, expiryBuckets } from "@/lib/usage-charts";
+import { usageWindowSpanDays } from "@/lib/usage-window";
 
-/** 趋势图展示的天数（含今日）。 */
-const TREND_DAYS = 7;
-
-/** 趋势系列只存**键**：表在模块加载时定型，存中文会让语言切换整条失效。 */
-const TREND_SERIES: { key: string; labelKey: TranslationKey; color: string }[] = [
-  { key: "total", labelKey: "trae.stats.credits.series.total", color: "var(--data-series-indigo)" },
-  { key: "earned", labelKey: "trae.stats.credits.series.earned", color: "var(--data-series-emerald)" },
-  { key: "consumed", labelKey: "trae.stats.credits.series.consumed", color: "var(--data-series-amber)" },
-];
-
-/** 本地日期 `YYYY-MM-DD`（与后端快照的日期口径一致，不用 UTC 以免跨时区错位）。 */
-function localDate(date: Date): string {
-  const year = date.getFullYear();
-  const month = `${date.getMonth() + 1}`.padStart(2, "0");
-  const day = `${date.getDate()}`.padStart(2, "0");
-  return `${year}-${month}-${day}`;
-}
-
-function formatCredits(value: number | null | undefined): string {
-  if (value === null || value === undefined || !Number.isFinite(value)) return "—";
-  return value.toLocaleString("zh-CN", { maximumFractionDigits: 2 });
-}
-
-function StatMetric({
-  icon: Icon,
-  label,
-  value,
-  hint,
-  tone = "default",
-  divided = false,
-}: {
-  icon: LucideIcon;
-  label: string;
-  value: string;
-  hint?: string;
-  tone?: "default" | "up" | "down";
-  divided?: boolean;
-}) {
-  return (
-    <div
-      className={cn(
-        "flex min-w-0 flex-col items-center justify-center px-4 py-5 text-center sm:py-3",
-        divided && "sm:border-l sm:border-border/60",
-      )}
-    >
-      <div className="flex max-w-full items-center justify-center gap-2 text-[13px] font-medium leading-5 text-muted-foreground">
-        <Icon className="size-4 shrink-0 stroke-[1.75]" aria-hidden="true" />
-        <span className="truncate">{label}</span>
-      </div>
-      <div
-        className={cn(
-          "mt-3 max-w-full truncate text-[26px] font-semibold leading-8 tracking-[-0.025em] tabular-nums",
-          tone === "up"
-            ? "text-emerald-600 dark:text-emerald-400"
-            : tone === "down"
-              ? "text-amber-600 dark:text-amber-400"
-              : "text-foreground",
-        )}
-        style={{ fontFamily: '"Bricolage Grotesque Variable", "SF Pro Display", ui-sans-serif, sans-serif' }}
-      >
-        {value}
-      </div>
-      {hint && <div className="mt-1.5 max-w-full truncate text-xs text-muted-foreground">{hint}</div>}
-    </div>
-  );
-}
+/** 原型的两个环形只展示**前 6 名**账号（`accountShare.slice(0, 6)`）。 */
+const ACCOUNT_SHARE_LIMIT = 6;
 
 /**
- * 「积分统计」页（Trae 分区）。
- *
- * 数据源是 `get_trae_credits` 的聚合结果（剩余积分缓存 + 签到明细 + 每日快照），
- * 账号名与分组来自 `get_trae_accounts`——积分缓存只存 uid，展示必须回表取名字。
+ * ⚠️ 这一页**没有**「每 N 分钟」的文案了（issue #133 复核 §3）：它读的是**本地快照**，
+ * 不向上游发请求 ⇒ 「向官方查询一次」是假话，「跟随后台同步」才是事实。文案见
+ * `shared.credit.autoFollow`。
  */
-export default function TraeCreditsPage() {
+
+/**
+ * 「用量 · 积分」视图（Trae 分区）。
+ *
+ * `range` / `combineAll` 由 `UsagePage` 传入（受控）；本页不放任何页内区域选择器。
+ */
+export default function TraeCreditsPage({ viewWindow, combineAll }: UsageViewProps) {
   const t = useT();
-  /** 当前产品线（由侧栏分区 / URL `?line=` 决定），决定读哪份积分与账号数据。 */
-  const [variant] = useTraeVariant();
+  /** 当前区域（由路径作用域 / `?line=` 决定），决定默认读哪一份积分与账号数据。 */
+  const [region] = useTraeVariant();
   const [refreshing, setRefreshing] = useState(false);
+  const scope: TraeTokenScope = combineAll ? "all" : region;
+  /* ★ 同 `TraeTokenStatsPage`：拉**覆盖整个窗口**的跨度，再按日历日切片。
+     窗口锚在过去时只拉「窗口天数」会让那段历史根本不在返回里。 */
+  const spanDays = usageWindowSpanDays(viewWindow);
 
   /**
-   * 积分与账号两份数据都按**当前选中的产品线**读：它们的分家文件不同，
-   * 混读会让「积分趋势」是 Trae CN 的、而「账号列表」是 Trae Work 的。
-   *
-   * 两者放在**同一个快照**里：账号名与分组来自账号视图，积分缓存只存 uid，
-   * 展示必须回表取名字 —— 拆成两个快照就会出现「积分已刷新、名字还是旧的」这种
-   * 中间态。
+   * 积分与账号两份数据都按**区域**读：它们分家存放，混读会让「积分趋势」是国内版的、
+   * 而「账号列表」是国际版的。合并态 ⇒ 两区各取一份，交给纯函数聚合。
    */
-  const loadSnapshot = useCallback(
-    async (): Promise<{ credits: TraeCreditsOverview; overview: TraeAccountsOverview }> => {
-      const [creditData, accountData] = await Promise.all([
-        api.getTraeCredits(variant),
-        api.getTraeAccounts(variant),
-      ]);
-      return { credits: creditData, overview: accountData };
-    },
-    [variant],
-  );
+  const loadSnapshot = useCallback(async (): Promise<TraeRegionSlice[]> => {
+    const regions: TraeRegionId[] = combineAll ? ["cn", "global"] : [region];
+    return Promise.all(
+      regions.map(async (target) => {
+        const [credits, overview] = await Promise.all([
+          api.getTraeCredits(target),
+          api.getTraeAccounts(target),
+        ]);
+        return { region: target, credits, overview };
+      }),
+    );
+  }, [combineAll, region]);
 
   const {
     data: snapshot,
     loading,
+    slow,
     error,
     refresh: loadAll,
-  } = useCachedResource(`trae:credits:${variant}`, loadSnapshot);
-
-  const credits = snapshot?.credits ?? null;
-  const overview = snapshot?.overview ?? null;
-
-  const accounts = overview?.accounts ?? [];
-  const groups = overview?.groups ?? [];
-  const today = localDate(new Date());
-
-  /** 每个账号的可用积分：`remaining` 是权威缓存，缺失时回落账号视图里的同名字段。 */
-  const rows = useMemo(
-    () =>
-      accounts
-        .map((account) => ({
-          userId: account.userId,
-          name: account.name,
-          groupId: account.groupId,
-          credits:
-            credits?.remaining?.[account.userId] ?? account.remainingCredits ?? account.credits ?? null,
-        }))
-        .sort((left, right) => {
-          if (left.credits === null && right.credits === null) return 0;
-          if (left.credits === null) return 1;
-          if (right.credits === null) return -1;
-          return right.credits - left.credits;
-        }),
-    [accounts, credits],
+    revalidate: revalidateSnapshot,
+    at: snapshotAt,
+  } = useCachedResource<TraeRegionSlice[]>(
+    `trae:credits:${combineAll ? "all" : region}`,
+    loadSnapshot,
   );
 
-  const total = useMemo(() => rows.reduce((sum, row) => sum + (row.credits ?? 0), 0), [rows]);
-  const average = rows.length === 0 ? 0 : total / rows.length;
+  /**
+   * ★ 自动跟随本地快照（issue #133），无手动操作也能看到新余额。
+   *
+   * ⚠️ 只**重读快照**，不调 `traeRefreshCredits`（那才是「去上游同步」，会真的打接口）。
+   * 上游同步由后台 `TRAE_CREDITS_REFRESH_INTERVAL_MS` 循环负责 —— 页面跟着把新读数读回来即可。
+   *
+   * ★ 节拍用 `CREDITS_LOCAL_REFRESH_INTERVAL_MS`（3 分钟）：读本地库零上游成本，比
+   * 后台的 10 分钟写循环更密也无所谓 —— 页面只是「更及时地看到后台刚写进去的数」。
+   */
+  useAutoRefreshWhenVisible(snapshotAt, revalidateSnapshot, CREDITS_LOCAL_REFRESH_INTERVAL_MS);
 
-  const todaySnapshot = useMemo(() => credits?.daily.find((item) => item.date === today), [credits, today]);
-
-  /** 今日新增：优先用每日快照的 `earned`（含签到 + 购买），回落签到明细的正增量之和。 */
-  const todayEarned = useMemo(() => {
-    if (todaySnapshot && todaySnapshot.earned > 0) return todaySnapshot.earned;
-    const fromRecords = (credits?.records ?? [])
-      .filter((record) => record.date === today)
-      .reduce((sum, record) => sum + Math.max(0, record.delta), 0);
-    return fromRecords > 0 ? fromRecords : (credits?.todayEarned ?? 0);
-  }, [todaySnapshot, credits, today]);
-
-  const todayConsumed = todaySnapshot?.consumed ?? 0;
-
-  /** 近 7 日趋势：缺快照的日期补 0，保证 x 轴天数固定。 */
-  const trend = useMemo(() => {
-    const byDate = new Map((credits?.daily ?? []).map((item) => [item.date, item]));
-    const points: { date: string; label: string; total: number; earned: number; consumed: number }[] = [];
-    for (let offset = TREND_DAYS - 1; offset >= 0; offset -= 1) {
-      const date = new Date(Date.now() - offset * 86_400_000);
-      const key = localDate(date);
-      const snapshot = byDate.get(key);
-      points.push({
-        date: key,
-        label: `${date.getMonth() + 1}/${date.getDate()}`,
-        total: snapshot?.total ?? 0,
-        earned: snapshot?.earned ?? 0,
-        consumed: snapshot?.consumed ?? 0,
-      });
-    }
-    // 今日尚无快照时，用当前实时总额补上最后一个点，避免曲线末端突然掉到 0。
-    const last = points[points.length - 1];
-    if (last && last.total === 0 && total > 0) last.total = Math.round(total);
-    return points;
-  }, [credits, total]);
-
-  const hasTrend = trend.some((point) => point.total > 0 || point.earned > 0 || point.consumed > 0);
-
-  const chartConfig: ChartConfig = useMemo(
-    () =>
-      Object.fromEntries(
-        TREND_SERIES.map((series) => [series.key, { label: t(series.labelKey), color: series.color }]),
-      ) as ChartConfig,
-    [t],
+  /**
+   * 原型的两个环形（账号 Token 占比 / 网关状态码分布）数据在 **Token 统计**里，
+   * 不在积分载荷里 ⇒ 这里再读一次 token 统计。
+   *
+   * ⚠️ 缓存键与 Token 页**逐字相同** ⇒ 两页命中同一份快照，来回切不重复取数。
+   * 取不到（或失败）时两个环形**不渲染** —— 积分页本身不受影响（不把配角的失败
+   * 升级成整页错误）。
+   */
+  const loadTokens = useCallback(
+    () => api.getTraeTokenStatistics(spanDays, scope),
+    [spanDays, scope],
   );
+  const { data: tokenStats } = useCachedResource<TraeTokenStatistics>(
+    `trae:token-stats:${spanDays}:${scope}`,
+    loadTokens,
+  );
+
+  /** 单区也走同一个聚合函数 ⇒ 只有一条渲染路径（见 `lib/trae-credits-merge.ts`）。 */
+  const merged = useMemo(() => mergeTraeCredits(snapshot ?? []), [snapshot]);
+  const credits = snapshot?.[0]?.credits ?? null;
+
+  const bars = useMemo(
+    () => traeCreditBars(merged.daily, viewWindow),
+    [merged.daily, viewWindow],
+  );
+  const balancePoints = useMemo(() => balanceCurve(bars, merged.total), [bars, merged.total]);
+  const buckets = useMemo(() => expiryBuckets(traeCreditExpiry(merged.rows)), [merged.rows]);
+  const hasExpiry = buckets.some((bucket) => bucket.value > 0);
+  const expiringTotal = buckets.reduce((sum, bucket) => sum + bucket.value, 0);
+  const soonestDay = buckets.find((bucket) => bucket.value > 0)?.day ?? null;
+
+  const inAmount = bars.reduce((sum, bar) => sum + bar.inAmt, 0);
+  const outAmount = bars.reduce((sum, bar) => sum + bar.outAmt, 0);
+  const net = inAmount - outAmount;
+
+  const accountSlices = useMemo(
+    () => (tokenStats ? traeAccountSlices(tokenStats).slice(0, ACCOUNT_SHARE_LIMIT) : []),
+    [tokenStats],
+  );
+  const statusSlices = useMemo(
+    () => (tokenStats ? traeStatusSlices(tokenStats) : []),
+    [tokenStats],
+  );
+
+  /** 账号名回表（流水表要给人看的名字）；行键带区域前缀，不会串。 */
+  const nameByKey = useMemo(
+    () => new Map(merged.rows.map((row) => [row.key, displayText(row.name) || row.userId])),
+    [merged.rows],
+  );
+
+  const balanceCaptionText =
+    balancePoints.length > 0
+      ? balanceCaption(
+          t,
+          balancePoints[0].value,
+          balancePoints[balancePoints.length - 1].value,
+          balancePoints[0].baseline,
+        )
+      : "";
+
+  const tiles: StatTile[] = [
+    {
+      icon: Coins,
+      label: t("wbStats.usage.credits.available"),
+      value: formatCredits(merged.total),
+      /* ★ issue #186：`total` 是**部分和**（未知额度的账号不进），把未知数写进 hint，
+         否则「总计 0」会被读成「所有账号都没额度」。 */
+      hint:
+        merged.unknownCount > 0
+          ? t("trae.stats.credits.accountsHintPartial", {
+              count: merged.rows.length,
+              unknown: merged.unknownCount,
+            })
+          : t("wbStats.usage.credits.accountsHint", { count: merged.rows.length }),
+    },
+    {
+      icon: TrendingUp,
+      label: t("wbStats.usage.credits.in"),
+      value: signedCredits(inAmount, "+"),
+      hint: t("trae.stats.credits.inHint"),
+    },
+    {
+      icon: TrendingDown,
+      label: t("wbStats.usage.credits.out"),
+      value: signedCredits(outAmount, "-"),
+      hint: t("trae.stats.credits.netHint", { net: `${net >= 0 ? "+" : ""}${formatCredits(net)}` }),
+    },
+    {
+      icon: CalendarDays,
+      label: t("wbStats.usage.credits.expiring"),
+      value: formatCredits(expiringTotal),
+      hint: soonestDay
+        ? t("trae.stats.credits.soonestHint", { days: soonestDay })
+        : t("trae.stats.credits.noExpiryHint"),
+    },
+  ];
 
   async function refreshCredits() {
     setRefreshing(true);
     try {
-      await api.traeRefreshCredits(undefined, variant);
+      /* 合并态 ⇒ 两区都同步；否则只同步当前区域（**不**给没在看的那一区发请求）。 */
+      const regions: TraeRegionId[] = combineAll ? ["cn", "global"] : [region];
+      await Promise.all(regions.map((target) => api.traeRefreshCredits(undefined, target)));
       await loadAll();
       toast.success(t("trae.stats.credits.refreshDone"));
     } catch (e) {
@@ -223,29 +254,31 @@ export default function TraeCreditsPage() {
   }
 
   return (
-    <div className="mx-auto w-full max-w-[1180px] px-6 py-8 sm:px-8 sm:py-9">
-      <header className="mb-6 flex flex-wrap items-end justify-between gap-3">
-        <div>
-          <h1 className="text-[28px] font-semibold tracking-tight">{t("trae.stats.credits.title")}</h1>
-          <p className="mt-2 text-sm leading-6 text-muted-foreground">
-            {t("trae.stats.credits.subtitle")}
-          </p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          {/* 产品线切换器：Trae 分区的每个页面都可切，位置固定在页头右侧动作区。
-              侧栏已合并为单个 `Trae` 入口，产品线的选择在这里。 */}
-          <TraeVariantSwitch />
-          <DemoAction>
-            <Button variant="outline" size="sm" disabled={refreshing} onClick={() => void refreshCredits()}>
-              {refreshing ? <Loader2 className="animate-spin" /> : <RefreshCw />}
-              {refreshing ? t("trae.stats.credits.syncing") : t("trae.stats.credits.sync")}
-            </Button>
-          </DemoAction>
-        </div>
-      </header>
+    /* ⚠️ 页头 / 子 Tab / **视图参数条**都由**上层** `UsagePage` 统一渲染
+       （原型 `viewUsage` 只有一个「用量」页头、一条参数条）⇒ 本页只渲染视图内容。 */
+    <div className="min-w-0 space-y-6">
+      {/* 原型 `creditsHeadBar()`：说明 + 「刷新积分」。
+          它是**独立的上游动作**（真的去上游同步），不能只靠页头那个「刷新」（那只重挂视图）。 */}
+      <div className="flex min-w-0 flex-wrap items-center gap-3">
+        <span className="text-[11px] text-muted-foreground">{t("trae.stats.credits.subtitle")}</span>
+        <span className="text-[11px] text-muted-foreground">
+          {t("shared.credit.autoFollow")}
+        </span>
+        {/* 「上次刷新」是事实：这份数字何时读到的（绝对时刻；相对时间不会自己走）。 */}
+        {snapshotAt > 0 && (
+          <span className="text-[11px] tabular-nums text-muted-foreground">
+            {t("shared.credit.lastRefresh", { time: formatDate(snapshotAt) })}
+          </span>
+        )}
+        <div className="grow" />
+        <Button variant="outline" size="sm" disabled={refreshing} onClick={() => void refreshCredits()}>
+          {refreshing ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+          {refreshing ? t("trae.stats.credits.syncing") : t("trae.stats.credits.sync")}
+        </Button>
+      </div>
 
       {error && (
-        <Alert variant="destructive" className="mb-5">
+        <Alert variant="destructive">
           <AlertTriangle />
           <AlertTitle>{t("trae.stats.credits.loadFailed")}</AlertTitle>
           <AlertDescription>{error}</AlertDescription>
@@ -253,242 +286,171 @@ export default function TraeCreditsPage() {
       )}
 
       {loading && !credits ? (
-        <Skeleton className="mb-6 h-24 w-full" />
+        <div className="space-y-6" aria-busy="true">
+          {slow ? <SlowLoadHint onRetry={() => void loadAll()} /> : null}
+          <Skeleton className="h-[74px] w-full" />
+          <Skeleton className="h-64 w-full" />
+        </div>
+      ) : merged.rows.length === 0 && merged.daily.length === 0 ? (
+        <EmptyState
+          icon={Coins}
+          title={t("trae.stats.credits.trendEmptyAccounts")}
+          description={t("trae.stats.credits.trendEmptyData")}
+          action={
+            <Button size="sm" variant="outline" disabled={refreshing} onClick={() => void refreshCredits()}>
+              {refreshing ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+              {t("trae.stats.credits.sync")}
+            </Button>
+          }
+        />
       ) : (
-        <Card className="mb-6 min-w-0 gap-0 overflow-hidden rounded-2xl bg-card/70 py-0 shadow-none" aria-label={t("trae.stats.credits.overviewAria")}>
-          <CardContent className="grid min-w-0 grid-cols-1 divide-y divide-border/60 p-0 sm:grid-cols-5 sm:divide-y-0 sm:py-5">
-            <StatMetric
-              icon={Coins}
-              label={t("trae.stats.credits.metric.total")}
-              value={formatCredits(total)}
-              hint={t("trae.stats.credits.metric.totalHint")}
-            />
-            <StatMetric
-              icon={CalendarDays}
-              label={t("trae.stats.credits.metric.average")}
-              value={formatCredits(Math.round(average))}
-              hint={t("trae.stats.credits.metric.averageHint")}
-              divided
-            />
-            <StatMetric
-              icon={User}
-              label={t("trae.stats.credits.metric.accounts")}
-              value={String(rows.length)}
-              hint={t("trae.stats.credits.metric.accountsHint", {
-                count: rows.filter((row) => row.credits !== null).length,
-              })}
-              divided
-            />
-            <StatMetric
-              icon={TrendingUp}
-              label={t("trae.stats.credits.metric.todayEarned")}
-              value={formatCredits(todayEarned)}
-              hint={today}
-              tone={todayEarned > 0 ? "up" : "default"}
-              divided
-            />
-            <StatMetric
-              icon={TrendingDown}
-              label={t("trae.stats.credits.metric.todayConsumed")}
-              value={formatCredits(todayConsumed)}
-              hint={today}
-              tone={todayConsumed > 0 ? "down" : "default"}
-              divided
-            />
-          </CardContent>
-          {credits?.updatedAt && (
-            <div className="border-t border-border/60 px-5 py-2.5 text-xs text-muted-foreground">
-              {t("trae.stats.credits.cacheUpdated", { time: credits.updatedAt })}
-              {credits.historyDays > 0 && (
-                <span className="ml-3">
-                  {t("trae.stats.credits.historyDays", { days: credits.historyDays })}
-                </span>
+        <>
+          <StatTiles tiles={tiles} ariaLabel={t("trae.stats.credits.overviewAria")} />
+
+          {/* 3 · 每日积分收支（**双向**：Trae 的入账可得） */}
+          {bars.length > 0 ? (
+            <ChartFrame
+              title={t("trae.stats.credits.dailyTitle")}
+              caption={t("trae.stats.credits.dailyNote")}
+              ariaLabel={t("trae.stats.credits.dailyAria")}
+            >
+              <CreditDivergingBar bars={bars} />
+            </ChartFrame>
+          ) : null}
+
+          {/* 4 · 余额曲线 | 到期分布 */}
+          <div className="grid min-w-0 gap-6 lg:grid-cols-2">
+            {balancePoints.length > 0 ? (
+              <ChartFrame
+                title={t("wbStats.usage.credits.balanceTitle")}
+                caption={balanceCaptionText}
+                ariaLabel={t("wbStats.usage.credits.balanceTitle")}
+              >
+                <CreditBalanceArea points={balancePoints} />
+              </ChartFrame>
+            ) : null}
+            <ChartFrame
+              title={t("wbStats.usage.credits.expiryTitle")}
+              caption={t("wbStats.usage.credits.expiryDesc")}
+              ariaLabel={t("wbStats.usage.credits.expiryAria")}
+            >
+              {hasExpiry ? (
+                <CreditExpiryBars buckets={buckets} />
+              ) : (
+                <p className="py-8 text-center text-sm text-muted-foreground">
+                  {t("trae.stats.credits.expiryEmpty")}
+                </p>
               )}
-            </div>
-          )}
-        </Card>
-      )}
-
-      <section className="min-w-0 space-y-2.5" aria-labelledby="trae-credits-trend-title">
-        <div className="flex flex-wrap items-center justify-between gap-2 px-1">
-          <h2 id="trae-credits-trend-title" className="text-[13px] font-medium leading-5">
-            {t("trae.stats.credits.trendTitle", { days: TREND_DAYS })}
-          </h2>
-          <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
-            {TREND_SERIES.map((series) => (
-              <span key={series.key} className="inline-flex items-center gap-1.5">
-                <span className="size-2 shrink-0 rounded-full" style={{ backgroundColor: series.color }} aria-hidden="true" />
-                {t(series.labelKey)}
-              </span>
-            ))}
+            </ChartFrame>
           </div>
-        </div>
-        <Card className="min-w-0 gap-0 overflow-hidden rounded-xl py-0 shadow-none">
-          <CardHeader className="gap-0 px-4 pt-3 pb-0 sm:px-5">
-            <CardDescription className="text-xs">
-              {t("trae.stats.credits.trendNote")}
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="min-w-0 px-4 pt-3 pb-4 sm:px-5">
-            {loading && !credits ? (
-              <Skeleton className="h-56 w-full" />
-            ) : rows.length === 0 ? (
-              <div className="rounded-lg border border-dashed px-4 py-10 text-center text-sm text-muted-foreground">
-                {t("trae.stats.credits.trendEmptyAccounts")}
+
+          {/* 5 · 账号 Token 占比 | 网关状态码分布（原型在这一页放这两个环形） */}
+          <div className="grid min-w-0 gap-6 lg:grid-cols-2">
+            <ChartFrame
+              title={t("trae.stats.credits.accountShareTitle")}
+              caption={t("trae.stats.credits.shareNote")}
+              ariaLabel={t("trae.stats.credits.accountShareAria")}
+            >
+              {accountSlices.length > 0 ? (
+                <ModelDonut slices={accountSlices} size={150} />
+              ) : (
+                <p className="py-8 text-center text-sm text-muted-foreground">
+                  {t("trae.stats.credits.accountShareEmpty")}
+                </p>
+              )}
+            </ChartFrame>
+            <ChartFrame
+              title={t("trae.stats.credits.statusTitle")}
+              caption={t("trae.stats.credits.statusNote")}
+              ariaLabel={t("trae.stats.credits.statusAria")}
+            >
+              {statusSlices.length > 0 ? (
+                <ModelDonut slices={statusSlices} size={150} />
+              ) : (
+                <p className="py-8 text-center text-sm text-muted-foreground">
+                  {t("trae.stats.credits.statusEmpty")}
+                </p>
+              )}
+            </ChartFrame>
+          </div>
+
+          {/* 6 · 积分流水（原型：时间 / 账号 / 变动 / 说明） */}
+          {merged.records.length > 0 ? (
+            <Card className="min-w-0 gap-0 overflow-hidden rounded-lg py-0 shadow-none">
+              <CardHead
+                title={t("wbStats.usage.credits.flowTitle")}
+                caption={t("trae.stats.credits.flowNote")}
+              />
+              <div className="min-w-0 overflow-x-auto">
+                <table className="w-full min-w-[560px] text-left text-xs">
+                  <thead className="bg-muted/45 text-muted-foreground">
+                    <tr>
+                      <th scope="col" className="px-4 py-2.5 font-medium">
+                        {t("wbStats.usage.credits.colTime")}
+                      </th>
+                      <th scope="col" className="px-3 py-2.5 font-medium">
+                        {t("wbStats.usage.credits.colAccount")}
+                      </th>
+                      <th scope="col" className="px-3 py-2.5 text-right font-medium">
+                        {t("wbStats.usage.credits.colAmount")}
+                      </th>
+                      <th scope="col" className="px-4 py-2.5 font-medium">
+                        {t("wbStats.usage.credits.colNote")}
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {merged.records.map((record) => {
+                      const name = nameByKey.get(`${record.region}:${record.userId}`) ?? record.userId;
+                      return (
+                        <tr key={record.key} className="border-t border-border/60">
+                          <td className="whitespace-nowrap px-4 py-2.5 text-muted-foreground">
+                            {record.date}
+                          </td>
+                          <td className="max-w-[200px] truncate px-3 py-2.5" title={name}>
+                            {name}
+                            {/* 合并态下同名账号可能来自两个区域 ⇒ 标出归属。 */}
+                            {combineAll
+                              ? ` · ${t(record.region === "cn" ? "shared.region.version.cn" : "shared.region.version.global")}`
+                              : ""}
+                          </td>
+                          <td
+                            className={
+                              record.delta >= 0
+                                ? "px-3 py-2.5 text-right tabular-nums text-success"
+                                : "px-3 py-2.5 text-right tabular-nums text-warning"
+                            }
+                          >
+                            {record.delta >= 0 ? "+" : ""}
+                            {formatCredits(record.delta)}
+                          </td>
+                          <td className="px-4 py-2.5 text-muted-foreground">
+                            {record.delta >= 0
+                              ? t("trae.stats.credits.recordEarned")
+                              : t("trae.stats.credits.recordSpent")}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
               </div>
-            ) : !hasTrend ? (
-              <div className="rounded-lg border border-dashed px-4 py-10 text-center text-sm text-muted-foreground">
-                {t("trae.stats.credits.trendEmptyData")}
-              </div>
-            ) : (
-              <ChartContainer config={chartConfig} className="h-56 w-full">
-                <LineChart data={trend} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
-                  <CartesianGrid vertical={false} strokeDasharray="3 3" />
-                  <XAxis dataKey="label" tickLine={false} axisLine={false} tickMargin={8} />
-                  <YAxis
-                    tickLine={false}
-                    axisLine={false}
-                    width={52}
-                    tickFormatter={(value) => formatCredits(Number(value))}
-                  />
-                  <ChartTooltip
-                    cursor={{ stroke: "var(--border)", strokeDasharray: "3 3" }}
-                    content={<ChartTooltipContent labelFormatter={(_, payload) => {
-                      const item = Array.isArray(payload) ? payload[0] : payload;
-                      return String(item?.payload?.date ?? "");
-                    }} />}
-                  />
-                  {TREND_SERIES.map((series) => (
-                    <Line
-                      key={series.key}
-                      type="monotone"
-                      dataKey={series.key}
-                      stroke={series.color}
-                      strokeWidth={series.key === "total" ? 2.5 : 2}
-                      dot={{ r: 3, fill: series.color, strokeWidth: 0 }}
-                      activeDot={{ r: 5 }}
-                      isAnimationActive={false}
-                    />
-                  ))}
-                </LineChart>
-              </ChartContainer>
-            )}
-          </CardContent>
-        </Card>
-      </section>
-
-      {/* ---- 平台做不到的维度（置灰说明；形状来自 handlers::unsupported_note） ---- */}
-      {(credits?.unsupported.length ?? 0) > 0 && (
-        <section className="mt-6 min-w-0 space-y-2.5" aria-labelledby="trae-credits-unsupported-title">
-          <div className="px-1">
-            <h2 id="trae-credits-unsupported-title" className="text-[13px] font-medium leading-5">
-              {t("trae.stats.credits.unsupportedTitle")}
-            </h2>
-          </div>
-          <Card className="min-w-0 gap-0 overflow-hidden rounded-xl border-dashed py-0 shadow-none">
-            <div className="divide-y divide-border/60">
-              {credits?.unsupported.map((item) => (
-                <div key={item.capability} className="flex flex-wrap items-baseline gap-x-3 gap-y-1 px-5 py-3 opacity-70">
-                  <span className="text-sm font-medium text-muted-foreground">{item.label}</span>
-                  <span className="text-xs text-muted-foreground">
-                    {t("trae.stats.credits.unsupportedOnly", { on: item.supportedOn })}
-                  </span>
-                  <span className="w-full text-xs leading-5 text-muted-foreground">{item.reason}</span>
-                </div>
-              ))}
-            </div>
-          </Card>
-        </section>
-      )}
-
-      <section className="mt-6 min-w-0 space-y-2.5" aria-labelledby="trae-credits-detail-title">
-        <div className="px-1">
-          <h2 id="trae-credits-detail-title" className="text-[13px] font-medium leading-5">
-            {t("trae.stats.credits.detailTitle")}
-          </h2>
-          {/* 口径说明：Trae 积分来自签到快照，**没有**「请求用量」这一口径的数据源，
-              因此这里是单栏明细 + 说明，而不是 WorkBuddy 那套「明细 / 请求用量」分栏。 */}
-          <p className="mt-1 text-xs leading-5 text-muted-foreground">
-            {t("trae.stats.credits.detailNote")}
-          </p>
-        </div>
-        <Card className="min-w-0 gap-0 overflow-hidden rounded-xl py-0 shadow-none">
-          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border/60 px-5 py-3">
-            <span className="text-[13px] font-medium">{t("trae.stats.credits.detail.byAccount")}</span>
-            <span className="text-xs text-muted-foreground">
-              {t("trae.stats.credits.detail.accountCount", { count: rows.length })}
-            </span>
-          </div>
-          {loading && !overview ? (
-            <div className="p-4">
-              <Skeleton className="h-40 w-full" />
-            </div>
-          ) : rows.length === 0 ? (
-            <div className="px-4 py-10 text-center text-sm text-muted-foreground">
-              {t("trae.stats.credits.detail.empty")}
-            </div>
+            </Card>
           ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full min-w-[700px] text-sm">
-                <thead className="bg-muted/50 text-xs text-muted-foreground">
-                  <tr>
-                    <th className="px-4 py-2.5 text-left font-medium">{t("trae.stats.credits.col.rank")}</th>
-                    <th className="px-4 py-2.5 text-left font-medium">{t("trae.stats.credits.col.account")}</th>
-                    <th className="px-4 py-2.5 text-left font-medium">{t("trae.stats.credits.col.group")}</th>
-                    <th className="px-4 py-2.5 text-left font-medium">{t("trae.stats.credits.col.expires")}</th>
-                    <th className="px-4 py-2.5 text-right font-medium">{t("trae.stats.credits.col.remaining")}</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-border/60">
-                  {rows.map((row, index) => {
-                    const group = groups.find((item) => item.id === row.groupId);
-                    const expireAt = credits?.expireTimes?.[row.userId];
-                    return (
-                      <tr key={row.userId}>
-                        <td className="px-4 py-2.5 tabular-nums text-muted-foreground">#{index + 1}</td>
-                        <td className="px-4 py-2.5">
-                          <div className="font-medium">{row.name}</div>
-                          <div className="font-mono text-xs text-muted-foreground">{row.userId}</div>
-                        </td>
-                        <td className="px-4 py-2.5">
-                          {group ? (
-                            <Badge variant="secondary" className="gap-1.5">
-                              <span
-                                className="size-2 rounded-full"
-                                style={{ backgroundColor: group.color }}
-                                aria-hidden="true"
-                              />
-                              {group.name}
-                            </Badge>
-                          ) : (
-                            <span className="text-xs text-muted-foreground">
-                              {t("trae.stats.credits.ungrouped")}
-                            </span>
-                          )}
-                        </td>
-                        <td className="px-4 py-2.5 text-xs text-muted-foreground">
-                          {expireAt
-                            ? new Date(expireAt * 1000).toLocaleDateString("zh-CN")
-                            : "—"}
-                        </td>
-                        <td className="px-4 py-2.5 text-right tabular-nums">
-                          {row.credits === null ? (
-                            <span className="text-xs text-muted-foreground">
-                              {t("trae.stats.credits.notSynced")}
-                            </span>
-                          ) : (
-                            formatCredits(row.credits)
-                          )}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
+            <EmptyState
+              icon={Coins}
+              title={t("trae.stats.credits.flowEmptyTitle")}
+              description={t("trae.stats.credits.flowEmptyBody")}
+              action={
+                <Button size="sm" variant="outline" disabled={refreshing} onClick={() => void refreshCredits()}>
+                  {refreshing ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+                  {t("trae.stats.credits.sync")}
+                </Button>
+              }
+            />
           )}
-        </Card>
-      </section>
+        </>
+      )}
     </div>
   );
 }

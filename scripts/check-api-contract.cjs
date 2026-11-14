@@ -39,6 +39,15 @@ const SCREENSHOT_DEMO_TS = path.join(ROOT, "src", "lib", "screenshot-demo.ts");
 const SERVER_RS = path.join(ROOT, "crates", "buddy-switch-server", "src", "api.rs");
 const TAURI_LIB_RS = path.join(ROOT, "src-tauri", "src", "lib.rs");
 const TAURI_COMMANDS_RS = path.join(ROOT, "src-tauri", "src", "commands.rs");
+// 作用域解析的**唯一事实来源**（core）—— 第 9 条反例扫描的对象。
+const CORE_PRODUCT_RS = path.join(
+  ROOT,
+  "crates",
+  "buddy-switch-core",
+  "src",
+  "modules",
+  "product.rs",
+);
 
 // 第 7 条校验的豁免表。留空是**有意**的：目前所有「单 Value 参数」命令都能用对象
 // 字面量调用，豁免项一旦出现，说明出现了需要人工判断的形态，应在评审时说明理由。
@@ -55,9 +64,174 @@ const ROUTE_EXEMPT_COMMANDS = new Set([
   "check_auth_permission",
   "reveal_app_in_finder",
   "relaunch_app",
+  "get_app_prefs",
+  "set_app_prefs",
   "get_launch_at_login_enabled",
   "set_launch_at_login_enabled",
 ]);
+
+/**
+ * 第 8 条：「参数化命令」清单（`*_for(scope, …)` 风格，与 `docs/specs/P5-ARCH.md` §2.3
+ * 命令表**同源**）。对集合内每个命令断言「四处都带了 scope」：
+ * ① `commands.rs` 该 fn 签名含 `scope`；② `api.ts` 的 `call("<cmd>", {…})` 顶层键含 `scope`；
+ * ③ `api.rs` 的 handler 从 query/body 读到 `scope`。
+ *
+ * ## 为什么要有它（防的是「参数化只做一半」）
+ *
+ * 命令签名带了 `scope`、但前端没传 / 服务端没读 ⇒ 桌面端与 webui **行为分叉**，
+ * 而**构建全绿**（两端各自都能编译）。这是最难在评审里发现的一类漂移。
+ *
+ * ⚠️ **本集合在 T03（命令面参数化）之前是空集**：门禁规则先就位，等 T03 填命令名。
+ * 刻意**不**为了「让规则有事可做」去提前参数化任何命令 —— 那是 T03 的范围。
+ */
+const SCOPE_PARAMETERIZED = new Set([
+  // T03 在此登记参数化命令名，例："accounts_list", "account_checkin", …
+  /* ✅ 2026-10-04：以下三条已参数化 —— 前端 `api.ts` 改调并显式传 `scope`，
+     后端 `commands.rs` 签名含 `scope` 参数。
+     ⚠️ **登记即激活第 8 条**：此后任一侧漏改（前端不传 scope / 后端签名没有 scope）都会红。
+     这正是要防的「参数化只做一半」—— 桌面端与 webui 会分叉，而构建全绿。 */
+  "accounts_list",
+  "account_delete",
+  "account_remark",
+  /* ✅ 2026-10-04（续）：账号导出 / 导入家族 —— **区域纯**（只按区域读写账号库，不触碰
+     客户端 / 程序位）且两平台**同构**（WB `export_accounts_for(region, ids)` vs Trae
+     `export_accounts_for(variant, ids)`），故可安全折叠到 `scope`。
+     ⚠️ 名字**不**沿用 §2.3 的 `export_accounts` / `export_accounts_to_path` / `import_accounts`
+     —— 那三个与 **WorkBuddy 旧命令同名**，与 §2.4「旧命令保留为别名」冲突（`generate_handler!`
+     不允许重名）。旧命令保留为别名（见 `api.ts` ALIASES），参数化命令取不冲突新名。 */
+  "accounts_export",
+  "accounts_export_to_path",
+  "accounts_import",
+  /* ✅ 2026-10-04（续）：积分 —— **区域纯**（只按区域读账号库 / 积分缓存，不触碰
+     客户端 / 程序位）且两平台**同构**（WB `get_credit_expiry` 单账号 vs Trae
+     `get_trae_credits` 区域总览），故可折叠到 `scope`。形状按 `scope.product()` 分叉；
+     `accountId` 仅 WB 分支使用（Trae 分支忽略）。旧命令保留为别名（见 api.ts ALIASES）。 */
+  "credits",
+  /* ✅ 2026-10-04（续）：签到状态 —— **区域纯**（只按区域读账号库 / 签到缓存，不触碰
+     客户端 / 程序位）且两平台**同构**（WB `get_checkin_status` 单账号 vs Trae
+     `get_trae_checkin_status` 区域摘要），故可折叠到 `scope`。形状按 `scope.product()` 分叉；
+     `accountId` 仅 WB 分支使用（Trae 分支忽略）。旧命令保留为别名（见 api.ts ALIASES）。
+     ⚠️ 参数化命令只对齐**桌面端单账号**契约：webui 的旧路由 `GET /api/checkin/status` 是
+     **批量整端点**（`getCheckinStatusMap` 依赖它），该差异刻意保留。 */
+  "checkin_status",
+  /* ✅ 2026-10-04（续）：从本机客户端导入账号 —— **区域纯**（读**该区域客户端**登录态、
+     写**该区域**账号库；客户端由 `scope` 决定，不用 detected_variant 猜测）且两平台同构
+     （WB `import_local` vs Trae `trae_import_local_account`）。名字**不**沿用 §2.3 的
+     `import_local` —— 与 **WorkBuddy 旧命令同名**（`generate_handler!` 不允许重名），
+     故取不冲突新名 `accounts_import_local`（与 `accounts_import` 同族）。旧命令保留为别名。 */
+  "accounts_import_local",
+  /* ✅ 2026-10-04（续）：打开客户端数据目录 —— 两平台**同形**（都收 scope、返回 `{ok,path}`
+     或结构化 `Unsupported`）。判为区域纯的依据：**只读**客户端数据目录的**路径**并交文件管理器
+     打开，**不写**程序位状态（区别于会关/重启进程的 `switch_account`）。旧命令保留为别名。 */
+  "open_data_dir",
+  /* ✅ 2026-10-15：Qoder（第三个平台）账号族 —— **6 条生来参数化**（不是「折叠」出来的）：
+     双区域是**两本互不相通的账号库**，`scope` 是唯一的区域判据，缺它不该读任何一本。
+     登记的价值在**防回退**：任一侧漏改（前端不传 scope / 后端签名丢 scope）都会红。 */
+  "get_qoder_accounts",
+  "get_qoder_local_sources",
+  "qoder_import_local",
+  "qoder_import_pat",
+  "qoder_set_account_remark",
+  "qoder_delete_account",
+  /* ✅ 2026-10-15：模型禁用偏好 —— **作用域纯**（只读写 `gateway_disabled_models.json`，
+     不触碰任何客户端 / 程序位）且三平台同构（共用同一份存储，键 = 作用域）。
+     ⚠️ 本次同时是**存量缺陷修复**：旧契约用 `region`（`cn`/`global`）作键，
+     而 Qoder 的 cn/global 会与 WB/Trae **共用同一把键**（三套互不相通的模型目录互相串权）。
+     升级为 `scope` 后，旧文件键在加载时**扇出迁移**（`cn` → `wb-cn` + `trae-cn`，见
+     `disabled_models.rs` 的模块文档）；命令面 `scope` 必填且 fail-closed。 */
+  "get_disabled_models",
+  "set_model_disabled",
+  /* ✅ 2026-10-15（续）：Qoder 账号运维四件 —— **区域纯**（只读写该区域账号库 +
+     该区域 openapi 端点，不触碰客户端 / 程序位）。`scope` 必填且 fail-closed
+     （`require_qoder_region`：非 Qoder 作用域 ⇒ 可读错误，不静默另投别家）。 */
+  "qoder_refresh_account",
+  "qoder_checkin_status",
+  "qoder_checkin_claim",
+  "qoder_credits",
+  /* ✅ 2026-10-15（续）：Qoder OAuth 设备授权两条 —— **生来参数化**。判据：双区域各有
+     自己的授权页 / `client_id` / redirect_uri（`send_redirect_uri` 与 `nonce_dashed`
+     两区相反），缺 scope 就无从构造授权 URL，也没有「默认区域」可以回落。 */
+  "qoder_oauth_start",
+  "qoder_oauth_status",
+  /* ✅ 2026-10-15（续）：Qoder 程序位 / 切换 / 分组 / 用量 —— 四条**生来参数化**。
+     `qoder_switch_account` 虽写客户端登录态，但**区域是必填**：双区各有自己的客户端目录
+     （`.qoder-cn` / `.qoder`），缺 scope 无从判断该写哪一处的登录态 ——
+     与 WB 的 `switch_account`（收 `region`、非本集合）不是同一情形。 */
+  "qoder_program_status",
+  "qoder_switch_account",
+  "qoder_set_account_group",
+  "qoder_usage",
+  /* ✅ 2026-10-18（issue #47）：逐账号「今日」只读重取三条 —— **生来参数化**。
+     判据同 `checkin_status` / `qoder_checkin_status`：三者都是**区域纯**的
+     （只读该区域的账号库 / 网关日志 / 上游签到状态），缺 scope 就无从判断该读哪一本。
+     `get_trae_account_token_today` 的 `force` 是**第二参数**，不影响 scope 在场性。
+     ⚠️ 它们与 WB 的 `get_account_token_today` / `get_checkin_status_map` **同构**：
+     前端三平台共用一套渲染，字段名不得分叉。 */
+  "get_trae_checkin_status_map",
+  "get_trae_account_token_today",
+  "qoder_checkin_status_map",
+  /* ✅ 2026-10-15（续）：导入预览 —— 原签名第二个参数是 `region` 且**后端一直忽略**它
+     （纯函数解析）。Qoder 的预览要按区域判「归属不符」，而裸 `region=cn` 分不出
+     `wb-cn` 与 `qoder-cn` ⇒ 升级为 `scope`（前端传、服务端读、桌面端读）。 */
+  "preview_import_accounts",
+  /* ✅ 2026-10-15（续）：Qoder 网关管理面三条 —— `qoder_gateway_status` /
+     `get_qoder_gateway_models` / `create_qoder_api_key`。判为**必须带 scope**的依据：
+     网关**一个监听服务两个区域**，池 / 清单 / Key 归属都按区域分家 —— 缺 scope 就无从
+     判断该读哪本账号库（不是「有个默认值可以回落」）。配置 / 吊销 / 恢复 / 删除 / 日志
+     不在此列：它们是**跨区域**的（同一份配置文件、按 id 操作、一本共享日志）。 */
+  "qoder_gateway_status",
+  "get_qoder_gateway_models",
+  "create_qoder_api_key",
+  /* ✅ 2026-10-21：限额护栏视图 —— **生来参数化**。计数落盘是 `qoder/gateway_usage.{region}.json`
+     （两区两本文件），缺 scope 就无从判断该读哪一本（没有「默认区域」可回落）。 */
+  "qoder_gateway_quota",
+  /* ✅ 2026-10-16：限流探测四条 —— **作用域参数化**。原签名收 `region`（`cn` / `global`），
+     分不出 `wb-cn` 与 `qoder-cn` ⇒ 升级为 `scope`（`Scope::parse` fail-closed）。
+     `probe_start` 的 scope 决定探测目标（WB / Qoder 的账号库与目录）；`probe_status` /
+     `probe_cancel` 的 scope 为**命令面统一必填**（作业槽是进程级全局，但未知 / 拼错的
+     作用域一律拒绝，不静默接受）。登记即激活第 8 条：任一侧漏改都会红。 */
+  "probe_start",
+  "probe_status",
+  "probe_cancel",
+  /* ✅ 2026-10-23：实测台账（跨重启的探测结论）—— **必须带 scope**：台账按作用域隔离，
+     缺 scope 会把 wb-cn 的格读成 qoder 的（同名模型、不同上游）。 */
+  "probe_ledger",
+]);
+
+/**
+ * 第 9 条：「scope 解析必须 fail-closed」——**只**扫作用域解析点（core `product.rs`）。
+ *
+ * ## 为什么只扫这一个文件（不误伤旧 `region` 兼容解析）
+ *
+ * 旧 `region` 参数（两宿主的 `parse_region` / core `parse_region_filter`）是**合法**的
+ * 宽容入口（老前端不带该参数等价于 CN），其 `unwrap_or(Region::Cn)` 语义**保留**。
+ * fail-closed 只约束**新的 `scope` 参数路径**。把旧入口一起扫进来会立刻假红，
+ * 于是整条护栏被绕过 —— 那比没有护栏更坏。故第 9 条**只**锚在 `Scope` 的唯一解析点上。
+ */
+const SCOPE_RESOLUTION_FILES = [CORE_PRODUCT_RS];
+
+/** scope 解析点**禁止**出现的 fail-open 回落（命中即红）。 */
+const SCOPE_FAIL_OPEN_PATTERNS = [
+  /unwrap_or\s*\(\s*Region::Cn\s*\)/,
+  /unwrap_or\s*\(\s*Region::[A-Za-z]+\s*\)/,
+  /unwrap_or\s*\(\s*Scope::[A-Za-z]+\s*\)/,
+  /unwrap_or_default\s*\(\s*\)/,
+  /unwrap_or\s*\(\s*DEFAULT_SCOPE\s*\)/,
+  /\?\?\s*DEFAULT_SCOPE/,
+];
+
+/**
+ * 第 10 条：全局探测**不得进任何写路径**（PLAN §2.4 / P5-ARCH §前置 1）。
+ *
+ * `platform::detected_variant()` / `platform::detect_data_dir()` 是**无入参的全局探测**
+ * （挑本机最近活跃的客户端），只适合环境自检与展示。若它们出现在宿主的命令 / handler 里，
+ * 一个「按本机活跃客户端推断作用域」的写操作就会把数据写进**错误的库**（别名转发尤其危险：
+ * 旧命令必须**硬编码自己的 scope**，不接受「由调用方决定」或「按本机推断」）。
+ *
+ * 判据只锚**裸调用**（`detected_variant(` / `detect_data_dir(`）—— `detect_data_dir_for(v)`
+ * 是**按变体取目录**的写侧来源，语义不同，不在此列。
+ */
+const HOST_COMMAND_FILES = [TAURI_COMMANDS_RS, SERVER_RS];
 
 /** 读文件并去掉可能存在的 UTF-8 BOM。 */
 function read(file) {
@@ -71,9 +245,17 @@ function read(file) {
  * 报出「未登记的命令 <cmd>」，而真正的调用点全都没问题——护栏于是从
  * 「保护构建」变成「制造噪声」，最后被开发者绕过。
  * 用 `(^|[^:])` 排除 `://`，避免把 URL 里的 `//` 当成行注释起点。
+ *
+ * ## 顺序：**先剥行注释，再剥块注释**（2026-10-21 修正）
+ *
+ * 反过来会出事：行注释里出现块注释的**起始标记**（本仓真实存在 ——
+ * `// 对齐 WB 的 /api/oauth/…` 后跟一个星号）时，块注释的正则从那里起吃到下一个
+ * 结束标记，一口气吞掉十几万字符 ⇒ 后面所有「handler 是否读到 scope」都变成假红
+ * （实测把 40 条断言全打成红）。行注释先剥，那类字样连同行一起消失，
+ * 块注释就只剩真正的注释块了。
  */
 function stripComments(text) {
-  return text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/[^\n]*/g, "$1");
+  return text.replace(/(^|[^:])\/\/[^\n]*/g, "$1").replace(/\/\*[\s\S]*?\*\//g, "");
 }
 
 /**
@@ -333,6 +515,64 @@ function extractCallArgKeys(apiTs) {
   return map;
 }
 
+/**
+ * 从 api.ts 的 `ALIASES` 表提取「旧命令名 → 新命令名」映射（第 3 条据此判定别名）。
+ *
+ * ## 为什么别名要「声明」而不是「豁免」
+ *
+ * 命令面参数化后，前端改调新名（`accounts_list`），旧 `ROUTES["get_accounts"]` 就没有
+ * 任何 `call()` 引用了 —— 按第 3 条它会被判**死路由**。但旧命令**必须保留**（别名转发 +
+ * 可回滚）。与其把旧命令加进一个**无条件静默豁免**集（别名链断了也不报），不如让别名
+ * **显式登记**在本表里：ROUTES 条目「活」当且仅当它有 `call()` 引用**或**是本表的键。
+ * 再加一条正向约束（见 main 的第 3b 条）：`ALIASES` 的**值**必须自身是活命令，防止
+ * 别名指向一条已经死掉的命令。
+ */
+function extractAliases(apiTs) {
+  const anchor = apiTs.indexOf("const ALIASES");
+  if (anchor < 0) {
+    throw new Error(
+      "api.ts 中找不到 `const ALIASES`（第 3 条依赖它区分「别名」与「死路由」）",
+    );
+  }
+  const openIndex = apiTs.indexOf("{", anchor);
+  if (openIndex < 0) throw new Error("api.ts 的 ALIASES 不是对象字面量");
+  const block = sliceBalanced(apiTs, openIndex);
+  // 剥注释：注释里写 `旧名: "新名"` 这类示例会把扫描器骗过去（真实踩过 —— 见 stripComments）。
+  const source = stripComments(block);
+  const map = new Map();
+  const re = /([A-Za-z0-9_]+)\s*:\s*"([^"]+)"/g;
+  let m;
+  while ((m = re.exec(source)) !== null) map.set(m[1], m[2]);
+  return map;
+}
+
+/**
+ * 提取 commands.rs 里某个 `pub fn <name>(…)` 的**形参名**列表（第 8 条用）。
+ *
+ * 找不到该 fn 返回 `null`（由调用方报错，而不是静默跳过 —— 静默跳过会让规则失效）。
+ */
+function extractFunctionParams(commandsRs, fnName) {
+  const source = stripComments(commandsRs);
+  const re = new RegExp(`pub\\s+(?:async\\s+)?fn\\s+${fnName}\\s*\\(`);
+  const m = re.exec(source);
+  if (!m) return null;
+  const openIndex = m.index + m[0].length - 1;
+  const params = sliceBalanced(source, openIndex);
+  return splitTopLevel(params)
+    .map((param) => param.trim())
+    .filter((param) => param !== "")
+    .map((param) => {
+      const colon = param.indexOf(":");
+      return colon < 0 ? param : param.slice(0, colon).trim();
+    });
+}
+
+/** api.rs 是否从 query/body 读到 `scope`（第 8 条的服务端一侧，粗粒度）。 */
+function serverReadsScope(serverRs) {
+  const source = stripComments(serverRs);
+  return /query_value\s*\([^)]*"scope"/.test(source) || /body\.get\s*\(\s*"scope"\s*\)/.test(source);
+}
+
 function main() {
   const apiTs = read(API_TS);
   const screenshotTs = read(SCREENSHOT_DEMO_TS);
@@ -348,6 +588,8 @@ function main() {
   const serverRoutes = extractServerRoutes(serverRs);
   const invokeCmds = extractInvokeCommands(libRs);
   const singleValueCommands = extractSingleValueParamCommands(commandsRs);
+  const aliases = extractAliases(apiTs);
+  const aliasKeys = new Set(aliases.keys());
 
   const routeCmds = new Set(routes.map((r) => r.cmd));
   const errors = [];
@@ -371,10 +613,33 @@ function main() {
     }
   }
 
-  // 3) ROUTES 不得有死路由（没有任何 call("<cmd>") 使用它）。
+  // 3) ROUTES 不得有死路由。一个条目「活」当且仅当它有 call("<cmd>") 引用，**或**它是
+  //    ALIASES 的键（旧命令保留为别名 ⇒ 旧 ROUTES 条目不是死路由，而是被**声明**的别名）。
+  //
+  //    为什么改成「有引用 **或** 是别名键」：命令面参数化后前端改调新名，旧命令**必须保留**
+  //    （别名转发 + 可回滚）。若仍按「必须有 call() 引用」判，保留旧命令的**第一步就红**，
+  //    且红的原因与真实缺陷无关（假失败）。用 ALIASES 表把别名**显式声明**出来，
+  //    比无条件豁免更安全 —— 别名链断了（见 3b）仍会报。
   for (const cmd of [...routeCmds].sort()) {
-    if (!callCmds.has(cmd)) {
-      errors.push(`[webui] ROUTES["${cmd}"] 是死路由：没有任何 call("${cmd}") 使用它`);
+    if (!callCmds.has(cmd) && !aliasKeys.has(cmd)) {
+      errors.push(
+        `[webui] ROUTES["${cmd}"] 是死路由：没有 call("${cmd}") 使用它，也不是 ALIASES 的键`,
+      );
+    }
+  }
+
+  // 3b) 别名的两条正向约束：键必须有 ROUTES 条目（webui 才能路由旧命令）；值必须自身是
+  //     活命令（防止别名指向一条已经死掉的命令 —— 别名链悄悄腐烂）。
+  for (const [oldCmd, newCmd] of [...aliases].sort()) {
+    if (!routeCmds.has(oldCmd)) {
+      errors.push(
+        `[alias] ALIASES 的键 "${oldCmd}" 没有 ROUTES 条目 → webui 无法路由旧命令（别名形同虚设）`,
+      );
+    }
+    if (!callCmds.has(newCmd)) {
+      errors.push(
+        `[alias] ALIASES["${oldCmd}"] 指向 "${newCmd}"，但后者没有任何 call() 引用 → 别名链断了`,
+      );
     }
   }
 
@@ -452,11 +717,115 @@ function main() {
     }
   }
 
+  // 8) 参数化命令必须**四处**都带 scope：commands.rs 签名 / api.ts 顶层键 / api.rs 读取。
+  //    任一缺失 ⇒ 桌面端与 webui 行为分叉，且构建全绿（最难发现的一类漂移）。
+  for (const cmd of [...SCOPE_PARAMETERIZED].sort()) {
+    const params = extractFunctionParams(commandsRs, cmd);
+    if (params === null) {
+      errors.push(`[scope] SCOPE_PARAMETERIZED 含 "${cmd}"，但 commands.rs 找不到该命令的 fn`);
+    } else if (!params.includes("scope")) {
+      errors.push(
+        `[scope] 参数化命令 "${cmd}" 的 commands.rs 签名缺 \`scope\` 参数（桌面端拿不到作用域）`,
+      );
+    }
+
+    const keys = callArgKeys.get(cmd);
+    if (keys === undefined) {
+      errors.push(`[scope] 参数化命令 "${cmd}" 在 api.ts 没有 \`call("${cmd}", {…})\` 调用点`);
+    } else if (keys === null) {
+      errors.push(
+        `[scope] call("${cmd}") 的实参不是对象字面量，无法校验顶层是否含 \`scope\`（请改用对象字面量）`,
+      );
+    } else if (!keys.includes("scope")) {
+      errors.push(`[scope] call("${cmd}") 的顶层键缺 \`scope\` → webui 通道拿不到作用域`);
+    }
+
+    if (!serverReadsScope(serverRs)) {
+      errors.push(`[scope] api.rs 的 "${cmd}" handler 未从 query/body 读到 \`scope\``);
+    }
+  }
+
+  // 9) scope 解析必须 fail-closed：反例扫描（禁 fail-open 回落）+ 正向断言（Result + 单测）。
+  for (const file of SCOPE_RESOLUTION_FILES) {
+    const code = stripComments(read(file));
+    const rel = path.relative(ROOT, file);
+    for (const re of SCOPE_FAIL_OPEN_PATTERNS) {
+      const hit = re.exec(code);
+      if (hit) {
+        errors.push(
+          `[scope] ${rel} 出现 fail-open 回落 \`${hit[0]}\` —— scope 解析必须 fail-closed，` +
+            `未知 / 空 / 缺一律 Err（静默回落会读写**错误的库**）`,
+        );
+      }
+    }
+  }
+  {
+    const productRs = read(CORE_PRODUCT_RS);
+    const rel = path.relative(ROOT, CORE_PRODUCT_RS);
+    if (
+      !/pub\s+fn\s+parse\s*\([^)]*\)\s*->\s*Result<\s*Scope\s*,\s*ScopeError\s*>/.test(
+        stripComments(productRs),
+      )
+    ) {
+      errors.push(`[scope] ${rel} 的 Scope::parse 未返回 Result<Scope, ScopeError>（fail-closed 的前提）`);
+    }
+    if (!/fn\s+scope_parse_is_fail_closed_for_unknown_empty_and_typos\s*\(/.test(productRs)) {
+      errors.push(
+        `[scope] ${rel} 缺少「未知 scope ⇒ Err」的单测 ` +
+          `\`scope_parse_is_fail_closed_for_unknown_empty_and_typos\``,
+      );
+    }
+    if (!/\.is_err\s*\(\s*\)/.test(productRs)) {
+      errors.push(
+        `[scope] ${rel} 未发现 \`.is_err()\` 断言 —— 「未知 scope ⇒ Err」的错误分支可能不可达（断言在空转）`,
+      );
+    }
+  }
+
+  // 10) 全局探测不得进任何写路径（宿主的命令 / handler 里禁止裸调用）。
+  for (const file of HOST_COMMAND_FILES) {
+    const code = stripComments(read(file));
+    const rel = path.relative(ROOT, file);
+    for (const fn of ["detected_variant", "detect_data_dir"]) {
+      if (new RegExp(`\\b${fn}\\s*\\(`).test(code)) {
+        errors.push(
+          `[alias] ${rel} 出现全局探测 \`${fn}(\` —— 禁止进任何写路径（会按本机活跃客户端` +
+            `推断作用域，把数据写进错误的库）。写侧来源应用 \`detect_data_dir_for(variant)\`。`,
+        );
+      }
+    }
+  }
+
   if (hints.length > 0) {
     for (const hint of hints) process.stdout.write(`${hint}\n`);
   }
 
-  if (errors.length > 0) {
+  
+  // 11) ★ 服务端 handler 的多词 snake JSON 键必须 **camelCase 双读**（`.get("xY")` 在前、
+  //     `.get("x_y")` 兜底）—— 前端经 `call()` **原样发 camelCase**，服务端只读 snake 会
+  //     拿到空值走静默 no-op（2026-10-15 实测：webui 通道的 `set_model_disabled` 曾因此
+  //     「后端没禁用、界面已翻转」= 假开关；tauri 侧因自动驼峰转换而看不出来）。
+  //     变异：删掉任一 `.get("camelKey")` 双读行 ⇒ 本条红。
+  {
+    const source = stripComments(serverRs);
+    const camelOf = (snake) => snake.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+    /* ⚠️ **接收者无关**（`body` / `value` / 任意链式）：初版只匹配 `body.get(`,
+       把「body 换行 + .get(...)」的形态整段漏掉 —— 变异验证实测假绿（2026-10-15）。 */
+    const re = /\.get\("([a-z]+(?:_[a-z]+)+)"\)/g;
+    let hit;
+    while ((hit = re.exec(source)) !== null) {
+      const snake = hit[1];
+      const camelKey = camelOf(snake);
+      const head = source.slice(Math.max(0, hit.index - 160), hit.index);
+      if (!head.includes(`.get("${camelKey}")`)) {
+        errors.push(
+          `[naming] api.rs 的 \`body.get("${snake}")\` 缺 camelCase 双读（应先 \`.get("${camelKey}")\`）` +
+            `—— 前端发 camelCase，只读 snake 会静默 no-op`,
+        );
+      }
+    }
+  }
+if (errors.length > 0) {
     process.stderr.write(`API 契约校验失败（共 ${errors.length} 项）：\n`);
     for (const error of errors) process.stderr.write(`  - ${error}\n`);
     process.exit(1);
@@ -467,6 +836,7 @@ function main() {
       `server=${serverRoutes.size}，invoke=${invokeCmds.size}，` +
       `demoRead=${demoReadCmds.size}，demoCase=${demoCaseCmds.size}，` +
       `单Value参数=${singleValueCommands.size}，` +
+      `参数化=${SCOPE_PARAMETERIZED.size}，别名=${aliases.size}，` +
       `桌面专属豁免=${ROUTE_EXEMPT_COMMANDS.size}\n`,
   );
 }

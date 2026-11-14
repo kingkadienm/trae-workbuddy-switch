@@ -107,6 +107,18 @@ pub fn rewrite_body_model(raw: &str, bare_model: &str) -> String {
     serde_json::to_string(&body).unwrap_or_else(|_| raw.to_string())
 }
 
+/// 请求体里**有没有**顶层 `model` 字段。
+///
+/// 降级要改写 body 的模型名；body 缺这个字段时 [`rewrite_body_model`] 是 no-op，
+/// 而中继会用它自己的默认值（配置默认模型 / 清单第一条）发请求 —— 我们**不知道**那是哪个。
+/// ⇒ 这种情况下**不能降级**，否则每跳实际发同一个模型，却告诉客户端「降到了备选」。
+pub fn body_has_model(raw: &str) -> bool {
+    let Ok(body) = serde_json::from_str::<Value>(raw) else {
+        return false;
+    };
+    body.get("model").is_some()
+}
+
 /// 拒绝跨域前缀时的对外文案。
 ///
 /// 刻意**同时说明原因与出路**：只报「不支持」会让人反复试错。
@@ -196,7 +208,13 @@ mod tests {
                 bare_model: String::new(),
             }
         );
-        assert_eq!(split_model_prefix(""), ModelRoute { prefix_region: None, bare_model: String::new() });
+        assert_eq!(
+            split_model_prefix(""),
+            ModelRoute {
+                prefix_region: None,
+                bare_model: String::new()
+            }
+        );
         assert_eq!(
             split_model_prefix(":x"),
             ModelRoute {
@@ -242,7 +260,10 @@ mod tests {
     fn no_prefix_keeps_key_region() {
         let route = split_model_prefix("glm-5.2");
         assert_eq!(decide(Region::Cn, false, &route), PrefixDecision::NoPrefix);
-        assert_eq!(decide(Region::Global, true, &route), PrefixDecision::NoPrefix);
+        assert_eq!(
+            decide(Region::Global, true, &route),
+            PrefixDecision::NoPrefix
+        );
     }
 
     #[test]
@@ -268,7 +289,10 @@ mod tests {
     fn rejection_message_names_both_regions_and_the_flag() {
         let message = rejection_message(Region::Global, Region::Cn);
         assert!(message.contains("global:"), "应回显被请求的前缀: {message}");
-        assert!(message.contains("allow_model_region_prefix"), "应指出开关名: {message}");
+        assert!(
+            message.contains("allow_model_region_prefix"),
+            "应指出开关名: {message}"
+        );
     }
 
     #[test]

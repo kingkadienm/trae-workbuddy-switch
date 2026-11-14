@@ -10,38 +10,17 @@
  */
 export const zh = {
   // ---- 页面：账号管理 ----
-  "wbAccounts.page.title": "账号管理",
-  "wbAccounts.page.subtitle": "分别管理国内版与国际版 {product} 账号、积分和签到状态，两版账号库互相隔离。",
-  "wbAccounts.page.addTitle": "添加与迁移账号",
-  "wbAccounts.page.addSubtitle": "快速接入新账号，或从已有环境恢复",
+  // 与原型 `viewAccounts` 的 h1（`buddy-switch-prototype.html:2432`）一致：短标题「账号」。
+  "wbAccounts.page.title": "账号",
   "wbAccounts.page.oauthAdd": "OAuth 扫码添加",
-  "wbAccounts.page.importLocal": "导入本机账号",
-  "wbAccounts.page.importBackup": "导入备份",
-  "wbAccounts.page.importBackupTitle": "从备份文件导入账号",
-  "wbAccounts.page.importPanelAuths": "导入 panel auths 目录",
-  "wbAccounts.page.importPanelAuthsTitle": "导入 panel auths 目录",
-  "wbAccounts.page.importPanelAuthsDesc": "选择 workbuddy2api-panel 的 auths 目录（每个 JSON 文件一个账号，嵌套形）。域与本版本不符的账号会被跳过。",
-  "wbAccounts.page.importPanelAuthsPrompt": "请输入 panel 的 auths 目录路径",
-  "wbAccounts.page.importPanelAuthsPick": "选择 auths 目录",
-  "wbAccounts.page.importPanelAuthsImporting": "正在导入…",
-  "wbAccounts.page.importPanelAuthsResult": "已导入 {imported} 个{overwrite}，跳过 {skipped} 个，域不符 {mismatch} 个",
-  "wbAccounts.page.importPanelAuthsNoMatchTitle": "没有账号导入",
-  "wbAccounts.page.importPanelAuthsNoMatch": "该目录下所有账号的域都与当前页签不符，请切到对应域（CN / Global）的账号页重试。",
-  "wbAccounts.page.export": "导出",
   "wbAccounts.page.exportTitle": "导出账号备份",
   "wbAccounts.page.loadFailed": "加载失败",
   "wbAccounts.page.accountsAria": "{count} 个账号",
-  "wbAccounts.page.expiringSummary": "近期到期 {amount}（{accounts} 个账号）",
-  "wbAccounts.page.expiringSummaryAria": "近期到期共 {amount} 积分，涉及 {accounts} 个账号",
   "wbAccounts.page.autoCheckin": "自动签到",
   "wbAccounts.page.autoCheckinSaving": "正在保存自动签到设置",
   "wbAccounts.page.autoTravel": "自动旅行",
   "wbAccounts.page.autoTravelSaving": "正在保存自动旅行设置",
-  "wbAccounts.page.compactToLoose": "切换为宽松模式",
-  "wbAccounts.page.compactToCompact": "切换为紧凑模式",
   "wbAccounts.page.refreshCredits": "签到并刷新全部账号积分",
-  "wbAccounts.page.demoDisabled": "演示模式下不可操作",
-  "wbAccounts.page.statusLoggedIn": "已登录: {name}",
   "wbAccounts.page.cliTitle": "CodeBuddy CLI 接入",
   "wbAccounts.page.cliDescEnvOverride": "检测到进程环境变量 CODEBUDDY_AUTH_TOKEN。它会覆盖 settings.json；请先从 Windows 用户或系统环境变量中删除它，再重启本应用与 CodeBuddy CLI。",
   "wbAccounts.page.cliDescEnvSyncPending": "Windows CLI 认证配置与当前账号 Token 已脱节。点击更新认证后写入最新 Token；当前运行会话不会切换，请由 ACP 重新加载会话或重启 CLI 后生效。",
@@ -66,16 +45,8 @@ export const zh = {
   "wbAccounts.page.mismatchEnvVar": "环境变量",
 
   // ---- 通用状态词（多组件复用） ----
-  "wbAccounts.common.running": "运行中",
-  "wbAccounts.common.notRunning": "未运行",
-  "wbAccounts.common.connected": "已接入",
-  "wbAccounts.common.notConnected": "未接入",
-  "wbAccounts.common.needsUpgrade": "需升级",
-  "wbAccounts.common.currentAccount": "当前账号: {name}",
   "wbAccounts.common.unknownAccount": "未知账号",
   "wbAccounts.common.notLoggedIn": "未登录",
-  "wbAccounts.common.notDetected": "未检测到",
-  "wbAccounts.common.notInstalled": "未安装",
 
   // ---- 空态（未安装/未登录） ----
   // ⚠️ 标题**必须**按 `installed` 分叉：客户端已安装但没登录态时说「未检测到」，
@@ -102,7 +73,6 @@ export const zh = {
 
   // ---- 账号卡片 ----
   "wbAccounts.card.forever": "长期有效",
-  "wbAccounts.card.expirySuffix": "到期",
   "wbAccounts.card.arrivingSoon": "即将到达",
   "wbAccounts.card.remainingHM": "剩余 {hours} 小时 {minutes} 分钟",
   "wbAccounts.card.remainingH": "剩余 {hours} 小时",
@@ -115,64 +85,115 @@ export const zh = {
   "wbAccounts.card.currentWorkbuddy": "WorkBuddy 当前账号",
   "wbAccounts.card.currentIde": "CodeBuddy IDE 当前账号",
   "wbAccounts.card.currentCli": "CodeBuddy CLI 当前账号",
+  "wbAccounts.card.currentPlugin": "{client} 当前账号",
+  // ⚠️ 这句讲的是**本机没装编辑器扩展**（不是「尚未支持」）⇒ 必须指向「去装」这个正确动作；
+  //    写成「尚未支持」会把用户引向错误判断（那是 `planned` 的口径）。
+  "wbAccounts.card.guidePlugin": "未检测到 {client}：请先在编辑器里安装该 CodeBuddy 扩展，装好后回到这里即可切换",
+  // P5 §2.5：程序位展示名 —— core `modules/programs.rs` 的 `ProgramSpec.label_key` 指向这几条。
+  // ⚠️ **显示名两两不同**（门禁钉住）：`vscodeCnInject` 是**只读**探测槽，
+  //    `vscodeCodebuddyPlugin` 是**可切换**槽 —— 两者都跟 VS Code 有关，名字若相同，
+  //    用户根本分不清该点哪个（改造前这两条就重名）。措辞与后端 `adapter.label()` 逐字一致。
+  "wbAccounts.program.codebuddyCli": "CodeBuddy CLI",
+  "wbAccounts.program.codebuddyCnIde": "CodeBuddy CN IDE",
+  "wbAccounts.program.vscodeCnInject": "VS Code CodeBuddy 插件",
+  "wbAccounts.program.vscodeCodebuddyPlugin": "VS Code CodeBuddy 扩展",
+  "wbAccounts.program.jetbrainsCodebuddyPlugin": "JetBrains CodeBuddy 插件",
+  // ⚠️ **计划新增（尚未支持）** 的兜底说明：当前**没有** planned 条目（两条目标均已落地），
+  //    但机制保留 ⇒ 措辞只能是「尚未支持」，**不许**用「未检测到客户端」—— 后者会**引导用户去装，
+  //    而装了也没用**（原型断言 `verify-behaviors.cjs:1297-1302` 反向禁止）。
+  "wbAccounts.program.plannedHint": "尚未支持",
   "wbAccounts.card.unnamed": "未命名账号",
-  "wbAccounts.card.checkedIn": "已签到",
-  "wbAccounts.card.notCheckedIn": "未签到",
+  "wbAccounts.card.checkedIn": "今日已签到",
+  // 原型 `accountStatus()`（`buddy-switch-prototype.html:2390-2395`）是**互斥的一枚**状态：
+  // 凭据已过期 → 需重新登录 → 今日未签到 → （否则）已签到。
+  "wbAccounts.card.notCheckedIn": "今日未签到",
   "wbAccounts.card.needRelogin": "需重新登录",
-  "wbAccounts.card.tokenExpired": "Token 已过期",
-  "wbAccounts.card.deactivated": "已停用",
-  "wbAccounts.card.priorityAria": "建议优先",
+  "wbAccounts.card.tokenExpired": "凭据已过期",
+  // 「优先」——原型 `.acct-chips` 里是**带文字**的 `badge info`（`:2508`），
+  // 此前我们只摆一枚星形图标，与原型不同。
+  "wbAccounts.card.priority": "优先",
   "wbAccounts.card.priorityTip": "建议优先使用",
-  "wbAccounts.card.toolsInUse": "{n} 个工具正在使用",
+  // 原型 `.acct-chips` 第三条（`:2507`）的形态。
+  // ★ 2026-11-09：徽章只报**最快到期的那一批** —— 天数与该批金额同批（`batches[0]`），
+  //   不再把「窗口内总量」和某一批的天数拼在一起（那是两批积分，怎么拼都有半句假话）。
+  "wbAccounts.card.expiringChip": "最近到期 {days}天 · {amount} 积分",
+  /* ≤ 48 小时用小时：25 小时与 47 小时各自说准，不被都写成「1 天」。 */
+  "wbAccounts.card.expiringChipHours": "最近到期 {hours}小时 · {amount} 积分",
+  "wbAccounts.card.expiringTipTitle": "按到期时间分批（共 {n} 批）",
+  /* 明细一行一批：**绝对时刻**（`2026-11-20 23:59`）+ 该批金额。
+     ★ 不用相对倒计时：这一行要和账号页 / 抽屉里的日期直接对照；
+       徽章已经回答过「还有几天」，列表回答「具体哪天」。 */
+  "wbAccounts.card.expiringTipLine": "{time} · {amount} 积分",
+  "wbAccounts.card.toolsInUse": "使用中 {n} 个工具",
+  // 头部「当前登录」徽章（原型 `accountCard` :2502）：绑定任一程序位即为当前登录。
+  "wbAccounts.card.currentLogin": "当前登录",
+  // 卡片指标行（原型 `.acct-metrics` :2510）：`积分 1,240/2,000` · `今日 42.1K` · `2 分钟前`。
+  // ⚠️ 三项都有真实来源：积分（credit.resources）、今日 Token（get_account_token_today）、
+  //    最后使用（AccountMeta.lastUsedAt）。缺值仍按诚实边界渲染：缺席 ⇒ 「—」（非 0）。
+  "wbAccounts.card.metric.credits": "积分",
+  // 原型该格只有「今日」两字（`<span>今日 <b>…</b></span>`），不是「今日 Token」。
+  "wbAccounts.card.metric.todayTokens": "今日",
+  // 第三格原型是**无标签的相对时间**；标签与绝对时刻改挂 `title`。
+  "wbAccounts.card.metric.lastUsedTip": "最后使用 {time}",
+  // 「今日 Token」= 下界（网关日志已到保留上限）时的前缀；`{value}` 已含紧凑计数（如 42.1K）。
+  "wbAccounts.card.metric.atLeast": "≥{value}",
+  // 「今日 Token」明细（tooltip）：客户端自身 CLI 用量 / 经本网关的用量，各自 输入·输出。
+  "wbAccounts.card.metric.todayTokensClient": "客户端 入 {input} · 出 {output}",
+  "wbAccounts.card.metric.todayTokensGateway": "网关 入 {input} · 出 {output}",
+  // 下界说明：`gatewayTruncated` 时**必须**带上，只给数字不说口径就是误导。
+  // ⚠️ 措辞锚定**判据**（今日部分可能被裁），不是「日志到过上限」—— 滚动窗口可能被
+  // 昨天的流量顶满而今天的条目全在，那种情况下不报（见 core `gateway_log_truncated_today`）。
+  "wbAccounts.card.metric.todayTokensTruncated": "网关日志或已裁去今日部分，网关用量为下界（实际更多）",
+  // 双桶重叠披露：客户端与网关是**两条独立记录**，同一请求只应落在其中一处；若某个
+  // 客户端既写自己的会话日志、又被指向本网关，两处会各记一次 ⇒ 合计**可能重复计数**。
+  // 两侧都非零时才出现（一侧为 0 时合计就是另一侧，无歧义）。
+  "wbAccounts.card.metric.todayTokensOverlap": "客户端与网关为两条独立记录，同一请求可能被重复计数",
   "wbAccounts.card.manageAria": "管理账号 {name}",
   "wbAccounts.card.moreActions": "更多账号操作",
   "wbAccounts.card.refreshToken": "刷新 Token",
   "wbAccounts.card.manualCheckin": "手动签到",
-  "wbAccounts.card.editRemark": "编辑备注",
-  "wbAccounts.card.deactivateAccount": "停用账号",
-  "wbAccounts.card.reactivateAccount": "启用账号",
   "wbAccounts.card.deleteAccount": "删除账号",
   "wbAccounts.card.setCurrentWorkbuddy": "设为 WorkBuddy 当前账号",
   "wbAccounts.card.setCurrentWorkbuddyRestart": "设为 WorkBuddy 当前账号（会重启 WorkBuddy）",
   "wbAccounts.card.switchIde": "切换到 CodeBuddy IDE",
   "wbAccounts.card.switchIdeRestart": "切换到 CodeBuddy IDE（会重启 IDE）",
-  "wbAccounts.card.ideNotDetected": "未检测到 CodeBuddy IDE",
   "wbAccounts.card.switchingIde": "正在切换 CodeBuddy IDE",
   "wbAccounts.card.setCurrentCli": "设为 CodeBuddy CLI 当前账号",
+  // issue #109：CLI 走本机网关时，切号语义上已不存在（选号由网关按模型决定）。
+  "wbAccounts.card.cliGatewayMode":
+    "CLI 已走本机网关，选号由网关按模型决定。要按账号切换，请先在「设置 → CodeBuddy CLI」切回直连上游。",
   "wbAccounts.card.switchingCli": "正在切换 CodeBuddy CLI 当前账号",
-  "wbAccounts.card.connectCliFirst": "请先接入 CodeBuddy CLI",
-  "wbAccounts.card.remarkPlaceholder": "例如：DS4.1 额度 · 10/03 解禁",
-  "wbAccounts.card.remarkAria": "{name} 的备注",
-  "wbAccounts.card.editRemarkAria": "编辑 {name} 的备注",
-  "wbAccounts.card.addRemark": "添加备注",
+  // P4：备注编辑器与「查看详情」入口。
+  // 备注编辑器已迁入**共享**抽屉，占位符 / 无障碍标签改由 `shared.drawer.remark.*` 提供；
+  // 卡片只保留「更多 → 编辑备注」这个入口（打开抽屉并进入编辑态）。
+  "wbAccounts.card.selectAria": "选择账号 {name}",
+  // 未检测到的程序位：**点击引导到设置**（§3.3 规则 1），而不是摆一枚点不动的灰按钮。
+  "wbAccounts.card.guideIdeSetting": "未检测到 CodeBuddy IDE，点击前往设置配置 IDE 路径",
+  "wbAccounts.card.guideCliSetting": "未接入 CodeBuddy CLI，点击前往设置完成接入",
   "wbAccounts.card.loadingCredits": "积分查询中…",
   "wbAccounts.card.waitingCredits": "等待积分数据…",
   "wbAccounts.card.creditFailed": "积分查询失败",
   "wbAccounts.card.addPlaintextAccount": "用 OAuth 扫码添加",
-  "wbAccounts.card.creditPacks": "{n} 个积分包",
-  "wbAccounts.card.expireSoon": "{amount} 积分将在 7 天内到期",
-  "wbAccounts.card.nextExpiry": "最近到期 {date}",
-  "wbAccounts.card.creditsForever": "当前积分长期有效",
-  "wbAccounts.card.updated": "更新",
-  "wbAccounts.card.expiringSoonTitle": "近期到期",
-  "wbAccounts.card.expiringTotal": "共 {amount}",
-  "wbAccounts.card.expiringTotalAria": "该账号近期到期共 {amount} 积分",
   "wbAccounts.card.creditPackFallback": "积分包",
-  "wbAccounts.card.resourceTitle": "{name} · 剩余 {remaining} / {total} · {expiry}",
-  "wbAccounts.card.creditsUnit": "{n} 积分",
-  "wbAccounts.card.noCredits": "暂无可用积分",
-  "wbAccounts.card.viewAllPacks": "查看全部积分包",
   "wbAccounts.card.setCurrent": "设为当前",
   "wbAccounts.card.switching": "切换中…",
-  "wbAccounts.card.cliCurrent": "CLI 当前",
-  "wbAccounts.card.allPacksTitle": "全部积分包",
-  "wbAccounts.card.allPacksDesc": "{name} · 共 {n} 个积分包",
-  "wbAccounts.card.noResourcePacks": "当前没有可展示的资源包。",
-  "wbAccounts.card.unnamedPack": "未命名资源包",
+  // P4：积分包明细从卡片内 Dialog 迁入**共享抽屉**，以下键改由 `AccountsPage` 装配
+  // `DetailPack` 时使用。
+  // ⚠️ 2026-10-12：卡片上的「大数字行 + 近期到期」整块已按原型删除（原型卡片只有
+  // `.acct-top` / `.acct-chips` / `.acct-metrics` / `.acct-actions` 四块），
+  // 故 `creditPacks` / `expireSoon` / `nextExpiry` / `creditsForever` / `updated` /
+  // `expiringSoonTitle` / `resourceTitle` / `creditsUnit` / `noCredits` 一并删除。
   "wbAccounts.card.expired": "已到期",
-  "wbAccounts.card.expiresIn7": "7 天内到期",
   "wbAccounts.card.expiresOn": "到期 {date}",
-  "wbAccounts.card.used": "已用 {n}",
+
+  // ---- 详情抽屉的信息区块（由 AccountsPage 装配后注入）----
+  "wbAccounts.detail.section.account": "账号信息",
+  "wbAccounts.detail.email": "邮箱",
+  "wbAccounts.detail.uid": "UID",
+  "wbAccounts.detail.id": "账号 ID",
+  "wbAccounts.detail.tokenExpiry": "Token 到期",
+  "wbAccounts.detail.expired": "已过期",
+  "wbAccounts.detail.checkedIn": "今日签到",
 
   // ---- 切换账号弹窗 ----
   "wbAccounts.dialog.switchTitle": "切换到「{name}」",
@@ -182,9 +203,6 @@ export const zh = {
   /** 切换结果摘要里多条片段的分隔符（中文用全角分号，英文用逗号）。 */
   "wbAccounts.dialog.listSeparator": "；",
   "wbAccounts.dialog.switchProcessing": "正在处理中，请勿关闭窗口",
-  "wbAccounts.dialog.sourceVersion": "数据来源版本",
-  "wbAccounts.dialog.sourceSame": "与目标一致（{region}），同版本内搬运",
-  "wbAccounts.dialog.sourceCross": "从 {from} 当前登录账号搬到 {to}",
   "wbAccounts.dialog.copySessions": "复制会话到目标账号",
   "wbAccounts.dialog.copyHintLoading": "正在加载会话…",
   "wbAccounts.dialog.copyHintErrorEmpty": "无法加载会话列表，暂不能复制",
@@ -199,8 +217,6 @@ export const zh = {
   "wbAccounts.dialog.migrateConnectors": "迁移连接器配置",
   "wbAccounts.dialog.migrateConnectorsDescSame": "合并当前账号的连接器配置到目标账号；同名条目递归合并、重复项去重，改写前自动备份原文",
   "wbAccounts.dialog.migrateConnectorsDescCross": "把 {from} 当前账号的连接器配置合并到 {to} 目标账号；同名条目递归合并、重复项去重，改写前自动备份原文",
-  "wbAccounts.dialog.sourceVersionAria": "数据来源版本",
-  "wbAccounts.dialog.loadingSessions": "加载会话…",
   "wbAccounts.dialog.noSessionsCurrent": "当前账号暂无会话",
   "wbAccounts.dialog.noSessionsNoCurrent": "未检测到当前登录账号，无法列出会话",
   "wbAccounts.dialog.selectKind": "选择 {label}",
@@ -209,8 +225,6 @@ export const zh = {
   "wbAccounts.dialog.selectFolder": "选择文件夹 {label}",
   "wbAccounts.dialog.collapseFolder": "折叠文件夹 {label}",
   "wbAccounts.dialog.expandFolder": "展开文件夹 {label}",
-  "wbAccounts.dialog.task": "任务",
-  "wbAccounts.dialog.space": "空间",
   "wbAccounts.dialog.ungrouped": "未分组",
   "wbAccounts.dialog.hasBody": "有正文",
   "wbAccounts.dialog.permissionTitle": "如何授权（只需 3 步）：",
@@ -222,7 +236,6 @@ export const zh = {
   "wbAccounts.dialog.checkNow": "立即检测",
   "wbAccounts.dialog.cancel": "取消",
   "wbAccounts.dialog.continue": "继续",
-  "wbAccounts.dialog.confirmSwitch": "确认切换",
   "wbAccounts.dialog.permissionChecking": "检测中…",
   "wbAccounts.dialog.permissionOk": "✓ 授权成功，可以重新切换了",
   "wbAccounts.dialog.permissionFailDir": "✗ {error}（{dir}）",
@@ -239,6 +252,54 @@ export const zh = {
   "wbAccounts.dialog.switchedDefault": "WorkBuddy 已重启为目标账号。",
   "wbAccounts.dialog.copiedSessions": "已复制 {n} 个会话",
   "wbAccounts.dialog.skippedSessions": "跳过 {n} 个已存在副本",
+
+  // ---- 切换账号：跨作用域迁移向导（P4 · 抽屉内三步向导）----
+  // ⚠️ 能力边界如实说（§1.3 / §3.5 红线）：跨产品（WB→Trae）会话复制**后端不支持** ⇒
+  //    跨产品来源 disabled + 原因；**绝不**写「已打通 WB→Trae」这类假承诺。
+  "wbAccounts.wizard.stepsAria": "迁移步骤",
+  "wbAccounts.wizard.stepTarget": "目标与来源",
+  "wbAccounts.wizard.stepContent": "迁移内容",
+  "wbAccounts.wizard.stepConfirm": "确认",
+  // 本向导只切换 WorkBuddy 桌面客户端 ⇒ 程序位是**单值**（只读展示，不做假选择器）。
+  "wbAccounts.wizard.programLabel": "目标程序位",
+  "wbAccounts.wizard.programWorkbuddy": "WorkBuddy 桌面",
+  // 第 1 步：来源账号（只列各作用域的**当前账号**，§1.3 结论 1）。
+  "wbAccounts.wizard.sourceTitle": "从哪里迁移内容？",
+  "wbAccounts.wizard.sourceDesc": "默认是当前登录账号。",
+  "wbAccounts.wizard.crossShow": "从其他作用域选择…",
+  "wbAccounts.wizard.crossHide": "仅看当前作用域",
+  "wbAccounts.wizard.sourceCurrent": "当前登录账号",
+  "wbAccounts.wizard.sourceBadge": "来源",
+  "wbAccounts.wizard.sourceUnsupported": "该平台不支持会话复制（会话复制依赖 WorkBuddy 的会话存储与云端归属）",
+  "wbAccounts.wizard.sourceUnsupportedBadge": "不支持会话复制",
+  // 第 2 步：迁移内容（会话 / 记忆 / 连接器平级开关）+ 三层会话树。
+  "wbAccounts.wizard.contentTitle": "要一并迁移哪些内容？",
+  "wbAccounts.wizard.treeTitle": "选择要复制的会话",
+  "wbAccounts.wizard.treeCount": "已选 {n} / {m}",
+  "wbAccounts.wizard.treeSelectAll": "全选",
+  "wbAccounts.wizard.treeSelectNone": "全不选",
+  "wbAccounts.wizard.typeConversation": "对话",
+  "wbAccounts.wizard.typeWorkspace": "工作区",
+  // 会话树空态的出口（该账号确实没有会话时，用户能做的下一步）。
+  "wbAccounts.wizard.emptyExit": "跳过会话复制",
+  // 第 3 步：确认页（如实汇总 + 影响 + 不可逆提示）。
+  "wbAccounts.wizard.confirmTarget": "目标账号",
+  "wbAccounts.wizard.confirmSource": "来源账号",
+  "wbAccounts.wizard.confirmProgram": "程序位",
+  "wbAccounts.wizard.confirmContent": "迁移内容",
+  "wbAccounts.wizard.confirmSessions": "会话（已选 {n} 个会话 / {d} 个目录）",
+  "wbAccounts.wizard.confirmNoSessions": "会话（未选择任何会话）",
+  "wbAccounts.wizard.confirmMemory": "记忆",
+  "wbAccounts.wizard.confirmConnectors": "连接器",
+  "wbAccounts.wizard.confirmNone": "不迁移",
+  "wbAccounts.wizard.contentSeparator": "、",
+  "wbAccounts.wizard.impact": "影响",
+  "wbAccounts.wizard.impactText": "客户端将被重启，未保存的编辑器内容可能丢失。",
+  "wbAccounts.wizard.irreversible": "迁移会写入目标账号的数据，此操作不可逆。",
+  // 导航。
+  "wbAccounts.wizard.back": "上一步",
+  "wbAccounts.wizard.next": "下一步",
+  "wbAccounts.wizard.run": "执行切换",
 
   // ---- 导入账号弹窗 ----
   "wbAccounts.dialog.importTitle": "导入账号",
@@ -272,19 +333,14 @@ export const zh = {
   "wbAccounts.dialog.oauthDesc": "在浏览器中打开验证链接，扫码授权后将自动采集账号并入库。",
   "wbAccounts.dialog.oauthStart": "开始扫码登录",
   "wbAccounts.dialog.oauthStarting": "正在发起登录…",
-  "wbAccounts.dialog.oauthWaiting": "正在等待扫码授权，请在浏览器完成操作…",
   "wbAccounts.dialog.oauthCollected": "已采集账号：{name}",
   "wbAccounts.dialog.oauthLoginFail": "登录失败",
   "wbAccounts.dialog.oauthClose": "关闭",
   "wbAccounts.dialog.oauthDone": "完成",
-  "wbAccounts.dialog.postTasksCheckin": "签到",
-  "wbAccounts.dialog.postTasksRegister": "注册激活",
-  "wbAccounts.dialog.postTasksTrial": "Trial 加油包",
-  "wbAccounts.dialog.postTasksCredits": "积分",
 
   // ---- 删除账号确认框 ----
   "wbAccounts.dialog.deleteTitle": "删除账号",
-  "wbAccounts.dialog.deleteDesc": "确定删除账号「{name}」？此操作不可撤销。",
+  "wbAccounts.dialog.deleteDesc": "确定删除账号「{name}」？删除后可在回收站恢复。",
   "wbAccounts.dialog.deleteConfirm": "删除",
 
   // ---- 接入/升级 CLI 确认框 ----
@@ -311,17 +367,18 @@ export const zh = {
   "wbAccounts.toast.importSuccess": "导入成功",
   "wbAccounts.toast.importOverwrite": "（覆盖 {n} 个）",
   "wbAccounts.toast.importDetail": "已导入 {imported} 个{overwrite}，跳过 {skipped} 个。token 可能已过期，切换后可能需要重新登录。",
-  "wbAccounts.toast.deleted": "账号已删除",
   "wbAccounts.toast.deleteFail": "删除失败",
   "wbAccounts.toast.checkinSuccess": "签到成功",
   "wbAccounts.toast.checkedInToday": "今天已签到",
   "wbAccounts.toast.checkinFail": "签到失败",
   "wbAccounts.toast.tokenRefreshFail": "Token 刷新失败",
   "wbAccounts.toast.tokenRefreshed": "Token 已刷新",
+  "wbAccounts.toast.tokenRefreshRetry": "Token 刷新暂时失败，请稍后重试",
   "wbAccounts.toast.needRelogin": "需重新登录",
   "wbAccounts.toast.checkinBatchSuccess": "{n} 个签到成功",
   "wbAccounts.toast.checkinBatchAlready": "{n} 个已签到",
   "wbAccounts.toast.checkinBatchFailed": "{n} 个失败",
+  "wbAccounts.toast.checkinRetryFailed": "只重试失败项",
   "wbAccounts.toast.checkinNone": "无账号需要签到",
   "wbAccounts.toast.checkinFailBatch": "签到失败",
   "wbAccounts.toast.checkinDone": "签到完成",
@@ -334,21 +391,226 @@ export const zh = {
   "wbAccounts.toast.switchCliFail": "CodeBuddy CLI 切换失败",
   "wbAccounts.toast.switchIdeLoading": "正在切换 CodeBuddy IDE…",
   "wbAccounts.toast.switchIdeLoadingDesc": "将注入凭证并重启 CodeBuddy IDE",
+  /* ★ issue #86：切换成功后给「复制会话」入口（**不自动复制** —— 写数据必须用户点）。 */
+  "wbAccounts.toast.switchIdeCopySessions": "复制会话",
   "wbAccounts.toast.switchIdeUpdated": "CodeBuddy IDE 已切换",
   "wbAccounts.toast.switchIdeFail": "CodeBuddy IDE 切换失败",
+  // 编辑器内 CodeBuddy 插件（VS Code / JetBrains）：四个程序位共用一套文案（`{client}` 插值）。
+  "wbAccounts.toast.switchPluginLoading": "正在切换 {client} 账号…",
+  "wbAccounts.toast.switchPluginLoadingDesc": "将注入凭证并重启 {client}",
+  "wbAccounts.toast.switchPluginUpdated": "{client} 已切换",
+  "wbAccounts.toast.switchPluginFail": "{client} 切换失败",
   "wbAccounts.toast.cliIntegrationUpdated": "CodeBuddy CLI 接入已更新",
   "wbAccounts.toast.cliIntegrationFail": "CodeBuddy CLI 接入失败",
   "wbAccounts.toast.remarkSaved": "备注已保存",
   "wbAccounts.toast.remarkCleared": "备注已清除",
   "wbAccounts.toast.remarkSaveFail": "备注保存失败",
+  "wbAccounts.toast.groupSaved": "分组已保存",
+  "wbAccounts.toast.groupCleared": "已移出分组",
+  "wbAccounts.toast.groupSaveFail": "分组保存失败",
+  // P4：未检测到的程序位点击后，引导用户去设置页完成配置。
+  "wbAccounts.toast.guideIdeSetting": "请到设置页配置 CodeBuddy IDE 路径",
+  "wbAccounts.toast.guideCliSetting": "请到设置页完成 CodeBuddy CLI 接入",
+  "wbAccounts.page.accounts": "账号",
+
+  // =====================================================================
+  // ---- P4 工具栏 / 表格（WorkBuddy 专属数据：选项标签 + 列头）----
+  // =====================================================================
+  // 壳的通用文案在 `shared.toolbar.*` / `shared.table.*`；这里只放 WB 的**选项与列头**。
+  // ★ 2026-10-10：后端为 `AccountMeta` 记录了 `lastUsedAt` ⇒ 「最近使用」不再是假选项
+  //   （决策 #3 的原判据是「无字段」，现已不成立）。
+  "wbAccounts.toolbar.sort.priority": "积分优先级",
+  "wbAccounts.toolbar.sort.name": "名称",
+  "wbAccounts.toolbar.sort.expiry": "到期时间",
+  "wbAccounts.toolbar.sort.recent": "最近使用",
+  // 工具栏主操作（原型 `viewAccounts` :2428）：打开「添加账号」三选抽屉（原型 `drawerAdd()`）。
+  "wbAccounts.toolbar.addAccount": "添加账号",
+  "wbAccounts.toolbar.group.none": "不分组",
+  "wbAccounts.toolbar.group.program": "按程序位",
+  "wbAccounts.toolbar.group.status": "按状态",
+  // ★ 2026-10-10：后端为 `AccountMeta` 记录了 `groupName`（自由文本）⇒ 支持「自定义组」分组。
+  "wbAccounts.toolbar.group.custom": "自定义组",
+  // 「自定义组」分桶里，空 / 缺省 `groupName` 落入的显式桶名。
+  "wbAccounts.toolbar.groupBucket.ungrouped": "未分组",
+  // 「按状态」分桶的状态集由本平台自备（决策 #8）。
+  "wbAccounts.toolbar.statusBucket.normal": "正常",
+  "wbAccounts.toolbar.statusBucket.notCheckedIn": "今日未签到",
+  "wbAccounts.toolbar.statusBucket.expired": "凭据已过期",
+  "wbAccounts.toolbar.statusBucket.needsRelogin": "需重新登录",
+  // 该账号未挂在任何程序位上时的桶名。
+  "wbAccounts.toolbar.programBucket.unbound": "未绑定程序位",
+  "wbAccounts.table.account": "账号",
+  "wbAccounts.table.status": "状态",
+  "wbAccounts.table.credits": "积分",
+  "wbAccounts.table.todayTokens": "今日 Token",
+  /* issue #69：积分到期与 Token 到期是**两件事**，列名必须区分。 */
+  "wbAccounts.table.creditExpiry": "积分到期",
+  "wbAccounts.table.creditExpiryDays": "{value} 天",
+  "wbAccounts.table.creditExpiryHours": "{value} 小时",
+  "wbAccounts.table.tokenExpiry": "Token 到期",
+  "wbAccounts.table.programs": "程序位",
+  "wbAccounts.table.current": "当前",
+
+  // =====================================================================
+  // 客户端限流台账（账号 × 模型 × 恢复时刻，**只读**观测）
+  // =====================================================================
+  // 数据源是客户端自身落盘的三张只读表 join（见 core `client_limits.rs`）——
+  // **不依赖网关、不代理客户端流量**。排序与状态由后端定：仍受限 → 状态未知 → 已恢复。
+  "wbAccounts.limits.title": "客户端限流",
+  "wbAccounts.limits.subtitle": "从客户端本地数据自动汇总：哪个账号在哪个模型上被上游限流、何时恢复。",
+  "wbAccounts.limits.refresh": "刷新",
+  "wbAccounts.limits.windowLabel": "扫描范围",
+  "wbAccounts.limits.window.7": "近 7 天",
+  "wbAccounts.limits.window.30": "近 30 天",
+  "wbAccounts.limits.window.all": "全部",
+  "wbAccounts.limits.loadFailed": "读取失败",
+  "wbAccounts.limits.empty": "所选范围内没有限流记录。",
+  /* 无「客户端限流台账」的平台（Qoder / Trae）：同一张卡、同一套行与时间口径，
+     但**不能**声称「从客户端本地数据汇总」—— 那两句关于台账的话必须换掉。 */
+  "wbAccounts.limits.subtitleNoLedger": "本平台没有可反推的客户端日志，下面只有**实测**结论（与网关「限流探测」同一份）；恢复时刻取上游声明。",
+  "wbAccounts.limits.emptyNoLedger": "还没有实测结论。",
+  "wbAccounts.limits.emptyNoLedgerDesc": "账号 × 模型 的选择在网关「限流探测」里做（那里会明示成本）；跑完一轮，结论就同步到这里。",
+  "wbAccounts.limits.emptyNoLimitNoLedger": "实测结论里没有限流的格。",
+  "wbAccounts.limits.emptyNoLimitNoLedgerDesc": "全部可用是好事 —— 完整矩阵（含可用格与各自的耗时）在网关「限流探测」里看。",
+  "wbAccounts.limits.active": "仍受限",
+  "wbAccounts.limits.recovered": "已恢复",
+  // 「恢复时间未知」是**第三种状态**，既不是「仍受限」也不是「已恢复」。
+  "wbAccounts.limits.unknown": "状态未知",
+  "wbAccounts.limits.accountUnknown": "未知账号",
+  "wbAccounts.limits.modelUnknown": "未知模型",
+  "wbAccounts.limits.resetAt": "恢复于 {time}",
+  "wbAccounts.limits.resetUnknown": "恢复时间未知",
+  // ⚠️ 上游文案里的「恢复于」是**配额窗口**重置时刻，不是解锁时刻（实测报 429 后 16 分钟即恢复产出）。
+  // 有实测实证时改显实证时刻，避免「已恢复」与「恢复于 明天 09:04」自相矛盾。
+  "wbAccounts.limits.resetHint": "上游文案里的恢复时刻是**配额窗口**的重置时间，不等于解锁时刻；判状态以右侧徽章为准。",
+  "wbAccounts.limits.recoveredByEvidence": "已恢复（{time} 实测有产出）",
+  "wbAccounts.limits.occurredAt": "最近 {time}",
+  "wbAccounts.limits.summary": "共 {total} 条 · 仍受限 {active} 条",
+  "wbAccounts.limits.summaryUnknown": " · 状态未知 {unknown} 条",
+  "wbAccounts.limits.summarySkipped": " · 已排除 {skipped} 条非限流错误",
+  "wbAccounts.limits.skippedHint": "窗口内的网络类错误（502 网络不可达、ECONNRESET 断连等）不是上游限流，不计入本台账，这里只报数。",
+  "wbAccounts.limits.occurrences": "{count} 条记录",
+  "wbAccounts.limits.occurrencesHint": "该条目合并了 {count} 条原始记录（同一账号 · 模型 · 错误码 · 恢复时刻）。同一次上游限流会**扇出**到多个会话文件，故条数常大于 1。",
+  "wbAccounts.limits.code": "错误码 {code}",
+  "wbAccounts.limits.queued": "排队中",
+  "wbAccounts.limits.queuedHint": "上游排队类错误（6020 / 6022）：模型资源紧张或已达使用上限，等待恢复。精确文案待确认，暂按 code 原样标注。",
+  "wbAccounts.limits.session": "会话 {id}",
+  /* ── 与网关「限流探测」的联动（2026-10-22） ─────────────────────────────
+     台账 = 日志反推、探测 = 真发一次请求。两侧读同一份实测结论（store `probeCells`），
+     所以这里的文案要**明确说「同一份数据」**，否则用户会以为账号页在编造。 */
+  "wbAccounts.limits.probeShared": "实测结论与网关「限流探测」是同一份数据。",
+  "wbAccounts.limits.openProbeMatrix": "查看探测矩阵 →",
+  "wbAccounts.limits.probeSummary": "实测 {cells} 格 · 限流 {limited} · 可用 {ok}（{time}）",
+  "wbAccounts.limits.probeAll": "实测 {cells} 格",
+  "wbAccounts.limits.probeAllHint": "只测台账里出现过的组合：{cells} 格（{accounts} 个账号 / {models} 个模型），每格一次最小请求，不回填池冷却。",
+  "wbAccounts.limits.probeAllEmpty": "没有可实测的条目（需要「仍受限 / 状态未知」且能关联到账号与模型）。",
+  "wbAccounts.limits.probeAllHintNoLedger": "重测这 {cells} 个限流格：每格一次最小请求，不回填池冷却。",
+  "wbAccounts.limits.probeAllEmptyNoLedger": "还没有限流格可重测 —— 先去网关「限流探测」跑一轮。",
+  "wbAccounts.limits.probeRow": "实测",
+  "wbAccounts.limits.probeRowHint": "只实测这一格：一次最小请求，不回填池冷却。",
+  "wbAccounts.limits.probeRowDisabled": "关联不到账号或模型（会话已删除 / playground），无法实测。",
+  "wbAccounts.limits.probing": "探测中",
+  "wbAccounts.limits.probeCancel": "取消",
+  "wbAccounts.limits.probeStartFail": "启动实测失败",
+  "wbAccounts.limits.probeVerdict": "实测 · {state}",
+  "wbAccounts.limits.probeVerdictHint": "实测结论：{state}（HTTP {http} · {ms} ms{reset}）{probed}",
+  "wbAccounts.limits.conflictRecovered": "实测可用，台账仍受限（历史证据，不改写）",
+  "wbAccounts.limits.conflictLimited": "台账已恢复，但此刻实测受限",
+  "wbAccounts.limits.probeNotCredit": "不是限流：额度用尽，等解锁没用。",
+  "wbAccounts.limits.probeOnlyTitle": "实测独有 {count} 格",
+  "wbAccounts.limits.probeOnlyHint": "实测查出限流、但台账没有记录的格。只在这里列出 —— 不写进台账（台账是「客户端日志里出现过」的事实）。",
+  // 「恢复时间」与「实测时刻」是**两条**独立信息，必须都写，且缺失时说「未知」而不是留白。
+  // 留白会被读成「已恢复」；而这两格本来就是「此刻仍限流」。
+  // 上游 6004 把恢复时刻写在 `msg` 文案里（`… will reset at 2026-10-28 15:33:19 UTC+8 …`），
+  // 结构化 JSON 里没有 ⇒ 解析后只用于**展示**，绝不进回填（那是配额窗口、不是解锁时刻）。
+  "wbAccounts.limits.probeOnlyResetHint": "上游声明的恢复时刻：先看结构化字段，没有就从 `msg` 文案里解析。它是**配额窗口**的重置时间，不等于解锁时刻，也不参与回填。两者都没有才写「恢复时间未知」。",
+  "wbAccounts.limits.probedAt": "实测于 {time}",
+  "wbAccounts.limits.probedAtUnknown": "实测时间未知（旧台账）",
+  "wbAccounts.limits.legacyRows": "其中 {count} 格由旧版本记录：既没有逐格实测时刻，也没有上游声明的恢复时刻。点行尾「实测」重测一次即可补齐（本作用域实测台账最近写入 {time}）。",
+  "wbAccounts.limits.probedAtHint": "这一格的实测结论是哪一刻打的（`probed_at_ms`，逐格记录）。"
+    + "旧版台账没有该字段 ⇒ 如实显示「未知」并提示重测 —— **绝不**拿本作用域最近写入时刻冒充：那会让多个账号显示同一个时间，看起来像逐格结论。",
+
+  // fork扩展：保留成长任务、两步验证及会员信息词条。
+  "wbAccounts.page.subtitle": "分别管理国内版与国际版 {product} 账号、积分和签到状态，两版账号库互相隔离。",
+  "wbAccounts.page.addTitle": "添加与迁移账号",
+  "wbAccounts.page.addSubtitle": "快速接入新账号，或从已有环境恢复",
+  "wbAccounts.page.importLocal": "导入本机账号",
+  "wbAccounts.page.importBackup": "导入备份",
+  "wbAccounts.page.importBackupTitle": "从备份文件导入账号",
+  "wbAccounts.page.importPanelAuths": "导入 panel auths 目录",
+  "wbAccounts.page.importPanelAuthsTitle": "导入 panel auths 目录",
+  "wbAccounts.page.importPanelAuthsDesc": "选择 workbuddy2api-panel 的 auths 目录（每个 JSON 文件一个账号，嵌套形）。域与本版本不符的账号会被跳过。",
+  "wbAccounts.page.importPanelAuthsPrompt": "请输入 panel 的 auths 目录路径",
+  "wbAccounts.page.importPanelAuthsPick": "选择 auths 目录",
+  "wbAccounts.page.importPanelAuthsImporting": "正在导入…",
+  "wbAccounts.page.importPanelAuthsResult": "已导入 {imported} 个{overwrite}，跳过 {skipped} 个，域不符 {mismatch} 个",
+  "wbAccounts.page.importPanelAuthsNoMatchTitle": "没有账号导入",
+  "wbAccounts.page.importPanelAuthsNoMatch": "该目录下所有账号的域都与当前页签不符，请切到对应域（CN / Global）的账号页重试。",
+  "wbAccounts.page.export": "导出",
+  "wbAccounts.page.expiringSummary": "近期到期 {amount}（{accounts} 个账号）",
+  "wbAccounts.page.expiringSummaryAria": "近期到期共 {amount} 积分，涉及 {accounts} 个账号",
+  "wbAccounts.page.compactToLoose": "切换为宽松模式",
+  "wbAccounts.page.compactToCompact": "切换为紧凑模式",
+  "wbAccounts.page.demoDisabled": "演示模式下不可操作",
+  "wbAccounts.page.statusLoggedIn": "已登录: {name}",
+  "wbAccounts.common.running": "运行中",
+  "wbAccounts.common.notRunning": "未运行",
+  "wbAccounts.common.connected": "已接入",
+  "wbAccounts.common.notConnected": "未接入",
+  "wbAccounts.common.needsUpgrade": "需升级",
+  "wbAccounts.common.currentAccount": "当前账号: {name}",
+  "wbAccounts.common.notDetected": "未检测到",
+  "wbAccounts.common.notInstalled": "未安装",
+  "wbAccounts.card.expirySuffix": "到期",
+  "wbAccounts.card.deactivated": "已停用",
+  "wbAccounts.card.priorityAria": "建议优先",
+  "wbAccounts.card.editRemark": "编辑备注",
+  "wbAccounts.card.deactivateAccount": "停用账号",
+  "wbAccounts.card.reactivateAccount": "启用账号",
+  "wbAccounts.card.ideNotDetected": "未检测到 CodeBuddy IDE",
+  "wbAccounts.card.connectCliFirst": "请先接入 CodeBuddy CLI",
+  "wbAccounts.card.remarkPlaceholder": "例如：DS4.1 额度 · 10/03 解禁",
+  "wbAccounts.card.remarkAria": "{name} 的备注",
+  "wbAccounts.card.editRemarkAria": "编辑 {name} 的备注",
+  "wbAccounts.card.addRemark": "添加备注",
+  "wbAccounts.card.creditPacks": "{n} 个积分包",
+  "wbAccounts.card.expireSoon": "{amount} 积分将在 7 天内到期",
+  "wbAccounts.card.nextExpiry": "最近到期 {date}",
+  "wbAccounts.card.creditsForever": "当前积分长期有效",
+  "wbAccounts.card.updated": "更新",
+  "wbAccounts.card.expiringSoonTitle": "近期到期",
+  "wbAccounts.card.expiringTotal": "共 {amount}",
+  "wbAccounts.card.expiringTotalAria": "该账号近期到期共 {amount} 积分",
+  "wbAccounts.card.resourceTitle": "{name} · 剩余 {remaining} / {total} · {expiry}",
+  "wbAccounts.card.creditsUnit": "{n} 积分",
+  "wbAccounts.card.noCredits": "暂无可用积分",
+  "wbAccounts.card.viewAllPacks": "查看全部积分包",
+  "wbAccounts.card.cliCurrent": "CLI 当前",
+  "wbAccounts.card.allPacksTitle": "全部积分包",
+  "wbAccounts.card.allPacksDesc": "{name} · 共 {n} 个积分包",
+  "wbAccounts.card.noResourcePacks": "当前没有可展示的资源包。",
+  "wbAccounts.card.unnamedPack": "未命名资源包",
+  "wbAccounts.card.expiresIn7": "7 天内到期",
+  "wbAccounts.card.used": "已用 {n}",
+  "wbAccounts.dialog.sourceVersion": "数据来源版本",
+  "wbAccounts.dialog.sourceSame": "与目标一致（{region}），同版本内搬运",
+  "wbAccounts.dialog.sourceCross": "从 {from} 当前登录账号搬到 {to}",
+  "wbAccounts.dialog.sourceVersionAria": "数据来源版本",
+  "wbAccounts.dialog.loadingSessions": "加载会话…",
+  "wbAccounts.dialog.task": "任务",
+  "wbAccounts.dialog.space": "空间",
+  "wbAccounts.dialog.confirmSwitch": "确认切换",
+  "wbAccounts.dialog.oauthWaiting": "正在等待扫码授权，请在浏览器完成操作…",
+  "wbAccounts.dialog.postTasksCheckin": "签到",
+  "wbAccounts.dialog.postTasksRegister": "注册激活",
+  "wbAccounts.dialog.postTasksTrial": "Trial 加油包",
+  "wbAccounts.dialog.postTasksCredits": "积分",
+  "wbAccounts.toast.deleted": "账号已删除",
   "wbAccounts.toast.accountDeactivated": "账号已停用",
   "wbAccounts.toast.accountReactivated": "账号已启用",
   "wbAccounts.toast.deactivateFail": "停用失败",
   "wbAccounts.toast.reactivateFail": "启用失败",
   "wbAccounts.page.loadingAccounts": "加载账号…",
-  "wbAccounts.page.accounts": "账号",
-
-  // ---- 成长任务中心（panel 移植；CN 专有）----
   "wbAccounts.card.growthTasks": "成长任务",
   "wbAccounts.page.taskCenter": "任务中心",
   "wbAccounts.growth.dialogTitle": "成长任务",
@@ -375,7 +637,6 @@ export const zh = {
   "wbAccounts.growth.resultError": "失败",
   "wbAccounts.growth.refresh": "刷新",
   "wbAccounts.growth.opFail": "操作失败",
-  // 任务中心（全账号队列）
   "wbAccounts.growth.centerDesc": "扫描全部账号的成长任务待办，可跨账号并发批量执行",
   "wbAccounts.growth.scan": "扫描",
   "wbAccounts.growth.scanning": "正在扫描…",
@@ -395,7 +656,6 @@ export const zh = {
   "wbAccounts.growth.status.done": "完成",
   "wbAccounts.growth.status.skipped": "跳过",
   "wbAccounts.growth.status.error": "失败",
-  // 成长任务中心（独立页）
   "wbAccounts.growth.scanResult": "扫描结果",
   "wbAccounts.growth.tasks": "任务",
   "wbAccounts.growth.queue": "队列",
@@ -407,8 +667,6 @@ export const zh = {
   "wbAccounts.growth.completed": "已完成",
   "wbAccounts.growth.actions.accept": "接受",
   "wbAccounts.growth.actions.claim": "领取",
-
-  // 账号池
   "wbAccounts.pool.available": "可用",
   "wbAccounts.pool.cooldown": "冷却中",
   "wbAccounts.pool.disabled": "已停用",

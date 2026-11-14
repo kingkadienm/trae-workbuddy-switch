@@ -22,7 +22,7 @@ use crate::modules::config::{
     add_checkin_log, http_request, load_checkin_config, load_checkin_logs, now_ms, RunFlagGuard,
     CHECKIN_API_PREFIX,
 };
-use crate::modules::refresh::{ensure_fresh_token_for, refresh_account_token_for};
+use crate::modules::refresh::ensure_fresh_token_for;
 use crate::modules::region::{region_spec, Region};
 
 static CHECKIN_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -81,6 +81,7 @@ impl Drop for AccountRunGuard {
 }
 
 /// 判断是否因 token 失效被拒（用于触发刷新重试）。
+#[cfg(test)]
 fn is_unauthorized(resp: &Value) -> bool {
     let code = resp.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
     if code == 401 || code == 403 {
@@ -105,18 +106,32 @@ async fn checkin_request_for(region: Region, path: &str, account: &Value) -> Val
     }
     let url = format!("{}{path}", region_spec(region).billing_base);
     let headers = build_auth_headers(account);
-    let mut resp = http_request(&url, "POST", Some(json!({})), Some(&headers)).await;
-    if is_unauthorized(&resp)
-        && !account
-            .get("refresh_token")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .is_empty()
+    let uid = account.get("uid").and_then(Value::as_str).unwrap_or("");
+    let _risk_permit = match crate::modules::risk_control::admit_platform_request(
+        "workbuddy",
+        region.as_str(),
+        uid,
+    )
+    .await
     {
-        let refreshed = refresh_account_token_for(region, account.clone()).await;
-        let headers = build_auth_headers(&refreshed);
-        resp = http_request(&url, "POST", Some(json!({})), Some(&headers)).await;
-    }
+        Ok(permit) => permit,
+        Err(error) => return json!({"code": -3, "message": format!("风控准入拦截：{error}")}),
+    };
+    let resp = http_request(&url, "POST", Some(json!({})), Some(&headers)).await;
+    let code = resp.get("code").and_then(Value::as_i64).unwrap_or(-1);
+    let reason = resp
+        .get("message")
+        .or_else(|| resp.get("msg"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let _ = crate::modules::risk_control::record_platform_response(
+        "workbuddy",
+        region.as_str(),
+        uid,
+        code,
+        reason,
+    );
     resp
 }
 
@@ -145,6 +160,15 @@ pub async fn get_checkin_status_for(region: Region, account: &Value) -> Value {
                 .or_else(|| data.get("todayCheckedIn"))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
+            // ★ B5：把上游的**积分数据显式提取** —— 此前只透传 `raw`，前端**无从展示「逐条 +N」**。
+            //   字段名来自实测响应（`checkin-activity-status`）：
+            //   `daily_credit` / `today_credit` / `total_credits` / `streak_days` / `checkin_dates`。
+            "dailyCredit": data.get("daily_credit").and_then(Value::as_f64),
+            "todayCredit": data.get("today_credit").and_then(Value::as_f64),
+            "totalCredits": data.get("total_credits").and_then(Value::as_f64),
+            "streakDays": data.get("streak_days").and_then(Value::as_i64),
+            "streakBonusCredit": data.get("streak_bonus_credit").and_then(Value::as_f64),
+            "checkinDates": data.get("checkin_dates").cloned().unwrap_or(Value::Null),
             "raw": data,
         });
     }
@@ -163,6 +187,13 @@ pub async fn get_checkin_status_for(region: Region, account: &Value) -> Value {
                 .or_else(|| data.get("todayCheckedIn"))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
+            // 与上面同源（备用端点，字段一致）。
+            "dailyCredit": data.get("daily_credit").and_then(Value::as_f64),
+            "todayCredit": data.get("today_credit").and_then(Value::as_f64),
+            "totalCredits": data.get("total_credits").and_then(Value::as_f64),
+            "streakDays": data.get("streak_days").and_then(Value::as_i64),
+            "streakBonusCredit": data.get("streak_bonus_credit").and_then(Value::as_f64),
+            "checkinDates": data.get("checkin_dates").cloned().unwrap_or(Value::Null),
             "raw": data,
         });
     }
@@ -186,8 +217,12 @@ pub async fn perform_checkin_for(region: Region, account: &Value) -> Value {
     if region == Region::Global {
         return json!({"ok": false, "error": UNSUPPORTED_MESSAGE});
     }
-    let resp =
-        checkin_request_for(region, &format!("{CHECKIN_API_PREFIX}/daily-checkin"), account).await;
+    let resp = checkin_request_for(
+        region,
+        &format!("{CHECKIN_API_PREFIX}/daily-checkin"),
+        account,
+    )
+    .await;
     let code = resp.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
     if code == 0 || code == 200 {
         return json!({"ok": true, "raw": resp.get("data").cloned().unwrap_or_else(|| json!({}))});
@@ -202,6 +237,18 @@ pub async fn perform_checkin_for(region: Region, account: &Value) -> Value {
         return json!({"ok": true, "already": true, "message": msg});
     }
     json!({"ok": false, "error": msg})
+}
+
+/// 从签到状态响应里取**本次签到可得额度**（逐条「+N」的 N）。
+///
+/// 字段名来自**上游实测响应**（`checkin-activity-status`，见 [`get_checkin_status_for`]）：
+/// 优先 `dailyCredit`（当日签到额度），回落 `todayCredit`（今日已得）。
+/// 只认**正数** —— `0` / 缺失一律视为「上游没给」⇒ `None`（宁可不写，也不摆「+0」）。
+fn checkin_reward_from_status(status: &Value) -> Option<f64> {
+    ["dailyCredit", "todayCredit"]
+        .iter()
+        .filter_map(|field| status.get(*field).and_then(Value::as_f64))
+        .find(|amount| *amount > 0.0)
 }
 
 fn decide_from_status(status: &Value) -> StatusDecision {
@@ -244,6 +291,10 @@ pub async fn checkin_account_for(region: Region, account: &Value) -> Value {
         }
         StatusDecision::Submit => {}
     }
+    // ★ 逐条「+N」：本次签到额度取自**提交前**的状态查询（`checkin-activity-status`），
+    //   与 Trae 侧「预检返回的 credits 就是本次签到可得的额度」同源 —— 不必再打一次
+    //   状态接口算差值。只认上游**实测**字段，取不到就不写金额（前端显示「—」，不摆「+0」）。
+    let reward = checkin_reward_from_status(&status);
 
     // Only this branch submits daily-checkin, so only its outcome is eligible
     // for the sign-in log.
@@ -277,6 +328,12 @@ pub async fn checkin_account_for(region: Region, account: &Value) -> Value {
     });
     if let Some(e) = error.clone() {
         entry_map["error"] = json!(e);
+    }
+    // 只有「真的签到成功」才落金额；`already` / `error` 不写（拿不到就是拿不到）。
+    if result == "success" {
+        if let Some(amount) = reward {
+            entry_map["amount"] = json!(amount);
+        }
     }
     add_checkin_log(&entry_map);
     json!({"result": result, "error": error})
@@ -365,7 +422,11 @@ pub fn all_accounts_checked_in_today() -> bool {
 ///
 /// Empty account list is false so the tray keeps offering 一键签到.
 pub fn all_accounts_checked_in_today_for(region: Region) -> bool {
-    accounts_checked_in_today(&load_accounts_for(region), &load_checkin_logs(), &date_str(None))
+    accounts_checked_in_today(
+        &load_accounts_for(region),
+        &load_checkin_logs(),
+        &date_str(None),
+    )
 }
 
 pub fn accounts_checked_in_today(accounts: &[Value], logs: &[Value], today: &str) -> bool {
@@ -423,6 +484,10 @@ pub async fn run_checkin_all_for(region: Region) -> Value {
 
 #[cfg(test)]
 mod tests {
+    // 测试串行锁（`lock_*()`）会被**故意**持有到用例结束：它防的是多个用例同时抢占
+    // 同一个回调端口 / 全局状态。`#[tokio::test]` 默认是 current-thread 运行时，
+    // 不存在「持锁跨线程唤醒」的风险；clippy 的 await_holding_lock 在这里是误报。
+    #![allow(clippy::await_holding_lock)]
     use super::*;
 
     /// 拟人停顿（与 Trae 侧 `human_pause_secs` 同款双实现，测试两边各钉一份）：
@@ -505,6 +570,39 @@ mod tests {
         );
     }
 
+    /// 逐条「+N」的取值：优先 `dailyCredit`，回落 `todayCredit`，**只认正数**。
+    ///
+    /// 可证伪：把 `find(|amount| *amount > 0.0)` 换成 `.next()`（不筛正数）⇒ 第 3 条
+    /// 断言会拿到 `0.0` 而红；把字段顺序调换 ⇒ 第 1 条断言拿到 `30.0` 而红。
+    #[test]
+    fn checkin_reward_prefers_daily_then_today_and_ignores_non_positive() {
+        assert_eq!(
+            checkin_reward_from_status(&json!({"dailyCredit": 100.0, "todayCredit": 30.0})),
+            Some(100.0),
+            "dailyCredit 优先"
+        );
+        assert_eq!(
+            checkin_reward_from_status(&json!({"todayCredit": 30.0})),
+            Some(30.0),
+            "dailyCredit 缺失时回落 todayCredit"
+        );
+        assert_eq!(
+            checkin_reward_from_status(&json!({"dailyCredit": 0.0, "todayCredit": 0.0})),
+            None,
+            "0 视为「上游没给」，不摆 +0"
+        );
+        assert_eq!(
+            checkin_reward_from_status(&json!({"dailyCredit": null})),
+            None,
+            "null 视为「上游没给」"
+        );
+        assert_eq!(
+            checkin_reward_from_status(&json!({"ok": true})),
+            None,
+            "字段全缺时为 None"
+        );
+    }
+
     #[test]
     fn same_account_cannot_acquire_two_operation_guards() {
         let account = json!({"id": "checkin-guard-test-account"});
@@ -582,7 +680,8 @@ mod tests {
             json!("unsupported")
         );
         assert_eq!(
-            run_checkin_cycle_for(Region::Global, CheckinCycleMode::PeriodicRecovery).await["status"],
+            run_checkin_cycle_for(Region::Global, CheckinCycleMode::PeriodicRecovery).await
+                ["status"],
             json!("unsupported")
         );
         assert_eq!(

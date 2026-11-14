@@ -184,7 +184,10 @@ mod tests {
             text.contains("error sending request for url"),
             "顶层信息丢失: {text}"
         );
-        assert!(text.contains("client error (Connect)"), "第一层原因丢失: {text}");
+        assert!(
+            text.contains("client error (Connect)"),
+            "第一层原因丢失: {text}"
+        );
         assert!(
             text.contains("os error 10061"),
             "底层原因丢失——只剩一行顶层文案就无从诊断: {text}"
@@ -198,11 +201,7 @@ mod tests {
             error = wrap("layer", error);
         }
         let text = join_error_chain(&error);
-        assert_eq!(
-            text.matches("；原因:").count(),
-            4,
-            "原因链未截断: {text}"
-        );
+        assert_eq!(text.matches("；原因:").count(), 4, "原因链未截断: {text}");
         assert!(text.ends_with("；…"), "截断后缺少省略标记: {text}");
     }
 
@@ -255,10 +254,17 @@ mod tests {
             transport_error_code(TransportErrorKind::BodyOrDecode),
             transport_error_code(TransportErrorKind::Other),
         ];
-        assert_eq!(codes[0], crate::modules::error_code::ErrorCode::NetTransportTimeout);
+        assert_eq!(
+            codes[0],
+            crate::modules::error_code::ErrorCode::NetTransportTimeout
+        );
         let mut unique = std::collections::HashSet::new();
         for code in codes {
-            assert!(unique.insert(code.as_str()), "错误码重复: {}", code.as_str());
+            assert!(
+                unique.insert(code.as_str()),
+                "错误码重复: {}",
+                code.as_str()
+            );
         }
     }
 

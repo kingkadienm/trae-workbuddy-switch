@@ -10,8 +10,6 @@ export interface RegionSlice {
   error: string | null;
   creditMap: Record<string, CreditExpiry>;
   creditLoadingMap: Record<string, boolean>;
-  /** 账号 id -> 最近一次积分查询完成时间（成功/失败都记录） */
-  creditUpdatedAtMap: Record<string, number>;
   refreshingCredits: boolean;
 }
 
@@ -23,7 +21,6 @@ function emptySlice(): RegionSlice {
     error: null,
     creditMap: {},
     creditLoadingMap: {},
-    creditUpdatedAtMap: {},
     refreshingCredits: false,
   };
 }
@@ -60,7 +57,6 @@ export function selectRegionSlice(state: AccountsState, region: Region): RegionS
     error: state.error,
     creditMap: state.creditMap,
     creditLoadingMap: state.creditLoadingMap,
-    creditUpdatedAtMap: state.creditUpdatedAtMap,
     refreshingCredits: state.refreshingCredits,
   };
 }
@@ -83,10 +79,15 @@ interface AccountsState {
   error: string | null;
   creditMap: Record<string, CreditExpiry>;
   creditLoadingMap: Record<string, boolean>;
-  /** 账号 id -> 最近一次积分查询完成时间（成功/失败都记录） */
-  creditUpdatedAtMap: Record<string, number>;
   refreshingCredits: boolean;
-  lastCreditRefreshAt: number;
+  /**
+   * 各 region「上一次积分取数完成」的墙钟（`0` = 本次会话还没取过）。
+   *
+   * ★ 必须**按 region 分开记**（issue #133）：自动刷新要判断「这一区是否已经过期」，
+   * 共用一份时间会让刚切过去的另一个区被判成新鲜而跳过刷新。
+   * 它只服务自动刷新与「上次刷新」提示，**不参与**任何数据口径判断。
+   */
+  creditRefreshedAt: Record<Region, number>;
   // —— 国际版 ——
   global: RegionSlice;
 
@@ -115,7 +116,12 @@ interface AccountsState {
   ) => Promise<void>;
   importLocal: (region?: Region) => Promise<AccountMeta>;
   reconcileAccounts: (region?: Region) => Promise<void>;
+  /** 两个 region 的账号列表一起重拉（60s 轮询用；不设 loading）。issue #171。 */
+  reconcileAllAccounts: () => Promise<void>;
 }
+
+/** 轮询重拉账号列表的 in-flight 去重：避免与页面加载 / 相邻 tick 并发时旧列表覆盖新列表。 */
+let accountsReconcileInflight: Promise<void> | null = null;
 
 async function loadRegion(region: Region): Promise<void> {
   useAccountsStore.setState((s) => regionPatch(s, region, { loading: true, error: null }));
@@ -129,7 +135,7 @@ async function loadRegion(region: Region): Promise<void> {
 
 export const useAccountsStore = create<AccountsState>((set, get) => ({
   ...emptySlice(),
-  lastCreditRefreshAt: 0,
+  creditRefreshedAt: { cn: 0, global: 0 },
   global: emptySlice(),
 
   async fetchAll() {
@@ -173,15 +179,12 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
       const slice = selectRegionSlice(s, region);
       const nextCredits = { ...slice.creditMap };
       const nextLoading = { ...slice.creditLoadingMap };
-      const nextUpdatedAt = { ...slice.creditUpdatedAtMap };
       delete nextCredits[id];
       delete nextLoading[id];
-      delete nextUpdatedAt[id];
       return regionPatch(s, region, {
         accounts: slice.accounts.filter((a) => a.id !== id),
         creditMap: nextCredits,
         creditLoadingMap: nextLoading,
-        creditUpdatedAtMap: nextUpdatedAt,
       });
     });
   },
@@ -203,6 +206,22 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
   async reconcileAccounts(region = "cn") {
     const { accounts } = await api.getAccounts(region);
     set((s) => regionPatch(s, region, { accounts }));
+  },
+
+  async reconcileAllAccounts() {
+    // 与 `refreshAllStatus` 同形：两个 region 各自独立，一个失败不影响另一个。
+    // 只写 accounts、不设 loading（60s 轮询不该闪骨架屏）；逐 region 吞错保留旧值。
+    if (accountsReconcileInflight) return accountsReconcileInflight;
+    const inflight = Promise.all([
+      get().reconcileAccounts("cn").catch(() => {}),
+      get().reconcileAccounts("global").catch(() => {}),
+    ])
+      .then(() => undefined)
+      .finally(() => {
+        accountsReconcileInflight = null;
+      });
+    accountsReconcileInflight = inflight;
+    return inflight;
   },
 }));
 
@@ -238,7 +257,6 @@ async function loadCredits(accountIds: string[], force: boolean, silent: boolean
         const cur = selectRegionSlice(s, region);
         return regionPatch(s, region, {
           creditMap: { ...cur.creditMap, [id]: result },
-          creditUpdatedAtMap: { ...cur.creditUpdatedAtMap, [id]: Date.now() },
           creditLoadingMap: silent ? cur.creditLoadingMap : { ...cur.creditLoadingMap, [id]: false },
         });
       });
@@ -252,8 +270,8 @@ async function loadCredits(accountIds: string[], force: boolean, silent: boolean
     });
   });
 
-  // 仅 CN 维护全局「最近刷新时间」，供既有自动刷新钩子使用。
-  if (region === "cn") {
-    useAccountsStore.setState({ lastCreditRefreshAt: Date.now() });
-  }
+  // 「上一次取数时间」按 region 记（自动刷新判过期 + 界面「上次刷新」提示共用这一份）。
+  useAccountsStore.setState((s) => ({
+    creditRefreshedAt: { ...s.creditRefreshedAt, [region]: Date.now() },
+  }));
 }

@@ -14,12 +14,6 @@
 use serde_json::{json, Value};
 use std::time::Duration;
 
-use super::{
-    activity, cat, checkin, config, growth, refresh,
-    region::Region,
-    schedule::{self, ScheduleConfig, ScheduleTask},
-    school, travel,
-};
 /// Trae 分区（第二条产品线）的定时签到。**与上面的 `checkin` 是两套**：
 /// 前者签 WorkBuddy 的账号库，它签 Trae 的区域账号库，两者数据、端点、凭据全不相通。
 ///
@@ -27,27 +21,73 @@ use super::{
 /// 「请求参数 > 用户设置 > 内置默认」在 handlers 里单点承担，绕过去就会让设置页的
 /// 「重试次数 / 跳过已签 / 跳过过期」对自动签到失效（本仓库已踩过三次的假控件）。
 use super::trae::handlers as trae_handlers;
+use super::{
+    activity, cat, checkin, config, growth, qoder, refresh,
+    region::Region,
+    schedule::{self, ScheduleConfig, ScheduleTask},
+    school, travel,
+};
 
 /// 任务被禁用（`hours` 为空）时重查配置的间隔：1 分钟。
 ///
 /// 禁用态不能退出循环（否则用户后来打开开关就再也不会生效），只需低频重查。
 const DISABLED_RECHECK_MS: u64 = 60_000;
 
+/// 单次 `sleep` 的上限：**1 分钟分片**。
+///
+/// 排程点可能远在十几小时后，但「待办时刻」会由**另一条路径**写入（启动补跑里的
+/// Qoder 签到会写 `pendingRetryMs`）。一口气睡到排程点就会把它错过——那正是
+/// 「09:00 白跑、10:05 该补跑却没跑」的成因。分片后最迟 1 分钟必重算一次。
+const MAX_SLEEP_MS: u64 = 60_000;
+
+/// 某类任务在当前进程里的「待办时刻」（epoch 毫秒）。
+///
+/// 目前只有 Qoder 签到需要它：上游每日实例在 10:00（UTC+8）切换，排程若在本日
+/// 10:00 之前跑，签到的必然是上一个实例（`already`）。`qoder::checkin` 会把
+/// 「新实例出来后再跑一轮」的时刻写进台账，本循环据此提前唤醒。
+fn pending_retry_at(task: ScheduleTask) -> Option<i64> {
+    match task {
+        ScheduleTask::QoderCheckin => qoder::region::QoderRegion::all()
+            .into_iter()
+            .filter_map(qoder::checkin::pending_retry_ms)
+            .min(),
+        _ => None,
+    }
+}
+
+/// 清掉待办（已到点执行 / 任务被关闭）。
+fn clear_pending_retry(task: ScheduleTask) {
+    if task == ScheduleTask::QoderCheckin {
+        for region in qoder::region::QoderRegion::all() {
+            qoder::checkin::clear_pending_retry(region);
+        }
+    }
+}
+
 /// 哪些任务在**进程启动时补跑一轮**。
 ///
-/// 只补「今天该做但还没做」的几类：签到核验（WorkBuddy 与 Trae 各一）、旅行派出+领取、
-/// 保活。活跃上报 / 开学季 / 夜猫子不在其中——它们是「每天至多一次」的积分动作，
-/// 交给排程小时表即可，启动就跑会让「我明明设了 10 点」的语义失效。
+/// 只补「今天该做但还没做」的几类：签到核验（WorkBuddy 与 Trae 各一）、Trae JWT 续期、
+/// 旅行派出+领取、保活。活跃上报 / 开学季 / 夜猫子不在其中——它们是「每天至多一次」的
+/// 积分动作，交给排程小时表即可，启动就跑会让「我明明设了 10 点」的语义失效。
 ///
 /// Trae 签到**在其中**：排程定在 9 点、而用户 10 点才开这个应用是常态，
 /// 不补跑就会变成「打开时已过点，今天整天不签」——那等于「自动签到」对多数人不生效。
 /// 它有自己的开关且**默认关闭**（见 `schedule::default_schedule`），
 /// 因此补跑不会让任何人被突如其来的外部请求影响。
-const STARTUP_TASKS: [ScheduleTask; 4] = [
+///
+/// Trae JWT 续期**也在其中**（2026-10-14 新增）：它是「凭据到期前必须有人换」的动作，
+/// 而到期时刻由**上游签发时决定**、与我们的小时表无关 —— 应用恰好没开在那两个整点是
+/// 常态，不补跑就等于「续期看运气」。它只对**真的快到期**的账号发请求
+/// （`account::needs_jwt_refresh`），没有到期账号时这一轮只是读一遍账号库。
+const STARTUP_TASKS: [ScheduleTask; 7] = [
     ScheduleTask::Checkin,
     ScheduleTask::TraeCheckin,
+    ScheduleTask::TraeJwtRefresh,
     ScheduleTask::Travel,
     ScheduleTask::Keepalive,
+    // Qoder 两条与 Trae 两条**同判据**：签到默认关（opt-in）、保活默认开。
+    ScheduleTask::QoderCheckin,
+    ScheduleTask::QoderKeepalive,
 ];
 
 /// 启动补跑的任务清单（**纯函数**）：受各自排程开关约束，关掉的任务一次都不跑。
@@ -121,26 +161,70 @@ pub async fn run_scheduled_task(task: ScheduleTask) -> Value {
         ScheduleTask::TraeCheckin => {
             json!({ "task": task.as_str(), "result": trae_handlers::run_scheduled_checkin().await })
         }
+        // 同上：Trae 的账号库按**变体**分家（不是 `Region`），遍历哪几条由
+        // `run_jwt_refresh_cycle` 自己决定（`all_specs()` 全 6 条，含国际版与 TraeCode）。
+        ScheduleTask::TraeJwtRefresh => {
+            json!({ "task": task.as_str(), "result": trae_handlers::run_jwt_refresh_cycle().await })
+        }
+        // Qoder 的账号库同样按它**自己的区域轴**分家（`QoderRegion`，不是 `Region`）——
+        // 两者恰好都是 cn/global，但语义不同（`Region` 是 WorkBuddy 的轴）。
+        // 显式遍历 `QoderRegion::all()` 而不是复用 `Region::all()`：一旦哪天真加了
+        // 第三个区域，这里不会静默少签一个。
+        ScheduleTask::QoderCheckin => {
+            let mut regions = Vec::new();
+            for region in qoder::region::QoderRegion::all() {
+                regions.push(qoder::checkin::run_cycle_for(region).await);
+            }
+            json!({ "task": task.as_str(), "regions": regions })
+        }
+        ScheduleTask::QoderKeepalive => {
+            let mut regions = Vec::new();
+            for region in qoder::region::QoderRegion::all() {
+                regions.push(qoder::refresh::run_keepalive_cycle_for(region).await);
+            }
+            json!({ "task": task.as_str(), "regions": regions })
+        }
     }
 }
 
 /// 某一类任务的排程循环：**永不返回**，由调用方 `spawn` 到后台。
 ///
-/// 每轮**重新读取配置**并重算自己的 `next_fire`，因此运行期间改动小时表或开关、
-/// **下一轮即生效**，无需重启应用。任务被禁用（`hours` 为空）时不派发，只按 1 分钟重查。
+/// 每轮**重新读取配置**并重算自己的 `next_fire`，因此运行期间改动时点表或开关、
+/// **下一轮即生效**，无需重启应用。任务被禁用（`times` 为空）时不派发，只按 1 分钟重查。
+///
+/// 唤醒时刻取 `min(下一个排程点, 待办时刻)`：待办时刻由签到模块在**发现「只是重复签
+/// 上一个实例」**时写入（见 `qoder::checkin::retry_after_ms`），用于等上游 10:00 刷新后
+/// 补跑一轮。睡眠按 [`MAX_SLEEP_MS`] 分片，保证「另一条路径刚写进去的待办」不会被长睡吞掉。
 pub async fn schedule_loop(task: ScheduleTask) {
     loop {
         let cfg = schedule::load_schedule_config();
         let now = config::now_ms();
-        let at = schedule::next_fire(task.hours(&cfg), now);
-        let wait_ms = match at {
-            Some(at) => (at - now).max(0) as u64,
-            // 任务被禁用：1 分钟后重查配置，避免无谓空转。
-            None => DISABLED_RECHECK_MS,
-        };
-        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
-        if at.is_none() {
+        // 抖动在这里叠加（`jitter == 0` 时与 `next_fire` 等价）：salt 用任务标识，
+        // 于是每个任务各自一条偏移序列 —— 同一时点上的多类任务不会一起被推到同一分钟。
+        let at = schedule::next_fire_with_jitter(
+            task.times(&cfg),
+            task.jitter(&cfg),
+            task.as_str(),
+            now,
+        );
+        // 任务被禁用：1 分钟后重查配置，并**清掉待办** —— 否则关掉开关后仍会在
+        // 待办时刻跑一次，那个开关就成了假控件。
+        let Some(at) = at else {
+            clear_pending_retry(task);
+            tokio::time::sleep(Duration::from_millis(DISABLED_RECHECK_MS)).await;
             continue;
+        };
+        let pending = pending_retry_at(task);
+        let wake = pending.map_or(at, |deferred| deferred.min(at));
+        let wait_ms = ((wake - now).max(0) as u64).min(MAX_SLEEP_MS);
+        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+        // 分片醒来未必到点（也可能是配置刚被改）⇒ 回到循环开头重算。
+        if config::now_ms() < wake {
+            continue;
+        }
+        // 待办到点：先消费掉再执行，执行失败也不会变成每小时重试的滚雪球。
+        if pending == Some(wake) {
+            clear_pending_retry(task);
         }
         let _ = run_scheduled_task(task).await;
     }
@@ -153,6 +237,18 @@ pub async fn schedule_loop(task: ScheduleTask) {
 pub async fn run_startup_maintenance() {
     if let Err(error) = config::compact_checkin_logs() {
         eprintln!("[签到] 历史日志整理失败: {error}");
+    }
+    // 回收站清扫：**复用本入口**（`TaskKind::StartupMaintenance`），不新增调度器。
+    //
+    // 回收站条目带 30 天 `expires_at`，另有 200 条上限；两者都需要一个「低频、每进程至少跑一次」
+    // 的时机来落地。启动补跑正好满足：它天然在进程起来时执行一次，且不依赖任何排程开关
+    // （软删除的过期清理不该被用户的「签到/旅行」开关影响）。
+    //
+    // WorkBuddy 与 Trae 是**两套互不相通**的账号库与回收站，各自清扫，互不吞噬计数。
+    let wb_swept = super::account::sweep_all_trash();
+    let trae_swept = super::trae::account::sweep_all_trash();
+    if wb_swept + trae_swept > 0 {
+        eprintln!("[回收站] 启动清扫过期条目: WorkBuddy {wb_swept} / Trae {trae_swept}");
     }
     let cfg = schedule::load_schedule_config();
     for task in startup_tasks(&cfg) {
@@ -174,14 +270,19 @@ mod tests {
         let cfg = schedule::default_schedule();
         // ⚠️ Trae 签到**默认关闭**（它会对用户没授权过的外部服务发请求），
         // 因此默认状态下它不在补跑清单里。这条同时钉住了「默认不替用户做他没授权的事」。
+        // ⚠️ 反之 Trae JWT 续期**默认开启**（`refresh_token` 的唯一用途就是续期，
+        // 是用户走网页登录时明确交出来的）⇒ 它必须在默认清单里，否则「自动续期」
+        // 又只剩小时表那两次机会（应用没开就整天不续）。
         assert_eq!(
             startup_tasks(&cfg),
             vec![
                 ScheduleTask::Checkin,
+                ScheduleTask::TraeJwtRefresh,
                 ScheduleTask::Travel,
                 ScheduleTask::Keepalive,
+                ScheduleTask::QoderKeepalive,
             ],
-            "默认状态下（Trae 签到默认关闭）启动补跑应恰好是这三类"
+            "默认状态下（两条签到默认关闭、两条保活默认开启）启动补跑应恰好是这五类"
         );
 
         // 打开 Trae 签到后它**必须**进入补跑清单，否则「排程定在 9 点、10 点才开应用」
@@ -193,27 +294,66 @@ mod tests {
             vec![
                 ScheduleTask::Checkin,
                 ScheduleTask::TraeCheckin,
+                ScheduleTask::TraeJwtRefresh,
                 ScheduleTask::Travel,
                 ScheduleTask::Keepalive,
+                ScheduleTask::QoderKeepalive,
             ],
             "Trae 签到开启后必须进入启动补跑"
+        );
+
+        // Qoder 签到同判据：默认不在清单里，打开后必须在。
+        let mut with_qoder = cfg.clone();
+        with_qoder.qoder_checkin_enabled = true;
+        assert_eq!(
+            startup_tasks(&with_qoder),
+            vec![
+                ScheduleTask::Checkin,
+                ScheduleTask::TraeJwtRefresh,
+                ScheduleTask::Travel,
+                ScheduleTask::Keepalive,
+                ScheduleTask::QoderCheckin,
+                ScheduleTask::QoderKeepalive,
+            ],
+            "Qoder 签到开启后必须进入启动补跑"
+        );
+
+        // 关掉 JWT 续期 ⇒ 它**必须**从补跑清单消失（否则开关形同虚设）。
+        let mut no_jwt = cfg.clone();
+        no_jwt.trae_jwt_refresh_enabled = false;
+        assert_eq!(
+            startup_tasks(&no_jwt),
+            vec![
+                ScheduleTask::Checkin,
+                ScheduleTask::Travel,
+                ScheduleTask::Keepalive,
+                ScheduleTask::QoderKeepalive,
+            ],
+            "关掉 Trae JWT 续期后它不得再补跑（逐类 gating）"
         );
 
         let mut all_off = cfg.clone();
         all_off.checkin_enabled = false;
         all_off.travel_enabled = false;
         all_off.keepalive_enabled = false;
+        all_off.trae_jwt_refresh_enabled = false;
+        all_off.qoder_keepalive_enabled = false;
         assert!(
             startup_tasks(&all_off).is_empty(),
-            "三类全关时启动补跑必须为空（否则开关形同虚设）"
+            "全关时启动补跑必须为空（否则开关形同虚设）"
         );
 
         let mut travel_off = cfg.clone();
         travel_off.travel_enabled = false;
         assert_eq!(
             startup_tasks(&travel_off),
-            vec![ScheduleTask::Checkin, ScheduleTask::Keepalive],
-            "gating 必须是逐类的：关 travel 不影响另外两类"
+            vec![
+                ScheduleTask::Checkin,
+                ScheduleTask::TraeJwtRefresh,
+                ScheduleTask::Keepalive,
+                ScheduleTask::QoderKeepalive,
+            ],
+            "gating 必须是逐类的：关 travel 不影响另外几类"
         );
 
         // 逐类 gating 的第二个探针：一条线关闭时**不能**把另一条线一起带走。
@@ -225,9 +365,11 @@ mod tests {
             vec![
                 ScheduleTask::Checkin,
                 ScheduleTask::TraeCheckin,
+                ScheduleTask::TraeJwtRefresh,
                 ScheduleTask::Travel,
+                ScheduleTask::QoderKeepalive,
             ],
-            "关 keepalive 不能带走 Trae 签到"
+            "关 keepalive 不能带走 Trae 签到 / Trae JWT 续期"
         );
 
         // 活跃上报 / 开学季 / 夜猫子**不在**启动补跑里（交给排程小时表）。
@@ -235,21 +377,33 @@ mod tests {
             checkin_enabled: false,
             travel_enabled: false,
             keepalive_enabled: false,
+            trae_jwt_refresh_enabled: false,
+            qoder_keepalive_enabled: false,
             ..cfg.clone()
         };
         assert!(startup_tasks(&only_others).is_empty());
     }
 
-    /// 启动补跑的集合必须**恰好**是这四类；新增第五类进来必须有意为之。
+    /// 启动补跑的集合必须**恰好**是这七类；新增进来必须有意为之。
     ///
-    /// Trae 签到是 2026-09-22 有意加进来的第四类（理由见 [`STARTUP_TASKS`] 的文档），
-    /// 不是顺手带上的 —— 这条断言的作用就是让下次有人想加第五类时被迫说明理由。
+    /// Trae 签到是 2026-09-22 有意加进来的第四类，Trae JWT 续期是 2026-10-14 有意加进来的
+    /// 第五类，Qoder 签到 / 保活是 2026-10-19 有意加进来的第六、七类（理由见
+    /// [`STARTUP_TASKS`] 的文档），都不是顺手带上的 ——
+    /// 这条断言的作用就是让下次有人想加第八类时被迫说明理由。
     #[test]
     fn startup_task_set_is_exactly_the_intended_families() {
         let labels: Vec<&str> = STARTUP_TASKS.iter().map(|t| t.as_str()).collect();
         assert_eq!(
             labels,
-            vec!["checkin", "trae_checkin", "travel", "keepalive"]
+            vec![
+                "checkin",
+                "trae_checkin",
+                "trae_jwt_refresh",
+                "travel",
+                "keepalive",
+                "qoder_checkin",
+                "qoder_keepalive"
+            ]
         );
     }
 }

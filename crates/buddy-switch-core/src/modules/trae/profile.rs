@@ -491,11 +491,17 @@ fn local_login_from_dir(data_dir: &Path, variant: TraeVariant) -> Result<LocalLo
 
     let mut candidates: Vec<(PathBuf, &'static str)> = vec![
         (
-            data_dir.join("User").join("globalStorage").join("storage.json"),
+            data_dir
+                .join("User")
+                .join("globalStorage")
+                .join("storage.json"),
             "登录态文件",
         ),
         (
-            data_dir.join("User").join("globalStorage").join("state.vscdb"),
+            data_dir
+                .join("User")
+                .join("globalStorage")
+                .join("state.vscdb"),
             "令牌数据库",
         ),
     ];
@@ -807,7 +813,7 @@ fn collect_log_candidates(data_dir: &Path) -> Vec<PathBuf> {
     }
     // 新的排前面：同时命中的多个 token 由调用方按 exp 取最新，但先扫新文件
     // 能让「确定性截断」发生在最不可能相关的那一批上。
-    files.sort_by(|a, b| b.1.cmp(&a.1));
+    files.sort_by_key(|f| std::cmp::Reverse(f.1));
     files.truncate(LOG_SCAN_MAX_FILES);
     files.into_iter().map(|(path, _)| path).collect()
 }
@@ -1138,7 +1144,11 @@ fn copy_entry(source: &Path, target: &Path, kind: EntryKind) -> Result<u64, Stri
 }
 
 /// 递归复制目录，返回复制的文件数。
-fn copy_dir_recursive(source: &Path, target: &Path) -> Result<u64, String> {
+///
+/// `pub(crate)` 而不是私有：`snapshot_migrate` 也要用它（把遗留程序线的快照槽位
+/// 搬进合并版槽位）。**刻意只有这一份实现** —— 再写一个「差不多的」递归复制，
+/// 迟早出现「备份时跳过锁文件、搬运时却整目录失败」这类分叉。
+pub(crate) fn copy_dir_recursive(source: &Path, target: &Path) -> Result<u64, String> {
     std::fs::create_dir_all(target).map_err(|e| format!("创建目录失败: {e}"))?;
     let mut copied = 0u64;
     for entry in std::fs::read_dir(source)
@@ -1406,8 +1416,7 @@ fn restore_from_slot_in_dir(
     if !source_root.is_dir() {
         return Err(format!("槽位 {slot} 的登录态快照不存在"));
     }
-    std::fs::create_dir_all(target_root)
-        .map_err(|e| format!("创建客户端数据目录失败: {e}"))?;
+    std::fs::create_dir_all(target_root).map_err(|e| format!("创建客户端数据目录失败: {e}"))?;
 
     let unpurged = purge_restore_relatives(target_root);
 
@@ -1523,14 +1532,80 @@ pub fn delete_slot_for(variant: TraeVariant, slot: &str) -> Result<(), String> {
 /// 且能区分「装了但从未启动」与「真的没装」。这里再写一句，迟早出现
 /// 「一处说没装、另一处说没启动」的自相矛盾。
 fn missing_snapshot_reason(variant: TraeVariant, target: &str, can_save: bool) -> String {
-    if can_save {
+    let base = if can_save {
         format!("账号 {target} 的登录态快照不存在，请先保存该账号的登录态")
     } else {
         format!(
             "账号 {target} 的登录态快照不存在，且现在也无法保存 —— {}",
             platform::data_dir_missing_reason(variant)
         )
+    };
+    // ★ issue #152：把「快照**实际**在哪一格」直接写进文案。
+    //
+    // 报告原文（macOS 国内版）：「说什么登陆态快照不存在，请先保存该账号的登陆态」——
+    // 而用户早就存过。这类现场靠猜是猜不出来的：快照可能在**历史池**（合并前存的，
+    // 见 [`super::snapshot_migrate`]）、也可能属于**另一个区域**（国内版账号被建到国际版）。
+    // 把磁盘上的真实位置报出来，下一次报告就能一次定死，而不是再来一轮问答。
+    let elsewhere = snapshot_locations_for(target);
+    if !elsewhere.is_empty() {
+        return format!(
+            "{base}（该账号的快照实际在：{} —— 可能属于另一条产品线/另一个区域，切到对应区域再试）",
+            elsewhere
+                .iter()
+                .map(|dir| dir.display().to_string())
+                .collect::<Vec<_>>()
+                .join("、")
+        );
     }
+    /* ★ issue #152 第二轮（报障截图复现）：**合并池与历史池都查过、确实没有**时，光说
+       「请先保存」会让人对着同一个按钮反复点 —— 因为他以为自己早就存过了。
+
+       这里补三件他真正缺的信息：
+       ① 保存拷的是**客户端此刻**的登录态，不是账号库里的凭据（这是最容易误解的一步）；
+       ② 我们把哪些池都查过了（否则「找不到」像是工具没找对地方）；
+       ③ 客户端此刻登着的账号是谁（若那个账号已有快照 ⇒ 说明之前存给了另一个号）。
+    */
+    if !can_save {
+        return base;
+    }
+    let mut message = format!(
+        "{base}（合并池与历史池里都没有它的快照）。\
+         注意「保存登录态」拷的是**客户端此刻**的登录态：需要先把 {target} 登录到 Trae 客户端里，再点保存"
+    );
+    if let Some(current) = client_login_uid_for(variant) {
+        if current != target {
+            message.push_str(&format!("；客户端此刻登录的是 {current}"));
+        }
+    }
+    let searched = paths::profile_dirs_for_region(variant.region(), target);
+    if !searched.is_empty() {
+        message.push_str(&format!(
+            "。已查过的池：{}",
+            searched
+                .iter()
+                .map(|dir| dir.display().to_string())
+                .collect::<Vec<_>>()
+                .join("、")
+        ));
+    }
+    message
+}
+
+/// 这个账号的快照**实际**躺在哪些池里（跨区域、含历史池）—— **只用于诊断文案**。
+///
+/// 返回空 ≠ 错误：那正是「真的没存过」的形态。判据只看目录是否存在，
+/// 不读任何文件、不改任何东西。
+fn snapshot_locations_for(user_id: &str) -> Vec<PathBuf> {
+    use crate::modules::trae::region::TraeRegion;
+    let mut out: Vec<PathBuf> = Vec::new();
+    for region in [TraeRegion::Cn, TraeRegion::Global] {
+        for dir in paths::profile_dirs_for_region(region, user_id) {
+            if dir.is_dir() && !out.contains(&dir) {
+                out.push(dir);
+            }
+        }
+    }
+    out
 }
 
 /// 切换失败后的**回滚**：把 `last` 槽（切换前的现场）恢复回客户端，并把客户端拉回来。
@@ -1651,18 +1726,52 @@ where
     //    `account` 富对象与 `iCubeServerData` 缓存（账号库里没有、也造不出来）。
     //    客户端读到缺 `iCubeServerData` 的 `cloudide` 后**把整份登录态判为无效并清掉**
     //    ⇒ 用户的两个客户端双双变成未登录。实测取证与结论见
-    //    `docs/trae-login-materialize-probe-2026-09-29.md`。
-    let target_slot = match paths::profile_dir_for(variant, &target) {
-        Some(dir) if dir.is_dir() => dir,
-        _ => {
-            let can_save = snapshot_data_dir_for(variant)
-                .filter(|dir| dir.is_dir())
-                .is_some();
-            let message = missing_snapshot_reason(variant, &target, can_save);
-            emit(&mut outcome, SwitchStep::new("fatal", "fail", message.clone()));
-            outcome.error = Some(message);
-            return outcome;
+    //    `docs/history/trae-login-materialize-probe-2026-09-29.md`。
+    // ★ issue #152：目标槽位不在**合并池**时，先补搬一次历史池再判。
+    //
+    // 合并前存的快照躺在 `profiles` / `profiles_trae_cn` / `profiles_global*` 里；
+    // 页面加载时会搬一次（`carry_merged_snapshots`），但「切号」可能发生在搬完之前，
+    // 也可能那次搬运里有失败项。不补搬的后果就是 #152 的原话：**用户早就存过**，
+    // 却被告知「请先保存该账号的登录态」（与 issue #28 完全同款的症状）。
+    //
+    // 补搬是幂等、只增不改、只复制的（`snapshot_migrate` 的三条硬约束），
+    // 而且只在这条**失败路径**上执行 ⇒ 正常切换的耗时与行为都不变。
+    let mut target_slot = paths::profile_dir_for(variant, &target).filter(|dir| dir.is_dir());
+    if target_slot.is_none() {
+        let carried = super::snapshot_migrate::carry_merged_snapshots();
+        if carried.carries.iter().any(|entry| entry.slot == target) {
+            emit(
+                &mut outcome,
+                SwitchStep::new(
+                    "migrate",
+                    "ok",
+                    format!("已从历史快照池补搬账号 {target} 的登录态"),
+                ),
+            );
         }
+        if !carried.errors.is_empty() {
+            emit(
+                &mut outcome,
+                SwitchStep::new(
+                    "migrate",
+                    "skip",
+                    format!("历史快照搬运有失败项：{}", carried.errors.join("；")),
+                ),
+            );
+        }
+        target_slot = paths::profile_dir_for(variant, &target).filter(|dir| dir.is_dir());
+    }
+    let Some(target_slot) = target_slot else {
+        let can_save = snapshot_data_dir_for(variant)
+            .filter(|dir| dir.is_dir())
+            .is_some();
+        let message = missing_snapshot_reason(variant, &target, can_save);
+        emit(
+            &mut outcome,
+            SwitchStep::new("fatal", "fail", message.clone()),
+        );
+        outcome.error = Some(message);
+        return outcome;
     };
     let _ = target_slot;
     emit(
@@ -1740,7 +1849,11 @@ where
         match backup_to_slot_for(variant, LAST_SLOT) {
             Ok(count) => emit(
                 &mut outcome,
-                SwitchStep::new("backup", "ok", format!("当前登录态已保存到 last 槽位（{count} 个文件）")),
+                SwitchStep::new(
+                    "backup",
+                    "ok",
+                    format!("当前登录态已保存到 last 槽位（{count} 个文件）"),
+                ),
             ),
             Err(error) => emit(
                 &mut outcome,
@@ -1802,24 +1915,24 @@ where
                         format!("跳过更新 {previous} 的快照：{error}"),
                     ),
                 ),
-            Ok(()) => match backup_to_slot_for(variant, previous) {
-                Ok(count) => emit(
-                    &mut outcome,
-                    SwitchStep::new(
-                        "backup-current",
-                        "ok",
-                        format!("当前账号 {previous} 的登录态已更新（{count} 个文件）"),
+                Ok(()) => match backup_to_slot_for(variant, previous) {
+                    Ok(count) => emit(
+                        &mut outcome,
+                        SwitchStep::new(
+                            "backup-current",
+                            "ok",
+                            format!("当前账号 {previous} 的登录态已更新（{count} 个文件）"),
+                        ),
                     ),
-                ),
-                Err(error) => emit(
-                    &mut outcome,
-                    SwitchStep::new(
-                        "backup-current",
-                        "skip",
-                        format!("更新 {previous} 失败: {error}"),
+                    Err(error) => emit(
+                        &mut outcome,
+                        SwitchStep::new(
+                            "backup-current",
+                            "skip",
+                            format!("更新 {previous} 失败: {error}"),
+                        ),
                     ),
-                ),
-            },
+                },
             }
         }
     }
@@ -1893,13 +2006,20 @@ where
                     "账号 {target} 的快照为空或损坏，且{reason}。请在客户端里确认当前登录状态。"
                 ),
             };
-            emit(&mut outcome, SwitchStep::new("fatal", "fail", message.clone()));
+            emit(
+                &mut outcome,
+                SwitchStep::new("fatal", "fail", message.clone()),
+            );
             outcome.error = Some(message);
             return outcome;
         }
         Ok(count) => emit(
             &mut outcome,
-            SwitchStep::new("restore", "ok", format!("已恢复 {target} 的登录态（{count} 个文件）")),
+            SwitchStep::new(
+                "restore",
+                "ok",
+                format!("已恢复 {target} 的登录态（{count} 个文件）"),
+            ),
         ),
         Err(error) => {
             emit(
@@ -1950,7 +2070,10 @@ where
                      且{reason}。请在客户端里确认当前登录状态。"
                 ),
             };
-            emit(&mut outcome, SwitchStep::new("fatal", "fail", message.clone()));
+            emit(
+                &mut outcome,
+                SwitchStep::new("fatal", "fail", message.clone()),
+            );
             outcome.error = Some(message);
             return outcome;
         }
@@ -2198,7 +2321,10 @@ pub fn save_current_login_for(variant: TraeVariant, user_id: &str) -> Result<u64
     // ② 更要紧的是——**没有东西可备份却先把用户的客户端关了**，是纯粹的破坏：
     //    实测踩到过（既有用例走这条路径时，把用户正在用的 Trae 关掉，并因为随后
     //    反复查进程而把测试挂住 12 分钟）。
-    if snapshot_data_dir_for(variant).filter(|dir| dir.is_dir()).is_none() {
+    if snapshot_data_dir_for(variant)
+        .filter(|dir| dir.is_dir())
+        .is_none()
+    {
         return backup_to_slot_for(variant, user_id);
     }
 
@@ -2304,6 +2430,12 @@ pub fn overview_for(variant: TraeVariant) -> Value {
 }
 
 #[cfg(test)]
+// 本模块的 fixture 辅助（`base64url` / `fixture_uids` 等）只被 `#[cfg(windows)]`
+// 用例消费（真机 `storage.json` 布局与 mtime 活跃度都是 Windows 特有语义）。
+// Linux / macOS 上那些用例被 cfg 掉，辅助函数便无人引用 —— 而 CI 的 `cargo test`
+// 带 `-D warnings`，会把「平台裁剪造成的假未使用」判成编译错误。
+// 只在非 Windows 放行：Windows 上它们确实被用到，放行反而会掩盖真实的未使用项。
+#[cfg_attr(not(windows), allow(dead_code))]
 mod tests {
     use super::*;
 
@@ -2329,10 +2461,7 @@ mod tests {
             "Network",
             "Partitions/trae-webview",
         ] {
-            assert!(
-                relatives.contains(&required),
-                "核心文件清单缺少 {required}"
-            );
+            assert!(relatives.contains(&required), "核心文件清单缺少 {required}");
         }
         assert!(CORE_ENTRIES.len() >= 13, "至少覆盖 13 类核心文件");
     }
@@ -2412,7 +2541,10 @@ mod tests {
             "cands",
             &[
                 ("20260101T000000/main.log", "a"),
-                ("20260102T000000/window1/exthost/trae.ai-code-completion/completion.log", "b"),
+                (
+                    "20260102T000000/window1/exthost/trae.ai-code-completion/completion.log",
+                    "b",
+                ),
                 // 非 .log 不能被当成候选
                 ("20260102T000000/main.log.bak", "c"),
                 ("20260102T000000/notes.txt", "d"),
@@ -2451,7 +2583,10 @@ mod tests {
         let root = std::env::temp_dir().join(format!("trae-profile-cap-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         for i in 0..(LOG_SCAN_MAX_FILES + 7) {
-            let path = root.join("logs").join(format!("run{i:04}")).join("main.log");
+            let path = root
+                .join("logs")
+                .join(format!("run{i:04}"))
+                .join("main.log");
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, "x").unwrap();
         }
@@ -2461,7 +2596,8 @@ mod tests {
 
     #[test]
     fn read_capped_stops_at_limit_and_ignores_the_rest() {
-        let root = std::env::temp_dir().join(format!("trae-profile-cap-read-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("trae-profile-cap-read-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("big.log");
@@ -2494,14 +2630,19 @@ mod tests {
             "c2lnbmF0dXJl"
         );
 
-        let base = std::env::temp_dir().join(format!("trae-profile-appdata-{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("trae-profile-appdata-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
-        // 候选目录名必须取自 `platform::data_dir_names()` 的固定列表。
-        let client = base.join("TRAE SOLO CN");
+        // 候选目录名必须取自 `platform::data_dir_names()` 的固定列表
+        // （★ issue #28 收敛后主候选是 `Trae CN` —— 老值 `TRAE SOLO CN` 已不在跨变体候选里）。
+        let client = base.join(platform::data_dir_names()[0]);
         std::fs::create_dir_all(client.join("User").join("globalStorage")).unwrap();
         // 造一个「活跃标志」文件，使该候选按最近活跃排到第一。
         std::fs::write(
-            client.join("User").join("globalStorage").join("storage.json"),
+            client
+                .join("User")
+                .join("globalStorage")
+                .join("storage.json"),
             r#"{"telemetry":{}}"#,
         )
         .unwrap();
@@ -2760,7 +2901,10 @@ mod tests {
         let original = std::env::var("APPDATA").ok();
         std::env::set_var("APPDATA", &base);
         std::thread::sleep(std::time::Duration::from_millis(40));
-        let cn_storage = cn_dir.join("User").join("globalStorage").join("storage.json");
+        let cn_storage = cn_dir
+            .join("User")
+            .join("globalStorage")
+            .join("storage.json");
         std::fs::create_dir_all(cn_storage.parent().unwrap()).unwrap();
         std::fs::write(&cn_storage, r#"{"telemetry":{}}"#).unwrap();
 
@@ -2790,7 +2934,8 @@ mod tests {
     #[test]
     fn extract_local_jwt_for_reports_variant_specific_missing_dir() {
         // 空 base：两条产品线的目录都不存在。
-        let base = std::env::temp_dir().join(format!("trae-variant-missing-{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("trae-variant-missing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
 
@@ -2800,8 +2945,8 @@ mod tests {
 
         let error = extract_local_jwt_for(TraeVariant::TraeWork)
             .expect_err("两条候选目录都不存在时必须报错");
-        let cn_error = extract_local_jwt_for(TraeVariant::Trae)
-            .expect_err("两条候选目录都不存在时必须报错");
+        let cn_error =
+            extract_local_jwt_for(TraeVariant::Trae).expect_err("两条候选目录都不存在时必须报错");
 
         match original {
             Some(value) => std::env::set_var("APPDATA", value),
@@ -2829,26 +2974,29 @@ mod tests {
         // 只断言 basename：这些是无参全局路径函数，每次调用都重读进程级
         // `BUDDY_SWITCH_HOME`。断言绝对路径会被并行跑的其它用例改 home 而"假红"
         // （症状是左右目录名差一个 PID 后缀），只比 basename 天然免疫。
-        let work = paths::profiles_dir_for(TraeVariant::TraeWork);
-        let cn = paths::profiles_dir_for(TraeVariant::Trae);
+        let cn = paths::profiles_dir_for(TraeVariant::TraeMerged);
+        let global = paths::profiles_dir_for(TraeVariant::GlobalTraeMerged);
 
-        assert_eq!(
-            work.file_name().and_then(|n| n.to_str()),
-            Some("profiles"),
-            "默认变体必须沿用旧目录名，否则老用户的既有快照全部失效"
-        );
+        // ★ issue #28：默认变体是 CN 合并版，目录名一律走 `profiles_<as_str>` 规则。
+        //   老目录 `profiles` 不再是任何写路径的落点（它只是迁移来源），
+        //   所以这里**不再**断言「默认变体沿用旧名」。
         assert_eq!(
             cn.file_name().and_then(|n| n.to_str()),
-            Some("profiles_trae_cn"),
-            "非默认变体用独立目录名"
+            Some("profiles_trae_merged"),
+            "默认变体（CN 合并版）的目录名必须是 profiles_<as_str>"
         );
-        assert_ne!(work, cn, "两条产品线的快照目录绝不该是同一个");
+        assert_eq!(
+            global.file_name().and_then(|n| n.to_str()),
+            Some("profiles_global_trae_merged"),
+            "国际合并版用独立目录名"
+        );
+        assert_ne!(cn, global, "两个区域的快照目录绝不该是同一个");
 
         // 单个账号的快照目录同样分家。
         assert_ne!(
-            paths::profile_dir_for(TraeVariant::TraeWork, "u1"),
-            paths::profile_dir_for(TraeVariant::Trae, "u1"),
-            "同一个 uid 在两条产品线下必须是两个槽位"
+            paths::profile_dir_for(TraeVariant::TraeMerged, "u1"),
+            paths::profile_dir_for(TraeVariant::GlobalTraeMerged, "u1"),
+            "同一个 uid 在两个区域下必须是两个槽位"
         );
     }
 
@@ -2866,8 +3014,14 @@ mod tests {
         set_current_account_for(TraeVariant::TraeWork, "u-work").unwrap();
         set_current_account_for(TraeVariant::Trae, "u-cn").unwrap();
 
-        assert_eq!(current_account_for(TraeVariant::TraeWork).as_deref(), Some("u-work"));
-        assert_eq!(current_account_for(TraeVariant::Trae).as_deref(), Some("u-cn"));
+        assert_eq!(
+            current_account_for(TraeVariant::TraeWork).as_deref(),
+            Some("u-work")
+        );
+        assert_eq!(
+            current_account_for(TraeVariant::Trae).as_deref(),
+            Some("u-cn")
+        );
 
         // 覆盖其中一条不得影响另一条。
         set_current_account_for(TraeVariant::Trae, "u-cn-2").unwrap();
@@ -2900,7 +3054,10 @@ mod tests {
             .map(|info| info.slot)
             .collect();
 
-        assert!(cn_slots.contains(&"cn-only".to_string()), "Trae CN 应看到自己的槽位");
+        assert!(
+            cn_slots.contains(&"cn-only".to_string()),
+            "Trae CN 应看到自己的槽位"
+        );
         assert!(
             !work_slots.contains(&"cn-only".to_string()),
             "Trae Work 看到了 Trae CN 的槽位 —— 这就是串味"
@@ -2931,7 +3088,10 @@ mod tests {
         let cn = overview_for(TraeVariant::Trae);
         let work = overview_for(TraeVariant::TraeWork);
 
-        assert_eq!(cn.get("currentAccount").and_then(Value::as_str), Some("u-cn"));
+        assert_eq!(
+            cn.get("currentAccount").and_then(Value::as_str),
+            Some("u-cn")
+        );
         assert_eq!(
             work.get("currentAccount").and_then(Value::as_str),
             None,
@@ -2998,7 +3158,10 @@ mod tests {
             "客户端登着 {client_uid}，状态条不得报「未登录」"
         );
         // 展示名键必须仍在（值可以是 null：账号库还没采集到这条记录）。
-        assert!(value.get("currentAccountName").is_some(), "currentAccountName 键不得缺失");
+        assert!(
+            value.get("currentAccountName").is_some(),
+            "currentAccountName 键不得缺失"
+        );
     }
 
     /// ★ 展示端**不得**走明文兜底：客户端没有登录态时，日志里的旧 token 不算「已登录」。
@@ -3033,10 +3196,10 @@ mod tests {
         );
     }
 
-
     /// 客户端打包后的 JS（模板串 `Cloud-IDE-JWT ${e}`）不得被误当成凭据。
     #[test]
-    fn scan_jwt_tokens_ignores_js_templates() {        let js = r#"if(n.headers={...t.headers,Authorization:`Cloud-IDE-JWT ${e}`},null==a)"#;
+    fn scan_jwt_tokens_ignores_js_templates() {
+        let js = r#"if(n.headers={...t.headers,Authorization:`Cloud-IDE-JWT ${e}`},null==a)"#;
 
         assert!(
             scan_jwt_tokens(js).is_empty(),
@@ -3097,6 +3260,15 @@ mod tests {
 
     #[test]
     fn switch_reports_missing_snapshot_as_fatal() {
+        // ★ 预检查现在会在「槽位缺失」时**补搬一次历史池**（issue #152）⇒ 必须隔离 home，
+        //   否则单测会读/写用户真实的 `~/.buddy-switch/trae`（测试纪律：无参全局路径函数）。
+        let home = std::env::temp_dir().join(format!(
+            "buddy-switch-switch-missing-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&home).expect("临时 home 应能创建");
+        let _guard = crate::modules::config::HomeOverrideGuard::set(&home);
+
         let options = SwitchOptions {
             user_id: "definitely_no_such_account_slot".into(),
             launch: true,
@@ -3172,12 +3344,14 @@ mod tests {
             uuid::Uuid::new_v4().simple()
         ));
         let client = home.join("TRAE SOLO CN");
-        std::fs::create_dir_all(client.join("User").join("globalStorage")).expect("建临时 userData");
+        std::fs::create_dir_all(client.join("User").join("globalStorage"))
+            .expect("建临时 userData");
         let storage = icube::storage_path_in_dir(&client);
         let guard = crate::modules::config::HomeOverrideGuard::set(&home);
 
         std::fs::write(&storage, r#"{"first":1}"#).expect("铺第一版");
-        let first = backup_storage_before_write(&client, TraeVariant::TraeWork).expect("第一次留档");
+        let first =
+            backup_storage_before_write(&client, TraeVariant::TraeWork).expect("第一次留档");
         std::fs::write(&storage, r#"{"second":2}"#).expect("铺第二版");
         let second =
             backup_storage_before_write(&client, TraeVariant::TraeWork).expect("第二次留档");
@@ -3231,6 +3405,62 @@ mod tests {
     ///
     /// 判据 `can_save` 是显式入参，因此**两支都能在本机被跑到**（不受本机装没装影响），
     /// 不会退化成「只有一支恒真的空护栏」。
+    /// ★ issue #152：快照躺在**历史池**里时，失败文案必须指出它**实际在哪**。
+    ///
+    /// 报告原文（macOS 国内版）：「说什么登陆态快照不存在，请先保存该账号的登陆态」——
+    /// 用户早就存过，只是存在合并前的池子里。文案不给位置，下一轮只能继续猜。
+    #[test]
+    fn missing_snapshot_reason_points_at_where_the_snapshot_actually_is() {
+        let home = std::env::temp_dir().join(format!(
+            "buddy-switch-missing-hint-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&home).expect("临时 home 应能创建");
+        let _guard = crate::modules::config::HomeOverrideGuard::set(&home);
+
+        // 历史池（合并前 CN TraeWork 的目录名）里有一份该账号的快照。
+        let legacy = paths::trae_dir().join("profiles").join("u-legacy");
+        std::fs::create_dir_all(&legacy).unwrap();
+
+        let message = missing_snapshot_reason(TraeVariant::default(), "u-legacy", true);
+        assert!(message.contains("u-legacy"), "{message}");
+        assert!(
+            message.contains(&legacy.display().to_string()),
+            "必须把快照**实际**的路径报出来（否则用户/维护者只能继续猜）: {message}"
+        );
+        assert!(
+            message.contains("另一条产品线") || message.contains("另一个区域"),
+            "要点明「可能是区域/产品线不对」这条最可能的原因: {message}"
+        );
+
+        // 真的没存过 ⇒ 不加尾巴（不许编一个位置出来）。
+        let none = missing_snapshot_reason(TraeVariant::default(), "u-never-saved", true);
+        assert!(!none.contains("实际在"), "{none}");
+    }
+
+    /// 快照位置查询必须**跨区域**看：国内版账号被建到国际版上是最常见的误配。
+    #[test]
+    fn snapshot_locations_look_across_regions() {
+        let home = std::env::temp_dir().join(format!(
+            "buddy-switch-missing-regions-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&home).expect("临时 home 应能创建");
+        let _guard = crate::modules::config::HomeOverrideGuard::set(&home);
+
+        let cn = paths::profiles_dir_for(TraeVariant::default()).join("u-both");
+        std::fs::create_dir_all(&cn).unwrap();
+        let global = paths::trae_dir()
+            .join("profiles_global_trae_merged")
+            .join("u-both");
+        std::fs::create_dir_all(&global).unwrap();
+
+        let found = snapshot_locations_for("u-both");
+        assert!(found.contains(&cn), "{found:?}");
+        assert!(found.contains(&global), "跨区域也要报出来: {found:?}");
+        assert!(snapshot_locations_for("u-nowhere").is_empty());
+    }
+
     #[test]
     fn missing_snapshot_reason_distinguishes_cannot_save_from_not_saved() {
         // 第二支会经 `platform::data_dir_missing_reason` → `detect_install_for` → `settings::load()`
@@ -3265,12 +3495,40 @@ mod tests {
         assert_ne!(saved_able, cannot_save);
     }
 
+    /// ★ issue #152 第二轮：**哪里都没有**该账号的快照时（报障截图的形态），文案必须
+    /// 交代「保存拷的是客户端此刻的登录态」+「查过哪些池」。
+    ///
+    /// 反例（改坏会红）：只留一句「请先保存该账号的登录态」—— 用户以为自己早就存过，
+    /// 只会对着同一个按钮反复点，而每次都得到同一句话。
+    #[test]
+    fn missing_snapshot_reason_explains_what_saving_actually_copies() {
+        let home = std::env::temp_dir().join(format!(
+            "buddy-switch-missing-prereq-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&home).expect("临时 home 应能创建");
+        let _guard = crate::modules::config::HomeOverrideGuard::set(&home);
+
+        let message = missing_snapshot_reason(TraeVariant::default(), "u-absent", true);
+        assert!(message.contains("u-absent"), "{message}");
+        assert!(
+            message.contains("客户端此刻"),
+            "必须点明「保存」拷的是客户端当前的登录态，不是账号库里的凭据: {message}"
+        );
+        assert!(
+            message.contains("已查过的池"),
+            "必须列出查过的池（否则用户以为工具没找对地方）: {message}"
+        );
+        // 空池上也**不许**编一个位置出来。
+        assert!(!message.contains("实际在"), "{message}");
+    }
+
     #[test]
     fn safe_slot_rejects_traversal_slots() {
         for bad in ["..", "../x", "a/b", "", "a\\b"] {
             assert!(!paths::safe_slot_name(bad), "{bad} 不应通过校验");
         }
-        assert_eq!(delete_slot("../x").unwrap_err().contains("非法"), true);
+        assert!(delete_slot("../x").unwrap_err().contains("非法"));
     }
 
     #[test]
@@ -3310,10 +3568,7 @@ mod tests {
 
         copy_entry(&source, &target, EntryKind::Dir).unwrap();
         assert!(target.join("new.txt").is_file());
-        assert!(
-            !target.join("stale.txt").exists(),
-            "旧文件必须被整体替换掉"
-        );
+        assert!(!target.join("stale.txt").exists(), "旧文件必须被整体替换掉");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -3386,6 +3641,7 @@ mod tests {
             refresh_token: None,
             added_at: None,
             updated_at: None,
+            remark: None,
         });
         account::save_accounts_for(variant, &file).unwrap();
 
@@ -3431,9 +3687,8 @@ mod tests {
     fn scan_tolerates_binary_noise_and_dedupes() {
         // 模拟 SQLite 二进制内容：JWT 前后有非 UTF-8 字节，且同一 token 出现两次。
         let token = "header111.payload222.signature333";
-        let text = format!(
-            "\u{fffd}\u{0}Cloud-IDE-JWT {token}\u{1}\u{2}again Cloud-IDE-JWT {token}",
-        );
+        let text =
+            format!("\u{fffd}\u{0}Cloud-IDE-JWT {token}\u{1}\u{2}again Cloud-IDE-JWT {token}",);
         let tokens = scan_jwt_tokens(&text);
         assert_eq!(tokens, vec![token.to_string()], "同 token 必须去重");
     }
@@ -3527,12 +3782,15 @@ mod tests {
         let (cn_uid, cn_header) =
             extract_local_jwt_for(TraeVariant::Trae).expect("Trae CN 必须能从 tc 信封导入");
 
-        assert!(work_uids.contains(&work_uid), "读到了别的目录的账号：{work_uid}");
+        assert!(
+            work_uids.contains(&work_uid),
+            "读到了别的目录的账号：{work_uid}"
+        );
         assert!(cn_uids.contains(&cn_uid), "读到了别的目录的账号：{cn_uid}");
         assert_ne!(work_uid, cn_uid, "两条产品线必须各自读到自己的目录");
 
         // 落库形态：**完整请求头值**（含 `Cloud-IDE-JWT ` 前缀），与 OAuth 路径一致。
-        for (label, header) in [("Trae Work", &work_header), ("Trae CN", &cn_header)] {
+        for (label, header) in [("TraeWork CN", &work_header), ("TraeCode CN", &cn_header)] {
             assert!(
                 header.starts_with("Cloud-IDE-JWT "),
                 "{label} 的落库值必须含前缀，实际：{header}"
@@ -3733,11 +3991,18 @@ mod tests {
         )
         .unwrap();
         let with_key = diagnose_missing_credential(&root, TraeVariant::TraeWork);
-        assert!(with_key.contains("登录态副本键"), "必须报告主来源：{with_key}");
+        assert!(
+            with_key.contains("登录态副本键"),
+            "必须报告主来源：{with_key}"
+        );
         assert!(with_key.contains("重新登录"), "必须给出下一步：{with_key}");
 
         // ② 信封键不存在 ⇒ 必须明说主来源缺失，而不是笼统的「没找到凭据」。
-        std::fs::write(global.join("storage.json"), r#"{"telemetry.machineId":"x"}"#).unwrap();
+        std::fs::write(
+            global.join("storage.json"),
+            r#"{"telemetry.machineId":"x"}"#,
+        )
+        .unwrap();
         let without_key = diagnose_missing_credential(&root, TraeVariant::TraeWork);
         assert!(
             without_key.contains("没有 iCube 登录态副本键"),
@@ -3809,7 +4074,10 @@ mod tests {
         let snapshot = paths::profiles_dir_for(variant).join(slot);
         std::fs::create_dir_all(snapshot.join("User").join("globalStorage")).unwrap();
         std::fs::write(
-            snapshot.join("User").join("globalStorage").join("storage.json"),
+            snapshot
+                .join("User")
+                .join("globalStorage")
+                .join("storage.json"),
             br#"{"aha":{"account":"A"}}"#,
         )
         .unwrap();
@@ -3912,7 +4180,10 @@ mod tests {
         let fixtures = icube::test_support::write_cloudide_only_user_data(&env.appdata(), exp);
         let variant = TraeVariant::TraeWork;
         let work_uids = fixture_uids(&fixtures, variant);
-        assert!(work_uids.len() >= 2, "需要至少两个候选目录才能构造「存错槽位」");
+        assert!(
+            work_uids.len() >= 2,
+            "需要至少两个候选目录才能构造「存错槽位」"
+        );
 
         // 前置：fixture 必须让两个选择器分叉 —— 否则本用例证明不了「同目录」这件事。
         let op_dir = platform::detect_data_dir_for(variant).expect("临时 APPDATA 下应能定位目录");
@@ -4106,8 +4377,8 @@ mod tests {
         );
 
         // 备份：必须真的拷出登录态，且内容归属 == 该目录的 userId。
-        let count = backup_to_slot_for(variant, "acct-r3")
-            .expect("只存在次位候选且已登录时，备份必须可用");
+        let count =
+            backup_to_slot_for(variant, "acct-r3").expect("只存在次位候选且已登录时，备份必须可用");
         assert!(count > 0, "必须真的复制到文件");
         let slot = paths::profiles_dir_for(variant).join("acct-r3");
         let (saved_uid, _) =
@@ -4407,7 +4678,10 @@ mod tests {
         std::fs::create_dir_all(polluted.join("User").join("globalStorage")).unwrap();
         std::fs::copy(
             src.join("storage.json"),
-            polluted.join("User").join("globalStorage").join("storage.json"),
+            polluted
+                .join("User")
+                .join("globalStorage")
+                .join("storage.json"),
         )
         .unwrap();
 
@@ -4530,15 +4804,14 @@ mod tests {
         // 前置：活跃的是**次位**、写侧（首个存在）是**首位** —— 两者不同目录。
         assert!(!grid.cells[0].active && grid.cells[1].active);
         assert_eq!(
-            snapshot_data_dir_for(variant).and_then(|dir| dir
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())),
+            snapshot_data_dir_for(variant)
+                .and_then(|dir| dir.file_name().map(|n| n.to_string_lossy().to_string())),
             Some(grid.cells[0].name.to_string()),
             "前置：写侧来源必须解析到首位"
         );
 
         let error = import_local_login_for(variant).expect_err("两处都没有登录态，必须报错");
-        assert!(error.contains("Trae Work"), "错误必须指向该变体: {error}");
+        assert!(error.contains("TraeWork CN"), "错误必须指向该变体: {error}");
         assert!(
             error.contains(&grid.cells[1].dir.display().to_string()),
             "诊断应显示**导入侧实际选定**的目录（活跃的那个）: {error}"
@@ -4591,11 +4864,7 @@ mod tests {
             chrono::Utc::now().timestamp() + 3600,
         );
         let device_id = "22929298067000007";
-        icube::test_support::attach_device_entry(
-            &env.appdata(),
-            grid.cells[0].name,
-            device_id,
-        );
+        icube::test_support::attach_device_entry(&env.appdata(), grid.cells[0].name, device_id);
 
         let login = import_local_login_for(variant).expect("首位有登录态，必须成功");
         assert_eq!(login.source_dir, grid.cells[0].dir);

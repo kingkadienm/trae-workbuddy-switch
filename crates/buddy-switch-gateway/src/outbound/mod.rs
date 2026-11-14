@@ -54,16 +54,47 @@ pub struct OutboundMeta {
     pub conversation_id: Option<String>,
 }
 
-/// 按参考实现顺序执行完整出站改写。
+/// 出站改写结果。
+pub struct PreparedOutbound {
+    /// 发往上游的请求体（已按管线改写过）。
+    pub body: String,
+    /// 本轮是否**改写过已知黑名单指纹**（`sanitize_fingerprints` 开启且命中）。
+    ///
+    /// 唯一用途是降级门的**成因判定**：同一个 400 + `11-128` 文案下有两种成因
+    /// （渠道校验 / 内容前缀拦截），只有后者能靠换提示词自救。区分手段就是这一位 ——
+    /// 「网关确实改写过请求体、却仍被判渠道校验」⇒ 成因在请求体，降级重试有意义
+    /// （issue #67 方案 B2）。
+    ///
+    /// ⚠️ 它**不是**「上游认定内容有问题」的证据：只说明网关动过请求体。
+    pub sanitized: bool,
+}
+
+/// 按参考实现顺序执行完整出站改写（只返回请求体）。
 ///
-/// `degraded` 表示当前处于内容拦截降级期（决定 `passthrough` 模式是否改用降级提示词）。
+/// 需要「本轮是否改写过指纹」这一诊断位时用 [`prepare_outbound_body_report`]。
 pub fn prepare_outbound_body(
     region: Region,
     source: &str,
     options: &OutboundOptions,
     meta: &OutboundMeta,
     degraded: bool,
+    model_efforts: Option<&std::collections::HashMap<String, String>>,
 ) -> String {
+    prepare_outbound_body_report(region, source, options, meta, degraded, model_efforts).body
+}
+
+/// 按参考实现顺序执行完整出站改写，并回报是否改写过指纹。
+///
+/// `degraded` 表示当前处于内容拦截降级期（决定 `passthrough` 模式是否改用降级提示词）。
+/// `model_efforts` 是用户按模型配置的默认思考档（可选），优先于静态表使用。
+pub fn prepare_outbound_body_report(
+    region: Region,
+    source: &str,
+    options: &OutboundOptions,
+    meta: &OutboundMeta,
+    degraded: bool,
+    model_efforts: Option<&std::collections::HashMap<String, String>>,
+) -> PreparedOutbound {
     // 步骤 0：提示词体系。
     let after_prompt = match options.prompt.active_text(degraded) {
         Some(text) => prompt::rewrite_system_prompt(source, text),
@@ -73,10 +104,16 @@ pub fn prepare_outbound_body(
     // 步骤 1：基础规范化（core 唯一实现）。
     let base = prepare_chat_body(&after_prompt);
     let Ok(mut body) = serde_json::from_str::<Value>(&base) else {
-        return base;
+        return PreparedOutbound {
+            body: base,
+            sanitized: false,
+        };
     };
     let Some(obj) = body.as_object_mut() else {
-        return base;
+        return PreparedOutbound {
+            body: base,
+            sanitized: false,
+        };
     };
 
     // 步骤 2：usage 上报（上游按流式返回，非流式聚合依赖末帧 usage）。
@@ -90,23 +127,59 @@ pub fn prepare_outbound_body(
     // 步骤 3：孤儿工具调用。
     cleanup_orphan_tool_calls(obj);
 
-    // 步骤 4：DeepSeek 思维链（仅 DeepSeek 系模型）。
+    // 步骤 4：思维链 / 默认思考档。
     let model = obj
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
     if is_deepseek_model(&model) {
-        let default_effort = lookup_default_effort(region, &model);
+        // ★ 优先使用用户配置，再回退到静态表
+        let default_effort = lookup_default_effort_with_config(region, &model, model_efforts);
         inject_thinking(obj, &default_effort);
         normalize_effort_in_place(region, &model, obj);
         backfill_reasoning_content(obj);
+    } else {
+        /* 非 DeepSeek 系模型：**只**补用户显式配置的默认档。
+        `thinking` 注入与 `reasoning_content` 回填是 DeepSeek 通道专有参，
+        对其它模型发过去会被判非法参数，故这里不碰它们。
+
+        但 `reasoning_effort` 是通用参数：上游目录里 `glm-5.3` / `hy3` /
+        `gpt-6-astra` 等**都声明了 `reasoning.efforts`**，说明这些模型接受它。
+        所以只在「静态表确认该模型声明了档位」时才写 —— 这是一张保守白名单，
+        避免把参数发给不认识它的模型换个 400。 */
+        if let Some(configured) = model_efforts
+            .and_then(|map| map.get(&model))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            let already_set =
+                obj.contains_key("reasoning_effort") || obj.contains_key("reasoningEffort");
+            if !already_set {
+                if let Some(spec) = effort::static_effort_cap(region).get(model.trim()) {
+                    if !spec.efforts.is_empty() {
+                        // 配置值必须是该模型支持的档；不支持则按 `adjust_effort`
+                        // 落到「不高于它的最高支持档」——与 deepseek 路径同一条规则。
+                        let chosen = if spec.efforts.iter().any(|item| item == &configured) {
+                            Some(configured.clone())
+                        } else {
+                            effort::adjust_effort(region, &model, &configured)
+                                .map(|adjustment| adjustment.effort)
+                        };
+                        if let Some(value) = chosen {
+                            obj.insert("reasoning_effort".to_string(), json!(value));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // 步骤 5：指纹脱敏。
+    let mut sanitized = false;
     if options.sanitize_fingerprints {
         if let Some(Value::Array(messages)) = obj.get_mut("messages") {
-            sanitize::sanitize_messages(messages);
+            sanitized = sanitize::sanitize_messages(messages);
         }
     }
 
@@ -118,7 +191,29 @@ pub fn prepare_outbound_body(
         ensure_console_system(obj);
     }
 
-    serde_json::to_string(&body).unwrap_or(base)
+    PreparedOutbound {
+        body: serde_json::to_string(&body).unwrap_or(base),
+        sanitized,
+    }
+}
+
+/// 按模型查找默认思考档：优先用户配置，再回退到静态表。
+fn lookup_default_effort_with_config(
+    region: Region,
+    model: &str,
+    model_efforts: Option<&std::collections::HashMap<String, String>>,
+) -> String {
+    // ★ 优先使用用户配置（精确匹配模型名）
+    if let Some(configs) = model_efforts {
+        if let Some(effort) = configs.get(model.trim()) {
+            if !effort.is_empty() {
+                return effort.clone();
+            }
+        }
+    }
+
+    // 用户未配置 → 回退到静态表
+    lookup_default_effort(region, model.trim())
 }
 
 /// 按模型支持档位归一 `reasoning_effort`（原地改写）。
@@ -126,7 +221,11 @@ pub fn prepare_outbound_body(
 /// 字段探测顺序 `reasoning_effort` → `reasoningEffort`；两者都无、值非字符串、
 /// 或值不是已知档位 → 不改写。模型名精确匹配（非前缀）。
 fn normalize_effort_in_place(region: Region, model: &str, obj: &mut Map<String, Value>) {
-    let key = if obj.get("reasoning_effort").and_then(Value::as_str).is_some() {
+    let key = if obj
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .is_some()
+    {
         "reasoning_effort"
     } else if obj.get("reasoningEffort").and_then(Value::as_str).is_some() {
         "reasoningEffort"
@@ -287,17 +386,45 @@ fn inject_prompt_cache_key(
     );
 }
 
+/// Rebind a gateway-generated placeholder cache key after the relay has selected
+/// the account. Client-supplied cache keys are preserved verbatim.
+pub fn rebind_prompt_cache_key(source: &str, uid: &str, conversation_id: Option<&str>) -> String {
+    let Ok(mut body) = serde_json::from_str::<Value>(source) else {
+        return source.to_string();
+    };
+    let Some(object) = body.as_object_mut() else {
+        return source.to_string();
+    };
+    let generated_without_uid = object
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .is_some_and(|key| key.starts_with("wb2a--"));
+    if generated_without_uid {
+        object.remove("prompt_cache_key");
+    }
+    inject_prompt_cache_key(object, uid, conversation_id);
+    serde_json::to_string(&body).unwrap_or_else(|_| source.to_string())
+}
+
 /// 派生缓存键：`wb2a-<uid8>-<hash16>`。空 uid 的 uid8 段为 `-`。
 pub fn prompt_cache_key(uid: &str, conversation_id: &str) -> String {
     let uid8: String = uid.chars().take(8).collect();
-    let uid8 = if uid8.is_empty() { "-".to_string() } else { uid8 };
+    let uid8 = if uid8.is_empty() {
+        "-".to_string()
+    } else {
+        uid8
+    };
 
     let mut hasher = Sha256::new();
     hasher.update(uid.as_bytes());
     hasher.update(b"|");
     hasher.update(conversation_id.as_bytes());
     let digest = hasher.finalize();
-    let hex: String = digest.iter().take(8).map(|byte| format!("{byte:02x}")).collect();
+    let hex: String = digest
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
 
     format!("wb2a-{uid8}-{hex}")
 }
@@ -341,12 +468,21 @@ mod tests {
     }
 
     fn cn(source: &str) -> Value {
+        cn_with_efforts(source, None)
+    }
+
+    /// 带 per-model 配置的 CN 出站改写（`model_efforts` 为用户配置）。
+    fn cn_with_efforts(
+        source: &str,
+        model_efforts: Option<&std::collections::HashMap<String, String>>,
+    ) -> Value {
         let out = prepare_outbound_body(
             Region::Cn,
             source,
             &options(false, PromptSettings::default()),
             &meta(),
             false,
+            model_efforts,
         );
         serde_json::from_str(&out).expect("产出必须是合法 JSON")
     }
@@ -360,9 +496,8 @@ mod tests {
 
     #[test]
     fn existing_stream_options_are_not_overwritten() {
-        let value = cn(
-            r#"{"model":"glm-5.2","stream_options":{"include_usage":false},"messages":[]}"#,
-        );
+        let value =
+            cn(r#"{"model":"glm-5.2","stream_options":{"include_usage":false},"messages":[]}"#);
         assert_eq!(
             value["stream_options"]["include_usage"],
             json!(false),
@@ -372,12 +507,10 @@ mod tests {
 
     #[test]
     fn deepseek_gets_thinking_effort_and_reasoning_backfill() {
-        let value = cn(
-            r#"{"model":"deepseek-v4.1-flash","messages":[
+        let value = cn(r#"{"model":"deepseek-v4.1-flash","messages":[
                 {"role":"assistant","reasoning":"think","content":"a"},
                 {"role":"user","content":"b"}
-            ]}"#,
-        );
+            ]}"#);
         assert_eq!(value["thinking"], json!({"type": "enabled"}));
         assert_eq!(value["reasoning_effort"], json!("high"));
         assert_eq!(value["messages"][0]["reasoning_content"], json!("think"));
@@ -386,16 +519,76 @@ mod tests {
     #[test]
     fn non_deepseek_model_never_gets_thinking_fields() {
         let value = cn(r#"{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}"#);
-        assert!(value.get("thinking").is_none(), "非 DeepSeek 不得注入 thinking");
+        assert!(
+            value.get("thinking").is_none(),
+            "非 DeepSeek 不得注入 thinking"
+        );
         assert!(value.get("reasoning_effort").is_none());
+    }
+
+    /// 用户为**非 DeepSeek** 模型配了默认档 ⇒ 必须补上 `reasoning_effort`，
+    /// 但**不得**连带注入 `thinking` / `reasoning_content`（那是 DeepSeek 专有参）。
+    ///
+    /// 阳性对照：把注入条件改回「只认 deepseek」⇒ 第一条断言必红。
+    #[test]
+    fn configured_effort_applies_to_non_deepseek_models_without_thinking_fields() {
+        let mut configure = std::collections::HashMap::new();
+        configure.insert("glm-5.3".to_string(), "low".to_string());
+        let value = cn_with_efforts(
+            r#"{"model":"glm-5.3","messages":[{"role":"user","content":"hi"}]}"#,
+            Some(&configure),
+        );
+        assert_eq!(
+            value["reasoning_effort"],
+            json!("low"),
+            "glm-5.3 声明了 low/high/max，配置的档位必须真的发出去: {value}"
+        );
+        assert!(
+            value.get("thinking").is_none(),
+            "非 DeepSeek 仍不得注入 thinking: {value}"
+        );
+        assert!(
+            value["messages"][0].get("reasoning_content").is_none(),
+            "非 DeepSeek 仍不得回填 reasoning_content: {value}"
+        );
+    }
+
+    /// 客户端自己传了 `reasoning_effort` ⇒ 用户配置**不得覆盖**它（配置是默认值，不是强制值）。
+    #[test]
+    fn client_supplied_effort_wins_over_configured_default() {
+        let mut configure = std::collections::HashMap::new();
+        configure.insert("glm-5.3".to_string(), "low".to_string());
+        let value = cn_with_efforts(
+            r#"{"model":"glm-5.3","reasoning_effort":"max","messages":[]}"#,
+            Some(&configure),
+        );
+        assert_eq!(
+            value["reasoning_effort"],
+            json!("max"),
+            "客户端显式传的档位优先级高于网关默认档: {value}"
+        );
+    }
+
+    /// 静态表里没声明档位的模型（`kimi-k3` 的 efforts 为空）⇒ 不发这个参数，
+    /// 免得把一个它不认识的字段换回一个 400。
+    #[test]
+    fn configured_effort_is_dropped_when_model_declares_no_levels() {
+        let mut configure = std::collections::HashMap::new();
+        configure.insert("kimi-k3".to_string(), "high".to_string());
+        let value = cn_with_efforts(
+            r#"{"model":"kimi-k3","messages":[{"role":"user","content":"hi"}]}"#,
+            Some(&configure),
+        );
+        assert!(
+            value.get("reasoning_effort").is_none(),
+            "静态表标该模型无档位 ⇒ 不得注入: {value}"
+        );
     }
 
     #[test]
     fn effort_is_downgraded_for_deepseek_pro() {
         // deepseek-v4-pro: low/high/xhigh；请求 max → xhigh
-        let value = cn(
-            r#"{"model":"deepseek-v4-pro","reasoning_effort":"max","messages":[]}"#,
-        );
+        let value = cn(r#"{"model":"deepseek-v4-pro","reasoning_effort":"max","messages":[]}"#);
         assert_eq!(value["reasoning_effort"], json!("xhigh"));
     }
 
@@ -407,6 +600,7 @@ mod tests {
             &options(false, PromptSettings::default()),
             &meta(),
             false,
+            None,
         );
         let value: Value = serde_json::from_str(&out).unwrap();
         // Global 表该模型仅 high → 请求 low 被 floored 到 high
@@ -429,6 +623,7 @@ mod tests {
             &options(false, PromptSettings::default()),
             &meta(),
             false,
+            None,
         );
         let global_value: Value = serde_json::from_str(&out).unwrap();
         let messages = global_value["messages"].as_array().unwrap();
@@ -446,6 +641,7 @@ mod tests {
             &options(false, PromptSettings::default()),
             &meta(),
             false,
+            None,
         );
         let value: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(value["messages"].as_array().unwrap().len(), 1);
@@ -463,21 +659,89 @@ mod tests {
             &options(true, PromptSettings::default()),
             &meta(),
             false,
+            None,
         );
         let value: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(value["messages"][0]["content"], json!("code 11-128"));
     }
 
+    /// issue #67：`sanitize_fingerprints` 开启时，system 里的 Harness 身份句必须在
+    /// **出站请求体**里被改写（上游对该句偏移 0 命中即 400 / 11-128）。
+    /// 断言的是 `prepare_outbound_body` 的返回值，即真正发往上游的字节。
+    #[test]
+    fn sanitize_rewrites_harness_identity_in_system_message() {
+        let source = r#"{"model":"glm-5.2","messages":[{"role":"system","content":"You are an AI agent powered by DeepSeek Harness."},{"role":"user","content":"hi"}]}"#;
+        let out = prepare_outbound_body(
+            Region::Cn,
+            source,
+            &options(true, PromptSettings::default()),
+            &meta(),
+            false,
+            None,
+        );
+        let value: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            value["messages"][0]["content"],
+            json!("You are an AI agent powered by the DeepSeek Harness."),
+            "出站请求体里不得残留被上游拦截的身份句: {out}"
+        );
+    }
+
+    /// issue #67 方案 B2：降级门要的是「本轮**确实**改写过指纹」这一事实，
+    /// 不是「上游说内容有问题」。三条断言分别对应：
+    /// 命中即 true / 干净即 false / 脱敏关闭时即使命中也是 false（否则降级门拿假证据触发）。
+    #[test]
+    fn report_flags_sanitized_only_when_a_fingerprint_was_rewritten() {
+        let dirty = r#"{"model":"glm-5.2","messages":[{"role":"system","content":"You are an AI agent powered by DeepSeek Harness."}]}"#;
+        let clean = r#"{"model":"glm-5.2","messages":[{"role":"system","content":"You are a helpful engineer."}]}"#;
+
+        let reported = prepare_outbound_body_report(
+            Region::Cn,
+            dirty,
+            &options(true, PromptSettings::default()),
+            &meta(),
+            false,
+            None,
+        );
+        assert!(
+            reported.sanitized,
+            "命中指纹必须回报 true: {}",
+            reported.body
+        );
+        assert!(!reported
+            .body
+            .to_lowercase()
+            .contains("powered by deepseek harness"));
+
+        let reported = prepare_outbound_body_report(
+            Region::Cn,
+            clean,
+            &options(true, PromptSettings::default()),
+            &meta(),
+            false,
+            None,
+        );
+        assert!(!reported.sanitized, "干净请求体不得回报 true");
+
+        let reported = prepare_outbound_body_report(
+            Region::Cn,
+            dirty,
+            &options(false, PromptSettings::default()),
+            &meta(),
+            false,
+            None,
+        );
+        assert!(!reported.sanitized, "脱敏关闭时不得回报 true");
+    }
+
     #[test]
     fn orphan_tool_calls_are_cleaned() {
-        let value = cn(
-            r#"{"model":"glm-5.2","messages":[
+        let value = cn(r#"{"model":"glm-5.2","messages":[
                 {"role":"assistant","content":null,"tool_calls":[{"id":"ok","type":"function","function":{"name":"a","arguments":"{}"}}]},
                 {"role":"tool","tool_call_id":"ok","content":"result"},
                 {"role":"assistant","content":null,"tool_calls":[{"id":"orphan","type":"function","function":{"name":"b","arguments":"{}"}}]},
                 {"role":"tool","tool_call_id":"ghost","content":"dangling"}
-            ]}"#,
-        );
+            ]}"#);
         let messages = value["messages"].as_array().expect("数组");
         assert_eq!(
             messages.len(),
@@ -488,7 +752,11 @@ mod tests {
             messages[0].get("tool_calls").is_some(),
             "配对完整的 tool_calls 必须保留"
         );
-        assert_eq!(messages[1]["role"], json!("tool"), "配对成功的 tool 消息保留");
+        assert_eq!(
+            messages[1]["role"],
+            json!("tool"),
+            "配对成功的 tool 消息保留"
+        );
         assert_eq!(messages[2]["role"], json!("assistant"));
         assert!(
             messages[2].get("tool_calls").is_none(),
@@ -514,16 +782,14 @@ mod tests {
     /// 上游判 `tool_call_sequence_broken`（400）。
     #[test]
     fn partially_orphan_batch_does_not_leave_dangling_tool_result() {
-        let value = cn(
-            r#"{"model":"glm-5.2","messages":[
+        let value = cn(r#"{"model":"glm-5.2","messages":[
                 {"role":"user","content":"go"},
                 {"role":"assistant","content":null,"tool_calls":[
                     {"id":"a","type":"function","function":{"name":"x","arguments":"{}"}},
                     {"id":"b","type":"function","function":{"name":"y","arguments":"{}"}}
                 ]},
                 {"role":"tool","tool_call_id":"a","content":"result"}
-            ]}"#,
-        );
+            ]}"#);
         let messages = value["messages"].as_array().expect("数组");
         assert_eq!(
             messages.len(),
@@ -544,9 +810,8 @@ mod tests {
 
     #[test]
     fn prompt_cache_key_prefers_body_metadata() {
-        let value = cn(
-            r#"{"model":"glm-5.2","metadata":{"conversation_id":"body-conv"},"messages":[]}"#,
-        );
+        let value =
+            cn(r#"{"model":"glm-5.2","metadata":{"conversation_id":"body-conv"},"messages":[]}"#);
         let key = value["prompt_cache_key"].as_str().expect("字符串");
         assert!(key.starts_with("wb2a-u-123456-"), "uid 只取前 8 位: {key}");
         assert_eq!(key, prompt_cache_key("u-1234567890", "body-conv"));
@@ -566,6 +831,7 @@ mod tests {
             &options(false, PromptSettings::default()),
             &OutboundMeta::default(),
             false,
+            None,
         );
         let bare: Value = serde_json::from_str(&out).unwrap();
         assert!(
@@ -597,8 +863,7 @@ mod tests {
 
     #[test]
     fn passthrough_keeps_client_system_unless_degraded() {
-        let source =
-            r#"{"model":"glm-5.2","messages":[{"role":"system","content":"client system"},{"role":"user","content":"hi"}]}"#;
+        let source = r#"{"model":"glm-5.2","messages":[{"role":"system","content":"client system"},{"role":"user","content":"hi"}]}"#;
         let kept = cn_with(source, options(false, PromptSettings::default()), false);
         assert_eq!(
             kept["messages"][0]["content"],
@@ -615,7 +880,7 @@ mod tests {
     }
 
     fn cn_with(source: &str, options: OutboundOptions, degraded: bool) -> Value {
-        let out = prepare_outbound_body(Region::Cn, source, &options, &meta(), degraded);
+        let out = prepare_outbound_body(Region::Cn, source, &options, &meta(), degraded, None);
         serde_json::from_str(&out).expect("产出必须是合法 JSON")
     }
 
@@ -627,6 +892,7 @@ mod tests {
             &options(false, PromptSettings::default()),
             &meta(),
             false,
+            None,
         );
         assert_eq!(out, "not json");
     }
@@ -640,6 +906,7 @@ mod tests {
             &options(true, PromptSettings::default()),
             &meta(),
             false,
+            None,
         );
         let twice = prepare_outbound_body(
             Region::Cn,
@@ -647,6 +914,7 @@ mod tests {
             &options(true, PromptSettings::default()),
             &meta(),
             false,
+            None,
         );
         assert_eq!(once, twice, "管线重复执行必须稳定");
     }
@@ -656,6 +924,9 @@ mod tests {
         let key = prompt_cache_key("", "c");
         assert!(key.starts_with("wb2a--"), "空 uid 的 uid8 段应为 -: {key}");
         let key = prompt_cache_key("abcdefghij", "c");
-        assert!(key.starts_with("wb2a-abcdefgh-"), "超长 uid 截断到 8: {key}");
+        assert!(
+            key.starts_with("wb2a-abcdefgh-"),
+            "超长 uid 截断到 8: {key}"
+        );
     }
 }

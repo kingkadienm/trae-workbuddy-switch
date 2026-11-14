@@ -10,9 +10,13 @@ use crate::modules::config::{home_dir, official_usage_cache_file, store_dir};
 use crate::modules::update::APP_VERSION;
 
 /// 目标版本。CN 为既有默认，Global 为国际版。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Region {
+    /// 既有默认：CN 是历史行为，不能改（改了等于静默把老用户切到国际版）。
+    #[default]
     Cn,
     Global,
 }
@@ -41,12 +45,6 @@ impl Region {
     }
 }
 
-impl Default for Region {
-    fn default() -> Self {
-        Region::Cn
-    }
-}
-
 /// 统计查询范围：单版（cn / global）或合并（all）。
 ///
 /// 与「实体归属」的 [`Region`] **正交**：`Region` 描述一条账号/凭据/目录真正属于哪一版，
@@ -54,9 +52,13 @@ impl Default for Region {
 /// 允许出现 `All`。刻意不往 `Region` 里加 `All`，因为那会污染所有
 /// `match region { Cn | Global }` 的调用点，且 `region_spec(All)` / `accounts_file_for(All)`
 /// 等语义无定义。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum RegionFilter {
+    /// 与 `Region` 同一条判据：缺省一律 CN（统计范围不能被「合并」这种新值悄悄改掉）。
+    #[default]
     Cn,
     Global,
     All,
@@ -116,19 +118,15 @@ impl From<Region> for RegionFilter {
     }
 }
 
-impl Default for RegionFilter {
-    fn default() -> Self {
-        RegionFilter::Cn
-    }
-}
-
 /// 解析查询参数中的统计范围；缺省 / 空 / 未知一律回落 `Cn`（严格保持既有默认行为）。
 ///
 /// 与 `buddy-switch-server` / `src-tauri` 里既有的 `parse_region` **绑定规则一致**：
 /// `"ai"`/`"GLOBAL"` 绑定 `Global`，`""`/`"xx"` 绑定 `Cn`，并额外支持
 /// `"all" | "*" | "合并" | "全部"`。该函数放在 core，供 server 与 tauri 复用。
 pub fn parse_region_filter(value: Option<&str>) -> RegionFilter {
-    value.and_then(RegionFilter::parse).unwrap_or(RegionFilter::Cn)
+    value
+        .and_then(RegionFilter::parse)
+        .unwrap_or(RegionFilter::Cn)
 }
 
 /// 目录请求 UA 形态：CN 用 CLI 形态，Global 用 App 形态（`WorkBuddyAI/<v>`）。
@@ -155,6 +153,8 @@ pub struct RegionSpec {
     pub auth_env: &'static str,
     /// 账号库文件名：accounts.json | accounts.global.json。
     pub accounts_filename: &'static str,
+    /// 回收站文件名：accounts.trash.json | accounts.trash.global.json（P5 §2.7 软删除的落点）。
+    pub accounts_trash_filename: &'static str,
     /// chat 上游基址。
     pub chat_base: &'static str,
     /// billing / 官网基址。
@@ -179,6 +179,7 @@ const CN_SPEC: RegionSpec = RegionSpec {
     auth_filename: "workbuddy-desktop.info",
     auth_env: "WORKBUDDY_AUTH_FILE",
     accounts_filename: "accounts.json",
+    accounts_trash_filename: "accounts.trash.json",
     chat_base: "https://copilot.tencent.com",
     billing_base: "https://www.codebuddy.cn",
     models_path: "/console/enterprises/personal/models",
@@ -196,6 +197,7 @@ const GLOBAL_SPEC: RegionSpec = RegionSpec {
     auth_filename: "workbuddy-desktop-ai.info",
     auth_env: "WORKBUDDY_AI_AUTH_FILE",
     accounts_filename: "accounts.global.json",
+    accounts_trash_filename: "accounts.trash.global.json",
     chat_base: "https://www.workbuddy.ai",
     billing_base: "https://www.workbuddy.ai",
     models_path: "/v3/config",
@@ -244,6 +246,14 @@ pub fn accounts_file_for(region: Region) -> PathBuf {
     store_dir().join(region_spec(region).accounts_filename)
 }
 
+/// 账号回收站文件路径：`accounts.trash.json`（CN）/ `accounts.trash.global.json`（Global）。
+///
+/// P5 §2.7 软删除的落点。与 [`accounts_file_for`] 同款：**枚举 → 查表**派生，
+/// raw scope 字符串**从不**进 `PathBuf`（§前置 4 的路径派生唯一规则）。
+pub fn accounts_trash_file_for(region: Region) -> PathBuf {
+    store_dir().join(region_spec(region).accounts_trash_filename)
+}
+
 /// 网关配置文件路径：`~/.buddy-switch/gateway_config.json`。
 pub fn gateway_config_file() -> PathBuf {
     store_dir().join("gateway_config.json")
@@ -252,6 +262,14 @@ pub fn gateway_config_file() -> PathBuf {
 /// 网关 API Key 文件路径：`~/.buddy-switch/gateway_keys.json`。
 pub fn gateway_keys_file() -> PathBuf {
     store_dir().join("gateway_keys.json")
+}
+
+/// 按密钥的用量账本（issue #76）：`~/.buddy-switch/gateway_key_usage.json`。
+///
+/// 与 Key 台账**分文件**：台账低频写（创建 / 吊销 / 改策略），用量每请求写 ——
+/// 合并在一个文件里既放大写放大，也让「改策略」与「记一笔」在锁上打架。
+pub fn gateway_key_usage_file() -> PathBuf {
+    store_dir().join("gateway_key_usage.json")
 }
 
 /// 目录缓存文件路径：`~/.buddy-switch/gateway_models.<region>.json`。
@@ -275,6 +293,21 @@ pub fn official_usage_cache_file_for(region: Region) -> PathBuf {
     match region {
         Region::Cn => official_usage_cache_file(),
         Region::Global => store_dir().join("official_usage_cache.global.json"),
+    }
+}
+
+/// 每日 Token 记录（账号 × 来源 × 本地日）的 region 化落盘文件。
+///
+/// CN 用 `token_daily.json`，Global 用 `token_daily.global.json`，与
+/// [`official_usage_cache_file_for`] 同一命名习惯。
+///
+/// **为什么必须分家**：记录的归属键是上游账号 `uid`，而两版的账号库（及客户端
+/// 数据目录）各自独立；共用一个文件时，切换视图会让一版的当日用量被另一版读取或
+/// 覆盖（同 [`official_usage_cache_file_for`] 踩过的坑）。
+pub fn token_daily_file_for(region: Region) -> PathBuf {
+    match region {
+        Region::Cn => store_dir().join("token_daily.json"),
+        Region::Global => store_dir().join("token_daily.global.json"),
     }
 }
 
@@ -360,6 +393,7 @@ mod tests {
         assert_eq!(spec.chat_base, "https://copilot.tencent.com");
         assert_eq!(spec.auth_filename, "workbuddy-desktop.info");
         assert_eq!(spec.accounts_filename, "accounts.json");
+        assert_eq!(spec.accounts_trash_filename, "accounts.trash.json");
         assert_eq!(spec.models_path, "/console/enterprises/personal/models");
         assert_eq!(spec.catalog_ua, CatalogUa::Cli);
         assert_eq!(spec.fallback_app_version, APP_VERSION);
@@ -372,6 +406,7 @@ mod tests {
         assert_eq!(spec.chat_base, "https://www.workbuddy.ai");
         assert_eq!(spec.auth_filename, "workbuddy-desktop-ai.info");
         assert_eq!(spec.accounts_filename, "accounts.global.json");
+        assert_eq!(spec.accounts_trash_filename, "accounts.trash.global.json");
         assert_eq!(spec.models_path, "/v3/config");
         assert_eq!(spec.catalog_ua, CatalogUa::App);
         assert_eq!(spec.fallback_app_version, APP_VERSION);
@@ -393,7 +428,10 @@ mod tests {
         assert_eq!(RegionFilter::parse("global"), Some(RegionFilter::Global));
         assert_eq!(RegionFilter::parse("ai"), Some(RegionFilter::Global));
         assert_eq!(RegionFilter::parse("GLOBAL"), Some(RegionFilter::Global));
-        assert_eq!(RegionFilter::parse(" workbuddy-ai "), Some(RegionFilter::Global));
+        assert_eq!(
+            RegionFilter::parse(" workbuddy-ai "),
+            Some(RegionFilter::Global)
+        );
         assert_eq!(RegionFilter::parse("all"), Some(RegionFilter::All));
         assert_eq!(RegionFilter::parse("ALL"), Some(RegionFilter::All));
         assert_eq!(RegionFilter::parse("*"), Some(RegionFilter::All));
@@ -423,7 +461,10 @@ mod tests {
 
         assert_eq!(RegionFilter::Cn.regions(), vec![Region::Cn]);
         assert_eq!(RegionFilter::Global.regions(), vec![Region::Global]);
-        assert_eq!(RegionFilter::All.regions(), vec![Region::Cn, Region::Global]);
+        assert_eq!(
+            RegionFilter::All.regions(),
+            vec![Region::Cn, Region::Global]
+        );
 
         assert_eq!(RegionFilter::from(Region::Cn), RegionFilter::Cn);
         assert_eq!(RegionFilter::from(Region::Global), RegionFilter::Global);
@@ -436,13 +477,35 @@ mod tests {
         assert!(RegionFilter::All.is_all());
     }
 
+    /// ★ 回收站文件路径必须**按 region 分家**且与 live 账号库**不同文件**（P5 §2.7）。
+    ///
+    /// 可证伪：把 `accounts_trash_file_for` 改成写死 CN 的文件名 ⇒ 两版回收站互相覆盖，
+    /// 第二条断言变红（用户「删了 A 库的账号，却在 B 库的回收站里看到」）。
+    #[test]
+    fn accounts_trash_file_for_is_region_scoped_and_distinct_from_live() {
+        let cn = accounts_trash_file_for(Region::Cn);
+        let global = accounts_trash_file_for(Region::Global);
+
+        assert_eq!(
+            cn.file_name().and_then(|n| n.to_str()),
+            Some("accounts.trash.json"),
+            "CN 回收站文件名"
+        );
+        assert_eq!(
+            global.file_name().and_then(|n| n.to_str()),
+            Some("accounts.trash.global.json"),
+            "Global 回收站文件名"
+        );
+        assert_ne!(cn, global, "两版回收站不得指向同一文件");
+        // 与 live 账号库必须是**不同文件**，否则软删除会覆盖 live。
+        assert_ne!(cn, accounts_file_for(Region::Cn));
+        assert_ne!(global, accounts_file_for(Region::Global));
+    }
+
     #[test]
     fn region_mismatch_message_names_file_and_env() {
-        let mismatch = RegionMismatch::new(
-            "www.workbuddy.ai".to_string(),
-            Region::Global,
-            Region::Cn,
-        );
+        let mismatch =
+            RegionMismatch::new("www.workbuddy.ai".to_string(), Region::Global, Region::Cn);
         let message = mismatch.message();
         assert!(message.contains("www.workbuddy.ai"), "{message}");
         assert!(message.contains("WORKBUDDY_AUTH_FILE"), "{message}");

@@ -1,0 +1,899 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>密钥访问权限管理 · 界面设计方案 v2（issue #76）</title>
+<!--
+  设计稿（非生产代码）。issue #76「增加密钥访问权限管理功能」：
+    ① 根据密钥设置 token 可用量
+    ② 可限制密钥可访问的指定帐号列表
+
+  ★ v2 相对 v1 的四处升级（都是**真实缺口**，不是审美偏好）：
+    1. 计量单位不止 token —— Trae 网关代理的**业务请求**（/v2/billing/... 、/activity/...）
+       没有 token，只有请求数；统一网关的一把 key 还能同时访问 LLM 与业务命名空间。
+    2. 「不限/累计/每日」三档 → **上限值 + 重置周期**两个正交控件（自然月对齐成本归属）。
+    3. 账号范围支持引用**账号分组**（三条产品线都已有分组）—— 组内换号，key 策略不用改。
+    4. 抽屉顶部给「这把 key 的用量排名」—— 配额不能只配不看（账本当前没有 key 维度）。
+
+  约定：
+  - 令牌取自 Rhea 主题（与 `docs/prototype/demo.css`、`src/index.css` 同一套）。
+  - 形态与真实应用同构：密钥分区 = 「工具条 + 裸表 + 说明段」，编辑用**右侧抽屉**。
+  - 三条产品线（WB / Trae / Qoder）与统一网关**共用同一套**构件与文案，只换归属列。
+-->
+<style>
+:root{
+  --bg: oklch(0.208 0.042 265.755);
+  --card: oklch(0.279 0.041 260.031);
+  --card2: oklch(0.245 0.041 262);
+  --fg: oklch(0.929 0.013 255.508);
+  --muted: oklch(0.704 0.04 256.788);
+  --faint: oklch(0.58 0.03 258);
+  --border: oklch(1 0 0 / 10%);
+  --border-strong: oklch(1 0 0 / 18%);
+  --primary: oklch(0.696 0.17 162.48);
+  --primary-soft: oklch(0.696 0.17 162.48 / .16);
+  --warning: oklch(0.79 0.14 78);
+  --danger: oklch(0.704 0.191 22.216);
+  --success: oklch(0.72 0.15 155);
+  --r: 12px;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--fg);
+  font-family:ui-sans-serif,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  font-size:13.5px;line-height:1.55;-webkit-font-smoothing:antialiased}
+body{padding:26px 28px 60px}
+.app{max-width:1180px;margin:0 auto}
+h1{margin:0;font-size:21px;font-weight:600;letter-spacing:-.01em}
+h2{margin:0;font-size:14px;font-weight:600}
+p{margin:0}
+svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:1.8;flex:none}
+
+/* 位置指示条：让人一眼看出「这块 UI 挂在哪儿」——设计稿评审最常问的第一个问题。 */
+.where{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:14px;
+  padding:8px 12px;border:1px solid var(--border);border-radius:10px;background:var(--card2);
+  font-size:12px;color:var(--muted)}
+.where .crumb{padding:2px 8px;border-radius:6px;background:oklch(1 0 0 / 5%);color:var(--muted)}
+.where .crumb.on{background:var(--primary-soft);color:oklch(0.88 0.10 163)}
+.where .sep{color:var(--faint)}
+.where .tip{margin-left:auto;color:var(--faint);font-size:11.5px}
+.where .alt{width:100%;color:var(--faint);font-size:11.5px;line-height:1.6}
+
+.page-head{display:flex;align-items:flex-start;gap:16px;margin-bottom:18px}
+.page-head p{margin:5px 0 0;color:var(--muted);font-size:12.5px;max-width:790px}
+.tag{display:inline-flex;align-items:center;height:20px;padding:0 7px;border-radius:6px;
+  background:var(--primary-soft);color:oklch(0.88 0.10 163);font-size:11px;font-weight:500}
+
+.btn{display:inline-flex;align-items:center;gap:6px;height:32px;padding:0 12px;border-radius:8px;
+  border:1px solid var(--border);background:var(--card2);color:var(--fg);font-size:12.5px;cursor:pointer;
+  font-family:inherit;white-space:nowrap}
+.btn:hover{border-color:var(--border-strong)}
+.btn.primary{background:var(--primary);border-color:transparent;color:oklch(0.16 0.03 162);font-weight:500}
+.btn.ghost{background:transparent;border-color:transparent;color:var(--muted)}
+.btn.ghost:hover{background:oklch(1 0 0 / 5%);color:var(--fg)}
+.btn.sm{height:26px;padding:0 9px;font-size:12px;border-radius:7px}
+input,select{font:inherit;color:inherit}
+.input{height:32px;padding:0 10px;border-radius:8px;border:1px solid var(--border);
+  background:oklch(1 0 0 / 4%);font-size:12.5px;outline:none}
+.input:focus{border-color:var(--primary)}
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--r);padding:16px 18px}
+.muted{color:var(--muted)}
+.faint{color:var(--faint)}
+.mono{font-family:ui-monospace,"SF Mono",Consolas,monospace;font-size:11.5px}
+.num{font-variant-numeric:tabular-nums}
+
+.bar{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+.bar .count{font-size:12.5px;color:var(--muted)}
+.bar .count b{color:var(--fg);font-weight:500}
+
+table{width:100%;border-collapse:collapse}
+th{text-align:left;font-size:11.5px;font-weight:500;color:var(--muted);padding:0 12px 8px 0;white-space:nowrap}
+td{padding:9px 12px 9px 0;border-top:1px solid var(--border);vertical-align:top}
+tr.revoked td{opacity:.55}
+.name{font-weight:500}
+.sub{margin-top:2px;font-size:11px;color:var(--faint)}
+
+.badge{display:inline-flex;align-items:center;height:20px;padding:0 7px;border-radius:6px;font-size:11px;
+  background:var(--card2);border:1px solid var(--border);color:var(--muted);white-space:nowrap}
+.badge.ok{background:oklch(0.72 0.15 155 / .14);border-color:oklch(0.72 0.15 155 / .3);color:oklch(0.85 0.12 155)}
+.badge.warn{background:oklch(0.79 0.14 78 / .14);border-color:oklch(0.79 0.14 78 / .32);color:oklch(0.88 0.12 78)}
+.badge.danger{background:oklch(0.704 0.191 22.216 / .15);border-color:oklch(0.704 0.191 22.216 / .34);color:oklch(0.80 0.14 22)}
+.badge.neutral{background:oklch(1 0 0 / 4%)}
+
+.chip{display:inline-flex;align-items:center;gap:5px;height:24px;padding:0 8px;border-radius:7px;
+  font-size:11.5px;background:var(--card2);border:1px solid var(--border);color:var(--muted);
+  cursor:pointer;white-space:nowrap;font-family:inherit}
+.chip:hover{border-color:var(--border-strong);color:var(--fg)}
+.chip .dot{width:6px;height:6px;border-radius:3px;background:currentColor;opacity:.75}
+.chip.on{background:var(--primary-soft);border-color:oklch(0.696 0.17 162.48 / .35);color:oklch(0.88 0.10 163)}
+.chip.warn{color:var(--warning);border-color:oklch(0.79 0.14 78 / .35)}
+.chip.danger{color:var(--danger);border-color:oklch(0.704 0.191 22.216 / .4)}
+
+.usage{min-width:170px}
+.usage-top{display:flex;align-items:baseline;gap:6px;font-size:11.5px}
+.usage-top b{font-weight:500}
+.bar-track{position:relative;height:5px;border-radius:3px;background:oklch(1 0 0 / 8%);margin-top:5px;overflow:hidden}
+.bar-fill{position:absolute;inset:0 auto 0 0;border-radius:3px;background:var(--primary)}
+.bar-fill.warn{background:var(--warning)}
+.bar-fill.danger{background:var(--danger)}
+.usage-note{margin-top:3px;font-size:11px;color:var(--faint)}
+
+.mask{position:fixed;inset:0;background:oklch(0.12 0.03 265 / .55);backdrop-filter:blur(2px);z-index:40}
+.drawer{position:fixed;top:0;right:0;bottom:0;width:452px;max-width:92vw;z-index:41;
+  background:var(--card);border-left:1px solid var(--border);display:flex;flex-direction:column;
+  box-shadow:-24px 0 60px oklch(0 0 0 / .45)}
+.drawer-head{display:flex;align-items:flex-start;gap:10px;padding:16px 18px 12px;border-bottom:1px solid var(--border)}
+.drawer-head h2{font-size:14.5px}
+.drawer-head p{margin:3px 0 0;font-size:11.5px;color:var(--faint)}
+.drawer-body{flex:1;overflow:auto;padding:16px 18px}
+.drawer-foot{padding:12px 18px;border-top:1px solid var(--border);background:var(--card2);
+  display:flex;flex-direction:column;gap:8px}
+.preview{font-size:11.5px;color:var(--muted);line-height:1.6}
+.preview b{color:var(--fg);font-weight:500}
+.foot-row{display:flex;justify-content:flex-end;gap:8px}
+
+.section{margin-bottom:22px}
+.section-head{display:flex;align-items:baseline;gap:8px;margin-bottom:9px}
+.section-head .idx{display:inline-flex;align-items:center;justify-content:center;width:17px;height:17px;
+  border-radius:5px;background:oklch(1 0 0 / 6%);font-size:10.5px;color:var(--muted)}
+.section-head .hint{margin-left:auto;font-size:11px;color:var(--faint)}
+
+.opt{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border:1px solid var(--border);
+  border-radius:9px;margin-bottom:7px;cursor:pointer;background:oklch(1 0 2%)}
+.opt:hover{border-color:var(--border-strong)}
+.opt.on{border-color:oklch(0.696 0.17 162.48 / .5);background:oklch(0.696 0.17 162.48 / .07)}
+.opt .radio{width:15px;height:15px;border-radius:50%;border:1.5px solid var(--border-strong);margin-top:2px;flex:none;position:relative}
+.opt.on .radio{border-color:var(--primary)}
+.opt.on .radio::after{content:"";position:absolute;inset:3px;border-radius:50%;background:var(--primary)}
+.opt .t{display:block;font-size:12.5px}
+.opt .d{display:block;margin-top:3px;font-size:11.5px;color:var(--faint);line-height:1.55}
+
+.numrow{display:flex;align-items:center;gap:8px;margin-top:2px}
+.numrow .input{width:110px;text-align:right;font-variant-numeric:tabular-nums}
+.unit{height:32px;padding:0 8px;border-radius:8px;border:1px solid var(--border);background:oklch(1 0 0 / 4%);font-size:12.5px}
+.quick{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
+.quick button{border:1px solid var(--border);background:transparent;color:var(--muted);
+  border-radius:6px;height:22px;padding:0 8px;font-size:11px;cursor:pointer;font-family:inherit}
+.quick button:hover{color:var(--fg);border-color:var(--border-strong)}
+
+.seg{display:inline-flex;padding:2px;background:oklch(1 0 0 / 5%);border-radius:8px;gap:2px;flex-wrap:wrap}
+.seg button{border:0;background:transparent;color:var(--muted);font-size:12px;padding:5px 10px;
+  border-radius:6px;cursor:pointer;font-family:inherit;white-space:nowrap}
+.seg button:hover{color:var(--fg)}
+.seg button.on{background:var(--card);color:var(--fg);box-shadow:0 1px 2px oklch(0 0 0 / .25)}
+
+.acct-list{margin-top:8px;border:1px solid var(--border);border-radius:9px;overflow:hidden;max-height:196px;overflow-y:auto}
+.acct{display:flex;align-items:center;gap:9px;padding:7px 10px;border-top:1px solid var(--border);cursor:pointer}
+.acct:first-child{border-top:0}
+.acct:hover{background:oklch(1 0 0 / 3%)}
+.acct .box{width:15px;height:15px;border-radius:4px;border:1.5px solid var(--border-strong);flex:none;position:relative}
+.acct.on .box{background:var(--primary);border-color:var(--primary)}
+.acct.on .box::after{content:"";position:absolute;left:4px;top:1px;width:4px;height:8px;
+  border:solid oklch(0.16 0.03 162);border-width:0 2px 2px 0;transform:rotate(42deg)}
+.avatar{width:22px;height:22px;border-radius:7px;display:flex;align-items:center;justify-content:center;
+  font-size:10.5px;font-weight:600;flex:none;background:oklch(0.696 0.17 162.48 / .18);color:oklch(0.86 0.11 163)}
+.acct .nm{font-size:12.5px}
+.acct .st{margin-left:auto;font-size:11px;color:var(--faint);white-space:nowrap}
+.acct .st.cool{color:var(--warning)}
+.picked{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:11.5px;color:var(--muted)}
+.picked .tagc{display:inline-flex;align-items:center;gap:5px;height:22px;padding:0 6px 0 8px;border-radius:6px;
+  background:oklch(1 0 0 / 5%);font-size:11.5px}
+.picked .tagc button{background:none;border:0;color:var(--faint);cursor:pointer;line-height:1;font-size:13px;padding:0}
+
+.groups{margin-top:10px}
+.groups .ghead{font-size:11.5px;color:var(--faint);margin-bottom:6px}
+.gchip{display:inline-flex;align-items:center;gap:6px;height:26px;padding:0 9px;border-radius:7px;
+  border:1px solid var(--border);background:var(--card2);font-size:11.5px;color:var(--muted);
+  cursor:pointer;margin:0 6px 6px 0;font-family:inherit}
+.gchip:hover{border-color:var(--border-strong);color:var(--fg)}
+.gchip.on{background:var(--primary-soft);border-color:oklch(0.696 0.17 162.48 / .35);color:oklch(0.88 0.10 163)}
+.gchip .n{color:var(--faint);font-size:11px}
+.gchip.on .n{color:oklch(0.8 0.1 163)}
+
+.note{display:flex;gap:8px;padding:9px 11px;border-radius:9px;background:oklch(1 0 0 / 3%);
+  border:1px solid var(--border);font-size:11.5px;color:var(--muted);line-height:1.6}
+.note svg{margin-top:2px;color:var(--faint)}
+.note.warn{background:oklch(0.79 0.14 78 / .08);border-color:oklch(0.79 0.14 78 / .28);color:oklch(0.88 0.12 78)}
+
+.foot-note{margin:10px 2px 0;font-size:11.5px;line-height:1.7;color:var(--faint)}
+
+.dlg-mask{position:fixed;inset:0;background:oklch(0.12 0.03 265 / .55);z-index:50}
+.dlg{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);width:520px;max-width:92vw;max-height:88vh;
+  z-index:51;background:var(--card);border:1px solid var(--border);border-radius:14px;
+  box-shadow:0 24px 60px oklch(0 0 0 / .5);display:flex;flex-direction:column;overflow:hidden}
+.dlg-head{padding:16px 18px 12px;border-bottom:1px solid var(--border)}
+.dlg-head h2{font-size:14.5px}
+.dlg-head p{margin:4px 0 0;font-size:12px;color:var(--muted)}
+.dlg-body{padding:16px 18px;overflow:auto}
+.dlg-foot{padding:12px 18px;border-top:1px solid var(--border);background:var(--card2);
+  display:flex;justify-content:flex-end;gap:8px}
+.field{margin-bottom:14px}
+.field label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px}
+.field .input{width:100%}
+
+.err{display:flex;gap:7px;align-items:flex-start;margin-top:8px;font-size:11.5px;color:var(--danger)}
+
+.samples{margin-top:26px;display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
+.sample{background:var(--card2);border:1px solid var(--border);border-radius:var(--r);padding:14px 16px}
+.sample h3{margin:0 0 4px;font-size:12.5px;font-weight:600}
+.sample p{margin:0 0 10px;font-size:11.5px;color:var(--faint);line-height:1.6}
+code{font-family:ui-monospace,"SF Mono",Consolas,monospace;font-size:11.5px;
+  background:oklch(1 0 0 / 6%);padding:1px 5px;border-radius:5px}
+</style>
+</head>
+<body>
+<div class="app">
+
+  <div class="where">
+    <span class="crumb">网关</span><span class="sep">›</span>
+    <span class="crumb">独立网关</span><span class="sep">›</span>
+    <span class="crumb on">密钥</span>
+    <span class="tip">← 本次新增的全部交互就在这一页：行内两枚 chip + 右侧抽屉</span>
+    <span class="alt">
+      另一处落点：<b>统一网关 › 密钥</b>（该处 key 已带「命名空间」授权 ⇒ 抽屉里多一段
+      <b>命名空间 → 账号范围 → 配额</b>）。三条产品线（WorkBuddy / Trae / Qoder）各自的
+      「网关 › 密钥」用<b>同一个抽屉构件</b>。**不新增导航项**。
+    </span>
+  </div>
+
+  <div class="page-head">
+    <div>
+      <h1>密钥访问权限管理 <span class="tag">设计稿 v2 · issue #76</span></h1>
+      <p>
+        每把密钥新增两项策略：<b>用量配额</b>（这把 key 最多能消耗多少，计量单位可按
+        <b>token</b> 或<b>请求数</b>选——Trae 的业务代理没有 token，只有请求数）与
+        <b>可访问账号</b>（这把 key 只能落到哪些账号上，可整组引用）。
+        两项都挂在<strong>现有密钥行</strong>上，不新增页面；编辑用右侧抽屉。
+      </p>
+    </div>
+    <div style="flex:1"></div>
+    <button class="btn" id="btnCreate"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>创建密钥</button>
+  </div>
+
+  <div class="bar">
+    <span class="count">共 <b id="kTotal">0</b> 把密钥 · <b id="kLive">0</b> 把启用</span>
+    <div style="flex:1"></div>
+    <span class="count faint">策略变更立即生效，无需重启网关</span>
+  </div>
+
+  <div class="card" style="padding:14px 18px 16px">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:23%">名称</th>
+          <th style="width:8%">归属</th>
+          <th style="width:16%">密钥</th>
+          <th style="width:23%">用量</th>
+          <th style="width:21%">权限</th>
+          <th style="width:8%">状态</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <p class="foot-note">
+      掩码口径：仅显示前缀与尾部 4 位（<code>sk-wb-a1b2••••••••9f3c</code>），明文只在创建时出现一次。
+      配额按<strong>这把密钥自己</strong>的消耗计（与账号积分无关）：单位可选 token 或请求数，
+      周期可选不重置 / 每日 / 每周 / 自然月。账号范围为「指定」时，这把密钥
+      <strong>不会</strong>落到未勾选的账号上（白名单外不参与选号）。
+    </p>
+  </div>
+
+  <div class="samples">
+    <div class="sample">
+      <h3>① 配额正常</h3>
+      <p>已用不足 80%：进度条主色，chip 常态。用户扫一眼就知道还能用多少。</p>
+      <div class="usage">
+        <div class="usage-top"><b class="num">62.0万</b><span class="muted">/</span><span class="num">100万</span>
+          <span class="faint" style="margin-left:auto">剩余 38万</span></div>
+        <div class="bar-track"><div class="bar-fill" style="width:62%"></div></div>
+        <div class="usage-note">按 token 计 · 自然月结算</div>
+      </div>
+    </div>
+    <div class="sample">
+      <h3>② 接近上限（≥80%）</h3>
+      <p>进度条转警告色 + 徽标「接近上限」。此时网关<strong>照常放行</strong>，只提示该续额度了。</p>
+      <div class="usage">
+        <div class="usage-top"><b class="num">43.0万</b><span class="muted">/</span><span class="num">50万</span>
+          <span class="badge warn" style="margin-left:auto">接近上限</span></div>
+        <div class="bar-track"><div class="bar-fill warn" style="width:86%"></div></div>
+        <div class="usage-note">按请求数计 · 每日 00:00 重置</div>
+      </div>
+    </div>
+    <div class="sample">
+      <h3>③ 已用尽</h3>
+      <p>超额请求被拒（429），错误体里写明是哪把 key、哪个周期，客户端能自己停。
+        <strong>流式请求中途超额 ⇒ 优雅收尾</strong>（发完 error 事件再断流），不硬断连接。</p>
+      <div class="usage">
+        <div class="usage-top"><b class="num">10万</b><span class="muted">/</span><span class="num">10万</span>
+          <span class="badge danger" style="margin-left:auto">已用尽</span></div>
+        <div class="bar-track"><div class="bar-fill danger" style="width:100%"></div></div>
+        <div class="usage-note">按 token 计 · 不重置（累计）</div>
+      </div>
+      <div class="err" style="margin-top:10px">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/></svg>
+        <span>HTTP 429 · <code>{"error":"quota_exceeded","key":"my-laptop","unit":"token","used":1000000,"limit":1000000,"resetAt":null}</code></span>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ───────────── 权限抽屉 ───────────── -->
+<div id="mask" class="mask" style="display:none"></div>
+<aside id="drawer" class="drawer" style="display:none" aria-label="密钥权限设置">
+  <div class="drawer-head">
+    <div style="flex:1">
+      <h2 id="dwTitle">权限设置</h2>
+      <p id="dwSub"></p>
+    </div>
+    <button class="btn ghost sm" id="dwClose" aria-label="关闭">✕</button>
+  </div>
+  <div class="drawer-body">
+
+    <section class="section">
+      <div class="section-head">
+        <span class="idx">1</span><h2>用量配额</h2>
+        <span class="hint" id="quotaHint"></span>
+      </div>
+
+      <label class="opt" data-q="unlimited">
+        <span class="radio"></span>
+        <span><span class="t">不限</span>
+          <span class="d">这把密钥不设上限，消耗多少都放行（与现在的行为一致）。</span></span>
+      </label>
+
+      <label class="opt" data-q="limited">
+        <span class="radio"></span>
+        <span style="flex:1">
+          <span class="t">限额</span>
+          <span class="d">达到上限后拒绝新请求；超出只影响这把密钥，其它密钥不受影响。</span>
+
+          <span style="display:block;margin-top:10px;font-size:11.5px;color:var(--faint)">计量单位</span>
+          <span class="seg" id="segUnit" style="margin-top:5px">
+            <button data-unit="token" class="on">token</button>
+            <button data-unit="request">请求数</button>
+          </span>
+          <span class="faint" style="display:block;margin-top:6px;font-size:11px;line-height:1.5"
+                id="unitHint"></span>
+
+          <span style="display:block;margin-top:12px;font-size:11.5px;color:var(--faint)">上限</span>
+          <span class="numrow" style="margin-top:5px">
+            <input class="input" id="qLimit" inputmode="numeric" aria-label="用量上限">
+            <select class="unit" id="qLimitUnit" aria-label="单位"></select>
+          </span>
+          <span class="quick">
+            <button data-quick="10000" data-unit="10000">10 万</button>
+            <button data-quick="50000" data-unit="10000">50 万</button>
+            <button data-quick="100000" data-unit="10000">100 万</button>
+            <button data-quick="500000" data-unit="10000">500 万</button>
+          </span>
+
+          <span style="display:block;margin-top:12px;font-size:11.5px;color:var(--faint)">重置周期</span>
+          <span class="seg" id="segPeriod" style="margin-top:5px">
+            <button data-period="none">不重置</button>
+            <button data-period="daily" class="on">每日</button>
+            <button data-period="weekly">每周</button>
+            <button data-period="monthly">自然月</button>
+          </span>
+        </span>
+      </label>
+
+      <div class="note" id="quotaNote" style="margin-top:9px">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></svg>
+        <span id="quotaNoteText"></span>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <span class="idx">2</span><h2>可访问账号</h2>
+        <span class="hint" id="scopeHint"></span>
+      </div>
+
+      <label class="opt" data-s="all">
+        <span class="radio"></span>
+        <span><span class="t">全部账号</span>
+          <span class="d">沿用网关当前的选号策略，在全部可用账号里挑。</span></span>
+      </label>
+
+      <label class="opt" data-s="selected">
+        <span class="radio"></span>
+        <span style="flex:1">
+          <span class="t">指定账号</span>
+          <span class="d">这把密钥只落到勾选的账号上；未勾选的账号不会被它消耗。</span>
+        </span>
+      </label>
+
+      <div id="scopePicker" style="display:none">
+        <div class="numrow" style="margin-top:10px">
+          <input class="input" id="acctSearch" style="flex:1" placeholder="搜索账号名 / 昵称 / UID" aria-label="搜索账号">
+          <button class="btn sm" id="btnAll">全选</button>
+          <button class="btn sm" id="btnNone">清空</button>
+        </div>
+
+        <div class="groups" id="groups">
+          <div class="ghead">按分组整组选取（组内换号时，这把密钥的策略不用改）</div>
+          <div id="groupChips"></div>
+        </div>
+
+        <div class="picked" id="picked" style="margin-top:10px"></div>
+        <div class="acct-list" id="acctList" role="group" aria-label="账号列表"></div>
+      </div>
+
+      <div class="note" id="scopeNote" style="margin-top:9px">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></svg>
+        <span id="scopeNoteText"></span>
+      </div>
+    </section>
+  </div>
+
+  <div class="drawer-foot">
+    <div class="preview" id="preview"></div>
+    <div class="foot-row">
+      <button class="btn" id="dwCancel">取消</button>
+      <button class="btn primary" id="dwSave">保存</button>
+    </div>
+  </div>
+</aside>
+
+<!-- ───────────── 创建对话框 ───────────── -->
+<div id="dlgMask" class="dlg-mask" style="display:none"></div>
+<div id="dlg" class="dlg" style="display:none" role="dialog" aria-modal="true" aria-label="创建密钥">
+  <div class="dlg-head">
+    <h2>创建密钥</h2>
+    <p>明文只显示这一次。配额与账号范围可以先不填，之后再改。</p>
+  </div>
+  <div class="dlg-body">
+    <div class="field">
+      <label for="cName">名称</label>
+      <input class="input" id="cName" placeholder="例如：我的笔记本 / CI runner">
+    </div>
+    <div class="field">
+      <label for="cRegion">归属</label>
+      <select class="input" id="cRegion">
+        <option>国内版</option><option>国际版</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>用量配额</label>
+      <div class="seg" id="segCQuota" style="display:inline-flex;padding:2px;background:oklch(1 0 0 / 5%);border-radius:8px;gap:2px">
+        <button data-cq="unlimited" class="on">不限</button>
+        <button data-cq="limited">限额</button>
+      </div>
+      <div class="numrow" id="cQuotaRow" style="display:none;margin-top:8px">
+        <input class="input" id="cQuota" inputmode="numeric" value="100" aria-label="用量上限">
+        <select class="unit" id="cQuotaUnit">
+          <option value="10000" selected>万 tokens</option><option value="1">tokens</option>
+          <option value="1000000">M tokens</option><option value="10000" data-req="1">万次</option>
+        </select>
+      </div>
+    </div>
+    <div class="field" style="margin-bottom:0">
+      <label>可访问账号</label>
+      <div class="seg" style="display:inline-flex;padding:2px;background:oklch(1 0 0 / 5%);border-radius:8px;gap:2px">
+        <button data-cs="all" class="on">全部账号</button>
+        <button data-cs="selected">指定账号</button>
+      </div>
+    </div>
+  </div>
+  <div class="dlg-foot">
+    <button class="btn" id="cCancel">取消</button>
+    <button class="btn primary" id="cOk">创建</button>
+  </div>
+</div>
+
+<script>
+/* ─────────── 数据（模拟；口径与后端 `ApiKeyRecord` 扩展一致） ─────────── */
+const ACCOUNTS = [
+  {uid:"u-001", name:"JackDev", nickname:"jackdev@example.com", credits:6580, state:"正常"},
+  {uid:"u-002", name:"Jackey",  nickname:"jackey@example.com",  credits:810,  state:"正常"},
+  {uid:"u-003", name:"Andev",   nickname:"andev@example.com",   credits:658,  state:"冷却中"},
+  {uid:"u-004", name:"haocheng236", nickname:"hc236@example.com", credits:12480, state:"正常"},
+  {uid:"u-005", name:"mryzj0716",   nickname:"mryzj@example.com", credits:810,  state:"正常"},
+  {uid:"u-006", name:"test-bot",    nickname:"bot@example.com",    credits:0,    state:"已禁用"},
+];
+/* ★ 账号分组：三条产品线都已有（Trae `GroupsFile` / Qoder `set_group_for` / WB `set_account_group`），
+   白名单引用分组 ⇒ 组内换号不用改 key 策略。 */
+const GROUPS = [
+  {id:"g1", name:"主力号", members:["u-001","u-002"]},
+  {id:"g2", name:"备用号", members:["u-003","u-005"]},
+  {id:"g3", name:"外包",   members:["u-004"]},
+];
+const W = 10000;
+let KEYS = [
+  { id:"k1", name:"我的笔记本", region:"国内版", prefix:"sk-wb-a1b2", suffix:"9f3c",
+    createdAt:"10-12 09:24", lastUsedAt:"2 小时前", revoked:false,
+    quota:{mode:"limited", limit:100*W, unit:"token", period:"monthly", used:620000},
+    scope:{mode:"all"} },
+  { id:"k2", name:"ci-runner", region:"国内版", prefix:"sk-wb-c3d4", suffix:"71b0",
+    createdAt:"09-28 14:02", lastUsedAt:"12 分钟前", revoked:false,
+    quota:{mode:"limited", limit:50000, unit:"request", period:"daily", used:43000},
+    scope:{mode:"selected", accounts:["u-001","u-002","u-004"]} },
+  { id:"k3", name:"外包同学", region:"国内版", prefix:"sk-wb-e5f6", suffix:"2ad8",
+    createdAt:"08-30 19:41", lastUsedAt:"3 天前", revoked:false,
+    quota:{mode:"limited", limit:10*W, unit:"token", period:"none", used:100000},
+    scope:{mode:"selected", accounts:["u-004"]} },
+  { id:"k4", name:"同事的电脑", region:"国际版", prefix:"sk-wb-g7h8", suffix:"44c1",
+    createdAt:"07-02 11:08", lastUsedAt:"06-30 08:12", revoked:false,
+    quota:{mode:"unlimited"}, scope:{mode:"all"} },
+  { id:"k5", name:"临时演示", region:"国内版", prefix:"sk-wb-i9j0", suffix:"5e37",
+    createdAt:"06-11 16:20", lastUsedAt:"从未使用", revoked:true,
+    quota:{mode:"limited", limit:10*W, unit:"token", period:"none", used:30000},
+    scope:{mode:"all"} },
+];
+
+const state = { editing:null, draft:null, createQ:"unlimited", createS:"all" };
+
+/* ─────────── 工具 ─────────── */
+const fmt = (n) => {
+  /* ★ 中文优先「万」：100 万比 1M 好读；≥1 亿才用 M。 */
+  if (n >= 1e8) return (n/1e6).toFixed(n % 1e6 === 0 ? 0 : 1) + "M";
+  if (n >= W) return (n/W).toFixed(n % W === 0 ? 0 : 1) + "万";
+  if (n >= 1e6) return (n/1e6).toFixed(1) + "M";
+  return String(n);
+};
+const pct = (used, limit) => limit > 0 ? Math.min(100, Math.round(used / limit * 100)) : 0;
+const level = (used, limit) => {
+  if (!limit) return "";
+  const p = pct(used, limit);
+  if (p >= 100) return "danger";
+  if (p >= 80) return "warn";
+  return "";
+};
+const PERIOD_TEXT = { none:"不重置（累计）", daily:"每日 00:00 重置", weekly:"每周一 00:00 重置", monthly:"自然月结算" };
+const PERIOD_SHORT = { none:"累计", daily:"每日", weekly:"每周", monthly:"自然月" };
+const esc = (s) => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+/* ─────────── 列表 ─────────── */
+function quotaChip(k){
+  const q = k.quota;
+  if (q.mode === "unlimited") return `<span class="chip" data-open="quota"><span class="dot"></span>额度 不限</span>`;
+  const lv = level(q.used, q.limit);
+  const u = q.unit === "request" ? "请求" : "额度";
+  return `<span class="chip ${lv === "danger" ? "danger" : lv === "warn" ? "warn" : "on"}" data-open="quota">
+    <span class="dot"></span>${u} ${fmt(q.limit)}${q.period === "none" ? "" : "/" + PERIOD_SHORT[q.period]}</span>`;
+}
+function scopeChip(k){
+  if (k.scope.mode === "all") return `<span class="chip" data-open="scope"><span class="dot"></span>账号 全部</span>`;
+  const n = k.scope.accounts.length;
+  return `<span class="chip ${n ? "on" : "danger"}" data-open="scope"><span class="dot"></span>账号 ${n} 个</span>`;
+}
+function usageCell(k){
+  const q = k.quota;
+  if (q.mode === "unlimited") return `<span class="faint">不限</span>`;
+  const lv = level(q.used, q.limit);
+  const p = pct(q.used, q.limit);
+  const left = Math.max(0, q.limit - q.used);
+  const unit = q.unit === "request" ? " 次" : "";
+  return `<div class="usage">
+    <div class="usage-top">
+      <b class="num">${fmt(q.used)}</b><span class="muted">/</span><span class="num">${fmt(q.limit)}</span>
+      <span class="faint" style="margin-left:auto">${lv === "danger" ? "已用尽" : "剩余 " + fmt(left) + unit}</span>
+    </div>
+    <div class="bar-track"><div class="bar-fill ${lv}" style="width:${p}%"></div></div>
+    <div class="usage-note">${q.unit === "request" ? "按请求数计" : "按 token 计"} · ${PERIOD_TEXT[q.period]}</div>
+  </div>`;
+}
+function render(){
+  document.getElementById("kTotal").textContent = KEYS.length;
+  document.getElementById("kLive").textContent = KEYS.filter(k => !k.revoked).length;
+  document.getElementById("rows").innerHTML = KEYS.map(k => {
+    const st = k.revoked ? `<span class="badge neutral">已吊销</span>`
+      : k.quota.mode !== "unlimited" && k.quota.used >= k.quota.limit
+        ? `<span class="badge danger">已用尽</span>`
+        : k.quota.mode !== "unlimited" && pct(k.quota.used, k.quota.limit) >= 80
+          ? `<span class="badge warn">接近上限</span>`
+          : `<span class="badge ok">启用</span>`;
+    return `<tr class="${k.revoked ? "revoked" : ""}">
+      <td>
+        <div class="name">${esc(k.name)}</div>
+        <div class="sub">创建于 ${k.createdAt} · 最后使用 ${k.lastUsedAt}</div>
+      </td>
+      <td><span class="badge">${k.region}</span></td>
+      <td class="mono muted">${k.prefix}••••••••${k.suffix}</td>
+      <td>${usageCell(k)}</td>
+      <td>
+        <div style="display:flex;gap:6px;flex-wrap:nowrap">${quotaChip(k)}${scopeChip(k)}</div>
+      </td>
+      <td>${st}</td>
+      <td>
+        <button class="btn ghost sm" data-open="quota">编辑</button>
+      </td>
+    </tr>`;
+  }).join("");
+  document.querySelectorAll("[data-open]").forEach(el => {
+    el.onclick = (e) => { e.stopPropagation(); openDrawer(rowKey(el), el.dataset.open); };
+  });
+}
+const rowKey = (el) => {
+  const tr = el.closest("tr");
+  const idx = [...document.querySelectorAll("#rows tr")].indexOf(tr);
+  return KEYS[idx].id;
+};
+
+/* ─────────── 抽屉 ─────────── */
+function openDrawer(keyId, focus){
+  const k = KEYS.find(x => x.id === keyId);
+  if (!k) return;
+  state.editing = keyId;
+  state.draft = {
+    quota: JSON.parse(JSON.stringify(k.quota)),
+    // ★ `accounts` 归一化成**数组**：老记录只有 `{mode:"all"}`、没有该字段
+    //   （后端 `#[serde(default)]` 同款）⇒ 不归一化时切到「指定账号」会读到 undefined。
+    scope: { mode: k.scope.mode, accounts: [...(k.scope.accounts || [])] },
+  };
+  document.getElementById("dwTitle").textContent = "权限设置 · " + k.name;
+  document.getElementById("dwSub").textContent = k.region + " · " + k.prefix + "••••••••" + k.suffix;
+  document.getElementById("mask").style.display = "block";
+  document.getElementById("drawer").style.display = "flex";
+  syncLimitInput(); syncSegs(); syncQuotaRadio(); syncScopeRadio();
+  renderGroupChips(); renderAcctList(); updateDrawer();
+  if (focus === "scope") document.getElementById("acctSearch").focus();
+}
+function closeDrawer(){
+  document.getElementById("mask").style.display = "none";
+  document.getElementById("drawer").style.display = "none";
+  state.editing = null; state.draft = null;
+}
+/** 把上限值按「万 / M / 原始」回填到输入框与单位下拉（单位选项随计量单位变）。 */
+function syncLimitInput(){
+  const q = state.draft.quota;
+  const input = document.getElementById("qLimit");
+  const unit = document.getElementById("qLimitUnit");
+  const v = q.mode === "limited" ? q.limit : 100 * W;
+  const isReq = q.unit === "request";
+  unit.innerHTML = isReq
+    ? '<option value="1">次</option><option value="10000">万次</option>'
+    : '<option value="1">tokens</option><option value="10000">万 tokens</option><option value="1000000">M tokens</option>';
+  if (isReq) {
+    if (v >= W && v % W === 0) { input.value = String(v / W); unit.value = "10000"; }
+    else { input.value = String(v); unit.value = "1"; }
+  } else if (v >= W && v % W === 0) { input.value = String(v / W); unit.value = "10000"; }
+  else if (v >= 1e6) { input.value = String(v / 1e6); unit.value = "1000000"; }
+  else { input.value = String(v); unit.value = "1"; }
+}
+function readLimitInput(){
+  const q = state.draft.quota;
+  if (q.mode !== "limited") return;
+  const raw = Number(document.getElementById("qLimit").value || 0);
+  q.limit = Math.max(0, raw) * Number(document.getElementById("qLimitUnit").value);
+}
+function syncSegs(){
+  const q = state.draft.quota;
+  document.querySelectorAll("#segUnit button").forEach(b =>
+    b.classList.toggle("on", b.dataset.unit === q.unit));
+  document.querySelectorAll("#segPeriod button").forEach(b =>
+    b.classList.toggle("on", b.dataset.period === q.period));
+  document.getElementById("unitHint").textContent = q.unit === "request"
+    ? "按请求数计：适用于 Trae 的业务代理（签到、领取等没有 token 的接口），以及统一网关里跨业务命名空间的 key。"
+    : "按 token 计：适用于 LLM 请求（/v1/chat/completions、/v1/responses 等）。";
+}
+function syncQuotaRadio(){
+  const mode = state.draft.quota.mode;
+  document.querySelectorAll("[data-q]").forEach(el => el.classList.toggle("on", el.dataset.q === mode));
+  const k = KEYS.find(x => x.id === state.editing);
+  const used = k.quota.used || 0;
+  document.getElementById("quotaHint").textContent = mode === "unlimited" ? "" : `本周期已用 ${fmt(used)}`;
+  const note = document.getElementById("quotaNote");
+  const q = state.draft.quota;
+  if (mode === "unlimited") {
+    note.className = "note";
+    document.getElementById("quotaNoteText").textContent = "不限额：这把密钥不设用量上限，消耗多少都放行。";
+  } else if (q.limit <= 0) {
+    note.className = "note warn";
+    document.getElementById("quotaNoteText").textContent = "上限必须大于 0。";
+  } else if (used >= q.limit) {
+    note.className = "note warn";
+    document.getElementById("quotaNoteText").textContent =
+      `保存后立即超限（已用 ${fmt(used)} ≥ 上限 ${fmt(q.limit)}）：这把密钥的请求会立刻被拒（429）。`;
+  } else if (used >= q.limit * 0.8) {
+    note.className = "note warn";
+    document.getElementById("quotaNoteText").textContent =
+      `保存后用量已达新上限的 ${pct(used, q.limit)}%，接近上限会立刻提示。`;
+  } else {
+    note.className = "note";
+    document.getElementById("quotaNoteText").textContent =
+      `按${q.unit === "request" ? "请求数" : " token"}计，${PERIOD_TEXT[q.period]}；超额时该密钥的请求被拒（429），其它密钥不受影响。`;
+  }
+}
+function syncScopeRadio(){
+  const mode = state.draft.scope.mode;
+  document.querySelectorAll("[data-s]").forEach(el => el.classList.toggle("on", el.dataset.s === mode));
+  document.getElementById("scopePicker").style.display = mode === "selected" ? "block" : "none";
+  const usable = ACCOUNTS.filter(a => a.state !== "已禁用");
+  document.getElementById("scopeHint").textContent = mode === "selected"
+    ? `已选 ${state.draft.scope.accounts.length} / ${ACCOUNTS.length}`
+    : `共 ${usable.length} 个可用账号`;
+  const note = document.getElementById("scopeNote");
+  if (mode === "all") {
+    note.className = "note";
+    document.getElementById("scopeNoteText").textContent = "全部账号：沿用网关当前的选号策略（积分择优 / 粘性 / 随机）。";
+  } else if (state.draft.scope.accounts.length === 0) {
+    note.className = "note warn";
+    document.getElementById("scopeNoteText").textContent = "至少要选一个账号，否则这把密钥永远选不到号。";
+  } else {
+    note.className = "note";
+    document.getElementById("scopeNoteText").textContent =
+      "指定账号后，未勾选的账号不会参与这把密钥的选号，也就不会被它消耗。";
+  }
+}
+function renderGroupChips(){
+  const picked = new Set(state.draft.scope.accounts);
+  document.getElementById("groupChips").innerHTML = GROUPS.map(g => {
+    const inGroup = g.members.filter(uid => picked.has(uid)).length;
+    const all = inGroup === g.members.length;
+    return `<button class="gchip ${all ? "on" : ""}" data-group="${g.id}">
+      ${all ? "✓ " : ""}${esc(g.name)} <span class="n">${inGroup}/${g.members.length}</span></button>`;
+  }).join("");
+  document.querySelectorAll("[data-group]").forEach(b => b.onclick = () => {
+    const g = GROUPS.find(x => x.id === b.dataset.group);
+    const set = new Set(state.draft.scope.accounts);
+    const all = g.members.every(uid => set.has(uid));
+    g.members.forEach(uid => all ? set.delete(uid) : set.add(uid));
+    state.draft.scope.accounts = [...set];
+    renderGroupChips(); renderAcctList(); syncScopeRadio(); updateDrawer();
+  });
+}
+function renderAcctList(){
+  const q = (document.getElementById("acctSearch").value || "").trim().toLowerCase();
+  const picked = new Set(state.draft.scope.accounts);
+  const list = ACCOUNTS.filter(a => !q ||
+    a.name.toLowerCase().includes(q) || a.nickname.toLowerCase().includes(q) || a.uid.includes(q));
+  document.getElementById("acctList").innerHTML = list.length ? list.map(a => {
+    const on = picked.has(a.uid);
+    const group = GROUPS.find(g => g.members.includes(a.uid));
+    return `<div class="acct ${on ? "on" : ""}" data-uid="${a.uid}" role="checkbox" aria-checked="${on}" tabindex="0">
+      <span class="box"></span>
+      <span class="avatar">${esc(a.name.slice(0,2))}</span>
+      <span>
+        <span class="nm">${esc(a.name)}</span>
+        <span class="sub" style="margin:0">${esc(a.nickname)} · 积分 ${a.credits}${group ? " · " + esc(group.name) : ""}</span>
+      </span>
+      <span class="st ${a.state === "冷却中" ? "cool" : ""}">${a.state}</span>
+    </div>`;
+  }).join("") : `<div class="acct" style="cursor:default;color:var(--faint)">没有匹配的账号</div>`;
+
+  document.querySelectorAll(".acct[data-uid]").forEach(el => {
+    const toggle = () => {
+      const uid = el.dataset.uid;
+      const set = new Set(state.draft.scope.accounts);
+      set.has(uid) ? set.delete(uid) : set.add(uid);
+      state.draft.scope.accounts = [...set];
+      renderGroupChips(); renderAcctList(); syncScopeRadio(); updateDrawer();
+    };
+    el.onclick = toggle;
+    el.onkeydown = (e) => { if (e.key === " " || e.key === "Enter") { e.preventDefault(); toggle(); } };
+  });
+
+  document.getElementById("picked").innerHTML = state.draft.scope.accounts.length
+    ? `已选 <b style="color:var(--fg)">${state.draft.scope.accounts.length}</b> 个：` +
+      state.draft.scope.accounts.map(uid => {
+        const a = ACCOUNTS.find(x => x.uid === uid);
+        return `<span class="tagc">${esc(a ? a.name : uid)}<button data-rm="${uid}" aria-label="移除">✕</button></span>`;
+      }).join("")
+    : `<span class="faint">还没有选择账号</span>`;
+  document.querySelectorAll("[data-rm]").forEach(b => b.onclick = () => {
+    state.draft.scope.accounts = state.draft.scope.accounts.filter(u => u !== b.dataset.rm);
+    renderGroupChips(); renderAcctList(); syncScopeRadio(); updateDrawer();
+  });
+}
+function updateDrawer(){
+  const d = state.draft;
+  const k = KEYS.find(x => x.id === state.editing);
+  const scopeText = d.scope.mode === "all" ? "全部可用账号" : `${d.scope.accounts.length} 个指定账号`;
+  const quotaText = d.quota.mode === "unlimited" ? "不限额"
+    : `${d.quota.unit === "request" ? "请求数" : "token"} ${fmt(d.quota.limit)}（${PERIOD_SHORT[d.quota.period]}）`;
+  const warn = (d.quota.mode !== "unlimited" && d.quota.limit > 0 && k.quota.used >= d.quota.limit)
+    ? " <b style='color:var(--danger)'>（保存后立即超限，请求会被拒）</b>" : "";
+  document.getElementById("preview").innerHTML =
+    `保存后，「<b>${esc(k.name)}</b>」的请求只会使用 <b>${scopeText}</b>，配额 <b>${quotaText}</b>。${warn}`;
+  document.getElementById("dwSave").disabled =
+    (d.scope.mode === "selected" && d.scope.accounts.length === 0) ||
+    (d.quota.mode !== "unlimited" && d.quota.limit <= 0);
+}
+
+/* ─────────── 事件 ─────────── */
+document.querySelectorAll("[data-q]").forEach(el => el.onclick = () => {
+  readLimitInput();
+  state.draft.quota.mode = el.dataset.q;
+  syncLimitInput(); syncQuotaRadio(); updateDrawer();
+});
+document.querySelectorAll("[data-s]").forEach(el => el.onclick = () => {
+  state.draft.scope.mode = el.dataset.s;
+  syncScopeRadio(); updateDrawer();
+});
+document.querySelectorAll("#segUnit button").forEach(b => b.onclick = () => {
+  readLimitInput();
+  state.draft.quota.unit = b.dataset.unit;
+  syncLimitInput(); syncSegs(); syncQuotaRadio(); updateDrawer();
+});
+document.querySelectorAll("#segPeriod button").forEach(b => b.onclick = () => {
+  state.draft.quota.period = b.dataset.period;
+  syncSegs(); syncQuotaRadio(); updateDrawer();
+});
+["qLimit", "qLimitUnit"].forEach(id => {
+  document.getElementById(id).oninput = () => { readLimitInput(); syncQuotaRadio(); updateDrawer(); };
+  document.getElementById(id).onchange = () => { readLimitInput(); syncQuotaRadio(); updateDrawer(); };
+});
+document.querySelectorAll("[data-quick]").forEach(b => b.onclick = (e) => {
+  e.preventDefault();
+  document.getElementById("qLimit").value = b.dataset.quick;
+  document.getElementById("qLimitUnit").value = b.dataset.unit;
+  readLimitInput(); syncQuotaRadio(); updateDrawer();
+});
+document.getElementById("acctSearch").oninput = () => { renderGroupChips(); renderAcctList(); };
+document.getElementById("btnAll").onclick = () => {
+  const q = (document.getElementById("acctSearch").value || "").trim().toLowerCase();
+  const list = ACCOUNTS.filter(a => !q || a.name.toLowerCase().includes(q) ||
+    a.nickname.toLowerCase().includes(q) || a.uid.includes(q));
+  const set = new Set(state.draft.scope.accounts);
+  list.forEach(a => set.add(a.uid));
+  state.draft.scope.accounts = [...set];
+  renderGroupChips(); renderAcctList(); syncScopeRadio(); updateDrawer();
+};
+document.getElementById("btnNone").onclick = () => {
+  state.draft.scope.accounts = [];
+  renderGroupChips(); renderAcctList(); syncScopeRadio(); updateDrawer();
+};
+document.getElementById("mask").onclick = closeDrawer;
+document.getElementById("dwClose").onclick = closeDrawer;
+document.getElementById("dwCancel").onclick = closeDrawer;
+document.getElementById("dwSave").onclick = () => {
+  const k = KEYS.find(x => x.id === state.editing);
+  readLimitInput();
+  k.quota = JSON.parse(JSON.stringify(state.draft.quota));
+  k.scope = JSON.parse(JSON.stringify(state.draft.scope));
+  closeDrawer(); render();
+};
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape") {
+    if (document.getElementById("drawer").style.display !== "none") closeDrawer();
+    else if (document.getElementById("dlg").style.display !== "none") closeDlg();
+  }
+});
+
+/* ─────────── 创建对话框 ─────────── */
+function openDlg(){
+  document.getElementById("dlgMask").style.display = "block";
+  document.getElementById("dlg").style.display = "flex";
+  document.getElementById("cName").value = "";
+  document.getElementById("cName").focus();
+}
+function closeDlg(){
+  document.getElementById("dlgMask").style.display = "none";
+  document.getElementById("dlg").style.display = "none";
+}
+document.getElementById("btnCreate").onclick = openDlg;
+document.getElementById("cCancel").onclick = closeDlg;
+document.getElementById("dlgMask").onclick = closeDlg;
+document.querySelectorAll("[data-cq]").forEach(b => b.onclick = () => {
+  state.createQ = b.dataset.cq;
+  document.querySelectorAll("[data-cq]").forEach(x => x.classList.toggle("on", x === b));
+  document.getElementById("cQuotaRow").style.display = state.createQ === "unlimited" ? "none" : "flex";
+});
+document.querySelectorAll("[data-cs]").forEach(b => b.onclick = () => {
+  state.createS = b.dataset.cs;
+  document.querySelectorAll("[data-cs]").forEach(x => x.classList.toggle("on", x === b));
+});
+document.getElementById("cOk").onclick = () => {
+  const name = (document.getElementById("cName").value || "").trim() || "未命名密钥";
+  const limit = Math.max(0, Number(document.getElementById("cQuota").value || 0)) *
+    Number(document.getElementById("cQuotaUnit").value);
+  KEYS.unshift({
+    id:"k" + Date.now(), name, region: document.getElementById("cRegion").value,
+    prefix:"sk-wb-" + Math.random().toString(16).slice(2,6), suffix:Math.random().toString(16).slice(2,6),
+    createdAt:"刚刚", lastUsedAt:"从未使用", revoked:false,
+    quota: state.createQ === "unlimited"
+      ? {mode:"unlimited"}
+      : {mode:"limited", limit, unit:"token", period:"monthly", used:0},
+    scope: {mode: state.createS},
+  });
+  closeDlg(); render();
+};
+
+/* ─────────── 初始 ─────────── */
+render();
+</script>
+</body>
+</html>

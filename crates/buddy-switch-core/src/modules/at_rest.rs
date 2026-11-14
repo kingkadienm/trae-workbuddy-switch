@@ -297,16 +297,27 @@ pub fn decrypt_field(envelope_b64: &str, protector_key: &[u8; 32]) -> Result<Str
     String::from_utf8(buffer).map_err(|e| AtRestError::Envelope(format!("明文非 UTF-8：{e}")))
 }
 
-/// 客户端可执行文件（Windows 是 exe；macOS 是 `.app` 里的可执行体）。
+/// 客户端可执行文件路径（Windows 为 exe；macOS 为 `.app` 内的可执行体）。
 ///
-/// `workbuddy_app_path_for` 在 macOS 返回的是 **`.app` 包路径**，而 `ELECTRON_RUN_AS_NODE`
-/// 要的是包内的可执行体 ⇒ 这里补一层 `Contents/MacOS/<name>`（Electron 约定：
-/// `CFBundleExecutable` 与包名同名）。名字猜错不会静默：子进程起不来就是 `Spawn`。
+/// macOS 下 `workbuddy_app_path_for` 返回 `.app` 包路径，`ELECTRON_RUN_AS_NODE`
+/// 需要包内可执行体，故名称取自 `Info.plist` 的 `CFBundleExecutable`
+/// （[`crate::modules::process::bundle_executable`]）。
+///
+/// 早期实现假定 `CFBundleExecutable` 与包名相同并按包名拼接。实测两个 WorkBuddy
+/// bundle 的可执行体均为 `Electron`，该假定不成立：拼接结果不存在时，
+/// [`fetch_build_key`] 首行 `exe.exists()` 判假并返回 `ClientMissing`，
+/// 上层据此提示「凭据是加密信封态，请重新登录」，与真实原因无关。
+///
+/// plist 不可读时回落为按包名拼接。该路径仅在 bundle 结构异常时生效，
+/// 由调用方的 `exe.exists()` 判定。
 pub fn client_executable_for(region: Region) -> PathBuf {
     let path = crate::modules::auth_file::workbuddy_app_path_for(region);
     #[cfg(target_os = "macos")]
     {
         if path.extension().and_then(|e| e.to_str()) == Some("app") {
+            if let Some(exe) = crate::modules::process::bundle_executable(&path) {
+                return exe;
+            }
             if let Some(stem) = path.file_stem() {
                 return path.join("Contents").join("MacOS").join(stem);
             }
@@ -315,10 +326,42 @@ pub fn client_executable_for(region: Region) -> PathBuf {
     path
 }
 
-/// 探针脚本落盘路径（固定名，每次覆盖写；内容只有 1 KB）。
+/// 探针脚本落盘路径（**每次随机名**，用完即删）。
+///
+/// ## 为什么从「固定名」改成「随机名」（安全审计 P2-14）
+///
+/// 改造前是 `temp_dir()/buddy-switch-at-rest-key.js` —— 一个**可预测的固定路径**，
+/// 而 `/tmp` 是全世界可写的（sticky 位只防删别人的文件，**不防**对已知名字持续覆写）。
+/// 于是「写脚本 → 起子进程 → 子进程读脚本」之间有一个真实窗口：同机任意进程可以把
+/// 那个文件换成自己的 JS，`WorkBuddy.exe` 就会以当前用户身份执行它。
+///
+/// `PROBE_LOCK` 是**进程内**互斥，跨进程无效，挡不住这个。
+///
+/// 现在：随机名（不可预测）+ `create_new`（防预创建）+ `Drop` 删除（不残留）。
 fn key_probe_path() -> PathBuf {
-    std::env::temp_dir().join("buddy-switch-at-rest-key.js")
+    std::env::temp_dir().join(format!(
+        "buddy-switch-at-rest-key-{}.js",
+        uuid::Uuid::new_v4().simple()
+    ))
 }
+
+/// 探针文件的**作用域守卫**：任何返回路径（含 panic）都会删掉它。
+///
+/// 随机名解决了「被别人覆写」，删除解决「残留一堆探针文件」——
+/// 两者必须同时成立，否则只是把固定名的泄漏换成了随机名的泄漏。
+struct ProbeFile(PathBuf);
+
+impl Drop for ProbeFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// 取钥的**进程级节流**（并发取钥会同时拉起多个 Electron 子进程）。
+///
+/// ⚠️ 从安全审计 P2-14 起，**正确性不再依赖它**：探针文件已是随机名 + `create_new`，
+/// 并发写不会互相踩。保留它只是因为「起 N 个 Electron 子进程」本身昂贵。
+static PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// 起子进程取 `atRestSecretKey`。
 ///
@@ -328,12 +371,28 @@ pub fn fetch_build_key(exe: &Path) -> Result<String, AtRestError> {
     if !exe.exists() {
         return Err(AtRestError::ClientMissing);
     }
-    let probe = key_probe_path();
-    std::fs::write(&probe, KEY_PROBE_JS)
-        .map_err(|e| AtRestError::Spawn(format!("写探针脚本失败：{e}")))?;
+    // ★ 持锁覆盖**整个函数**（写脚本 → 起子进程 → 等它读完）：探针文件是**固定名**
+    //   （见 `key_probe_path`），并发写会让先起的子进程读到空/半文件。
+    //   锁在函数返回时释放 —— 正好覆盖「子进程读文件」的窗口。
+    let _probe_guard = PROBE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    // 随机名 + `create_new`：同机其他进程既猜不到名字，也无法**预先**占位。
+    let probe = ProbeFile(key_probe_path());
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe.0)
+            .map_err(|e| AtRestError::Spawn(format!("写探针脚本失败：{e}")))?;
+        file.write_all(KEY_PROBE_JS.as_bytes())
+            .map_err(|e| AtRestError::Spawn(format!("写探针脚本失败：{e}")))?;
+    }
 
     let mut child = crate::modules::process::cmd_builder(exe)
-        .arg(&probe)
+        .arg(&probe.0)
         .env("ELECTRON_RUN_AS_NODE", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -418,9 +477,16 @@ pub fn fetch_build_key(exe: &Path) -> Result<String, AtRestError> {
 ///
 /// `atRestSecretKey` 是客户端二进制的**编译期 payload**，进程生命周期内不会变
 /// （客户端升级后需重启本应用才生效）⇒ 按 region 记忆是安全的。
-static KEY_CACHE: OnceLock<Mutex<[Option<Result<String, AtRestError>>; 2]>> = OnceLock::new();
+/// 单个 region 的缓存槽：`None` = 还没取过，`Some(Err)` = 取过且失败（失败也缓存，
+/// 否则每个请求都会重新探测一次 exe 并起子进程）。
+type KeyCacheSlot = Option<Result<String, AtRestError>>;
 
-fn key_cache() -> &'static Mutex<[Option<Result<String, AtRestError>>; 2]> {
+/// 两个 region（cn / global）各一个槽 —— 下标由 [`cache_slot`] 给出。
+type KeyCache = [KeyCacheSlot; 2];
+
+static KEY_CACHE: OnceLock<Mutex<KeyCache>> = OnceLock::new();
+
+fn key_cache() -> &'static Mutex<KeyCache> {
     KEY_CACHE.get_or_init(|| Mutex::new([None, None]))
 }
 
@@ -482,10 +548,7 @@ pub fn is_unlockable(account: &Value) -> bool {
 /// 得到的记录形态一致 ⇒ 切换写回不会毁掉客户端登录态。
 ///
 /// 返回 `Ok(None)` 表示「没有需要解锁的字段」（不启子进程）；`Ok(Some(acc))` 是解锁后的账号。
-pub fn unlock_account_for(
-    region: Region,
-    account: &Value,
-) -> Result<Option<Value>, AtRestError> {
+pub fn unlock_account_for(region: Region, account: &Value) -> Result<Option<Value>, AtRestError> {
     // ① 先把要解的信封**全部收集并解析**（纯计算、无副作用），再考虑起子进程。
     //    这样「信封本身是坏的」会在**起子进程之前**就响亮失败，而不是白花一次
     //    0.5 秒 + 一次外部进程调用。
@@ -539,10 +602,18 @@ mod tests {
         assert_eq!(aad[7], 0x01, "版本字节");
         assert_eq!(&aad[8..12], &5u32.to_be_bytes(), "WBEV1 的 u32BE 长度前缀");
         assert_eq!(&aad[12..17], b"WBEV1", "STANDARD_FORMAT_ID.field");
-        assert_eq!(&aad[17..21], &6u32.to_be_bytes(), "sym-v1 的 u32BE 长度前缀");
+        assert_eq!(
+            &aad[17..21],
+            &6u32.to_be_bytes(),
+            "sym-v1 的 u32BE 长度前缀"
+        );
         assert_eq!(&aad[21..27], b"sym-v1", "scheme");
         assert_eq!(&aad[27..31], &1u32.to_be_bytes(), "suite（u32BE）");
-        assert_eq!(&aad[31..35], &16u32.to_be_bytes(), "keyId 的 u32BE 长度前缀");
+        assert_eq!(
+            &aad[31..35],
+            &16u32.to_be_bytes(),
+            "keyId 的 u32BE 长度前缀"
+        );
         assert_eq!(&aad[35..51], key_id.as_bytes(), "keyId");
         assert_eq!(aad[51], FRAMING_CODE_FIELD, "FRAMING_CODE.field = 2");
         assert_eq!(aad[52], 0x00, "encodeOptionalUint64(undefined) = 单字节 0");
@@ -555,10 +626,15 @@ mod tests {
         let key = derive_protector_key("test-secret-key");
         assert_eq!(
             key.as_slice(),
-            hex_to_bytes("2ceac6f36363c6246a64cca805cd43ca7a01b14eb2fcc532ceec3f60f2f7df1c").as_slice(),
+            hex_to_bytes("2ceac6f36363c6246a64cca805cd43ca7a01b14eb2fcc532ceec3f60f2f7df1c")
+                .as_slice(),
             "protectorKey = sha256(utf8(atRestSecretKey))"
         );
-        assert_eq!(key_id_for(&key), "ff09780817b2c04a", "keyId = sha256(key).hex[..16]");
+        assert_eq!(
+            key_id_for(&key),
+            "ff09780817b2c04a",
+            "keyId = sha256(key).hex[..16]"
+        );
     }
 
     /// 自造信封跑一遍 seal → decrypt：钉住「AAD 用法 + AES-GCM 装配」是对的。
@@ -729,7 +805,11 @@ mod tests {
         let first = cached_build_key_for(Region::Cn).expect("冷缓存应能取到钥匙");
         let second = cached_build_key_for(Region::Cn).expect("命中缓存应能取到钥匙");
         assert_eq!(first, second, "缓存前后必须一致");
-        assert_eq!(first, fetch_build_key(&exe).expect("直取"), "缓存值与直取必须一致");
+        assert_eq!(
+            first,
+            fetch_build_key(&exe).expect("直取"),
+            "缓存值与直取必须一致"
+        );
 
         // ④ ★ 本函数**不落盘**：隔离 home 的账号库必须仍是空的。
         //    这条是「网关每请求导入」那条路径的护栏 —— 一旦有人在 `unlock_account_for`
@@ -747,5 +827,37 @@ mod tests {
         (0..hex.len() / 2)
             .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).expect("hex"))
             .collect()
+    }
+
+    /// 回归：macOS 下 `client_executable_for` 必须返回存在的路径。
+    ///
+    /// 按包名拼接得到 `.../Contents/MacOS/WorkBuddy AI`，实际文件为 `Electron`；
+    /// 路径不存在时 [`fetch_build_key`] 返回 `ClientMissing`，上层提示与真实原因不符。
+    ///
+    /// 需本机安装客户端，故标记 `#[ignore]`；断言对象为路径本身，不涉及凭据。
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "需本机安装 WorkBuddy 客户端"]
+    fn client_executable_exists_on_this_machine() {
+        for region in [Region::Cn, Region::Global] {
+            let app = crate::modules::auth_file::workbuddy_app_path_for(region);
+            if !app.exists() {
+                continue;
+            }
+            let exe = client_executable_for(region);
+            assert!(
+                exe.exists(),
+                "{region:?} 拼出的可执行体不存在（按包名猜名即此后果）：{}",
+                exe.display()
+            );
+            assert_eq!(
+                exe.file_name().and_then(|n| n.to_str()),
+                crate::modules::process::bundle_executable(&app)
+                    .as_deref()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str()),
+                "可执行体名必须来自 Info.plist 的 CFBundleExecutable"
+            );
+        }
     }
 }

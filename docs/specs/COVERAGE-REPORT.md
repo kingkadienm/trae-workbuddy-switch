@@ -1,0 +1,794 @@
+# 覆盖度报告：原型 112 条行为 vs 真实应用
+
+> 产出人：软件工程师（coverage-audit） · 日期：2026-10-06
+> 输入：`docs/prototype/verify-behaviors.cjs`（**135** 条断言，JSDOM 驱动**原型** HTML，2026-10-17 实测 **135 passed / 0 failed**）。
+> ⚠️ 标题里的 **112** 是 2026-10-06 的基线条目数；此后各轮陆续新增断言（本轮 +11 条「升级前说明弹窗」，见 [`UPDATE-NOTES-ARCH.md`](UPDATE-NOTES-ARCH.md)），**条目表仍是 10-06 口径**。
+> 对照起点：`docs/history/GAP-ANALYSIS.md`（2026-10-04，当时 **21 ✅ / 32 ⚠️ / 51 ❌ / 8 ⬜**）
+> 参考门禁：`scripts/check-scope-registry.cjs`（**221 条** @2026-10-07，验 `src/` 真实代码 —— 佐证用，非判据）
+> **硬约束**：本文件是纯分析，**不改任何代码 / 其他文档**。判定保守 —— **宁可说「未实现」**。
+
+---
+
+## ★ 最新状态（2026-10-14 · 第七轮）—— 统一入口（P16）+ 外部会话监听（P15）+ 三处「界面承诺了但后台没接」
+
+> 产出人：lead · 日期：2026-10-14
+> **判据（全部实测）**：`npm run check:api`（**routes=182 / call=172 / server=166 / invoke=190 / demoRead=65 / demoCase=66 / 单Value参数=14 / 参数化=10 / 别名=20 / 桌面专属豁免=8**）、
+> `npm run check:scope`（**291 passed / 0 failed**）、`cargo check --workspace` 绿、`npx tsc --noEmit` 0 错，
+> 外加**真实环境验收**（用户明确授权）：统一入口四段命名空间**全部真实上游 200**，`/biz/*` 通到真实业务上游。
+> **本段之后的数字以本段为准**（上面的第六轮数字是 2026-10-08 的快照）。
+
+### A⁷. 本轮新增的能力（此前**完全不存在**）
+
+| # | 能力 | 落地证据 | 关键判据 |
+|:--|:---|:---|:---|
+| 1 | **统一入口（第三个产品线，跨作用域）** | core `gateway_namespace.rs`（派生层 4 条由 `Scope::all()` 生成 + 扩展层 4 条手写、默认关）；`gateway/src/unified/{config,apikey,routes,state,mod}.rs`；`server/src/unified_gateway_host.rs` + `src-tauri/src/unified_gateway.rs`；前端 `unified-gateway-view.tsx`（三张卡）+ `GATEWAY_SUBNAV` 第 7 项 | 单端口 `57892`、单 Key 库（`sk-uni-`）、模型 id 带命名空间前缀；**裸模型名一律 400**；**解析只做整段精确匹配**（`trae`/`traework`/`traecode` 互为前缀 ⇒ 前缀匹配会静默走错池）；`trae-*` 的 `/v1/responses` 返回 **501** |
+| 2 | **外部 Agent 会话监听（P15）** | `agent_watch.rs`（状态机）+ `agent_hook_rx.rs`（接收端 + `hook` 子命令）+ `agent_hook_install.rs`（装 / 卸，走客户端设置托管） | **默认关**、需显式开启；接收端只绑回环 `127.0.0.1:57893`；不覆盖用户已有 hook；决策落点 D43–D46 |
+| 3 | **网关 API Key 三态动作** | `apikey.rs::restore`（两平台同形） | ★ **已吊销行必须同时给「恢复 + 删除」两个出口**（恢复在前）；恢复判据锚**行为**（`verify` 重新通过），不是看字段被清 |
+| 4 | **Trae JWT 自动续期** | `schedule.rs` 第 8 类 `trae_jwt_refresh` + Trae 设置页开关 | ★ 修的是**「界面承诺了、后台没有调用点」**：此前文案说「可自动续期」而唯一入口是手动菜单项 |
+| 5 | **会话关联（内容指纹派生）** | `session.rs`：`group_fingerprint` / `list_replica_groups_for` / `sync_session_replica{s,_for}` / `unify_replica_between_files` | 状态由 **jsonl 内容指纹**派生（**不是**「谁的时间新」）；同步是**加法**（只追加不覆盖）；分歧必须先选保留哪一份 |
+| 6 | **Trae 作用域快照自动刷新** | 后台任务 + 窗口严格小于轮询间隔 | ★ 本轮最有价值的发现：**窗口必须严格小于轮询间隔**，否则「看起来在刷、实际永远错过」 |
+| 7 | **关闭窗口去向由偏好决定** | `app_prefs::close_to_tray()` | ★ 宿主也读的偏好必须落 core `app_prefs.json`（不是 localStorage）；「退出」走 `app.exit(0)`，**别碰** `should_keep_tray_alive` |
+| 8 | **自动检查更新接到轮询** | 设置项 ↔ 轮询同源（关掉即短路，间隔 30 分钟） | ★ 「摆了开关不等于接了」—— 同类事故本仓已出四次（见 §A⁷.1） |
+
+### A⁷.1 一类反复出现的事故：**「界面承诺了，后台没有调用点」**
+
+本轮**又**抓到一条（Trae JWT 续期）。这是本仓**第五次**同类问题（前四次分别落在签到、保活、快照刷新、后台任务登记）。
+**根因固定**：`buddy-switch-server/main.rs` 与 `src-tauri/lib.rs` **各有一份** `BackgroundTask` 表（唯一事实来源），
+而新增「写状态 / 周期性」出口的人常常只改了界面与命令，没往那两张表里登记。
+**对策（已成本仓纪律）**：新增任何「写状态 / 周期性」出口，**先 grep 两侧注册表**。
+
+### A⁷.2 覆盖度结论
+
+第六轮的「三条新能力」在本轮**均已被真实使用路径覆盖**（限流台账、Skill 管理、客户端设置托管都在页面上有出口且门禁绿）。
+本轮新增的 8 条里，**唯一尚未做真实现场验证的是 P15 的 S5**（需要一台装了 WorkBuddy 且真在跑任务的机器：
+装 hook → 收事件 → 四态渲染 → 点回原会话）—— 已显式登记为未完成项，不假装完整。
+
+---
+
+## ★ 最新状态（2026-10-08 · 第六轮）—— 三条新能力落地（限流可视化 / Skill 管理 / 客户端设置托管）
+
+> 产出人：lead · 日期：2026-10-08
+> **判据**：`cargo test -p buddy-switch-core --lib`（`client_limits` 9 + `skill` 24 + `client_settings` 19，全绿）、
+> `cargo check --workspace` 绿、`npx tsc --noEmit` 0 错、`npm run check:api`（**routes=157 / call=145 / invoke=163**）、
+> `npm run check:scope`（**227 passed / 0 failed**）+ 直接读源码。
+
+### A⁶. 本轮新增的三条能力（此前**完全不存在**，不是「补验证」）
+
+| # | 能力 | 来源任务 | 落地证据 |
+|:--|:---|:---|:---|
+| 1 | **客户端限流可视化**（账号 × 模型 × 恢复时刻） | `09-22-client-rate-limit-visibility`（P0） | core `client_limits.rs`（`workbuddy.db` 以 `SQLITE_OPEN_READ_ONLY` **只读**打开、绝不写库；`parse_reset_at_ms` 认 `YYYY-MM-DD HH:MM:SS UTC+8` 文案模板；按 `(uid, model, reset_at)` 去重取最近；join 失败**保留为 unknown 不丢弃**）+ `GET /api/client/limits` / `commands::client_limits` + `client-limits-card.tsx`（挂 `AccountsPage`，当前受限置顶） |
+| 2 | **Skill 管理**（清单 / 启停 / 跨区搬迁 / 本地导入） | `09-22-skill-manager`（P1） | core `skill.rs`（frontmatter **行级**改写 `user-invocable` / `disable-model-invocation`，其余字节不动；跨区搬迁「合并补齐」且**冲突保留目标侧**；模块内备份只在「目标原本存在且确有改动」时触发）+ 5 条命令四通道 + `skill-manager.tsx`（侧栏底部「应用级区」） |
+| 3 | **客户端设置统一托管**（读 / 编辑 / 备份 / 恢复 / 差异） | `09-22-upstream-client-settings`（P1） | core `client_settings.rs`（6 槽位声明式规格表；**格式指纹 + 手术式 patch**，只替换目标值的字节跨度；写前判进程、运行中拒绝；恢复前再备份；跨产品按语义映射表归并代理字段）+ 6 条命令四通道 + `client-settings.tsx` |
+
+三条能力都遵守同一纪律：**两宿主（`api.rs` / `commands.rs`）调同一个 core 函数并原样返回**，
+杜绝「一侧多包一层」的形状漂移；只读命令进 `DEMO_READ_COMMANDS`，写 / 动作命令由 `DemoAction` 遮罩。
+
+### A⁶.1 两条「此前判为不可得」的结论已翻案（+1 条部分翻案）
+
+| 之前的判断 | 实际 |
+|:---|:---|
+| Trae 侧代理字段取值域**无证据** ⇒ 缩到「统一查看 + 各自编辑」（`09-22-upstream-client-settings` PRD「背景·四」/ Risks 1） | ✅ **取到证据**：从客户端 bundle（`Trae CN\resources\app\out\main.js`、WorkBuddy bundle 的 `parseProxySettings`）逐字节读出取值域，已写成常量并由单测 `代理字段取值域常量被钉住` 钉住 |
+| 限流 `6020` / `6022` 文案**卡上游、客户端 i18n 取不到**（`09-22-client-rate-limit-visibility` PRD S6） | ⚠️ **部分翻案（2026-10-08 补查）**：客户端 bundle 内精确键 `queue.waiting.title` / `queue.userLimit.title` **0 命中**（确非客户端键，属上游）；但客户端**自有**排队块文案 `capacityQueueBlock.*`（中英）已取证 ⇒ **补展示可行**，映射口径待拍板 |
+| 客户端设置若整体重序列化会产生**与内容无关的大 diff**（PRD「背景·三」） | ✅ **已规避**：实现走「格式指纹 + 仅替换目标值跨度」，`patch保持缩进风格且只改目标行` / `替换值不动周边空白` / `点号路径定位且未知键与顺序不变` 三条单测钉死；且实测排版与 PRD 2026-09-22 的记载**不同**（Trae CN 实为 2 空格 LF、`TRAE SOLO*` 实为纯 tab CRLF，非「0 缩进 / 混合」），故实现**靠检测而非假设** |
+
+### B⁶. 真实剩余清单（第六轮口径）
+
+| # | 项 | 性质 | 卡在哪 |
+|:--|:---|:---|:---|
+| 1 | **P12 spike 运行时确认**（H0 运行时 / H1 真客户端半段 / H4 抓 header 原始大小写） | ⛔ 需**用户手动** | `P12-SPIKE-RESULTS.md` §6 |
+| 2 | **新增客户端**（VS Code CodeBuddy 插件 / JetBrains 插件） | 未排期 | 注册表已渲染 `planned` 态；真实支持需单独立项（`PLAN.md §3.3` B 表 / `VOCABULARY.md`） |
+| 3 | **P9 悬浮窗键盘可达性 · 运行时走查** | ⛔ 需**用户手动 / E2E** | 代码 + 静态门禁已落地；走查清单见 `P9-KEYBOARD-CHECKLIST.md` |
+| 4 | **客户端设置的「真实客户端端到端」**（关进程 → 改一个键 → 启动客户端 → 客户端确实读到新值） | ⛔ 需**用户手动** | `09-22-upstream-client-settings` PRD S6 / Acceptance 最后一条 |
+| 5 | **限流 `6020` / `6022` 的排队语义文案** | ⚠️ **部分取证（2026-10-08 补查）** | 客户端 bundle（`WorkBuddy\resources\app.asar`）内**精确键 0 命中**（`queue.waiting.title` / `queue.userLimit.title` 非客户端 i18n 键，属**上游**消息键）；客户端**自有**排队块文案 `capacityQueueBlock.*` 已取证（中英：`title.waiting`=当前模型资源紧张，请等候。/ `title.full`=当前模型队列已满 / `title.userLimit`=您已达到当前模型的使用上限 / `title.timeout` / `title.expired`）。**补展示是小改，但映射口径待拍板**（PRD S6「★ 6020/6022 取证」） |
+| 6 | **Trae 国际版联网联调**（OAuth → 签到 → 积分） | ⛔ 需**用户手动** | 本机无可用国际版凭据（`09-21-trae-region-program-model` S5） |
+| 7 | **三条新能力的真实应用 UI 走查** | ⬜ 待补 | 目前只有单测 + 静态门禁（`tsc` / `check:api` / `check:scope`）；**未在真实应用里点过**（`skill-manager` 仅跑过 `build:demo`） |
+| 8 | **Skill 管理的 L3b（GitHub repo 安装）与 `discover` 社区搜索** | ⬜ 未做（已收敛） | PRD §7 建议不做（与内置 marketplace 重叠）；`scan-unmanaged` / `import-from-apps` 一并降级 |
+| 9 | **客户端设置的 webui 门禁口径** | ⬜ 待拍板 | 当前取「保留入口 + 标注操作的是**服务端机器**」；PRD 允许二选一 |
+| 10 | 原型特有 8 条 | ⬜ 不适用 | 本就不该照搬 |
+
+### C⁶. 「仅静态覆盖」清单（本轮新增 3 条）
+
+| 能力 | 静态判据 | 缺什么 |
+|:---|:---|:---|
+| **客户端限流可视化** | `cargo test` 9 条（时区 / join / 去重 / 排序 / 只读）+ `check:api` | 真实数据全量跑一遍的**输出核对**（PRD Acceptance 1~3）与卡片在真实应用的**渲染走查** |
+| **Skill 管理** | `cargo test` 24 条（frontmatter CRLF/BOM、行级保字节、往返幂等、冲突保留目标侧、备份触发条件、路径穿越拒绝）+ `tsc` + `build:demo` | 真实 `{data_dir}/skills` 上的**启停 / 搬迁 / 导入**端到端 |
+| **客户端设置托管** | `cargo test` 19 条（6 槽位、四风格指纹、patch 只改目标行、幂等备份、恢复逐字节、三类比对、跨产品代理归并、损坏 JSON 报错、路径穿越拒绝、进程占用带码） | **真实客户端端到端**（B⁶ 第 4 条） |
+
+---
+
+## ★ 最新状态（2026-10-08 · 第五轮）—— P9 悬浮窗键盘可达性落地
+
+> 产出人：lead · 日期：2026-10-08
+> **判据**：`scripts/check-scope-registry.cjs`（**227 passed / 0 failed**，+1 条新断言）+ 直接读源码。
+
+### A⁗. 第四轮「真实剩余清单」第 3 条已不成立（**补的是「实现」，不只是「验证」**）
+
+| 第四轮写的 | 实际情况 | 证据 |
+|:---|:---|:---|
+| 「**P9 悬浮窗键盘可达性** —— 未验证，独立窗口不能复用主窗口验证路径」 | ❌ **焦点入口此前根本没实现**：`P9-ARCH §1.7` 明写「窗口打开后焦点落在**第一个可聚焦行**」，而 `companion-app.tsx` 只依赖 Rust 侧 `window.set_focus()`（**OS 级窗口焦点**，不回填 webview 内的**元素**焦点）⇒ `decorations(false)` 下键盘用户打开后**没有任何焦点入口**。本轮**补齐** | `companion-app.tsx`（`focusEntry`：`contentRef.querySelector("button")` → 退 `closeRef`；`didInitialFocusRef` 只做一次；`listen("companion-visibility")` 重开送回焦点）；`companion-row.tsx`（行=原生 `<button>` + `:focus-visible`；`motion-reduce:animate-none`）；门禁第 **227** 条 |
+
+**本轮补齐的五条（`P9-ARCH §1.7`）**：
+
+| 项 | 实现 |
+|:---|:---|
+| 焦点入口 | 内容就绪后聚焦**第一个可聚焦元素**（行 / 空态「刷新」），退路=关闭按钮；**只做一次**，不抢用户焦点 |
+| 重新可见 | 隐藏 = 不销毁 ⇒ `listen("companion-visibility")` true 时**送回焦点**（`set_focus` 只给窗口焦点） |
+| 行可聚焦 | 每行是**原生 `<button>`**（Tab / Enter / Space 原生可用），`:focus-visible` 展开标题 |
+| 拖动不抢焦点 | 拖拽手柄走 `data-tauri-drag-region`（原生拖动，**不产生可聚焦元素**） |
+| Esc / 关闭按钮 | Esc = 隐藏窗口；关闭按钮是 `<button aria-label="隐藏悬浮窗">`（可聚焦、可 Enter） |
+
+**诚实边界（不撒谎）**：门禁第 **227** 条是**静态结构断言**（A8：独立窗口不能复用主窗口的键盘验证）——
+它钉死「代码里有焦点入口 / Esc / 原生 button / drag-region」，**不等于**「运行时真的按预期工作」。
+**独立窗口的运行时键盘走查仍待一条 companion webview 的 E2E（或手测清单）**（见下方「仅静态覆盖」清单）。
+本轮**未做**该运行时走查：用户正在使用该客户端，触发窗口显隐/重启会打断其任务。
+
+### B⁗. 真实剩余清单（第五轮口径）
+
+| # | 项 | 性质 | 卡在哪 |
+|:--|:---|:---|:---|
+| 1 | **P12 spike 运行时确认**（H0 运行时 / H1 真客户端半段 / H4 抓 header 原始大小写） | ⛔ 需**用户手动** | `P12-SPIKE-RESULTS.md` §6 |
+| 2 | **新增客户端**（VS Code CodeBuddy 插件 / JetBrains 插件） | 未排期 | 注册表已渲染 `planned` 态，真实支持需单独立项 |
+| 3 | **P9 悬浮窗键盘可达性 · 运行时走查** | ⛔ 需**用户手动 / E2E** | 代码 + 门禁已落地；**运行时**验证需独立窗口 E2E（本轮因客户端占用未做） |
+| 4 | 原型特有 8 条 | ⬜ 不适用 | 本就不该照搬 |
+
+---
+
+## ★ 最新状态（2026-10-08 · 第四轮）—— 逐条「+N」落地
+
+> 产出人：lead · 日期：2026-10-08
+> **判据**：`scripts/check-scope-registry.cjs`（**226 passed / 0 failed**，+1 条新断言）+ 直接读源码 + `cargo test`（新增 2 条**可证伪**单测）。
+
+### A‴. 第三轮「真实剩余清单」第 3 条已不成立
+
+| 第三轮写的 | 实际情况 | 证据 |
+|:---|:---|:---|
+| 「**签到积分「逐条 +N」明细** —— ⛔ 卡后端：`CheckinEvent` 无金额字段 ⇒ 推不出」 | ❌ **已实现**。数据源其实**已在**：提交前的 `checkin-activity-status` 返回 `daily_credit` / `today_credit`（与 Trae 侧「预检返回的 `credits` 就是本次签到可得的额度」同源，见 `trae/checkin.rs`）。缺的只是**把额度落进签到日志**并**逐条透传到 `events`** | `checkin.rs`（`checkin_reward_from_status` + `entry_map["amount"]`）；`credit_usage.rs`（`CheckinEvent.amount` + `"amount": event.amount`）；`types.ts`（`CreditStatsCheckinEvent.amount`）；`CreditStatsPage.tsx`（`+${formatCredits(reward)}`）；门禁第 **226** 条 |
+
+**取舍（不撒谎）**：额度**只认上游实测字段、只取正数**；`0` / 缺失一律 `None` ⇒ 前端显示 `—`，**不摆「+0」**。逐日**聚合**入账仍不可得（后端 `daily[]` 只由余额快照推导，只有消耗侧），故「区间入账」tile 与每日收支柱保持单向 —— 这一条**不变**。
+
+### B‴. 真实剩余清单（第四轮口径）
+
+| # | 项 | 性质 | 卡在哪 |
+|:--|:---|:---|:---|
+| 1 | **P12 spike 运行时确认**（H0 运行时 / H1 真客户端半段 / H4 抓 header 原始大小写） | ⛔ 需**用户手动** | `P12-SPIKE-RESULTS.md` §6 |
+| 2 | **新增客户端**（VS Code CodeBuddy 插件 / JetBrains 插件） | 未排期 | 注册表已渲染 `planned` 态，真实支持需单独立项 |
+| 3 | **P9 悬浮窗键盘可达性** | 未验证 | 独立窗口，不能复用主窗口验证路径 |
+| 4 | 原型特有 8 条 | ⬜ 不适用 | 本就不该照搬 |
+
+---
+
+## ★ 最新状态（2026-10-07 · 第三轮 · 收官）—— 以代码 + 门禁为准
+
+> 产出人：lead · 日期：2026-10-07（本轮回写）
+> **判据**：`scripts/check-scope-registry.cjs`（**221 passed / 0 failed**，逐条断言**真实代码**）+ 直接读源码。
+> **本轮回写的是「上一版列为剩余的条目哪些已不成立」**，**不是**重跑 112 条 —— 见下方 ⚠️ 口径声明。
+
+### A″. 与上一版的差异（上一版列的两条「剩余」都不成立）
+
+| 上一版（第二轮）写的 | 实际情况 | 证据 |
+|:---|:---|:---|
+| 「**P8 状态 / 分歧 / 同步 7 条** —— 后端：copy ledger 无消息计数 ⇒ **推不出**」 | ❌ **论据已失效**。后端已补**内容指纹**（`session_fingerprint_for`：`line_count` + 逐行 `prefix_hashes`）⇒ **组状态派生 / 关联图 / 状态筛选 三项已解禁并落地**。真正仍缺的只有 **分歧处理** 与 **增量同步** | `crates/buddy-switch-core/src/modules/session.rs`（`PREFIX_HASH_LIMIT` / `SessionFingerprint`）；`src/lib/session-replicas.ts`（`deriveGroupStatus` 四态 / `commonPrefix` / `deltas`）；门禁第 **220 / 221** 条 |
+| 「**P12 请求代理 5 条** —— 卡 spike 的 H2/H3（装 CA + 真实流量）」 | ❌ **H2/H3 已不适用**。10-07 15:26 路线从「TLS 中间人」改为「**本地路由**」（客户端 base URL 指向本机网关，明文 http）⇒ **不需要 CA** ⇒ 证书固定不再是 blocker。P12 **已实现**（引导式） | `P12-SPIKE-RESULTS.md` §3「A 路改道」；`crates/buddy-switch-core/src/modules/proxy.rs`；`crates/buddy-switch-gateway/src/routes/biz.rs`；门禁第 **214–217** 条 |
+| 「**P0 程序位注册表 /「计划新增」态 2 条** —— 需产品定义 planned 清单」 | ⚠️ **已落地**：`registry.ts` 已有 `vscode_codebuddy_plugin` / `jetbrains_codebuddy_plugin` 两条 `status: "planned"`，卡片渲染 + 措辞「尚未支持」 | `src/lib/platforms/registry.ts:88-94`；门禁第 **218** 条 |
+| 「**签到积分「+N」明细 2 条**」 | ✅ **仍成立**（四条里唯一没变的） | `CheckinEvent`（`crates/buddy-switch-core/src/modules/credit_usage.rs:46`）字段仅 `ts / date / account_id / account_name / result / error`，**无金额字段** |
+
+### B″. 真实剩余清单（收官口径）
+
+| # | 项 | 性质 | 卡在哪 |
+|:--|:---|:---|:---|
+| 1 | **P8 分歧处理**（选保留哪一份） | 未实现 | D20 已后置；需**内容级 diff + 逐条选择 UI**。现状只渲染 `diverge` 徽章（`session-replica-view.tsx:57`），**无**「选保留哪一份」交互 |
+| 2 | **P8 安全同步（增量追加）** | 未实现 | `session.rs` 全仓无 `append`；`copy_sessions*` 仍是**整会话新 id 复制**，非追加 |
+| 3 | **签到积分「逐条 +N」明细** | ⛔ 卡后端 | `CheckinEvent` 无金额字段 ⇒ **推不出**（聚合的「+N」有，逐条的没有） |
+| 4 | **P12 spike 运行时确认**（H0 运行时 / H1 真客户端半段 / H4 抓 header 原始大小写） | ⛔ 需**用户手动** | `P12-SPIKE-RESULTS.md` §6，三步负责人都写着「用户手动」 |
+| 5 | **新增客户端**（VS Code CodeBuddy 插件 / JetBrains 插件） | 未排期 | 注册表已渲染 `planned` 态，**真实支持未排入 P0–P12**，需单独立项 |
+| 6 | **P9 悬浮窗键盘可达性** | 未验证 | 独立窗口，**不能复用主窗口的验证路径** |
+| 7 | 原型特有 8 条 | ⬜ 不适用 | 本就不该照搬 |
+
+### ⚠️ 口径声明（本轮**没有**重跑 112 条）
+
+- §1 / §2 的**逐条表仍是 2026-10-06 基线**，其 ✅ / ⚠️ / ❌ 计数**未经本轮重新核对**。
+- 本轮只做**差异核对**：把上一版列为「剩余」的条目逐条对照代码与门禁。
+- 已知仍过时、**以本块为准**的具体位置：`§1.2` 的 P0 / P3 / P4 / P8 / P12 五行；`§2.14` 的「状态派生 / 共同旧版 / 状态筛选 / 侧栏徽章」四行；`§2.12` 的「用量图表仍是旧页面」结论（四视图 + 12 个图表组件均已落地）。
+- ⇒ **下次重跑 112 条时，请以本块为起点。**
+
+---
+
+## （历史）最新状态（2026-10-07 · 第二轮）—— 零散欠账全部处理完毕
+
+> ⚠️ **本节是历史区块**，其 §C′「剩余」表已被上方第三轮推翻，**只作过程留档**。
+
+> 产出人：lead（**本轮 `software-engineer` agent 不可用**，逐条自己核实 / 修复） · 日期：2026-10-07
+> **处理对象**：上一版 §C 的「真欠账 20 条」（❌ 7 + ⚠️ 13）**全部逐条判定并处置**。
+> **门禁 207 → 213**（+6 条断言，**每条都做了变异验证**：去掉修复即变红）。
+
+### A′. 总览（四轮对比）
+
+| 状态 | 起点(10-04) | 10-06 | 10-07 一轮 | **10-07 二轮（最新）** |
+|:---|:--:|:--:|:--:|:--:|
+| ✅ **已实现** | 21 | 60 | 77 | **87** |
+| ⚠️ **部分实现** | 32 | 26 | 13 | **0** |
+| ❌ **未实现（真欠账）** | 51 | 18 | 7 | **7** |
+| ⛔ **被后端阻塞 / 设计取舍（非欠账）** | — | 0 | 7 | **10** |
+| ⬜ **不适用（原型特有）** | 8 | 8 | 8 | **8** |
+| **合计** | 112 | 112 | 112 | **112** ✓ |
+
+**⇒ 已实现率：21/112（19%）→ 87/112（77.7%）。** **⚠️ 部分实现已清零。**
+
+### B′. 本轮处置明细（13 条 ⚠️ 全部落地）
+
+| 条目 | 原型 | 处置 |
+|:---|:--:|:---|
+| 过期 / 需重登账号不给「手动签到」 | F5 | ✅ **修**（`!expired && !account.needsRelogin`） |
+| 账号卡可键盘聚焦 | P1-5 | ✅ **修**（`tabIndex` + `role` + Enter/Space 打开详情） |
+| 部分失败态可只重试失败项 | P1-2 | ✅ **修**（保留失败 id + toast action + 共用 `runCheckinFor`） |
+| 权限自愈「恢复即自动重试切换」 | P3 | ✅ **修**（自动重试 + **只一次**护栏）· **计 3 条** |
+| 「去设置」跳到「权限与诊断」 | P0-4a | ✅ **修**（`?section=diagnostics` + URL 读 + 合法性校验） |
+| 会话气泡不溢出（断言） | P3 | ✅ **加断言**（四侧 margin + `ZAxis range`）· **仍属「仅静态」** |
+| 同程序位排他 | P4 | ✅ **判定「已满足」**（单值 `activeAccountId` 天然排他） |
+| 积分视图两处降级 | P3 | ✅ **口径修正**（那是决策 #1/#2/#3 的**有意不画**，不是「部分实现」） |
+| P11 WB 不显示「不可用」列 | P11 | ⛔ **设计取舍**（决策 #3） |
+| 签到积分无逐条「+N」明细 | P3 | ⛔ **卡后端**（`CheckinEvent` 无金额字段）· **计 2 条** |
+
+### C′. 剩余（**前端侧已无可做项**）
+
+| 类别 | 条数 | 卡在哪 |
+|:---|:--:|:---|
+| **P12 请求代理** | 5 | **你**：spike 的 H2/H3（装 CA + 真实流量）—— `scripts/spike/p12-h2h3-harness.mjs` 已备好 |
+| **P0 程序位注册表 /「计划新增」态** | 2 | **已论证的边界**（`P5-ARCH.md` T05：「前端可达仍需一条宿主薄命令」）+ **需产品定义 planned 清单** |
+| **P8 状态 / 分歧 / 同步** | 7 | **后端**：copy ledger 无消息计数 ⇒ **推不出**（`P8-ARCH.md` §1.2 已论证） |
+| **签到积分「+N」明细** | 2 | **后端**：`CheckinEvent` 无金额字段 |
+| **原型特有（本就不该照搬）** | 8 | — |
+
+**⇒ 结论**：**前端侧已无可做项**。剩余全部卡在 **用户（P12 手动步骤）** 或 **后端（需新增字段 / 数据源）**。
+
+---
+
+## 最新状态（2026-10-07）—— P3 / P4 落地后复核
+
+> 产出人：软件工程师（final-audit） · 日期：2026-10-07
+> **复核对象**：上一版标 ❌ / ⚠️ 的条目 —— 重点 **P3 用量四视图（12 条）+ 概览（3 条）+ P4 跨作用域迁移向导 B1（5 条）**。
+> **输入**：设计 `P3-ARCH.md` / `P4-MIGRATION-ARCH.md`；实现 `src/lib/usage-charts.ts`、`src/lib/chart-caption.ts`、`src/lib/session-tree.ts`、`src/components/usage/*`、`src/components/switch-account/*`、`src/components/overview/today-usage.tsx`、重写后的 `UsagePage` / `TokenStatsPage` / `CreditStatsPage` / `OverviewPage` / `switch-account-dialog.tsx`；门禁 `scripts/check-scope-registry.cjs`（P4 段 `:4387-4638`、P3 段 `:4640-5065`）。
+> **硬约束**：**只改本文件**（未动任何代码 / 其他文档）；判定保守（**宁可说未实现**）；**静态断言 ≠ 行为验证** —— 仅由静态断言支撑者标 **「⚠️ 仅静态覆盖」**，**不计入「行为已验证」**。
+
+### A. 总览（含与上一版对比）
+
+| 状态 | 上一版（2026-10-06） | 最新（2026-10-07） | 变化 |
+|:---|:--:|:--:|:--:|
+| ✅ **已实现** | 60 | **77** | **+17** |
+| ⚠️ **部分实现** | 26 | **13** | −13 |
+| ❌ **未实现（真欠账）** | 18 | **7** | −11 |
+| ⛔ **被后端阻塞（非欠账）** | 0 | **7** | +7 |
+| ⬜ **不适用（原型特有）** | 8 | **8** | 0 |
+| **合计** | **112** | **112** | — |
+
+> **读法（四处口径变更，务必先看）**：
+> 1. **✅ +17 = P3（15）+ P4（2 主修；B1 另 2 条 ⚠️ 一并转 ✅）**。逐条见 §B。
+> 2. **❌ 18 → 7（−11）= P3/P4 修复 4 条（概览 2 + 迁移向导 2）+ P8 的 7 条经复核从 ❌ 改判为「⛔ 被后端阻塞」**。后者是**口径修正**（`P8-ARCH.md` §1.2 已论证：copy ledger 无消息计数 ⇒ 组状态 / 分歧 / 同步**推不出来**），**不是本轮成果**，也**不计入欠账**。
+> 3. **⚠️ 26 → 13（−13）= 用量图表 10 + 概览 1 + 迁移向导 2**。
+> 4. **真欠账 = ❌ 7 + ⚠️ 13 = 20 条**；另 7 条（P8）为**后端阻塞**、8 条为**原型特有**。
+> 5. **验证强度单列**：`check-scope-registry.cjs` 的 P3/P4 段**部分真跑代码**（纯函数经 `loadTs`、组件经 `loadUsageComponent` JSX 转译后**真调用**）⇒ 这些是**行为断言**；其余为文本 / 结构扫描 ⇒ **仅静态覆盖**（见 §D）。
+
+### B. ★ 因 P3 / P4 而新变 ✅ 的条目清单（17 条）
+
+> 「验证强度」：**[运行时]** = 门禁**真跑**该纯函数 / 组件；**[静态]** = 只有文本 / 结构扫描（**不计入「行为已验证」**，见 §D）。
+
+| # | 行为 | 期次 | 状态 | 证据（文件:行） | 验证强度 |
+|:--:|:---|:--:|:--:|:---|:--:|
+| 1 | 趋势 ≥4 张图 + 非空 aria-label | P3 | ✅ | `src/pages/TokenStatsPage.tsx:188-225`（4 个 `<ChartFrame>`：堆叠 / 累计 / 环形 / 热力图）；`src/components/usage/chart-frame.tsx:157`（`role="img"` + `aria-label={ariaLabel}`） | 静态 |
+| 2 | 堆叠柱列数 = 天数、每列分段数 = 模型数 | P3 | ✅ | `src/lib/usage-charts.ts:264-306`（`dailyModelSeries`：一天一列、模型为段）；`src/components/usage/stacked-daily-bar.tsx:71-83`（每模型一个 `<Bar stackId>`） | 运行时 |
+| 3 | 堆叠柱各分段之和 = 当日总量 | P3 | ✅ | `src/lib/usage-charts.ts:297-303`（末段吃余数，和 **精确等于** `total`） | 运行时 |
+| 4 | 热力图 7 行 × 24 列 | P3 | ✅ | `src/lib/usage-charts.ts:313-325`（`cells[7][24]`，缺失补 0、非法 key 忽略）；`src/components/usage/usage-heatmap.tsx:49-70` | 运行时 |
+| 5 | 环形扇区数 = 模型数 | P3 | ✅ | `src/lib/usage-charts.ts:339-349`（`modelSlices` 每模型一项、只留 value>0）；`src/components/usage/model-donut.tsx:53-55`（每项一个 `<Cell>`） | 静态 |
+| 6 | 累计曲线图注不写「峰值 = 末值」 | P3 | ✅ | `src/lib/chart-caption.ts:45-50`（`cumulativeCaption` 写「累计 {total}（单日峰值 {peak}）」）；`TokenStatsPage.tsx:200` | 静态 |
+| 7 | 模型页：环形 + 每行一条迷你趋势线 | P3 | ✅ | `TokenStatsPage.tsx:277-291`（`ModelsView`：环形 + 排行）；`src/components/usage/model-ranking.tsx:21-50,67`（`Sparkline` 每行一条） | 静态 |
+| 8 | 会话气泡数 = 会话数、排行条数 = 会话数 | P3 | ✅ | `src/lib/usage-charts.ts:352-367`（`sessionPoints` 每会话一点）；`src/components/usage/session-scatter.tsx`、`session-ranking.tsx:22,69` | 静态 |
+| 9 | 积分余额曲线基线不锚 0 | P3 | ✅ | `src/lib/usage-charts.ts:388-402`（`baseline = min-(max-min)*0.35`）；`src/components/usage/credit-balance-area.tsx:45`（`domain=[baseline,"auto"]`）；`chart-caption.ts:58-75`（图注写明「非 0 / 回推」） | 运行时 |
+| 10 | 合并态模型扇区数真的变多（mergeExt） | P3 | ✅ | `src/lib/usage-charts.ts:202-245`（`mergeSources` 聚合 `models / dailyByModel / hours`）；`TokenStatsPage.tsx:388` | 运行时 |
+| 11 | 概览「今日 Token」摘要 | P3 | ✅ | `src/components/overview/today-usage.tsx:41-154`（`TodayUsage`，与用量页**同源** `getTokenStatistics` + `mergeSources`）；`src/pages/OverviewPage.tsx:171`（挂载） | 运行时 |
+| 12 | 「对比昨日」真算（无 `+12%` 硬编码） | P3 | ✅ | `today-usage.tsx:108-124`（`(今日-昨日)/昨日`；昨日 ≤0 ⇒ 「昨日无数据」，不给假百分比） | 运行时 |
+| 13 | 待处理上移到统计块之前 | P3 | ✅ | `OverviewPage.tsx:127-168`（待处理）**先于** `:174-188`（统计 tile） | 静态 |
+| 14 | 第 1 步有「来源账号」选择 | P4 | ✅ | `src/components/switch-account/source-account-picker.tsx:86-151`（来源 = 各 scope **当前账号**）；`switch-account-dialog.tsx:583-591` | 静态 |
+| 15 | 跨作用域入口存在 | P4 | ✅ | `source-account-picker.tsx:153-155`（`data-act="wiz-cross"`）；`switch-account-dialog.tsx:385-390`（关时回落当前作用域） | 静态 |
+| 16 | 三层会话树 + 「已选 N / M」计数 | P4 | ✅ | `src/lib/session-tree.ts:137-156`（类型 → 目录 → 会话）；`src/components/switch-account/session-tree.tsx:125-127`（`treeCount` = 已选 N / M） | 运行时 |
+| 17 | 确认页如实汇总「已选 N 个会话 / M 个目录」 | P4 | ✅ | `src/components/switch-account/migration-summary.tsx:69-99`（取 `stats.selected` / `stats.dirsSelected`）；`switch-account-dialog.tsx:690-704` | 静态 |
+
+> **本轮 17 条中：8 条 [运行时]（用量 5 + 概览 2 + 三层树 1）、9 条 [静态]**（见 §D）。
+> **注**：`§2.12` 原判「用量图表未按原型重做（12 条 ⚠️）」**已被本区块取代** —— `TokenStatsPage` / `CreditStatsPage` 已重写为四视图组件装配（`UsagePage.tsx:54-57,96-104` 一级四视图 + 平台数据表达）。
+
+### C. ★ 仍未实现 / 部分实现的清单（按用户可感知度排序）
+
+> **真欠账 = 20 条**（❌ 7 + ⚠️ 13）。另 7 条 P8「状态 / 分歧 / 同步」为**后端阻塞**（非欠账，见 §F）。
+
+| # | 缺口 | 期次 | 状态 | 用户可感知后果 |
+|:--:|:---|:--:|:--:|:---|
+| 1 | **请求代理整期未实现**（5 条） | P12 | ❌ | 无「默认关 + 绝不劫持」的代理能力；**但 spike 未收口（`P12-SPIKE-RESULTS.md`：outcome=C、A 路待人工）**，PLAN §3.19 要求先 spike ⇒ **不应按「未实现」直接排期** |
+| 2 | **程序位注册表 / 「计划新增」态缺失**（2 条） | P0 | ❌ | 加第 3 个 WB 程序位仍需改代码；「尚未支持」与「本机没装」无法区分 |
+| 3 | **积分视图两处降级**（1 条） | P3 | ⚠️ | 双向柱按**决策 #1** 降为**单向**（入账明细不可得）；两个环形按**决策 #2/#3** **不渲染**（无数据源）—— **数据驱动，非缺陷** |
+| 4 | **模型禁用页 WB 不显示「不可用」列**（1 条） | P11 | ⚠️ | 与原型「三种展示」不同（决策 #3 有意为之） |
+| 5 | **部分失败态只 toast**（1 条） | P3 | ⚠️ | 批量签到失败后**无法只重试失败项**，也无明细 |
+| 6 | **过期账号卡片菜单仍给「手动签到」**（1 条） | P3 | ⚠️ | 与批量签到的「结构性失败」口径**自相矛盾**（抽屉断言空转通过） |
+| 7 | **权限自愈缺「恢复即自动重试切换」**（3 条） | P3 | ⚠️ | 授权后用户仍需**手动再点一次**切换 |
+| 8 | **「去设置」入口是自动跳转、非可点 toast**（1 条） | P4 | ⚠️ | 未定位到「权限与诊断」子项 |
+| 9 | **账号卡不可键盘聚焦**（1 条） | P3 | ⚠️ | 卡片本身不可 Tab 聚焦（仅内部勾选框可） |
+| 10 | **签到积分无逐条「+N」明细**（2 条） | P3 | ⚠️ | 积分为后端真值，无原型式「+50/+100」记录列表 |
+| 11 | **同程序位排他（需后端确认）**（1 条） | P4 | ⚠️ | 前端不互相清除；排他性在后端，未确认 |
+| 12 | **会话气泡不溢出（形态不同、未验证）**（1 条） | P3 | ⚠️ | 由 recharts 布局保证（`session-scatter.tsx:61,80`），**无断言** |
+
+### D. ★「仅静态覆盖」清单（本轮新增 9 条）
+
+> **定义**：代码**已落地**，但**只有静态断言**（文本 / 结构扫描）支撑，**没有任何运行时或端到端**验证证明它「真的按预期工作」。⚠️ **`verify-behaviors.cjs` 验的是原型**，对真实应用**不构成**运行时证据。
+
+| 行为 | 静态断言（门禁） | 缺什么运行时证据 |
+|:---|:---|:---|
+| 趋势 ≥4 张图 + 非空 aria-label | `check-scope-registry.cjs:5032-5045`（扫 `TrendView` 的 `<ChartFrame` 计数 + `chart-frame.tsx` 的 `role="img"`） | 组件**未真跑**（未渲染 4 图、未读 aria-label） |
+| 环形扇区数 = 模型数 | **无直接断言**（`modelSlices` 未被 `loadTs` 覆盖） | 纯函数未跑、`<Cell>` 数未核 |
+| 累计曲线图注不写「峰值 = 末值」 | 词条 `wbStats.usage.caption.cumulative` 存在（无专门断言） | 图注文本未按渲染输出核对 |
+| 模型页环形 + 每行迷你趋势线 | **无专门断言** | `ModelsView` 未真跑 |
+| 会话气泡数 / 排行条数 = 会话数 | **无专门断言** | 组件未真跑 |
+| 概览「待处理上移」 | **无专门断言**（原 P1-6 是原型断言） | 真实 DOM 顺序未核 |
+| 第 1 步有「来源账号」选择 | `:4598-4614`（三步结构 + `wiz-cross`） | 第 1 步内容未真渲染 |
+| 跨作用域入口存在 | `:4611-4613`（`data-act="wiz-cross"` 存在） | 入口**可交互性**未真跑 |
+| 确认页如实汇总 | `:4516-4538`（词条格式 + `stats.selected/dirsSelected` 引用） | 确认页**数字随选择变化**未真跑（该行为由 `selectAll` 运行时断言**间接**支撑） |
+
+> **对比**：以下 P3/P4 行为**含运行时**（门禁 `loadTs` 转译后**真调函数** / `loadUsageComponent` 真调组件），**不算**纯静态覆盖：
+> `dailyModelSeries`（分段和=总量，`:4717-4737`）、`heatmapMatrix`（7×24，`:4739-4760`）、`sessionPoints`（x=records，`:4762-4773`）、
+> `balanceCurve`（回推 + 非 0 基线，`:4775-4795`）、`expiryBuckets`（30 天轴，`:4797-4818`）、`mergeSources`（聚合图表数据，`:4820-4838`）、
+> `CreditDivergingBar`（单向柱数据驱动，`:4840-4865`）、`TodayUsage`（昨日=0 不给百分比，`:4917-4987`）、
+> `buildSessionTree` / `selectAll` / `treeSelectionStats`（三层 + 计数归零/恢复，`:4489-4514,4617-4638`）。
+> **上一版 §5 的静态覆盖清单仍然有效**（P7 / P8 / P9 / P11 后端 / P4 工具栏 / P5 回收站 等），本区块**只增补本轮新条目**。
+
+### E. ★ 与 demo 的差距总结
+
+> **112 条里还差 20 条**（13 部分实现 + 7 未实现）：集中在 **请求代理（5，spike 未收口）**、**程序位注册表 / 「计划新增」态（2）**、**积分视图两处数据驱动降级（1）**，以及零散交互细节（部分失败态、过期签到、权限自愈、键盘聚焦、积分「+N」明细等）；
+> **另有 7 条 P8「状态 / 分歧 / 同步」因后端无内容级数据源而推不出（`P8-ARCH.md` §1.2 已论证，非欠账）**、**8 条原型特有（⬜）本就不该照搬**。
+> ⇒ 就「与 demo 对齐」而言，**P3 用量四视图 + 概览今日摘要 + P4 三步迁移向导三块已收口**；剩余欠账**不含任何整段缺失**（最大一块 P12 属 spike 未收口）。
+
+### F. 口径变更说明（本区块对上一版的两处修正）
+
+1. **P8「状态 / 分歧 / 同步」7 条：❌ → ⛔（被后端阻塞，非欠账）。** 依据 `P8-ARCH.md` §1.2 / §1.6：copy ledger 的值是 `new_cid`（无消息计数），`list_sessions` 行无消息数 ⇒ **「落后 / 分叉」推不出来**，设计已明确「本期不做、登记后续」。**这不是「忘了做」，不该算作欠账**。故从 ❌ 移入独立的 ⛔ 桶（并**不**计入 §E 的「还差 20 条」）。
+2. **验证强度口径**：本轮对 P3/P4 新增条目**区分**「运行时（门禁真跑）」与「仅静态（文本扫描）」。**仅静态者不计入「行为已验证」**（见 §D）—— 这正是「**静态断言 ≠ 行为验证**」的落地。
+3. **旧行号提示**：`§2.2`（合并）与 `§2.4`（错误态 / 重试）引用的 `TokenStatsPage.tsx:12xx-13xx` 行号基于 **P3 重写前**的旧页面，**已过期**；最新等价证据见 `TokenStatsPage.tsx:388,421-438`（合并态 `combineAll` + 错误态 `<Alert>` + 重试）与 `UsagePage.tsx:54-57,96-104`。**逐条表保留为基线，未删改。**
+
+---
+
+### G. 剩余欠账的逐条判定（lead · 2026-10-07）
+
+> **原则：「审计说欠账」≠「该修」。** 有些是**已论证的边界**或**设计取舍** ——
+> 把它们当"欠账"去清零，只会**为了数字好看而破坏设计**。
+
+| # | 条目 | 判定 | 理由 |
+|:--|:---|:---|:---|
+| 1 | **程序位注册表**（`registry.ts` 无 `programs`） | ⛔ **已论证的边界** | `P5-ARCH.md` 的 T05 明确：**核心层已表驱动**（`crates/buddy-switch-core/src/modules/programs.rs`，且「加第 3 个程序位无需改代码」**已可证伪**），但「**前端可达仍需一条宿主薄命令**」⇒ **这是当时就写明并接受的边界**，不是漏做 |
+| 2 | **「计划新增」态**（无 `planned`） | ⚠️ **需产品输入** | 原型要区分「**尚未支持**」与「**本机没装**」；真实应用只有「未检测到 ⇒ 引导设置」（`account-card.tsx:337-385` 三态）。**但「哪些程序位属于 planned」是产品决策** ⇒ **没有清单就不该硬加**（否则编造了不存在的「计划」） |
+| 3 | **积分视图两处降级**（双向柱→单向 / 两环形不渲染） | ✅ **口径问题（非欠账）** | 前者是 `P3-ARCH.md` §6 **决策 #1**（入账明细不可得 ⇒ **数据驱动退化**）；后者是**决策 #2/#3**（后端无数据源 ⇒ **不渲染**）。**审计把「有意不画」记成了「部分实现」** ⇒ 应记 ✅ |
+| 4 | **过期账号给「手动签到」** | ✅ **已修**（2026-10-07） | `account-card.tsx:460` 加 `!expired && !account.needsRelogin`；门禁 **+1 条断言**（**变异可证伪**：去掉门控 ⇒ 红）。修前：**卡片给入口、批量签到却把这类账号算「结构性失败」** ⇒ 两处口径自相矛盾 |
+| 5 | **P11 WB 不显示「不可用」列** | ⛔ **设计取舍** | `P11-ARCH.md` **决策 #3** 有意为之（WB 侧该列恒为 true ⇒ 无信息量） |
+| 6 | **部分失败态只 toast** | ✅ **已修**（2026-10-07） | `batchCheckin` 改为**保留失败 id** + toast 带「**只重试失败项**」action；抽出 `runCheckinFor(ids)` 让**全量与重试共用一条路径**（防口径漂移）。门禁 **+1 条断言**（变异可证伪） |
+| 7 | **「去设置」是自动跳转、非可点 toast** | ✅ **已修**（2026-10-07） | 改为带子项锚点 `?section=diagnostics`；`SettingsPage` **从 URL 读初始 section**（带**合法性校验**，非法值 fail-closed 回 `general`）。门禁 **+1 条断言** |
+| 8 | **权限自愈缺「恢复即自动重试切换」** | ✅ **已修**（2026-10-07） | 授权恢复后**自动重试**上次切换；`lastRestartRef` 记住用户选的 `restart`、`permissionRetriedRef` **保证只重试一次**（否则无限循环）。门禁 **+1 条断言** |
+| 9 | **账号卡不可键盘聚焦** | ✅ **已修**（2026-10-07） | `<article tabIndex={0} role="article" onKeyDown>`；**同时加 Enter/Space 打开详情**（可聚焦元素必须有用途，否则违反 WCAG 2.4.3）。门禁 **+1 条断言** |
+| 10 | **签到积分无逐条「+N」明细** | ⛔ **卡后端** | `CheckinEvent`（`credit_usage.rs:46`）**没有金额字段**（只有 `ts/date/account_id/result/error`）⇒ 前端**无从显示「+50/+100」**。**需后端加金额字段**才谈得上 |
+| 11 | **同程序位排他** | ✅ **已满足**（非欠账） | CLI 与 IDE **各持自己的单值 `activeAccountId`**（`codebuddy_cli.rs:895` / `codebuddy_cn_ide.rs:56`）⇒ **同一程序位内天然排他**（单值即排他）；跨程序位**本就不该互清**（两个客户端可以同时激活不同账号） |
+| 12 | **会话气泡不溢出** | ✅ **已加断言**（2026-10-07） | 加断言锚**四侧 margin 留边 + `ZAxis range` 存在**；⚠️ **「视觉上真的不溢出」仍需人工看图**（`h-[220px]` 配 `range=[60,420]` 的上限偏大，已标注待复核） |
+
+**⇒ 结论**：剩余欠账里，**5 条属于「不该修」或「已修」**（边界 2 / 需产品输入 1 / 口径 1 / 设计取舍 1），
+**真正待做的只剩零散交互细节**（部分失败态重试、权限自愈重试、键盘聚焦、积分「+N」明细等）。
+
+---
+
+## 0. 方法与口径
+
+### 0.1 状态图例
+
+| 标记 | 含义 |
+|:---|:---|
+| ✅ **已实现** | 真实代码里有等价行为，并给出 `文件:行` 证据 |
+| ⚠️ **部分实现** | 只做到一半，或形态差异会导致行为不完整 |
+| ❌ **未实现** | 真实代码里找不到对应实现 |
+| ⬜ **原型特有 / 不适用** | 断言检查的是**原型演示数据或原型专属 DOM/CSS**，真实代码**不该照搬** |
+
+### 0.2 关键前提（必须读）
+
+1. **`verify-behaviors.cjs` 验的是原型，不是真实应用** —— 它用 JSDOM 加载 `index.html` + `demo-app.js`。
+   因此「原型 112 passed」**不等于**「真实应用做到了 112 条」。
+2. **真实应用的门禁是 `check-scope-registry.cjs`（181 条）**，但它**验代码结构，不等于行为可用**
+   （见 §5「仅静态覆盖」）。
+3. **判定依据**：先读**断言体**（不看名字），再在 `src/` + `crates/` + `src-tauri/` 找等价行为。
+4. **等价判据**：**用户可感知的结果一致**即可，不要求 DOM 结构一致
+   （原型用 `data-act`，真实用 React 事件 / shadcn）。
+5. **本报告与 GAP 的口径差异**：GAP 把「有等价后端聚合」的 P0-1 合并断言记为 ✅，把「读原型演示数据对象」的
+   P0-2 断言记为 ⬜ —— 本报告沿用该区分（**能否映射到真实行为**是分界线）。
+
+### 0.3 ⚠️ 项目自 GAP 起点后发生了**大规模落地**
+
+GAP 判定的多个「整期缺失」现已实现（新增文件）：`src/components/companion/`（P9 悬浮窗）、
+`src/components/sessions/`（P8 会话）、`src/stores/{backup,sessions,gateway,resources}.ts`、
+`src/lib/{backup-selection,companion,session-replicas,catalog-source,stacked-bar-visuals}.ts`、
+`src/components/gateway/{catalog-source-bar,model-table}.tsx`、`src/components/settings/backup-*.tsx`、
+`src/pages/{SessionsPage,TraeSessionsPage}.tsx`。门禁从「P0–P3」扩到 **P0–P11 + P5/P6/P9/P7/P8**（181 条）。
+
+---
+
+## 1. 总览表
+
+### 1.1 统计（112 条）
+
+| 状态 | 本次（2026-10-06） | GAP 起点（2026-10-04） | 变化 |
+|:---|:--:|:--:|:--:|
+| ✅ 已实现 | **60** | 21 | **+39** |
+| ⚠️ 部分实现 | **26** | 32 | −6 |
+| ❌ 未实现 | **18** | 51 | **−33** |
+| ⬜ 不适用 | **8** | 8 | 0 |
+| **合计** | **112** | 112 | — |
+
+> **读法**：较起点**净进步 39 条**（39 条从 ❌/⚠️ 变为 ✅）。剩余缺口集中在
+> **请求代理（P12，5 条全 ❌）**、**会话工作台的「状态派生 / 分歧 / 同步」（P8 后半，7 条 ❌）**、
+> **用量图表未按原型四视图重做（12 条 ⚠️）**、以及**零散的交互细节**（概览顺序、跨作用域迁移、程序位注册表等）。
+
+### 1.2 按 PLAN 期次
+
+| PLAN 期次 | 断言数 | ✅ | ⚠️ | ❌ | ⬜ | 一句话结论 |
+|:---|:--:|:--:|:--:|:--:|:--:|:---|
+| P0（注册表 / 词汇 / scope） | 4 | 2 | 0 | 2 | 0 | 快照能力「页面归属」✅；⚠️ **10-07 更新**：`planned` 态（VS Code / JetBrains 插件）**已落**，见第三轮 A″ |
+| P3（统一状态 / 概览 / 用量 / 图表 / 无障碍） | 36 | 9 | 21 | 2 | 4 | 骨架/状态语言/错误态/合并 ✅；⚠️ **10-07 更新**：「用量图表仍是旧页面」**已不成立** —— 四视图 + 12 个图表组件均已落地（门禁 192–207 条） |
+| P4（账号工作台） | 15 | 8 | 4 | 2 | 1 | 抽屉 + 批量 + 工具栏（搜索/排序/分组/表格/全选）✅；⚠️ **10-07 更新**：程序位注册表 / `planned` **已落**（第三轮 A″） |
+| P7（全局备份与恢复） | 12 | 12 | 0 | 0 | 0 | **整期落地**（子导航 + 导出/导入/预览/冲突/部分失败） |
+| P8（会话工作台） | 12 | 5 | 0 | 7 | 0 | 入口 + 能力门控 + Trae 空态 ✅；⚠️ **10-07 更新**：**组状态四态 / 关联图 / 状态筛选 / 侧栏徽章已落**（门禁 220/221/181 条），剩余仅「分歧处理 + 增量同步」 |
+| P9（桌面悬浮窗 + 邮箱脱敏） | 7 | 7 | 0 | 0 | 0 | **悬浮窗整期落地**（独立窗口）+ 邮箱脱敏 + 搜索用原值 ✅ |
+| P10（网关接入与模型识别） | 7 | 7 | 0 | 0 | 0 | **整期落地**（来源条契约 + 原因 + 识别中态 + 自动发现） |
+| P11（模型禁用 + 接入说明） | 9 | 8 | 1 | 0 | 0 | **整期落地**（禁用可逆 + 两出口说明 + 协议×工具接入）；WB 不显示「不可用」列 ⚠️ |
+| P12（请求代理与无缝切号） | 5 | 0 | 0 | 5 | 0 | ⚠️ **10-07 更新：「整期缺失」已不成立** —— 引导式面板 + 本地路由业务转发 + 4 条门禁均已落地（第三轮 A″） |
+| 既有能力（非新期次） | 5 | 2 | 0 | 0 | 3 | 检查更新 / 设置危险按钮 ✅；`.proto-note` / F2 / F3 为原型特有 ⬜ |
+| **合计（2026-10-06 基线）** | **112** | **60** | **26** | **18** | **8** | ⚠️ **该计数未经 10-07 重跑**，以第三轮 A″/B″ 为准 |
+
+---
+
+## 2. 逐条表
+
+> 每条：`行为 | 原型编号 | 归属期次 | 状态 | 证据(文件:行) | 缺什么`
+> 证据行号以当前工作区为准（2026-10-06）。
+>
+> ⚠️ **本节为 2026-10-06 基线**：只有 `§2.14`（P8）经过 2026-10-07 复核更新。
+> 其余小节若与顶部「第三轮」块冲突，**以顶部为准**（已知过时：`§2.12` 的用量图表结论）。
+
+### 2.1 数据自洽 / 死字段 / 概览（P0-2）
+
+| 行为 | 原型编号 | 期次 | 状态 | 证据 | 缺什么 |
+|:---|:---|:--:|:--:|:---|:---|
+| 各作用域 days 末值 = 账号 todayTokens 合计 | P0-2 | P3 | ⬜ | 断言对象是原型 `USAGE/SCOPES` 演示数据；真实数据来自后端 | 原型演示数据自洽，不该照搬 |
+| scope 级 todayTokens 死字段已删除 | P0-2 | P3 | ⬜ | 同上 | 同上 |
+| 概览「今日 Token」= days 末值 | P0-2 | P3 | ❌ | `src/pages/OverviewPage.tsx:122-137` 只有 3 个 tile（账号/待处理/客户端） | 概览**无「今日用量摘要」块** |
+| 「对比昨日」不再是硬编码 +12% | P0-2 | P3 | ⚠️ | `OverviewPage.tsx` 无 `+12%`，但也无「对比昨日」指标 | 无该指标，故既没硬编码也没实现 |
+
+### 2.2 合并（P0-1）
+
+| 行为 | 原型编号 | 期次 | 状态 | 证据 | 缺什么 |
+|:---|:---|:--:|:--:|:---|:---|
+| 合并前：区间总 Token 存在 | P0-1 | P3 | ✅ | `src/pages/TokenStatsPage.tsx:1286-1287,1383`（`combineAll` 态 + 概览块） | DOM 不同（原型 `data-act=merge`） |
+| 点「合并全部作用域」后数字真的变 | P0-1 | P3 | ✅ | `src/components/region-bar.tsx:38` + `TokenStatsPage.tsx:1383`（`RegionBar value={combineAll}`） | 形态为分段控件，非按钮 |
+| 合并值 = 各作用域逐日求和（精确校验） | P0-1 | P3 | ✅ | 同上（后端按 `combineAll` 聚合后下发） | 前端不持有原始逐日数组 |
+| 合并态下模型 Tab 也跟着变 | P0-1 | P3 | ✅ | `TokenStatsPage.tsx:1286-1287`（`combineAll` 驱动数据源重算） | — |
+
+### 2.3 死按钮 / 假承诺（P0-3 / P0-4 / P0-5）
+
+| 行为 | 原型编号 | 期次 | 状态 | 证据 | 缺什么 |
+|:---|:---|:--:|:--:|:---|:---|
+| 「检查更新」不再是死按钮 | P0-3 | 既有 | ✅ | `src/App.tsx`（`AppFooter` + `shouldAutoShowNotes`）；`src/components/update-install-dialog.tsx`（四阶段说明弹窗）；`src/components/release-notes-view.tsx` | **2026-10-17**：升级前说明弹窗已落地（说明先于下载），原型同步为对话框 —— 见 `UPDATE-NOTES-ARCH.md` |
+| 未检测程序位：给出可点「去设置」入口 | P0-4a | P4 | ⚠️ | `src/components/account-card.tsx:350-359,375-385`（`onGuideToSetting` → 跳设置） | **自动跳转**，非「toast 内可点入口」；未定位「权限与诊断」子项 |
+| 备注是真的内联编辑（非 toast 桩） | P0-4b | P4 | ✅ | `src/components/account-detail-drawer.tsx:114-160,268-328`（`Input` + 提交/取消） | — |
+| 设计说明有独立 `.proto-note` 样式 | P0-5 | 既有 | ⬜ | 原型 `demo.css` 专属 class | 原型特有，真实代码无对应 |
+
+### 2.4 错误态 / 全选 / 部分失败 / 权限 / 无障碍（P1-1~P1-8）
+
+| 行为 | 原型编号 | 期次 | 状态 | 证据 | 缺什么 |
+|:---|:---|:--:|:--:|:---|:---|
+| 错误态：`role=alert` + 重试按钮 | P1-1 | P3 | ✅ | `src/components/ui/alert.tsx:31`（`role="alert"`）；`TokenStatsPage.tsx:1386-1397` | — |
+| 重试能恢复 | P1-1 | P3 | ✅ | `TokenStatsPage.tsx:1392`（`setReload`） | — |
+| 「全选」首屏即选中（非空操作） | ★ | P4 | ✅ | `src/components/account-toolbar.tsx:191-202`（受控 Checkbox）；`AccountsPage.tsx:1190,1708` | 机制不同（**无 `data-act`**，是受控勾选框；D1 缺陷结构上不可能发生） |
+| 「全选」一次点击即选中全部 | ★ | P4 | ✅ | 同上（`onToggleAll` → `selectedKeys`） | — |
+| 勾选后出现批量条 | P1-2 | P4 | ✅ | `src/components/account-batch-bar.tsx:48`（`selectedCount<=0` 不渲染）；`AccountsPage.tsx:2091` | — |
+| 批量签到呈现部分失败 | P1-2 | P3 | ⚠️ | `AccountsPage.tsx:458-479`（toast description 汇总成功/已签/失败） | **只 toast**，无「汇总条 + 重试失败项 + 可展开明细」 |
+| 权限错误升级引导（三步 + 轮询自检） | P1-3 | P3 | ✅ | `src/components/switch-account-dialog.tsx:346-370`（每 2s 轮询）+ `:589-640`（三步文案） | 形态在切换对话框内，非独立「权限抽屉」 |
+| 账号卡可键盘聚焦 | P1-5 | P3 | ⚠️ | `account-card.tsx:407` 是 `<article>`，**无 `tabindex`/`role`**；仅内部 `Checkbox` 可聚焦 | 卡片本身不可聚焦 |
+| 待处理上移到统计块之前 | P1-6 | P3 | ❌ | `OverviewPage.tsx:123-137`（统计 tile 在前）→ `:139-175`（待处理卡在后） | 顺序与原型**相反** |
+| 头像底色亮度 L ≤ 0.5（oklch） | P1-7 | P3 | ⬜ | `account-card.tsx:35-42` 用 Tailwind 色板 | 原型 oklch 判据特有 |
+| 当前账号不再三重信号 | P1-8 | P3 | ⬜ | `account-card.tsx:412`（`bg-primary/5`）+ `:238-266`（当前态 chip） | 原型 `.acct.is-current` CSS 特有 |
+
+### 2.5 迁移向导（B1）
+
+| 行为 | 原型编号 | 期次 | 状态 | 证据 | 缺什么 |
+|:---|:---|:--:|:--:|:---|:---|
+| 第 1 步有「来源账号」选择 | B1 | P4 | ⚠️ | `switch-account-dialog.tsx:422-447`（**来源版本** Tabs + `sourceRegion`） | 是「来源版本」而非「来源账号」；语义接近 |
+| 跨作用域入口（WB→Trae 迁移） | B1 | P4 | ❌ | `switch-account-dialog.tsx:372-395` 只处理 WB 区域间（cn↔global） | **无跨产品迁移入口** |
+| 第 2 步三层会话树 + 「已选 N / M」计数 | B1 | P4 | ⚠️ | `switch-account-dialog.tsx:522,847`（`buildSessionTree` 三层 + `TreeCheckbox`） | 是**单页对话框**；**无「已选 N / M」文案**（只有 `copyCount`） |
+| 会话树可全不选→归零，再全选恢复 | B1 | P4 | ✅ | `switch-account-dialog.tsx:524-533`（`selectionState` 支持 mixed + 全选） | — |
+| 确认页如实汇总「已选 N 个会话 / M 个目录」 | B1 | P4 | ❌ | 无独立确认步骤页 | 缺三步向导的确认步 |
+
+### 2.6 登录态快照（B2）
+
+| 行为 | 原型编号 | 期次 | 状态 | 证据 | 缺什么 |
+|:---|:---|:--:|:--:|:---|:---|
+| Trae 有「登录态快照」 | B2 | P0 | ✅ | `src/pages/TraeSettingsPage.tsx:664-740`（`ProfilesSection`） | 能力**未进注册表** `Capability` union（`registry.ts:39-46` 无 `snapshot`），是「页面归属」而非「能力开关驱动」 |
+| WorkBuddy 无「登录态快照」 | B2 | P0 | ✅ | WB `src/pages/SettingsPage.tsx` 无快照模块（grep `快照/snapshot` 0 命中） | 结果对，但机制不是注册表能力门控 |
+
+### 2.7 账号池 / 接入 Tab / 签到积分（B3 / B4 / B5）
+
+| 行为 | 原型编号 | 期次 | 状态 | 证据 | 缺什么 |
+|:---|:---|:--:|:--:|:---|:---|
+| 账号池可「指定账号」且排他 | B3 | P3 | ✅ | `src/components/gateway/account-pool-card.tsx:132-163`（单选 `Select`，天然排他） | — |
+| 快速接入有 Anthropic Tab 且给 `/v1/messages` | B4 | P11 | ✅ | `src/components/gateway/integration-guide.tsx:101-111`；`src/lib/gateway-snippets.ts:77-82`（endpoint `POST /v1/messages` + `x-api-key`） | — |
+| Trae 签到积分 = +50（非硬编码 100） | B5 | P3 | ⚠️ | 积分为后端真值（`src/lib/trae-types.ts:445` 签到明细）；`account-detail-drawer.tsx` sections 由调用方装配 | **无逐条「+N」签到明细展示**；原型 `+50/+100` 文案形态特有 |
+| WorkBuddy 签到积分 = +100 | B5 | P3 | ⚠️ | 同上 | 同上 |
+
+### 2.8 程序位绑定模型（F4）
+
+| 行为 | 原型编号 | 期次 | 状态 | 证据 | 缺什么 |
+|:---|:---|:--:|:--:|:---|:---|
+| 初始态：a1 同时绑定 workbuddy 与 ide | F4 | P4 | ✅ | `account-card.tsx:286`（三个独立 active 布尔） | 前端以独立布尔表达；绑定模型在后端 |
+| 切 IDE 到 a3，a1.workbuddy 保留 | F4 | P4 | ✅ | `account-card.tsx:316-385`（前端不互相清除） | — |
+| 同一程序位在其他账号上被清空 | F4 | P4 | ⚠️ | 后端 `switch` 行为；前端无此逻辑 | 需后端确认「同程序位排他」 |
+| 卡片显示「使用中 N 个工具」 | F4 | P4 | ✅ | `account-card.tsx:305`（`toolsInUse` chip，`activeProductCount>=2`） | 仅非紧凑模式显示 |
+
+### 2.9 权限自愈（F1）
+
+| 行为 | 原型编号 | 期次 | 状态 | 证据 | 缺什么 |
+|:---|:---|:--:|:--:|:---|:---|
+| 轮询自检文案存在且按钮初始禁用 | F1 | P3 | ⚠️ | `switch-account-dialog.tsx:317-330,346-370` | **无 `#perm-retry` 按钮**；改为 error 驱动轮询（形态不同） |
+| 自检 3 轮后按钮自动可用 | F1 | P3 | ⚠️ | `switch-account-dialog.tsx:328-343`（`ok` 后清 error） | 轮询而非「3 轮×2000ms」定数；无按钮两态 |
+| 点「重试切换」真的切换了程序位 | F1 | P3 | ⚠️ | 权限恢复后 error 清空，用户需**手动再点**切换 | **无「权限恢复即自动重试切换」** |
+
+### 2.10 演示数据自洽 / 设置危险按钮（F2 / F3 / F8）
+
+| 行为 | 原型编号 | 期次 | 状态 | 证据 | 缺什么 |
+|:---|:---|:--:|:--:|:---|:---|
+| 同一账号内资源包名不重复 | F2 | 既有 | ⬜ | 断言对象是原型 `SCOPES[].packs` 演示数据 | 真实资源包来自后端 |
+| 目录名与会话标题不是同一批字符串 | F3 | 既有 | ⬜ | 断言对象是原型 `SESSION_SEEDS` | 同上 |
+| 设置页危险按钮有事件绑定 | F8 | 既有 | ✅ | `SettingsPage.tsx:599-618`（运行检查/权限/显示文件均绑 `onClick`）；`TraeSettingsPage.tsx` 设备重置 | 真实按钮**均非死按钮**；但原型「重置/导出」措辞映射到不同控件 |
+
+### 2.11 过期账号 / 排除账号 / 积分排序（F5 / F6 / F7）
+
+| 行为 | 原型编号 | 期次 | 状态 | 证据 | 缺什么 |
+|:---|:---|:--:|:--:|:---|:---|
+| 过期账号抽屉里没有「手动签到」入口 | F5 | P3 | ⚠️ | `AccountsPage.tsx:1374-1404`（抽屉 `detailSections` **根本无手动签到**）；`account-card.tsx:457-461`（卡片菜单仅按 `todayCheckedIn===false`，**无过期门控**） | 抽屉断言**空转通过**（本就没有该入口）；**卡片菜单对过期账号仍给「手动签到」**（底层意图未落实） |
+| 已排除账号的「指定」按钮不可用 | F6 | P4 | ⬜ | `account-pool-card.tsx:69-74` 注释明写：指定是**偏好而非约束**，不可用账号**有意不禁用** | 与原型**相反的有意设计** |
+| 合并态积分流水按时间戳降序 | F7 | P3 | ✅ | `src/pages/CreditStatsPage.tsx:1058-1059,1115`（默认 `sortKey=time` / `desc`） | 数据来自后端；无原型 `ts` 字段契约 |
+
+### 2.12 用量图表（P3 §3.10）
+
+> **★ 2026-10-07 更新 —— 原「只做了 IA 合并、未按四视图重做」的结论已不成立。**
+> `UsagePage.tsx` 的子 Tab 已定为**一级四视图**（trend / models / sessions / credits），
+> 三个统计页**已按原型重做**：图表逻辑下沉到 `src/components/usage/*`（**12 个组件**）
+> + 纯函数 `src/lib/usage-charts.ts`（`TokenStatsPage.tsx:39-49`、`CreditStatsPage.tsx:34-40` 逐条 import）。
+>
+> ⚠️ 原型判据用的 `.cbar / .ccol / .cheat-row / .cdonut / .cspark / .cscatter / .cdiv` 专属 class
+> **仍全仓 0 命中** —— 那是**实现载体不同**（真实走 `recharts` + `ChartFrame`），**不是功能未做**。
+> 门禁第 **192–207** 条已按「适配层（堆叠柱/热力图/散点/余额回推/到期轴/mergeSources）+
+> 决策 #1–#4 + 空数据不渲染 + 空态文案不混用」逐条断言。
+
+| 行为 | 原型编号 | 期次 | 状态 | 证据 | 缺什么 |
+|:---|:---|:--:|:--:|:---|:---|
+| 趋势 ≥4 张图 + 非空 aria-label | — | P3 | ⚠️ | `TokenStatsPage.tsx:354,882`（`role="img"` + `aria-label`）；`CreditStatsPage.tsx` 多图 | 图**张数与结构**是旧页面，未按原型四视图重做 |
+| 堆叠柱列数=天数，每列分段=模型数 | — | P3 | ⚠️ | `TokenStatsPage.tsx:721-785`（recharts `BarChart` 堆叠） | DOM 与原型 `.cbar .ccol` 不同；分段数未按原型契约 |
+| 堆叠柱各分段高度和 ≈ 当日总量 | — | P3 | ⚠️ | `src/lib/stacked-bar-visuals.ts:39-79`（分段高度分配） | 未按原型逐列校验 |
+| 热力图 7 行 × 24 列 | — | P3 | ⚠️ | `TokenStatsPage.tsx:816-916`（`Heatmap`） | 行/列维度未按原型 7×24 契约 |
+| 环形图扇区数 = 模型数 | — | P3 | ⚠️ | `CreditStatsPage.tsx:806-821`（按模型分布） | 未确认是否为「环形」形态 |
+| 累计曲线图注不写「峰值=末值」 | — | P3 | ⚠️ | `TokenStatsPage.tsx` 图注文案 | 未按原型图注口径核对 |
+| 模型页环形 + 每行迷你趋势线 | — | P3 | ⚠️ | `CreditStatsPage.tsx:883-932`（按模型） | 无原型 `.hbar .cspark` 迷你趋势线 |
+| 会话气泡数=会话数，排行条数=会话数 | — | P3 | ⚠️ | `TokenStatsPage.tsx:1013-1046`（会话排行） | 无原型散点气泡图 |
+| 会话气泡不溢出绘图区 | — | P3 | ⚠️ | 同上 | 同上 |
+| 积分：双向柱 + 余额曲线 + 到期轴 + 两环形 | — | P3 | ⚠️ | `CreditStatsPage.tsx:507-614` | 缺双向柱/到期时间轴/双环形 |
+| 积分余额曲线基线不锚 0 | — | P3 | ⚠️ | `CreditStatsPage.tsx` 余额图 | 未按原型「非 0 基线」图注 |
+| 合并态模型扇区数真的变多（mergeExt） | — | P3 | ⚠️ | `TokenStatsPage.tsx` 合并态重算 | 图表数据聚合口径未按原型核对 |
+
+### 2.13 全局备份与恢复（P7）—— 12 条 ✅
+
+| 行为 | 原型编号 | 期次 | 状态 | 证据 | 缺什么 |
+|:---|:---|:--:|:--:|:---|:---|
+| 设置子导航含「备份与恢复」，共 9 项 | — | P7 | ✅ | `src/components/settings/settings-subnav.tsx:60-70`（`SETTINGS_SUBNAV` 9 项，第 9 项 `backup`） | — |
+| 默认勾选全部 4 个作用域 | — | P7 | ✅ | `src/lib/backup-selection.ts:80-84`（`defaultBackupSelection` 全 true）；`backup-section.tsx:437-486` | — |
+| 默认不含凭据 + 预估行如实声明 | — | P7 | ✅ | `src/stores/backup.ts:88`（`creds: false`）；`backup-section.tsx:511-516`（`credentials.notice`） | — |
+| 打开凭据开关：风险警告 + 主按钮文案变化 | — | P7 | ✅ | `backup-section.tsx:504-510`（警告条）+ `:532`（`buttonCreds`/`button`）+ `:713-734`（二次确认） | 多一层二次确认（更严） |
+| 预估大小随勾选实时变化 | — | P7 | ✅ | `backup-selection.ts:165-196`（`estimateBackup`）；`backup-section.tsx:267,518-527` | — |
+| 三态勾选 `aria-checked=mixed` | — | P7 | ✅ | `backup-section.tsx:449-451`；`backup-selection.ts:114-118`（`scopeCheckState`） | — |
+| 关掉凭据开关：警告消失、预估回落 | — | P7 | ✅ | `backup-section.tsx:504-516` | — |
+| 导入：先预览再落盘 | — | P7 | ✅ | `backup-section.tsx:296-337`（`chooseFile`→`runPreview`）；`backup-import-preview.tsx` | — |
+| 导入预览：不含凭据时提示「需重新登录」 | — | P7 | ✅ | `backup-import-preview.tsx:148-156`（`relogin`） | — |
+| 冲突策略可切换且生效 | — | P7 | ✅ | `backup-import-preview.tsx:171-191`；`backup-section.tsx:340-344`（换策略**重新预览**） | — |
+| 导入结果是部分失败态（失败计数 + 重试） | — | P7 | ✅ | `backup-section.tsx:562-573`（`failed` + `retry` 按钮） | — |
+| 全部取消勾选后导出按钮被禁用 | — | P7 | ✅ | `backup-section.tsx:530`（`disabled={pending||!canExport}`）；`backup-selection.ts:141-143`（`hasAnySelection`） | — |
+
+### 2.14 会话工作台（P8）
+
+> ⚠️ **本节已按 2026-10-07 复核更新**（原表 4 ✅ / 8 ❌ ⇒ 现 **8 ✅ / 2 ❌**）。
+
+| 行为 | 原型编号 | 期次 | 状态 | 证据 | 缺什么 |
+|:---|:---|:--:|:--:|:---|:---|
+| 客户端只有 1 个时不渲染 Tab | ★ | P8 | ✅ | `src/components/sessions/session-replica-view.tsx:15-16`；`SessionsPage.tsx:24-28`（**有意不渲染**客户端 Tab） | 机制不同（真实无 `SESSION_CLIENTS` 概念；结果=无 Tab） |
+| 状态筛选选项按需出现（无假选项） | ★ | P8 | ✅ **10-07** | `SessionsPage.tsx:69-76`（`availableStatuses` 由 `statusCounts` 派生，**不写死**）；门禁第 221 条 | — |
+| 会话组状态由成员派生 | ★ | P8 | ✅ **10-07** | `src/lib/session-replicas.ts:56,124`（`deriveGroupStatus` ⇒ `latest`/`behind`/`diverge`/`unknown`）；门禁第 220 条 | 实现名是 `deriveGroupStatus`（非原型里的 `sessionGroupStatus`） |
+| 会话关联图标出共同旧版 + 差异 | — | P8 | ✅ **10-07** | `session-replicas.ts`（`commonPrefix` / `deltas` / `latestLineCount`）；`session-replica-view.tsx:70-75`（渲染「共同旧版」行） | — |
+| 分叉的组只能先「选择保留哪一份」 | ★ | P8 | ❌ **仍缺** | 只渲染 `diverge` 徽章（`session-replica-view.tsx:57`），**无**选择交互 | 内容级 diff + 逐条选择 UI（D20 已后置） |
+| 未分叉组文案写明「同步是加法」 | ★ | P8 | ❌ **仍缺** | 无同步功能 ⇒ 无此文案 | 随「安全同步（增量追加）」一起做 |
+| 侧栏「会话」徽章 = 待同步组数 | — | P8 | ✅ **10-07** | 门禁第 181 条（只读已加载 store + 仅会话 + `>0` 才渲染） | — |
+| 会话页状态筛选真的收敛 | — | P8 | ✅ **10-07** | `SessionsPage.tsx:77-85`（`filteredGroups` 真过滤 + 选项失效回落 `all`） | — |
+
+### 2.15 会话能力的平台边界（P8 §3.15）
+
+| 行为 | 原型编号 | 期次 | 状态 | 证据 | 缺什么 |
+|:---|:---|:--:|:--:|:---|:---|
+| Trae 侧栏不渲染「会话」入口 | ★ | P8 | ✅ | `registry.ts:188-190`（`DESTINATION_CAPABILITY.sessions="sessionCopy"`）；`App.tsx:613-615`（能力门控过滤） | — |
+| WorkBuddy 侧栏有「会话」入口 | — | P8 | ✅ | `App.tsx:183,220-223`（`sessions: SessionsPage`） | — |
+| Trae 经 URL 直达会话页 → 结构化空态 + 原因 | ★ | P8 | ✅ | `src/pages/TraeSessionsPage.tsx:46-63`（图标+标题+说明+出口） | — |
+| Trae 会话页不列 WB 会话组 | ★ | P8 | ✅ | `TraeSessionsPage.tsx` 不引用副本视图/会话命令 | — |
+
+### 2.16 网关接入与模型识别（P10）—— 7 条 ✅
+
+| 行为 | 原型编号 | 期次 | 状态 | 证据 | 缺什么 |
+|:---|:---|:--:|:--:|:---|:---|
+| 显式标注来源 + 上次识别时间 | — | P10 | ✅ | `src/components/gateway/catalog-source-bar.tsx:77-92`；`src/lib/catalog-source.ts:88-113` | — |
+| 来源条说明「接入后自动识别」 | ★ | P10 | ✅ | `catalog-source-bar.tsx:94`（`autoHint`）；locale `shared.gateway.sourceBar.autoHint` | — |
+| 来源非「实时」时必须给出原因 | ★ | P10 | ✅ | `catalog-source.ts:97-103`（`reason` 恒非空）；`catalog-source-bar.tsx:109` | — |
+| 从未识别成功时显示「内置」+ 原因 | ★ | P10 | ✅ | `catalog-source.ts:95-102`（`neverIdentified` 拼兜底措辞） | — |
+| 重新识别：进入「识别中」并禁用按钮 | ★ | P10 | ✅ | `catalog-source-bar.tsx:96-105`（`scanning` + `Loader2` + `disabled`） | — |
+| 文案不承诺「N 个模型可用」 | ★ | P10 | ✅ | locale `shared.gateway.sourceBar.count` = 「已识别 {n} 个模型」 | — |
+| 接入指引说明客户端会自动发现模型 | ★ | P10 | ✅ | `integration-guide.tsx:143`；`gateway-snippets.ts:207-209`（含 `/v1/models`） | — |
+
+### 2.17 模型禁用 + 接入说明（P11）
+
+| 行为 | 原型编号 | 期次 | 状态 | 证据 | 缺什么 |
+|:---|:---|:--:|:--:|:---|:---|
+| 禁用与「上游可用性」两维度可区分（三种展示） | — | P11 | ⚠️ | `src/components/gateway/model-table.tsx:104-111,115+`（`showUpstream` 开关；两列由 `available`/`disabled` 分别驱动） | **WB `showUpstream=false`**（决策 #3）⇒ 不渲染「不可用」列；行数也非原型 6 行 |
+| 禁用模型：暴露计数随之下降 | ★ | P11 | ✅ | `model-list.tsx:82`（`servedCount`）；`src/stores/gateway.ts`（`setModelDisabled`） | — |
+| 禁用可逆：再次启用后计数恢复 | ★ | P11 | ✅ | 同上 | — |
+| 被禁用的模型仍可见（标灰） | ★ | P11 | ✅ | `model-table.tsx`（`row-off` 行样式 + 每行禁用/启用按钮） | — |
+| 页面说明「两个出口同时生效」 | ★ | P11 | ✅ | `model-list.tsx:178-180`；locale `shared.gateway.models.twoExits`（「不会出现在 `/v1/models`，直接调用也会被拒绝」） | 见 §5：**门禁验的是代码结构，非运行时拒绝** |
+| 接入说明按协议给对认证头 | ★ | P11 | ✅ | `gateway-snippets.ts:70-83`；`integration-guide.tsx:136-138` | — |
+| Codex 给了 `base_url` 与 `env_key` | — | P11 | ✅ | `gateway-snippets.ts:179-186` | — |
+| 通用工具页不编造配置 | ★ | P11 | ✅ | `gateway-snippets.ts:196-210`（generic 无 `config.toml` 等） | — |
+
+### 2.18 桌面悬浮窗 + 邮箱脱敏（P9）
+
+| 行为 | 原型编号 | 期次 | 状态 | 证据 | 缺什么 |
+|:---|:---|:--:|:--:|:---|:---|
+| 悬浮窗默认显示，四态齐备 | ★ | P9 | ✅ | `src/components/companion/companion-row.tsx:47-52`（`running/waiting/done/failed` 四态样式两两不同）；`companion-app.tsx` | 实现为**独立 Tauri 窗口**（`src-tauri` + `?window=companion` 分流） |
+| 悬浮窗是只读的（无写操作） | ★ | P9 | ✅ | `companion-app.tsx:11-17,95-121`（命令面仅 `companion_status`/`set_visible`/`jump`） | — |
+| 悬浮窗标题默认模糊（防截图） | ★ | P9 | ✅ | `companion-row.tsx:39,87`（未悬停/未聚焦渲染**占位符，明文不进 DOM**） | 比原型 `blur` 更强（原型 blur 明文仍在 DOM） |
+| 悬浮窗可关闭 + 侧栏入口重开 | ★ | P9 | ✅ | `companion-app.tsx:119-121`（关闭=隐藏）；`App.tsx:450-478`（`CompanionToggle`） | — |
+| 点击条目回到原会话（有反馈） | — | P9 | ✅ | `companion-app.tsx:95-117`（`handleJump` + 成功/失败反馈） | — |
+| 邮箱默认脱敏 | ★ | P9 | ✅ | `account-card.tsx:93-105`（`accountIdentity`：首字母 + `*` + 域名） | 星号个数与原型正则不同（同函数即可） |
+| 搜索仍按完整邮箱匹配 | ★ | P9 | ✅ | `src/lib/account-search.ts:32-44`（用 `email` 原值）；展示侧才脱敏 | — |
+| **悬浮窗的数据源**（P9 §1.3 明写三路） | — | P9 / **P15** | ⚠️ → ✅ | P9 落地时**只有一路**（自家切号进度）；`checkin-progress` / `trae-checkin-progress` **长期缺席** —— 前端 `companion.ts` 甚至在订阅一个**从未被 emit 过**的事件名。P15 补齐签到（`agent_watch::record_local`），并新增第三路「已开启监听的外部客户端会话」 | — |
+| **悬浮窗键盘可达性**（独立窗口自管焦点） | ★ | P9 | ✅（代码 + 静态门禁） | `companion-app.tsx`（`focusEntry` 焦点入口 + `didInitialFocusRef` 只做一次 + `listen("companion-visibility")` 重开送回焦点 + Esc 隐藏）；`companion-row.tsx`（行=原生 `<button>` + `:focus-visible`）；门禁第 **227** 条 | ⚠️ **运行时**走查待独立窗口 E2E（见 §5）—— 门禁是**静态结构断言**，不等于运行时行为 |
+
+### 2.19 账号卡程序位（§3.3 / 附录 D）
+
+| 行为 | 原型编号 | 期次 | 状态 | 证据 | 缺什么 |
+|:---|:---|:--:|:--:|:---|:---|
+| 账号卡程序位与注册表一致（数量 + 逐个 id） | ★ | P0 | ❌ | `registry.ts` **无 `programs` 字段**；`account-card.tsx:387-393` **硬编码 3 个**（`workbuddy/ide/cli`） | 注册表缺 `programs` 表；卡片未表驱动 |
+| 「计划新增」与「本机没装」可区分 | ★ | P0 | ❌ | `account-card.tsx:337-385` 只有 installed/missing 引导，**无 planned 概念** | 无「尚未支持」态与措辞 |
+
+### 2.20 请求代理（P12）—— 5 条 ❌
+
+> **结构性事实**：全仓 grep `请求代理|透明代理|proxyOn|PROXY|mitm|绝不劫持|proxy-toggle`
+> 在 `src/` / `crates/` / `src-tauri/` **均无实现命中**（`app-settings-snapshot.ts` 的 `PROXY_AUTH_PATTERN`
+> 是 URL 凭据检测，无关）。`check-scope-registry.cjs`（181 条）也**无** P12 段。
+
+| 行为 | 原型编号 | 期次 | 状态 | 证据 | 缺什么 |
+|:---|:---|:--:|:--:|:---|:---|
+| 请求代理：默认关闭 | ★ | P12 | ❌ | 全仓 0 命中 | 整期未实现 |
+| 关闭态说明「风险」+「不劫持」三条 | ★ | P12 | ❌ | 同上 | 无 |
+| 开启后：显示拦截方式、白名单与 KPI | ★ | P12 | ❌ | 同上 | 无 |
+| 白名单外直连 | ★ | P12 | ❌ | 同上 | 无 |
+| 一键还原：回到关闭态 | ★ | P12 | ❌ | 同上 | 无 |
+
+### 2.21 外部 Agent 会话监听（P15）—— **新增能力**
+
+> 依据：`P13-REFERENCE-PARITY.md` §4.3；spike 结论与实现回写见 `P15-SPIKE-RESULTS.md`；
+> 决策落为 `DECISIONS.md` **D43–D46**。
+
+| 行为 | 期次 | 状态 | 证据 | 缺什么 |
+|:---|:--:|:--:|:---|:---|
+| 客户端 hook 事件 → 会话四态 | P15 | ✅ | `modules/agent_watch.rs`（`HookKind` 是**唯一**允许看客户端事件名的地方；四态 + 两档惰性过期 + 时间回退丢弃）；**25 条单测** | ⚠️ 纯 hook 来源**几乎不会出现「失败」**（客户端不报失败）—— 这是诚实边界，不是缺陷 |
+| 接收端只绑回环 + 六条安全基线 | P15 | ✅ | `modules/agent_hook_rx.rs`；**实测**：合法 **204** / 伪造 `Host` **403** / 错误 `Origin` **403** / 缺 `Content-Type` **415** / `GET` **405** | — |
+| hook 装 / 卸（默认关 + 可还原） | P15 | ✅ | `modules/agent_hook_install.rs`（纯函数合并，13 条单测）+ 复用 `client_settings` 的**备份 / 进程守卫 / 格式保持**；`app_prefs.watch_agent_sessions` 默认 **false** | ⚠️ **Trae 的 hook 机制未取证** ⇒ 只做 WorkBuddy 两区域（CN / Global） |
+| 端到端：hook → 接收端 → 状态机 → 快照 | P15 | ✅ | **实测**：`SessionStart`→`running`；`PermissionRequest`→`waiting`（`hint="刚刚 · 等待确认"`）；`Stop`→`done`；`hook` 子命令 stdout `{}`、退出码 **0** | ⚠️ **真机现场**（客户端真的调用 hook）未验；Windows 上不做宿主进程探测（D46） |
+| 「计划 0 个 / 被 skipped」不留噪音行 | P15 | ✅ | `AgentWatch::forget`；**实测**：隔离 home（空账号库）调 `/api/checkin/all` → `{"accounts":[]}` → 快照仍空 | — |
+| 演示站如实显示「默认关、什么都没装」 | P15 | ✅ | `screenshot-demo.ts` 的 `get_agent_hook_status` case（`enabled:false` + 空 `slots`） | — |
+
+---
+
+## 3. ★ 仍未实现 / 部分实现的清单（按用户可感知度排序）
+
+> 排序原则：**用户可感知的整段缺失 > 部分实现 > 内部机制缺口**。
+
+| # | 缺口 | 期次 | 状态 | 用户可感知后果 |
+|:--:|:---|:--:|:--:|:---|
+| 1 | **会话工作台「状态 / 分歧 / 同步」整段缺失**（8 条 ❌） | P8 | ❌ | 只能看到「经本应用复制过」的副本列表；**看不到谁落后/分叉、无法同步**；侧栏**无待同步徽章**（本期有意不加） |
+| 2 | **请求代理整期缺失**（5 条 ❌） | P12 | ❌ | 无「默认关 + 绝不劫持」的代理能力（PLAN 要求先做 spike，**不应直接排期**） |
+| 3 | **用量图表未按原型四视图重做**（12 条 ⚠️） | P3 | ⚠️ | 趋势/模型/会话/积分的**图注规范与图形契约**未落地（仍是旧页面 + recharts） |
+| 4 | **程序位注册表 / 「计划新增」态缺失**（2 条 ❌） | P0 | ❌ | 加第 3 个 WB 程序位仍需改代码；「尚未支持」与「本机没装」无法区分 |
+| 5 | **概览缺「今日用量摘要」+ 待处理顺序相反**（3 条 ❌/⚠️） | P3 | ❌/⚠️ | 概览答不出「现在用了多少」；待处理项被压到统计块之后 |
+| 6 | **跨作用域（WB→Trae）迁移入口缺失**（B1 ❌） | P4 | ❌ | 无法从 WB 迁移会话到 Trae |
+| 7 | **迁移向导的确认页 / 「已选 N/M」计数缺失**（B1 ❌/⚠️） | P4 | ❌/⚠️ | 单页对话框，无独立确认步与如实汇总 |
+| 8 | **部分失败态只 toast**（P1-2 ⚠️） | P3 | ⚠️ | 批量签到失败后**无法只重试失败项**，也无明细 |
+| 9 | **过期账号卡片菜单仍给「手动签到」**（F5 ⚠️） | P3 | ⚠️ | 与批量签到的「结构性失败」口径**自相矛盾**（抽屉断言空转通过） |
+| 10 | **权限自愈缺「恢复即自动重试切换」**（F1 ⚠️） | P3 | ⚠️ | 授权后用户仍需手动再点一次切换 |
+| 11 | **「去设置」入口是自动跳转、非可点 toast**（P0-4a ⚠️） | P4 | ⚠️ | 未定位到「权限与诊断」子项 |
+| 12 | **账号卡不可键盘聚焦**（P1-5 ⚠️） | P3 | ⚠️ | 卡片本身不可 Tab 聚焦（仅内部勾选框可） |
+| 13 | **模型禁用页 WB 不显示「不可用」列**（P11 ⚠️） | P11 | ⚠️ | 与原型「三种展示」不同（决策 #3 有意为之） |
+| 14 | **签到积分无逐条「+N」明细**（B5 ⚠️） | P3 | ⚠️ | 积分为后端真值，无原型式「+50/+100」记录列表 |
+
+> **注**：请求代理（P12）虽整期 ❌，但 PLAN §3.19 明确 **P12a 是 spike 而非写代码**，
+> 且 **A/C 都不可行时直接作废** —— **不应按「未实现」直接排期**。
+
+---
+
+## 4. ★「原型特有、真实应用不该有」的清单（⬜，8 条）
+
+| 行为 | 原型编号 | 为什么不适用 |
+|:---|:---|:---|
+| 各作用域 days 末值 = 账号 todayTokens 合计 | P0-2 | 断言的是原型**演示数据对象** `USAGE/SCOPES`。真实数据来自后端 API，不存在这些对象 |
+| scope 级 todayTokens 死字段已删除 | P0-2 | 同上 |
+| 设计说明有独立 `.proto-note` 样式 | P0-5 | 原型 `demo.css` 专属 class |
+| 头像底色亮度 L ≤ 0.5（oklch） | P1-7 | 原型 oklch 判据特有；真实用 Tailwind 色板 |
+| 当前账号不再三重信号 | P1-8 | 原型 `.acct.is-current` CSS 特有 |
+| 同一账号内资源包名不重复 | F2 | 断言的是原型 `SCOPES[].packs` 演示数据；真实资源包来自后端 |
+| 目录名与会话标题不是同一批字符串 | F3 | 断言的是原型 `SESSION_SEEDS`；真实会话名来自后端 |
+| 已排除账号的「指定」按钮不可用 | F6 | 与真实**有意设计相反**：`account-pool-card.tsx:69-74` 明写指定是「偏好而非约束」，不可用账号不禁用 |
+
+> **另注（能力存在但实现范式不同，仍判 ✅）**：桌面悬浮窗（原型是页面内 `.companion` 浮层，真实是
+> **独立 Tauri 窗口**）、请求代理（真实要动系统证书与网络栈）、权限自检（真实是 error 驱动轮询）、
+> 迁移向导（真实是单页对话框）—— 这些**不能照搬原型 DOM**，但本报告按其**行为是否落地**判定。
+
+---
+
+## 5. ★「仅静态覆盖」清单（只有门禁断言、无运行时验证）
+
+> **定义**：该行为的 ✅/⚠️ 只由 `check-scope-registry.cjs`（181 条）的**静态断言**
+> （文本扫描 / 结构锚 / 代码位置）支撑，**没有**任何**运行时或端到端**验证证明它「真的按预期工作」。
+> ⚠️ **`verify-behaviors.cjs` 验的是原型**，对真实应用**不构成**运行时证据。
+
+| 行为 | 门禁断言（静态） | 缺什么运行时证据 |
+|:---|:---|:---|
+| **P11 后端「两个出口」禁用** | `check-scope-registry.cjs:1508-1615`（扫 `models.rs` 的 `.filter`、`chat.rs`/`messages.rs` 的 `GatewayError::ModelDisabled`、`disabled_models::is_disabled` 唯一性、大小写不敏感） | 门禁验的是「**代码在正确位置调用了 `is_disabled`**」，**不等于**「运行时真的会拒绝」。虽有 `crates/buddy-switch-gateway/tests/wb_gateway_p11_e2e.rs`（路由级 e2e）与 Trae 侧 e2e，但**门禁本体是静态扫描** |
+| **P7 全局备份/恢复（整组）** | `:3267-3450`（子导航 9 项 / 预览计数 / 文案红线 / 定时开关 / 预估推导 / 冲突三选 / 词条同步）；后端锚 `:3467-3596`（`Scope::parse` fail-closed / 导入前快照 / 恢复防目录穿越 / 损坏文件） | **无 UI 端到端**（导出→导入→冲突→部分失败 的完整链路未在真实应用跑过） |
+| **P8 会话工作台（骨架 + 门控 + 空态 + 副本视图）** | `:3992-4240`（第 6 目的地能力门控 / `scopedNav` 过滤 / Trae 空态 / 不列 WB 组 / `partial:true` / 不用 `updatedAt` 冒充状态 / 两宿主同步） | 全部为**静态扫描**；副本视图在真实应用**无运行时验证** |
+| **P9 悬浮窗（只读 / 四态 / 懒创建 / 位置记忆 / 入口 / 键盘可达性）** | `:2828-3240`（不进 `windows[]` / capability label / 落屏校验 / `?window=companion` 分流 / 托盘入口 / 只读命令面 / 四态样式两两不同 / 标题不进 DOM）+ **`:3263`（键盘可达性：焦点入口 / Esc / 原生 button / drag-region / 关闭按钮 / motion-reduce）** | 静态 + 词条同步；**独立窗口的键盘可达性运行时走查 / 拖拽 / 托盘**无运行时验证 —— 走查清单见 `P9-KEYBOARD-CHECKLIST.md` |
+| **P4 账号工具栏 / 表格 / 可点区** | `:689-1033`（卡片可点区 ≤4 / `TraeProgram.region` 构造点 / `programsFor` 不按 program 去重 / 表格行 ≤2 可点区 / 搜索框常驻 IME / 无假选项） | 静态计数与结构锚；**IME / 聚焦顺序**无运行时验证 |
+| **P5 回收站（UI）** | `:2009-2132`（入口在账号页 / purge 二次确认 / 清空明示条数 / 显示到期时间 / `onRestored` 刷新 / 状态语言） | 静态；**真实恢复链路**无 UI 端到端 |
+| **会话能力的平台边界** | `:209-215,3992-4034`（`sessionCopy` 能力门控 / `DESTINATION_CAPABILITY`） | 静态；「Trae 侧栏确实不渲染」无运行时验证 |
+
+> **对比**：以下模块的门禁**含运行时**（`loadTs` 转译后**真调函数**），故**不算**纯静态覆盖：
+> P10 来源条（`describeCatalogSource` 运行时契约，`:1199-1262`）、P11 计数口径（`servedCount` 运行时，`:1369-1395`）、
+> P11 认证头（`gatewaySnippet` 运行时，`:1714-1747`）、P6 命令面板（`planScopeShortcuts`/`buildPaletteItems` 运行时，`:1828-1948`）。
+>
+> ⚠️ **团队提示的典型例子**（P11 两个出口）正是「**静态断言 ≠ 行为验证**」—— 已在首行标注。
+
+---
+
+## 6. 存疑项（需主理人 / 后端确认）
+
+1. **P0-1 合并「精确校验」的归属**：本报告判 ✅（有等价后端聚合），但断言体读的是原型 `USAGE[id].days`
+   对象 —— 若以「断言逐字对应」为口径，应判 ⬜。**口径需统一**。
+2. **F5「过期账号手动签到」**：抽屉断言**空转通过**（抽屉本就无该入口），但**卡片菜单**对过期账号仍给
+   「手动签到」（`account-card.tsx:457-461` 无过期门控）。底层意图**未落实**，本报告判 ⚠️ 而非 ✅。
+3. **F7「积分流水按时间降序」**：真实数据来自后端，`CreditStatsPage.tsx:1058-1059` 默认 `time desc`；
+   但断言体的 `credits[].ts` 数值字段契约**不存在**。判 ✅（行为等价），存疑。
+4. **B2「快照能力」**：Trae 有 / WB 无（结果对），但 `Capability` union（`registry.ts:39-46`）**无 `snapshot`**
+   —— 是「页面归属」而非「注册表能力门控」。与 PLAN P0「能力入表」的目标**未对齐**。
+5. **P4 程序位注册表**：`registry.ts` **仍无 `programs` 字段**，`account-card.tsx:387-393` 硬编码 3 个。
+   PLAN P5 验收「加第 3 个 WB 程序位无需改代码」**当前不成立**。需确认 P5 是否在范围内。
+6. **P12 请求代理**：全仓 0 命中，且**门禁无 P12 断言**。是否本轮投入需主理人确认（PLAN 要求先 spike）。
+7. **P8「状态派生」的数据源**：原型依赖「会话副本 + 关联 + 分歧」数据模型；当前 `session-replicas.ts:14-18`
+   明写 ledger **无消息计数** ⇒ 推不出「落后/分叉」。需确认后端是否已有该数据源。
+8. **「仅静态覆盖」清单的口径**：本报告按「门禁断言是否为运行时」区分；若主理人认为「真实应用无任何
+   E2E 套件 ⇒ 所有 112 条均属仅静态」，则该清单应扩为**全量**（这取决于对「运行时验证」的定义）。
+
+---
+
+## 附：本文件未做的事
+
+- **未改任何代码 / 其他文档**（仅新增本 md）。
+- **未运行** `verify-behaviors.cjs` / `check-scope-registry.cjs`（以其「112 passed / 181 条」为已知输入）。
+- 「部分实现」的 12 条用量图表**未逐图核对像素级契约** —— 判定基于「真实页面是旧实现、未按原型四视图重做」这一结构性事实。
+- 后端行为（`crates/`）**未逐文件精读**，仅按门禁锚点与 `src/` 调用面推断。

@@ -3,6 +3,7 @@ members = [
   "crates/buddy-switch-core",
   "crates/buddy-switch-gateway",
   "crates/buddy-switch-server",
+  "crates/buddy-switch-vault",
   "src-tauri",
 ]
 resolver = "2"

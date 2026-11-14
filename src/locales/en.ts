@@ -1,10 +1,22 @@
+import { en as backup } from "./domains/backup.en";
+import { en as aggregate } from "./domains/aggregate.en";
+import { en as cache } from "./domains/cache.en";
+import { en as clientSettings } from "./domains/clientSettings.en";
+import { en as legalConsent } from "./domains/legalConsent.en";
+import { en as recycleBin } from "./domains/recycleBin.en";
+import { en as proxy } from "./domains/proxy.en";
+import { en as sessions } from "./domains/sessions.en";
 import { en as shell } from "./domains/shell.en";
 import { en as shared } from "./domains/shared.en";
+import { en as skillManager } from "./domains/skillManager.en";
 import { en as traeComponents } from "./domains/traeComponents.en";
 import { en as traeGateway } from "./domains/traeGateway.en";
 import { en as traePages } from "./domains/traePages.en";
+import { en as qoderPages } from "./domains/qoderPages.en";
+import { en as qoderGateway } from "./domains/qoderGateway.en";
 import { en as traeStats } from "./domains/traeStats.en";
 import { en as wbAccounts } from "./domains/wbAccounts.en";
+import { en as wbOverview } from "./domains/wbOverview.en";
 import { en as wbSettings } from "./domains/wbSettings.en";
 import { en as wbStats } from "./domains/wbStats.en";
 import { en as growth } from "./domains/growth.en";
@@ -31,14 +43,26 @@ import type { TranslationKey } from "./zh";
  */
 export const en: Partial<Record<TranslationKey, string>> = {
   ...shell,
+  ...backup,
+  ...cache,
   ...shared,
   ...wbSettings,
   ...wbAccounts,
+  ...wbOverview,
   ...wbStats,
   ...traePages,
+  ...qoderPages,
+  ...qoderGateway,
   ...traeStats,
   ...traeComponents,
   ...traeGateway,
   ...growth,
   ...doubaoPages,
+  ...sessions,
+  ...recycleBin,
+  ...proxy,
+  ...skillManager,
+  ...clientSettings,
+  ...legalConsent,
+  ...aggregate,
 };

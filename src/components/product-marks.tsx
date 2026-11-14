@@ -3,8 +3,7 @@ import workbuddyIcon from "@/assets/workbuddy-official-icon.png";
 import codebuddyCnIdeIcon from "@/assets/codebuddy-cn-ide-icon.png";
 import traeIcon from "@/assets/trae.png";
 import traeworkIcon from "@/assets/traework.png";
-
-const appIconUrl = `${import.meta.env.BASE_URL}icon-transparent.png`;
+import qoderIcon from "@/assets/qoder.png";
 
 interface MarkProps {
   size?: number;
@@ -28,19 +27,6 @@ export function WorkBuddyMark({ size = 32, className }: MarkProps) {
         alt=""
         className="absolute left-1/2 top-1/2 size-[118%] max-w-none -translate-x-1/2 -translate-y-1/2 object-cover"
       />
-    </span>
-  );
-}
-
-/** 应用自身的透明角色图标；桌面安装图标仍使用 public/icon.png。 */
-export function AppIconMark({ size = 32, className }: MarkProps) {
-  return (
-    <span
-      aria-hidden
-      className={cn("inline-flex shrink-0", className)}
-      style={{ width: size, height: size }}
-    >
-      <img src={appIconUrl} alt="" className="size-full object-contain" />
     </span>
   );
 }
@@ -118,6 +104,34 @@ export function TraeMark({ size = 32, className }: MarkProps) {
   );
 }
 
+/**
+ * Qoder 官方图标（黑色「Q」字标 + 自带浅色底）。
+ *
+ * 源图为官方 logo 原图，已按 `WorkBuddyMark` / `TraeMark` 的**同一参数**归一化：
+ * 内容占画布 **80.4%**、严格居中、底色取原图自带色 ⇒ 直接复用
+ * 「放大 118% 居中 + 容器 `rounded-[22%]` 收口」的同款手法，
+ * 保证同排产品图标视觉体量一致。
+ *
+ * ⚠️ 曾经这里是一枚**手绘圆环字形**（本仓当时没有官方资产，形状只是原型的
+ * 抽象占位符）—— 2026-10-15 换用官方 logo 后**不要**回退到自绘字形：
+ * 作用域选择器 / 页头 chip 上的图标会被用户拿来和官方客户端比对。
+ */
+export function QoderMark({ size = 32, className }: MarkProps) {
+  return (
+    <span
+      aria-hidden
+      className={cn("relative inline-flex shrink-0 overflow-hidden rounded-[22%]", className)}
+      style={{ width: size, height: size }}
+    >
+      <img
+        src={qoderIcon}
+        alt=""
+        className="absolute left-1/2 top-1/2 size-[118%] max-w-none -translate-x-1/2 -translate-y-1/2 object-cover"
+      />
+    </span>
+  );
+}
+
 export function StatusDot({ on, className }: { on: boolean; className?: string }) {
   return (
     <span
@@ -137,8 +151,12 @@ type TraeVariantKey =
   | "trae_work"
   | "trae_cn"
   | "trae_code"
+  // 合并后的客户端（issue #20）：图标与 `trae_code` 同一个（同一家族）。
+  | "trae"
+  | "trae_merged"
   | "global"
   | "global_trae_code"
+  | "global_trae_merged"
   | "cn";
 
 /**
@@ -174,7 +192,9 @@ export function TraeVariantMark({
       )}
       style={{ width: size, height: size }}
     >
-      {/* `global`（国际版 TraeWork）与 `trae_work`（国内版）同属 TraeWork 家族 ⇒ 同一个图标。 */}
+      {/* `global`（国际版 TraeWork）与 `trae_work`（国内版）同属 TraeWork 家族 ⇒ 同一个图标。
+          `trae` / `trae_merged` / `trae_code` / `global_trae_merged` 同属 Trae 家族
+          ⇒ 都走 `traeIcon`（落 else 分支）。 */}
       <img
         src={variant === "trae_work" || variant === "global" ? traeworkIcon : traeIcon}
         alt=""

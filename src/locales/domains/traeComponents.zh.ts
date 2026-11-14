@@ -4,7 +4,6 @@
  * 归属文件：
  * `src/components/trae-account-card.tsx`、`src/components/trae-oauth-login-dialog.tsx`、
  * `src/components/trae-import-accounts-dialog.tsx`、`src/components/trae-export-accounts-dialog.tsx`、
- * `src/components/trae-variant-bar.tsx`、`src/components/trae-variant-switch.tsx`、
  * `src/components/gateway/trae-{model-list,request-log,integration-guide,account-pool-card,api-key-table}.tsx`
  *
  * ⚠️ 命名空间用 `trae`（不是 `traeComponents`）：与页面域共用前缀、靠二级段区分
@@ -17,10 +16,50 @@ export const zh = {
   // trae-types.ts —— 程序位 / 标识的展示名
   // =====================================================================
   // 品牌名中英同形，仍走词表：新增程序位时 `TranslationKey` 会编译期提醒补英文条目。
-  "trae.program.traeWork": "TraeWork",
-  "trae.program.traeCode": "TraeCode",
-  "trae.program.traeWorkGlobal": "TraeWork AI",
-  "trae.program.traeCodeGlobal": "Trae AI",
+  //
+  // ★★ 命名规则（用户确认，2026-10-13 更正）：**国内版带 ` CN` 后缀、国际版不带后缀**。
+  // 六个名字**逐字等于客户端自己的字符串**（`nameAlias` / `nameShort`，本机 `product.json`
+  // 实测）⇒ 一个都不是我们编的：
+  //
+  //   | 程序位 | 国内版 | 国际版 |
+  //   |:---|:---|:---|
+  //   | TraeWork | `TraeWork CN` | `TraeWork` |
+  //   | TraeCode | `TraeCode CN` | `TraeCode` |
+  //   | Trae（合并版） | `Trae CN` | `Trae` |
+  //
+  // ⚠️ 更正前的约定是「国际版带 `AI` 后缀」—— 那是**错的**：它凭空造了
+  // `Trae AI` / `TraeWork AI` 这类客户端根本不用的名字，而且 `Trae AI` 会同时指
+  // 国际 TraeCode 与国际合并版（Key 归属下拉里两个同名选项）。
+  // 六个名字两两不同有两条护栏：Rust `region::tests::六个程序位的展示名两两不同`
+  // + 跨语言门禁（本表兜底值 vs `region.rs` 的 `display_name`）。
+  //
+  // ⚠️ `traeWork` / `traeCode` / `trae` 三个**区域无关**的键（`traeProgramLabel` 用）
+  // 保持不带区域后缀的家族名；带区域的那几个键见下。
+  // 合并后的客户端（issue #20）：客户端自己就叫 `Trae CN` / `Trae`。
+  // 两者是**各自独立的变体**（`trae_merged` / `global_trae_merged`），
+  // 标识与快照目录都与 `traeCode*` 不同。
+  "trae.program.trae": "Trae",
+  "trae.program.traeCn": "Trae CN",
+  "trae.program.traeGlobal": "Trae",
+
+  // =====================================================================
+  // Trae 侧的**区域名**（用户 2026-10-13 定：用客户端自己的产品名）
+  // =====================================================================
+  // 取客户端在该区域的 `nameShort`：国内版客户端叫 `Trae CN`、国际版叫 `Trae`。
+  //
+  // ⚠️ 与 `shared.region.version.*`（`国内版` / `国际版`）**分工不同**，别混：
+  //   - `shared.region.version.*` 是**跨平台**的区域**词**，用于**组合**标签
+  //     （作用域芯片 = 平台 + 区域词，见 `scope-chip.tsx` ⇒「Trae 国内版」）。
+  //     它也被 WorkBuddy 读（`region.ts`），所以**不能**改成 Trae 产品名
+  //     （会变成「Trae Trae CN」与「WorkBuddy Trae CN」）。
+  //   - `trae.region.*` 是 Trae 侧**单独**说「哪个区域」时用的**名**（Key 归属提示、
+  //     后端文案、`env_status.variantLabel`）—— 与后端 `TraeRegion::display_name` 同源。
+  //
+  // ⚠️ 它与 `trae.program.traeCn` / `trae.program.traeGlobal`（合并版程序位）
+  // **逐字相同**（`Trae CN` / `Trae`）—— 客户端的产品名本就同时指这两件事，
+  // 用户明确选择如此。两者分属**区域轴**与**程序位轴**，别去重。
+  "trae.region.cn": "Trae CN",
+  "trae.region.global": "Trae",
 
   // =====================================================================
   // trae-account-card.tsx —— Trae 账号卡片
@@ -38,27 +77,54 @@ export const zh = {
 
   // ---- 到期 ----
   "trae.comp.card.expiry.permanent": "长期有效",
-  "trae.comp.card.expiry.short": "{date} 到期",
-  "trae.comp.card.expiry.cooldownUntil": "冷却至 {time}",
-  "trae.comp.card.expiry.earliest": "最早到期 {time}",
-  "trae.comp.card.expiry.none": "暂无到期时间",
-  "trae.comp.card.expiry.noneShort": "暂无到期",
+  "trae.comp.card.expiry.short": "到期 {date}",
+  // ⚠️ 2026-10-12：卡片按原型删掉「大数字行 + 近期到期逐包列表」后，
+  // `expiry.cooldownUntil` / `expiry.earliest` / `expiry.none` / `expiry.noneShort`
+  // 与 `section.expiring` / `package.tip` / `package.remaining` / `package.empty`
+  // 均已无引用，一并删除。
 
   // ---- 正文行标签 ----
-  "trae.comp.card.label.device": "设备",
-  "trae.comp.card.label.jwtExpiry": "JWT 到期",
-  "trae.comp.card.label.addedAt": "加入时间",
-  "trae.comp.card.label.updatedAt": "最近更新",
-  "trae.comp.card.label.group": "分组",
 
   // ---- 状态标签 ----
-  "trae.comp.card.chip.checked": "已签到",
-  "trae.comp.card.chip.unchecked": "未签到",
+  "trae.comp.card.chip.checked": "今日已签到",
+  // ★ 2026-10-12：与 WorkBuddy 卡片**同一组槽位**（原型对两个平台用同一个渲染器）。
+  "trae.comp.card.chip.toolsInUse": "使用中 {n} 个工具",
+  "trae.comp.card.chip.expired": "凭据已过期",
+  "trae.comp.card.chip.needRelogin": "需重新登录",
+  // 「最近到期 {days}天 · {amount} 积分」—— 天数与金额都取**最快到期的那一批**。
+  // 不把窗口总量和某一批的天数拼在一起：那是两批积分，怎么拼都有半句假话。
+  "trae.comp.card.chip.expiring": "最近到期 {days}天 · {amount} 积分",
+  /* ≤ 48 小时用小时：与 `summarizeExpiring.soonestUnit` 同源。 */
+  "trae.comp.card.chip.expiringHours": "最近到期 {hours}小时 · {amount} 积分",
+  /* 徽章浮层的逐批明细 —— **与 WB / Qoder 同一形状**（一行一批、按到期时刻合并、不带包名）。
+     金额前是**绝对时刻**（`YYYY-MM-DD HH:mm`），可与账号页 / 抽屉的日期直接对照。
+     ★ 包名不是 Trae 的特色：WB 的 `CreditResource` 本来就有 `packageName`，只是从未放进
+       tooltip。包名去抽屉的「资源包明细」表看（三平台都有那张表）。 */
+  "trae.comp.card.expiringTipTitle": "按到期时间分批（共 {n} 批）",
+  "trae.comp.card.expiringTipLine": "{time} · {amount} 积分",
+  /* 「优先」——与 WB 同语义（来自 `lib/credit-priority.ts` 的排序结果）。 */
+  "trae.comp.card.chip.priority": "优先",
+  "trae.comp.card.chip.priorityTip": "建议优先使用",
+  "trae.comp.card.chip.unchecked": "今日未签到",
   "trae.comp.card.chip.cooling": "冷却中",
-  "trae.comp.card.chip.jwtAuto": "自动刷新 JWT",
-  "trae.comp.card.chip.jwtManual": "支持刷新 JWT",
+  /* JWT 续期能力**不做徽章**：它属于长期属性而非「需要用户注意的状态」，做徽章只会
+     挤占到期/签到这些时效性槽位。该信息在抽屉的指标行里已完整体现
+     （`trae.comp.card.detail.jwtAuto*` 四态）——故此处不保留 chip 词条。 */
   "trae.comp.card.cooldown.until": " · 至 {time}",
   "trae.comp.card.cooldown.fallback": "冷却中（{type}）",
+  "trae.comp.card.chip.authRejected": "凭据被拒（可自愈）",
+  // ---- 冷却态 → 用户动作（唯一口径，见 src/lib/trae-cooldown.ts） ----
+  "trae.comp.card.cooldown.hint.sessionDead":
+    "上游已作废这个会话（12153）。请重新登录；凭据换新后这条标记会自动消失，也可在菜单里「解除冷却」",
+  "trae.comp.card.cooldown.hint.authRejected":
+    "上游拒了这份 access token，但没有作废会话 —— 多半是过期，保活刷新一轮就会自己恢复（约 60 秒）",
+  "trae.comp.card.cooldown.hint.planLimit": "套餐额度已用尽，等额度重置或换一个账号",
+  "trae.comp.card.cooldown.hint.transient":
+    "限流或上游抖动，冷却到期后自动恢复；到期后第一条成功请求会立刻清掉它",
+  "trae.comp.card.cooldown.age.justNow": "刚刚",
+  "trae.comp.card.cooldown.age.minutes": "{minutes} 分钟前",
+  "trae.comp.card.cooldown.age.hours": "{minutes} 小时前",
+  "trae.comp.card.cooldown.age.days": "{minutes} 天前",
 
   // ---- 程序切换控件 ----
   "trae.comp.card.currentOf": "{label} 当前账号",
@@ -70,69 +136,73 @@ export const zh = {
   "trae.comp.card.switch.aria": "切换到 {label}",
   "trae.comp.card.switch.ariaBusy": "正在切换到 {label}",
   "trae.comp.card.switch.busy": "切换中…",
+  // ⚠️ 2026-10-10：原「跨区域程序位引导切区域」两条文案（`regionHint` / `guideRegion`）已删除。
+  //    用户要求**国内版不显示国际版的程序位** ⇒ `programsFor` 只返回本区域程序位，
+  //    跨区域按钮永远不出现，那两条文案再无引用（`guideRegion` 在此之前就已无引用）。
 
   // ---- 操作菜单 ----
   "trae.comp.card.manage.aria": "管理账号 {name}",
   "trae.comp.card.manage.title": "更多账号操作",
+  "trae.comp.card.selectAria": "选择账号 {name}",
   "trae.comp.card.menu.save": "保存登录态",
   "trae.comp.card.menu.refreshJwt": "刷新 JWT",
+  "trae.comp.card.menu.refreshCredits": "刷新积分",
   "trae.comp.card.menu.checkin": "手动签到",
   "trae.comp.card.menu.thaw": "解除冷却",
+  "trae.comp.card.menu.remark": "编辑备注",
   "trae.comp.card.menu.delete": "删除账号",
 
   // ---- 积分区 ----
   "trae.comp.card.credits.remaining": "剩余积分",
-  "trae.comp.card.credits.unknown": "积分未查询",
-  "trae.comp.card.credits.notQueried": "尚未查询到积分，点右上角菜单「刷新积分」重试",
-  "trae.comp.card.credits.work": "Work",
-  "trae.comp.card.credits.general": "通用",
-  "trae.comp.card.credits.workTooltip": "Work 积分",
-  "trae.comp.card.credits.generalTooltip": "通用积分",
-  "trae.comp.card.membership.expire": "会员到期：{date}",
-  "trae.comp.card.membership.nextBilling": "下次扣款：{date}",
-  "trae.comp.card.membership.none": "非会员",
-  "trae.comp.card.payIdentity": "{identity}",
-  "trae.comp.card.section.expiring": "近期到期",
-  "trae.comp.card.section.info": "账号信息",
+  // issue #44：原文案让用户「点右上角菜单『刷新积分』」，而菜单里根本没有这一项 ——
+  // 现在提示只说事实，出口是同一行右侧那枚真的能点的按钮。
+  "trae.comp.card.credits.notQueried": "尚未查询到积分",
+  "trae.comp.card.credits.refresh": "刷新积分",
   "trae.comp.card.package.fallback": "积分包",
-  "trae.comp.card.package.tip": "{name} · 剩余 {remaining} / {total} · {expiry}",
-  "trae.comp.card.package.remaining": "{credits} 积分",
-  "trae.comp.card.package.empty": "暂无可用积分",
+  // P4：抽屉 `DetailPack` 的「已用 / 到期」文本（与 WorkBuddy 抽屉同形，各平台自持文案）。
+  "trae.comp.card.package.expired": "已到期",
 
-  // ---- 页脚按钮 ----
-  "trae.comp.card.action.saving": "保存中…",
+  // ---- 操作说明（作为「更多」菜单项的 `title`）----
+  // P4：卡片瘦身把页脚的「保存登录态 / 刷新 JWT」两枚按钮收回菜单（菜单本就有同名项），
+  // 原来的说明文案改挂在菜单项的 `title` 上 —— 不可用时的**原因**不能一起丢掉。
   // ★ 必须说明「会先关客户端」：备份是文件拷贝，客户端运行时 Cookie / leveldb / SQLite WAL
   //   被独占锁定，此时拷出来的快照是坏的（切过去会变成未登录）。用户得知道客户端会重启一次。
   "trae.comp.card.action.saveTip": "把客户端此刻的登录态保存到该账号名下（切换时用它恢复）；会先关闭并重新打开客户端",
   // 保存的目标只能是「该账号此刻登录着的那个程序位」—— 一个都没有时后端守卫也会拒绝，
   // 所以就地禁用并说明，别让用户点了再吃一句看不懂的拒绝。
   "trae.comp.card.action.saveNoLogin": "该账号当前没有登录在任何 Trae 客户端上 —— 先在客户端里登录它，再保存",
-  "trae.comp.card.action.refreshing": "刷新中…",
   "trae.comp.card.action.refreshJwtTip": "用 refresh token 换一份新的 JWT",
-  "trae.comp.card.footer.updatedAt": "{time} 更新",
-  "trae.comp.card.footer.noUpdate": "未记录更新时间",
+  // issue #44：这条说明挂在两个入口上（积分提示行的按钮 / 菜单项）—— 要写清「只动这一个账号」，
+  // 否则用户仍会以为必须全选账号才能刷。
+  "trae.comp.card.action.refreshCreditsTip": "只重新查询该账号的剩余积分，不必全选账号批量刷新",
   "trae.comp.card.footer.updatedTip": "该账号在本地账号库中的最近更新时间",
 
-  // ---- 详情弹窗 ----
+  // ---- 卡片头部与指标行（原型 `.acct-top` / `.acct-metrics`）----
+  // ★ 与 WorkBuddy 卡片**同名同义**（`wbAccounts.card.currentLogin` / `.metric.*`）：
+  //   两个产品分区的卡片是同一套结构，文案也不该各写一版。
+  "trae.comp.card.currentLogin": "当前登录",
+  "trae.comp.card.metric.credits": "积分",
+
+  // ---- 详情抽屉的信息区块（由 TraeAccountsPage 装配后注入）----
+  "trae.comp.card.detail.section.account": "账号信息",
+  "trae.comp.card.detail.section.credits": "积分",
+  "trae.comp.card.detail.section.credential": "凭据",
+
+  // ---- 详情（P4 起由共享抽屉 `account-detail-drawer.tsx` 承载）----
   "trae.comp.card.detail.open": "查看账号详情",
-  "trae.comp.card.detail.title": "账号详情",
   "trae.comp.card.detail.subtitle": "{name} · UID {uid}",
   "trae.comp.card.detail.accountId": "账号 ID",
-  "trae.comp.card.detail.enabledPrograms": "已启用的程序",
   "trae.comp.card.detail.creditsExpiry": "积分到期",
   "trae.comp.card.detail.jwtStatus": "JWT 状态",
   "trae.comp.card.detail.jwtAutoRefresh": "自动刷新 JWT",
   "trae.comp.card.detail.deviceId": "设备标识",
   "trae.comp.card.detail.cooldown": "冷却",
-  "trae.comp.card.detail.ungrouped": "未分组",
   "trae.comp.card.detail.none": "无",
   "trae.comp.card.detail.notQueried": "未查询",
-  "trae.comp.card.detail.jwtAutoOn": "已开启",
-  "trae.comp.card.detail.jwtAutoOff": "可手动刷新",
+  "trae.comp.card.detail.jwtAutoOn": "本次将续期",
+  "trae.comp.card.detail.jwtAutoOff": "到期前自动续期",
+  "trae.comp.card.detail.jwtAutoDisabled": "已关闭（仅可手动刷新）",
   "trae.comp.card.detail.noRefreshToken": "无 refresh token",
-  "trae.comp.card.detail.membershipExpire": "会员到期",
-  "trae.comp.card.detail.membershipNextBilling": "下次扣款",
-  "trae.comp.card.detail.payIdentity": "套餐身份",
 
   // =====================================================================
   // trae-oauth-login-dialog.tsx —— OAuth 网页登录
@@ -145,9 +215,6 @@ export const zh = {
   "trae.comp.oauth.error.timeout": "等待授权超时（{seconds} 秒）。请确认浏览器里已完成授权；若已授权但仍超时，通常是授权页没有把回调打回本机监听端口（端口见下方）。可先关闭弹窗后重试；若反复超时，请确认本机 17388 端口未被其它程序占用。也可改用「导入本机账号」。",
   "trae.comp.oauth.start": "开始 {variant} 网页登录",
   "trae.comp.oauth.startBusy": "正在为 {variant} 发起登录…",
-  "trae.comp.oauth.waiting": "正在等待授权，请在浏览器完成登录…",
-  "trae.comp.oauth.webMode": "本机未检测到客户端，已用网页模式登录（合成设备身份）；后续 Token 刷新同样走网页模式，无需安装客户端。",
-  "trae.comp.oauth.remaining": "剩余 {time}",
   "trae.comp.oauth.callback": "本机回调监听：",
   "trae.comp.oauth.result": "已添加账号：{name}",
   "trae.comp.oauth.close": "关闭",
@@ -156,6 +223,17 @@ export const zh = {
   "trae.comp.oauth.retryBusy": "正在发起登录…",
   "trae.comp.oauth.launch": "启动 {variant} 客户端",
   "trae.comp.oauth.launchBusy": "正在启动 {variant} 客户端…",
+  // ---- 远程 / 无客户端部署（issue #62）：授权页要探 127.0.0.1:17388 ----
+  "trae.comp.oauth.tunnel.title": "远程部署要多一步：授权页会探本机 {port}",
+  "trae.comp.oauth.tunnel.desc": "Trae 授权页停在「认证中」时会去探 127.0.0.1:{port} 确认客户端在线。服务器上没有这个端口，而你点授权的浏览器在自己电脑上 —— 先在自己电脑开一条端口转发接过去，转发后别关终端：",
+  "trae.comp.oauth.tunnel.copy": "复制命令",
+  "trae.comp.oauth.tunnel.copied": "已复制",
+  "trae.comp.oauth.pasteCallback.title": "回调没打回来？把地址栏整串贴进来",
+  "trae.comp.oauth.pasteCallback.hint": "授权完成后浏览器会跳向 127.0.0.1:{port}/authorize?… 并打不开 —— 把那一整串地址复制到这里，由服务端补完兑换。",
+  "trae.comp.oauth.pasteCallback.placeholder": "http://127.0.0.1:{port}/authorize?authCodeInfo=…",
+  "trae.comp.oauth.pasteCallback.submit": "提交回调",
+  "trae.comp.oauth.pasteCallback.busy": "正在兑换…",
+  "trae.comp.oauth.keyNote": "另外：Trae 的换 token 与续期都用客户端 storage.json 里的 icube 设备私钥。本机没有客户端就没有这把钥匙 —— 把装了客户端那台机器的 storage.json 拷到服务器同一路径，或改用「导入备份」（备份不含私钥，续期会失败，只能用到 access_token 过期）。",
   "trae.comp.oauth.launchOk": "已启动 {variant} 客户端。等它写完设备凭证（首次启动还会弹出登录页，按提示登录一次），再点「重新发起登录」。",
 
   // =====================================================================
@@ -195,4 +273,48 @@ export const zh = {
   "trae.comp.export.done": "完成",
   "trae.comp.export.cancel": "取消",
   "trae.comp.export.submit": "导出勾选账号",
+
+  // fork扩展：保留成长任务、两步验证及会员信息词条。
+  "trae.program.traeWork": "TraeWork",
+  "trae.program.traeCode": "TraeCode",
+  "trae.program.traeWorkGlobal": "TraeWork AI",
+  "trae.program.traeCodeGlobal": "Trae AI",
+  "trae.comp.card.expiry.cooldownUntil": "冷却至 {time}",
+  "trae.comp.card.expiry.earliest": "最早到期 {time}",
+  "trae.comp.card.expiry.none": "暂无到期时间",
+  "trae.comp.card.expiry.noneShort": "暂无到期",
+  "trae.comp.card.label.device": "设备",
+  "trae.comp.card.label.jwtExpiry": "JWT 到期",
+  "trae.comp.card.label.addedAt": "加入时间",
+  "trae.comp.card.label.updatedAt": "最近更新",
+  "trae.comp.card.label.group": "分组",
+  "trae.comp.card.chip.jwtAuto": "自动刷新 JWT",
+  "trae.comp.card.chip.jwtManual": "支持刷新 JWT",
+  "trae.comp.card.credits.unknown": "积分未查询",
+  "trae.comp.card.credits.work": "Work",
+  "trae.comp.card.credits.general": "通用",
+  "trae.comp.card.credits.workTooltip": "Work 积分",
+  "trae.comp.card.credits.generalTooltip": "通用积分",
+  "trae.comp.card.membership.expire": "会员到期：{date}",
+  "trae.comp.card.membership.nextBilling": "下次扣款：{date}",
+  "trae.comp.card.membership.none": "非会员",
+  "trae.comp.card.payIdentity": "{identity}",
+  "trae.comp.card.section.expiring": "近期到期",
+  "trae.comp.card.section.info": "账号信息",
+  "trae.comp.card.package.tip": "{name} · 剩余 {remaining} / {total} · {expiry}",
+  "trae.comp.card.package.remaining": "{credits} 积分",
+  "trae.comp.card.package.empty": "暂无可用积分",
+  "trae.comp.card.action.saving": "保存中…",
+  "trae.comp.card.action.refreshing": "刷新中…",
+  "trae.comp.card.footer.updatedAt": "{time} 更新",
+  "trae.comp.card.footer.noUpdate": "未记录更新时间",
+  "trae.comp.card.detail.title": "账号详情",
+  "trae.comp.card.detail.enabledPrograms": "已启用的程序",
+  "trae.comp.card.detail.ungrouped": "未分组",
+  "trae.comp.card.detail.membershipExpire": "会员到期",
+  "trae.comp.card.detail.membershipNextBilling": "下次扣款",
+  "trae.comp.card.detail.payIdentity": "套餐身份",
+  "trae.comp.oauth.waiting": "正在等待授权，请在浏览器完成登录…",
+  "trae.comp.oauth.webMode": "本机未检测到客户端，已用网页模式登录（合成设备身份）；后续 Token 刷新同样走网页模式，无需安装客户端。",
+  "trae.comp.oauth.remaining": "剩余 {time}",
 } as const;

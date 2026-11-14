@@ -11,7 +11,7 @@
 //! 若日后确要实现该能力，需要一并补：第二端口的配置位、监听生命周期、按 region 的路由分发。
 //! 那时应按新需求重新设计，**不要只是把字段加回来**（加回来又是一个空开关）。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,17 +19,20 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+use buddy_switch_core::modules::account;
 use buddy_switch_core::modules::catalog::CatalogStore;
 use buddy_switch_core::modules::config as core_config;
 use buddy_switch_core::modules::region::{self, Region};
+use buddy_switch_core::modules::risk_control::RiskStore;
 use buddy_switch_core::modules::upstream::UpstreamClient;
 
 use crate::account_strategy::{load_strategies, AccountStrategy};
 use crate::apikey::ApiKeyStore;
 use crate::autoclaw::AutoclawClient;
+use crate::disabled_models::DisabledModels;
 use crate::logging::RequestLog;
 use crate::outbound::{DegradeGate, PromptSettings};
-use crate::pool::{Pool, PoolConfig};
+use crate::pool::{Pool, PoolConfig, PoolSummary, RealmTag};
 use crate::sticky::StickyTable;
 
 /// 网关运行配置。
@@ -61,6 +64,20 @@ pub struct GatewayConfig {
     /// 单轮请求的最大换号次数（默认 3）。
     #[serde(alias = "maxRotate")]
     pub max_rotate: usize,
+    /// **账号故障时自动切换**（issue #129，默认 `false`）。
+    ///
+    /// 开启后，流中途的账号级失败不再被「补终止标记」伪装成成功，而是先发一条
+    /// **可重试**的错误帧（`429` / `502`，见 [`crate::failover`]），让客户端整步重跑；
+    /// 失败的账号同时写冷却、解绑粘性 ⇒ 重试必然落到另一个号。
+    ///
+    /// 默认关闭是刻意的：它改变对外字节语义（从「假成功」变成「显式错误」），
+    /// 不能让升级悄悄改变既有表现；也让「不勾选 = 回归基线」成为天然的回归测试。
+    ///
+    /// ★ 放在 config **顶层**而不是 `PoolConfig` 里：`PoolConfig` 是**启动期固化**的
+    /// （`Pool::new` 克隆一次、运行期无 setter），而本开关必须热生效 ⇒ 每轮从
+    /// `config_snapshot()` 读，与 `max_rotate` 同一处。
+    #[serde(alias = "autoFailover")]
+    pub auto_failover: bool,
     /// 是否启用出站指纹脱敏（默认 true）。
     #[serde(alias = "sanitizeFingerprints")]
     pub sanitize_fingerprints: bool,
@@ -95,6 +112,32 @@ pub struct GatewayConfig {
     /// AutoClaw 桥接配置。
     #[serde(default)]
     pub autoclaw: crate::autoclaw::AutoclawConfig,
+    /// **上下文上限策略**（默认 `true`）：模型清单声明上游的**上限**窗口
+    /// （`maxInputTokens`），关闭则声明**默认**窗口（`contextWindow.defaultLength`）。
+    ///
+    /// 上游给两档（如 300k 默认 / 1M 上限）；过去国际版直接拿默认档当窗口，
+    /// 用户会误以为 300k 就是上限。
+    #[serde(alias = "maxContext")]
+    pub max_context: bool,
+    /// **按模型配置的默认思考档**（可选）。键为模型名，值为档位。优先于静态表使用。
+    #[serde(default, alias = "modelEfforts")]
+    pub model_efforts: std::collections::HashMap<String, String>,
+    /// **上游请求是否走系统代理**（默认 `false` = 直连）。
+    ///
+    /// 为什么默认直连：`reqwest::Client::builder()` 不带 `.no_proxy()` 时会自动读取
+    /// `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`。这些变量一旦以 **User 作用域**残留
+    /// （代理客户端关掉后很常见），每一条上游请求都会先去连一个已死或半死的本地代理：
+    /// 端口没了 ⇒ 连接被拒；端口还在但链路坏 ⇒ 代理侧把 TLS 握手中断
+    /// （`UNEXPECTED_EOF_WHILE_READING`）。两种表现都是「**必须开着代理才能用**」。
+    ///
+    /// 实测（2026-11-08）：`www.workbuddy.ai` 直连 0.20s 可用，经本地代理必失败；
+    /// `www.codebuddy.cn` / `qoder.com` 两侧都通。故 WB 与 Qoder / Trae 统一走直连
+    /// （后两者分别在 `qoder/mod.rs` / `trae/mod.rs` 硬编码 `.no_proxy()`）。
+    ///
+    /// 逃生口：若所在网络只有代理能到上游，把本项置 `true`。
+    /// ⚠️ 客户端在网关状态初始化时构建一次 ⇒ **改本项需重启应用生效**。
+    #[serde(default, alias = "upstreamViaProxy")]
+    pub upstream_via_proxy: bool,
 }
 
 impl Default for GatewayConfig {
@@ -108,6 +151,7 @@ impl Default for GatewayConfig {
             log_bodies: false,
             per_key_rate_limit: None,
             max_rotate: 3,
+            auto_failover: false,
             sanitize_fingerprints: true,
             prompt_mode: "passthrough".to_string(),
             prompt_file: None,
@@ -116,6 +160,9 @@ impl Default for GatewayConfig {
             allow_model_region_prefix: false,
             max_body_mb: DEFAULT_MAX_BODY_MB,
             autoclaw: crate::autoclaw::AutoclawConfig::default(),
+            max_context: true,
+            model_efforts: std::collections::HashMap::new(),
+            upstream_via_proxy: false,
         }
     }
 }
@@ -142,7 +189,10 @@ impl GatewayConfig {
         core_config::atomic_write(&file, &content).map_err(|error| error.to_string())
     }
 
-    /// 对外 Base URL（供接入指引展示）。
+    /// 对外**根地址**（含协议与端口，**不含 `/v1`**）。
+    ///
+    /// OpenAI 系 Base URL 由前端派生（`src/lib/gateway-url.ts`），本字段只给根地址 ——
+    /// 两条分支返回不同形态曾导致「接入地址」少一层 `/v1`（#165）。
     pub fn base_url(&self) -> String {
         let host = if self.bind_addr.trim().is_empty() {
             "127.0.0.1"
@@ -161,7 +211,10 @@ impl GatewayConfig {
 ///
 /// `running` / `addr` / `version` 来自运行时而非持久化配置，故 [`From<&GatewayConfig>`]
 /// 只填充配置派生字段，这三项由调用方补充。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+//
+// ⚠️ 只 derive `PartialEq`（**不含 `Eq`**）：池视图带 `f64`（`total_credits`）与
+// `serde_json::Value`（`accounts`），两者都没有 `Eq`。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GatewayStatusView {
     /// 配置中的启用开关（与 [`GatewayConfig::enabled`] 同步）。
@@ -170,7 +223,7 @@ pub struct GatewayStatusView {
     pub running: bool,
     /// 实际监听地址；未监听时为 `None`。
     pub addr: Option<String>,
-    /// 对外 Base URL（含协议与端口，供接入指引展示）。
+    /// 对外**根地址**（含协议与端口，**不含 `/v1`**；OpenAI 基址由前端派生）。
     pub base_url: String,
     /// 配置中的监听地址。
     pub bind_addr: String,
@@ -189,6 +242,18 @@ pub struct GatewayStatusView {
     pub autoclaw_healthy: bool,
     /// 已知模型数量。
     pub autoclaw_model_count: u64,
+    /// 账号池五态计数，**按域分家**（键恒为 `cn` / `global`）。
+    ///
+    /// 形状与 Trae 侧 `TraeGatewayStatusView::pool` 同源（同一张管理面卡片读它）。
+    pub pools: BTreeMap<String, PoolSummary>,
+    /// 逐账号状态（含 `realm`，前端按域过滤）。键名与 Trae 侧 `accounts` 一致。
+    pub accounts: Vec<serde_json::Value>,
+    /// 逐账号「此刻为什么（不）能路由」，供排查「没有可用账号」。
+    pub diagnose: Vec<String>,
+    /// **最近一次请求失败**的可读原因（`None` = 本进程内还没失败过）。
+    ///
+    /// 与 Trae 侧 `TraeGatewayStatusView::last_error` 同名同义，管理面共用同一块展示。
+    pub last_error: Option<String>,
 }
 
 impl Default for GatewayStatusView {
@@ -206,12 +271,26 @@ impl Default for GatewayStatusView {
             autoclaw_base_url: String::new(),
             autoclaw_healthy: false,
             autoclaw_model_count: 0,
+            pools: default_pool_summaries(),
+            accounts: Vec::new(),
+            diagnose: Vec::new(),
+            last_error: None,
         }
     }
 }
 
+/// `pools` 的缺省值：**两个域的键恒定存在**（该域没有账号时计数全为 0）。
+///
+/// 让前端不必处理键缺失 —— 「CN 版一个号都没有」是正常状态，不该显示成「未知」。
+pub fn default_pool_summaries() -> BTreeMap<String, PoolSummary> {
+    BTreeMap::from([
+        ("cn".to_string(), PoolSummary::default()),
+        ("global".to_string(), PoolSummary::default()),
+    ])
+}
+
 impl From<&GatewayConfig> for GatewayStatusView {
-    /// 由配置派生响应视图；`running` / `addr` / `version` 需由调用方补充。
+    /// 由配置派生响应视图；`running` / `addr` / `version` / 池视图需由调用方补充。
     fn from(config: &GatewayConfig) -> Self {
         Self {
             enabled: config.enabled,
@@ -226,7 +305,58 @@ impl From<&GatewayConfig> for GatewayStatusView {
             autoclaw_base_url: config.autoclaw.base_url.clone(),
             autoclaw_healthy: false,
             autoclaw_model_count: 0,
+            pools: default_pool_summaries(),
+            accounts: Vec::new(),
+            diagnose: Vec::new(),
+            last_error: None,
         }
+    }
+}
+
+impl GatewayStatusView {
+    /// 填入账号池视图（`pools` / `accounts` / `diagnose`）；**只读**，不改动池。
+    ///
+    /// 由两侧宿主（server / 桌面端）在 [`sync_pool_with_accounts`] 之后调用。
+    /// 之所以不在这里自己取锁：桌面端那条命令是**同步**的，只能 `try_write`。
+    ///
+    /// ★ 保持只读是**有意的**：本函数被单测直接覆盖，一旦它自己去读账号库
+    /// （无入参的全局路径函数），用例就会被**本机真实账号库**污染（踩过）。
+    pub fn fill_pool(&mut self, pool: &Pool, now_ms: i64) {
+        self.pools = BTreeMap::from([
+            ("cn".to_string(), pool.summary(now_ms, Some(RealmTag::Cn))),
+            (
+                "global".to_string(),
+                pool.summary(now_ms, Some(RealmTag::Global)),
+            ),
+        ]);
+        self.accounts = pool.status_list(now_ms);
+        self.diagnose = pool.diagnose(now_ms);
+    }
+}
+
+/// 用**账号库** + **排除表**对齐池；已删除条目立即清除，存活账号治理状态保持。
+///
+/// ★ 为什么管理面读状态前必须先对齐一次：池条目平时只在有请求经过
+/// （[`crate::routes::relay::relay`]）时才同步，于是「刚导入账号、还没发过请求」
+/// 时池是空的 —— 用户打开管理页会看到「账号池为空」，而账号管理页明明列着好几个号。
+///
+/// ★★ **排除表必须一起同步**（2026-10-22 修 bug）：池内的 `excluded` 快照原先只在
+/// ①真实 relay 请求（`routes/relay.rs`）②`pool_admin::set` 两处被填充。于是进程刚启动、
+/// 还没发生过任何网关请求时，管理面 `status_list` 的 `excluded` 恒为 `false`：
+/// 已经在排除表里的账号在 UI 上显示成「排除」按钮，用户点它只会**再排除一次**
+/// （`excluded=true` 幂等），永远走不到「取消排除」——症状就是「点了排除却取消不掉，
+/// 账号一直被排除在外」，刷新页面也不恢复（只有发过一次请求才会「突然正常」）。
+///
+/// 与请求路径同款（同一函数 + 同一 `scope_key`），因此不会引入第二套对齐语义。
+pub fn sync_pool_with_accounts(pool: &mut Pool) {
+    for (region, realm) in [
+        (Region::Cn, RealmTag::Cn),
+        (Region::Global, RealmTag::Global),
+    ] {
+        pool.sync_accounts(&account::load_accounts_for(region), Some(realm));
+        // 按 scope 替换（`sync_exclusions` 只动该 scope 的条目），两个 region 各一次正好覆盖全池。
+        let scope = crate::routes::relay::scope_key(region);
+        pool.sync_exclusions(scope, &crate::pool::exclusions::load_for(scope));
     }
 }
 
@@ -260,11 +390,30 @@ pub fn body_limit_bytes(max_body_mb: usize) -> usize {
 #[derive(Clone)]
 pub struct GatewayState {
     pub config: Arc<RwLock<GatewayConfig>>,
+    /// 账号请求准入与暂停状态；损坏的状态文件保留为初始化错误，调用时 fail-closed。
+    pub risk_store: Result<RiskStore, String>,
     pub keys: Arc<ApiKeyStore>,
+    /// ★ 按密钥的用量账本（issue #76）：与 Key 台账**分文件** ——
+    /// 台账低频写（创建/吊销/改策略），用量每请求写；合并在一个文件里
+    /// 既放大写放大，也让「改策略」与「记一笔」在锁上打架。
+    pub key_usage: Arc<crate::key_usage::KeyUsageStore>,
     pub catalogs: Arc<CatalogStore>,
     pub strategies: Arc<RwLock<HashMap<Region, AccountStrategy>>>,
+    /// 用户禁用的模型（P11）：**两个出口共用**（`/v1/models` 过滤 + 调用拒绝）。
+    ///
+    /// 进程内**唯一**实例（[`crate::disabled_models::shared`]）—— 与 Trae 网关、命令面
+    /// 读的是同一个 `Arc`，否则「命令改了一份、网关读另一份」就是假开关。
+    pub disabled: Arc<RwLock<DisabledModels>>,
+    /// 模型降级链（主模型失败 ⇒ 改用备选重发一次）。
+    ///
+    /// 与 `disabled` 同一套纪律：进程内**唯一**实例（[`crate::model_fallback::shared`]）、
+    /// 独立文件、**保存即生效**（不进 `Pool.config`，否则改完要重启网关）。
+    pub fallback: Arc<RwLock<crate::model_fallback::ModelFallback>>,
     pub upstream: Arc<UpstreamClient>,
     pub log: Arc<RequestLog>,
+    /// ★ E1：代理 KPI 的热计数（今日代理请求 / 今日换号）。
+    /// 落盘由 [`crate::proxy_kpi::flush`] 负责（跨网关重启不丢，见该模块文档）。
+    pub proxy_kpi: Arc<crate::proxy_kpi::ProxyCounters>,
     pub started_at: i64,
     /// 账号池（多账号治理：选号 / 冷却 / 熔断 / 账本）。
     pub pool: Arc<RwLock<Pool>>,
@@ -282,6 +431,12 @@ pub struct GatewayState {
     /// 提示词加载失败原因（`None` 表示加载正常）；用于 `/status` 透出，
     /// 避免「配置写错但静默回落 passthrough」这种无声失效。
     pub prompt_error: Option<String>,
+    /// **最近一次请求失败**的可读原因（`None` = 本次进程内还没失败过）。
+    ///
+    /// 由 [`crate::routes::relay::relay`] 在失败出口写入（一处覆盖全部失败路径），
+    /// 管理面「网关卡」直接展示 —— 用户不必去翻请求日志才知道刚才为什么 502。
+    /// **成功不清空**（与 Trae 侧同语义）：残留一条历史失败比「什么都没显示」更利于排查。
+    pub last_error: Arc<RwLock<Option<String>>>,
     /// 请求体上限的**字节数**（由配置在构造时固化）。
     ///
     /// 之所以在构造时算一次而不是每次读配置：axum 的 `DefaultBodyLimit` 是 **layer**，
@@ -295,31 +450,31 @@ impl GatewayState {
     /// 依据配置构造一份完整运行状态。
     pub fn new(config: GatewayConfig) -> Self {
         let keys = Arc::new(ApiKeyStore::new(region::gateway_keys_file()));
+        let key_usage = Arc::new(crate::key_usage::KeyUsageStore::new(
+            region::gateway_key_usage_file(),
+        ));
         let catalogs = Arc::new(CatalogStore::new());
         let log = Arc::new(RequestLog::new(
             gateway_log_file(),
             config.log_keep,
             config.log_bodies,
         ));
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(600))
-            .proxy(reqwest::Proxy::custom(|target_url| {
-                let env_proxy = std::env::var("HTTPS_PROXY")
-                    .or_else(|_| std::env::var("https_proxy"))
-                    .ok()?;
-                if target_url.scheme() == "https" {
-                    url::Url::parse(&env_proxy).ok()
-                } else {
-                    None
-                }
-            }))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        /* ★ 用量流水：`token_daily` 的「今日网关桶」事实源。
+        环形日志只留 `log_keep` 条（缺省 200），高峰时统计侧会丢量；流水 append-only
+        按日分片，窗口怎么滚都不影响它。只给主网关启用 —— Trae / Qoder 有自己的账本。 */
+        log.enable_usage_stream(gateway_log_file().with_file_name("gateway_usage"));
+        // ★ 上游客户端默认 **直连**：`reqwest` 不带 `.no_proxy()` 会读 `HTTPS_PROXY`，
+        //   而该变量常以 User 作用域残留 ⇒ 上游请求被迫走本地代理。实测
+        //   `www.workbuddy.ai` 直连可用、经本地代理被掐断 TLS，表现为「只有开代理才能用」。
+        //   与 Qoder / Trae 同一条纪律（它们硬编码 `.no_proxy()`）；WB 用配置项，
+        //   给「只有代理能到上游」的网络留逃生口。
+        let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(600));
+        if !config.upstream_via_proxy {
+            builder = builder.no_proxy();
+        }
+        let http = builder.build().unwrap_or_else(|_| reqwest::Client::new());
         let upstream = Arc::new(UpstreamClient::new(http));
         let strategies = Arc::new(RwLock::new(load_strategies()));
-
-        // 提示词：配置错误不 panic（桌面端不能因为一个配置项启动失败），
-        // 但必须把原因留在 `prompt_error` 里供 `/status` 透出。
         let (prompt, prompt_error) = match PromptMode_::parse(&config.prompt_mode) {
             Ok(mode) => {
                 let file = config.prompt_file.as_deref().map(std::path::Path::new);
@@ -351,11 +506,25 @@ impl GatewayState {
 
         Self {
             config: Arc::new(RwLock::new(config.clone())),
+            risk_store: RiskStore::open_shared(
+                gateway_state_file().with_file_name("risk_control.json"),
+            ),
             keys,
+            key_usage,
             catalogs,
             strategies,
+            disabled: crate::disabled_models::shared(),
+            fallback: crate::model_fallback::shared(),
             upstream,
             log,
+            // 进程启动即把上次落盘的台账**并进来**，避免重启后「今日」从零起算。
+            proxy_kpi: Arc::new({
+                let counters = crate::proxy_kpi::ProxyCounters::new();
+                if let Some(day) = crate::proxy_kpi::today() {
+                    counters.restore(day.requests, day.switches);
+                }
+                counters
+            }),
             started_at: core_config::now_ms(),
             pool: Arc::new(RwLock::new(pool)),
             usage,
@@ -363,9 +532,15 @@ impl GatewayState {
             degrade: Arc::new(RwLock::new(DegradeGate::new())),
             sticky: Arc::new(RwLock::new(StickyTable::new(config.sticky_ttl_ms))),
             prompt_error,
+            last_error: Arc::new(RwLock::new(None)),
             body_limit_bytes: body_limit_bytes(config.max_body_mb),
             autoclaw,
         }
+    }
+
+    /// 记下「最近一次请求失败」的可读原因（管理面 `last_error`）。
+    pub async fn note_last_error(&self, message: impl Into<String>) {
+        *self.last_error.write().await = Some(message.into());
     }
 
     /// 读取配置快照。
@@ -445,6 +620,28 @@ mod tests {
             .collect()
     }
 
+    /// 上游客户端**默认直连**（`upstream_via_proxy == false`）。
+    ///
+    /// 阳性对照：把 `Default` 里的值改回 `true` ⇒ 本用例必红。这条默认值是有意为之：
+    /// `reqwest` 不带 `.no_proxy()` 会读 `HTTPS_PROXY`，而该变量常以 User 作用域残留，
+    /// 导致「只有开着代理才能用」（实测 `www.workbuddy.ai` 直连可用、经本地代理被掐断）。
+    #[test]
+    fn upstream_client_defaults_to_direct_connection() {
+        let config = GatewayConfig::default();
+        assert!(
+            !config.upstream_via_proxy,
+            "上游默认必须直连，否则会重新被 HTTPS_PROXY 劫持"
+        );
+        // 反序列化缺该键时也必须是直连（旧配置文件里没有这个键）。
+        let parsed: GatewayConfig =
+            serde_json::from_str(r#"{"enabled":true,"port":57891}"#).expect("deserialize");
+        assert!(!parsed.upstream_via_proxy, "旧配置缺键 ⇒ 默认直连");
+        // camelCase 别名必须被接受（前端某些路径会发 camelCase）。
+        let aliased: GatewayConfig =
+            serde_json::from_str(r#"{"upstreamViaProxy":true}"#).expect("deserialize alias");
+        assert!(aliased.upstream_via_proxy, "必须接受 camelCase 别名");
+    }
+
     #[test]
     fn gateway_status_view_serializes_with_pinned_snake_case_contract() {
         let config = GatewayConfig {
@@ -473,11 +670,26 @@ mod tests {
             "autoclaw_base_url",
             "autoclaw_healthy",
             "autoclaw_model_count",
+            // 账号池视图（与 Trae 侧 `trae_gateway_status` 的 pool/accounts/diagnose 对位）。
+            "pools",
+            "accounts",
+            "diagnose",
+            "last_error",
         ]
         .into_iter()
         .collect();
         // 精确匹配：多一个少一个都会失败，防止契约再次漂移。
-        assert_eq!(keys_of(&value), expected, "gateway_status key set must be pinned");
+        assert_eq!(
+            keys_of(&value),
+            expected,
+            "gateway_status key set must be pinned"
+        );
+
+        // 「某域一个账号都没有」是正常状态，`pools` 的两个键必须**恒定存在**，
+        // 否则前端会把「空池」显示成「未知」。
+        let pools = value["pools"].as_object().expect("pools 对象");
+        assert_eq!(keys_of(&value["pools"]), BTreeSet::from(["cn", "global"]));
+        assert_eq!(pools["cn"]["total"], 0);
 
         // 不得再出现 camelCase 键（此前手工拼装的风格）。
         assert!(!value.as_object().unwrap().contains_key("baseUrl"));
@@ -516,6 +728,41 @@ mod tests {
         assert_eq!(view.version, "");
     }
 
+    /// 池视图由 [`GatewayStatusView::fill_pool`] 填入：`pools` 按域分家、`accounts`
+    /// 逐账号带 `realm`、`diagnose` 逐账号一行。
+    ///
+    /// ⚠️ 这里**只测 `fill_pool`（纯读）**：`sync_pool_with_accounts` 会读本机账号库
+    /// （无入参的全局路径函数），在本进程并行跑的 lib 单测里必然读到**真实数据**，
+    /// 断言只能写成「≥ 0 条」这种不痛不痒的形式 —— 那还不如不写。
+    #[test]
+    fn fill_pool_splits_counts_by_realm_and_tags_every_account() {
+        let mut pool = Pool::new(PoolConfig::default());
+        pool.upsert("cn-1", Some(RealmTag::Cn), "CN 一号");
+        pool.upsert("g-1", Some(RealmTag::Global), "国际一号");
+        pool.set_credits("cn-1", 7, 0);
+        pool.mark_credits_refreshed("cn-1", 1_000);
+
+        let mut view = GatewayStatusView::default();
+        view.fill_pool(&pool, 1_000);
+
+        assert_eq!(view.pools["cn"].total, 1);
+        assert_eq!(view.pools["global"].total, 1);
+        assert_eq!(view.pools["cn"].total_credits, 7.0);
+        assert_eq!(
+            view.accounts.len(),
+            2,
+            "两个域的账号都给出，由前端按 realm 过滤"
+        );
+        assert_eq!(view.diagnose.len(), 2);
+
+        let realms: BTreeSet<&str> = view
+            .accounts
+            .iter()
+            .map(|item| item["realm"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(realms, BTreeSet::from(["cn", "global"]));
+    }
+
     #[test]
     fn gateway_config_serializes_with_snake_case_keys() {
         let value = serde_json::to_value(GatewayConfig::default()).expect("serialize config");
@@ -528,6 +775,7 @@ mod tests {
             "log_bodies",
             "per_key_rate_limit",
             "max_rotate",
+            "auto_failover",
             "sanitize_fingerprints",
             "prompt_mode",
             "prompt_file",
@@ -536,6 +784,11 @@ mod tests {
             "allow_model_region_prefix",
             "max_body_mb",
             "autoclaw",
+            "max_context",
+            // 按模型默认思考档（issue：Qoder/WB 思考档位可配）
+            "model_efforts",
+            // 上游是否走系统代理（默认 false = 直连，见字段文档）
+            "upstream_via_proxy",
         ]
         .into_iter()
         .collect();
@@ -589,8 +842,8 @@ mod tests {
             r#"{"port":60000,"dualPort":true}"#,
             r#"{"port":60000,"dual_port":true}"#,
         ] {
-            let config: GatewayConfig =
-                serde_json::from_str(body).unwrap_or_else(|e| panic!("老配置必须能加载 {body}: {e}"));
+            let config: GatewayConfig = serde_json::from_str(body)
+                .unwrap_or_else(|e| panic!("老配置必须能加载 {body}: {e}"));
             assert_eq!(config.port, 60000, "其余字段不受影响");
         }
         // 序列化出口也不得再出现该键（契约测试另行钉死键集合）

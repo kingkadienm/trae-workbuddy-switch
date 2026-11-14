@@ -66,14 +66,12 @@ fn record_jwt(item: &Value) -> Option<String> {
 /// 小写分支是**对外部导出文件的容错**：用户可能从别的工具导出成 camelCase，
 /// 不该因此整条丢弃。
 fn record_user_id(item: &Value) -> Option<String> {
-    ["UserID", "user_id"]
-        .iter()
-        .find_map(|key| {
-            item.get(*key)
-                .and_then(|value| value.as_str())
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-        })
+    ["UserID", "user_id"].iter().find_map(|key| {
+        item.get(*key)
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
 }
 
 /// 生成导入文件的脱敏预览（含文件内索引，不含 JWT 明文）。
@@ -144,6 +142,18 @@ fn merge_import_record(accounts: &mut Vec<RawAccount>, item: &Value) -> MergeOut
             // 同为「缺乏」语义的字段也做一次保留，避免导入低配版本文件时丢信息。
             if replaced.added_at.is_none() {
                 replaced.added_at = existing.added_at.clone();
+            }
+            // `updated_at` 与 `added_at` 同款：导入文件不带它时**不能**把本地的
+            // 已知值抹成 `null` —— 卡片页脚的「最近更新」会因此变成「未记录更新时间」，
+            // 而用户刚刚并没有更新过任何东西（2026-10-01 实测复现）。
+            if replaced.updated_at.is_none() {
+                replaced.updated_at = existing.updated_at.clone();
+            }
+            // 备注是**纯本地用户输入**：参考实现产出的文件、或旧版本导出的文件里
+            // 根本没有这个键。`*existing = replaced` 会把它整条抹掉 —— 那是用户
+            // 自己写的东西，丢了不会有任何提示。与 `added_at` 同一条规则。
+            if replaced.remark.is_none() {
+                replaced.remark = existing.remark.clone();
             }
             *existing = replaced;
             return MergeOutcome::Overwritten;
@@ -310,6 +320,7 @@ mod tests {
             refresh_token: None,
             added_at: Some("2026-09-01T00:00:00Z".to_string()),
             updated_at: None,
+            remark: None,
         }
     }
 
@@ -366,10 +377,73 @@ mod tests {
         assert_eq!(accounts[0].user_id.as_deref(), Some("u1"));
     }
 
+    /// 备注是**纯本地用户输入**，导入文件通常不带它 —— 不能被 `*existing = replaced` 抹掉。
+    ///
+    /// 反面现场（WorkBuddy 侧同款实现踩过）：用户写好的备注在「导入账号」之后
+    /// 无声消失，且没有任何提示。这条就是那个缺陷的护栏。
+    #[test]
+    fn merge_keeps_local_remark_when_import_record_lacks_it() {
+        let mut local = raw("u1", "本地名", "old-jwt");
+        local.remark = Some("本地备注".into());
+        let mut accounts = vec![local];
+
+        // ① 导入文件不带 remark（参考实现 / 旧版本导出的文件就是这样）⇒ 保留本地值。
+        let text = r#"[{ "UserID": "u1", "name": "导入名", "jwt": "new-jwt" }]"#;
+        let result = merge_import_records(&mut accounts, text, &[0]).unwrap();
+        assert_eq!(result.overwritten, 1);
+        assert_eq!(accounts[0].name, "导入名", "其余字段照常被覆盖");
+        assert_eq!(
+            accounts[0].remark.as_deref(),
+            Some("本地备注"),
+            "导入记录缺 remark 时不得抹掉本地备注"
+        );
+
+        // ② 导入文件**带** remark ⇒ 以导入值为准（换机器搬账号时备注要跟着走）。
+        let text = r#"[{ "UserID": "u1", "jwt": "newer-jwt", "remark": "导入备注" }]"#;
+        merge_import_records(&mut accounts, text, &[0]).unwrap();
+        assert_eq!(accounts[0].remark.as_deref(), Some("导入备注"));
+    }
+
+    /// 导入文件不带时间戳时，本地的**已知值**不得被抹成 `null`。
+    ///
+    /// 现场（2026-10-01 真机实测）：导入一份没有 `updated_at` 的文件后，卡片页脚的
+    /// 「最近更新」变成「未记录更新时间」—— 用户刚导入完，自己什么都没更新。
+    /// 与 `added_at` / `remark` 同属「缺乏 ≠ 应当清空」。
+    #[test]
+    fn merge_keeps_local_timestamps_when_import_record_lacks_them() {
+        let mut local = raw("u1", "本地名", "old-jwt");
+        local.updated_at = Some("2026-09-30T10:00:00Z".into());
+        let mut accounts = vec![local];
+
+        // ① 缺 `updated_at` ⇒ 保留本地值（`added_at` 早已如此，见上一条规则）。
+        let text = r#"[{ "UserID": "u1", "name": "导入名", "jwt": "new-jwt" }]"#;
+        merge_import_records(&mut accounts, text, &[0]).unwrap();
+        assert_eq!(accounts[0].name, "导入名", "其余字段照常被覆盖");
+        assert_eq!(
+            accounts[0].updated_at.as_deref(),
+            Some("2026-09-30T10:00:00Z"),
+            "导入记录缺 updated_at 时不得抹掉本地值"
+        );
+        assert_eq!(
+            accounts[0].added_at.as_deref(),
+            Some("2026-09-01T00:00:00Z")
+        );
+
+        // ② 带 `updated_at` ⇒ 以导入值为准（换机器搬账号时时间线要跟着走）。
+        let text =
+            r#"[{ "UserID": "u1", "jwt": "newer-jwt", "updated_at": "2026-10-01T00:00:00Z" }]"#;
+        merge_import_records(&mut accounts, text, &[0]).unwrap();
+        assert_eq!(
+            accounts[0].updated_at.as_deref(),
+            Some("2026-10-01T00:00:00Z")
+        );
+    }
+
     #[test]
     fn merge_tolerates_unknown_fields_and_lowercase_uid() {
         let mut accounts: Vec<RawAccount> = Vec::new();
-        let text = r#"[{ "user_id": "u9", "jwt": "jwt-9", "future_field": 1, "schema_version": 99 }]"#;
+        let text =
+            r#"[{ "user_id": "u9", "jwt": "jwt-9", "future_field": 1, "schema_version": 99 }]"#;
         let result = merge_import_records(&mut accounts, text, &[0]).unwrap();
         // 未知字段被忽略（不 panic）；小写 `user_id` 不是持久化键，
         // 会被当作未知字段丢弃 —— 这是**有意的**：持久化契约只认大写 `UserID`，
@@ -390,7 +464,9 @@ mod tests {
     #[test]
     fn merge_counts_out_of_range_index_as_skipped() {
         let mut accounts: Vec<RawAccount> = Vec::new();
-        let result = merge_import_records(&mut accounts, r#"[{ "UserID": "u1", "jwt": "j" }]"#, &[5]).unwrap();
+        let result =
+            merge_import_records(&mut accounts, r#"[{ "UserID": "u1", "jwt": "j" }]"#, &[5])
+                .unwrap();
         assert_eq!(result.skipped, 1);
         assert_eq!(result.imported, 0);
         assert!(accounts.is_empty());
@@ -412,8 +488,14 @@ mod tests {
         let record = raw("7512345678901234567", "主号", "Cloud-IDE-JWT abc.def.ghi");
         let value = serde_json::to_value(&record).unwrap();
         let text = serde_json::to_string(&vec![value]).unwrap();
-        assert!(text.contains("\"UserID\""), "导出必须保留大写 UserID：{text}");
-        assert!(!text.contains("\"user_id\""), "不得写出 snake_case 键：{text}");
+        assert!(
+            text.contains("\"UserID\""),
+            "导出必须保留大写 UserID：{text}"
+        );
+        assert!(
+            !text.contains("\"user_id\""),
+            "不得写出 snake_case 键：{text}"
+        );
     }
 
     #[test]
@@ -433,7 +515,10 @@ mod tests {
         let text = r#"[{ "UserID": "u1", "name": "主号", "jwt": "secret-token" }]"#;
         let preview = preview_accounts(text).unwrap();
         let serialized = serde_json::to_string(&preview).unwrap();
-        assert!(!serialized.contains("secret-token"), "预览不得泄露 JWT：{serialized}");
+        assert!(
+            !serialized.contains("secret-token"),
+            "预览不得泄露 JWT：{serialized}"
+        );
         assert_eq!(preview["accounts"][0]["hasJwt"], json!(true));
         assert_eq!(preview["accounts"][0]["userId"], json!("u1"));
     }
@@ -449,10 +534,8 @@ mod tests {
     /// 合并逻辑**结构上**碰不到容器键，而这条用例钉住**回存**那一步没把容器丢掉。
     #[test]
     fn import_accounts_keeps_device_bindings() {
-        let temp = std::env::temp_dir().join(format!(
-            "buddy-switch-trae-bindings-{}",
-            std::process::id()
-        ));
+        let temp =
+            std::env::temp_dir().join(format!("buddy-switch-trae-bindings-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&temp);
         let _guard = crate::modules::config::HomeOverrideGuard::set(&temp);
         let variant = TraeVariant::TraeWork;
@@ -460,8 +543,10 @@ mod tests {
         // 先造两条绑定。
         let mut file = account::load_accounts_for(variant);
         file.accounts.push(raw("u1", "一号", "jwt-1"));
-        file.device_bindings.insert("u1".to_string(), "dev-1".to_string());
-        file.device_bindings.insert("u2".to_string(), "dev-2".to_string());
+        file.device_bindings
+            .insert("u1".to_string(), "dev-1".to_string());
+        file.device_bindings
+            .insert("u2".to_string(), "dev-2".to_string());
         account::save_accounts_for(variant, &file).expect("造绑定");
 
         // 导入一份**不含任何绑定字段**的 JSON。

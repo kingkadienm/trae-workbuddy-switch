@@ -1,4 +1,5 @@
 import { t } from "@/lib/i18n";
+import type { GatewayPoolAccount, GatewayPoolSummary } from "@/lib/types";
 
 /**
  * Trae 模块前端类型。
@@ -24,6 +25,34 @@ export interface TraeEnvStatus {
   platform: string;
   configuredPath: string | null;
   /**
+   * `configuredPath` 是否**仍指向一个真实文件**（后端 `env_status`，issue #20）。
+   *
+   * ## 为什么要单独下发
+   *
+   * 后端在自定义路径失效时会**静默回落**到自动探测（客户端合并/升级会搬走甚至卸载
+   * 旧 exe，不该因此卡住启动）。于是界面会显示「已检测到」，而设置页仍摆着一个
+   * 不存在的路径 —— 用户无从知道该改。本字段就是给设置页做那条提示用的。
+   *
+   * `configuredPath` 为空时恒为 `false`；调用方**只在「填了且失效」时提示**。
+   */
+  configuredPathExists: boolean;
+  /**
+   * **按区域**配置的客户端路径（键 = {@link TraeRegionId}），未配置的区域为 `null`。
+   *
+   * ## 为什么必须有它（issue #20）
+   *
+   * `configuredPath` 是**全局视角**下的单值 —— 它取「检测到的那条线所属区域」的路径。
+   * 设置页是**按区域**渲染的：用户在国际版页面上必须看到国际版的值，
+   * 拿 `configuredPath` 会张冠李戴（在国内版页面看到国际版的路径）。
+   * 因此后端把每个区域的值都下发，由设置页按当前区域取。
+   */
+  configuredPaths: Record<TraeRegionId, string | null>;
+  /**
+   * `configuredPaths` 每个区域的值是否**仍指向一个真实文件**（判据同
+   * {@link configuredPathExists}）。设置页的「路径已失效」提示据此**按区域**判定。
+   */
+  configuredPathsExist: Record<TraeRegionId, boolean>;
+  /**
    * 自动探测到的**产品线变体**稳定标识（`"trae_work"` / `"trae_cn"`）。
    *
    * 自动探测横跨全部变体挑最近活跃的那一个，所以界面必须说得出挑中的是谁。
@@ -31,7 +60,7 @@ export interface TraeEnvStatus {
    */
   variant: TraeVariantId | null;
   /**
-   * 产品线**展示名**（`"Trae Work"` / `"Trae CN"`），可直接上界面。
+   * 产品线**展示名**（`"TraeWork CN"` / `"Trae CN"`），可直接上界面。
    *
    * 与 Rust 侧 `variant::TraeVariant::display_name()` 同源；`Trae Work` 这个名字
    * 来自客户端 `product.json` 的 `nameAlias`（`TRAE SOLO CN` 自称 `TraeWork CN`）。
@@ -53,11 +82,27 @@ export type TraeRegionId = "cn" | "global";
  *
  * 与 Rust 侧 `TraeProgram::as_str()` 同源。区域决定「账号属于哪套体系」，
  * 程序只决定「落到哪个客户端」。
+ *
+ * ## 三个取值的来历（issue #20）
+ *
+ * - `trae_work` / `trae_code`：改造前的两条产品线，各自对应一个客户端；
+ * - `trae`：2026-10-13 客户端把上面两条**合并**成的一个客户端（CN `Trae CN`、
+ *   国际 `Trae`）。
+ *
+ * ⚠️ `trae` 与 `trae_code` **候选名逐字相同**（客户端合并时复用了 TraeCode 的目录名
+ * 与 exe 名），但它们是**两条不同的程序位**、两个不同的**变体**
+ * （`trae_merged` / `global_trae_merged`）⇒ 快照目录、Key 归属、日志分档各自独立。
+ * 这正是「Trae 是 Trae、TraeCode 是 TraeCode」在数据层的落点。
  */
-export type TraeProgramId = "trae_work" | "trae_code";
+export type TraeProgramId = "trae_work" | "trae_code" | "trae";
 
 /**
  * 发给后端的「目标」标识 —— **区域与程序位共用一个字段**（后端宽容解析）。
+ *
+ * @deprecated P5 §2.6：`variant` 一词双义（既指区域、又指程序位），是 VOCABULARY §4 里
+ * 最要命的混淆。**新代码不得再引入 `TraeVariantId`**，请改用两根正交轴：
+ * {@link TraeRegionId}（持久化：账号库 / 端点）+ {@link TraeProgramId}（执行：写哪个客户端）。
+ * 现有引用待逐段迁移（截至 2026-10-05 前端仍有 12 文件 81 处，故暂不能删除本类型）。
  *
  * `trae_work` / `trae_cn` 是改造前的产品线标识，现在表示**国内区域下的两个程序位**
  * （`trae_work`＝TraeWork 客户端、`trae_cn`＝TraeCode 客户端）。保留它们是为了：
@@ -66,49 +111,78 @@ export type TraeProgramId = "trae_work" | "trae_code";
  * `global_trae_code` 是**国际版 TraeCode**（与 `global`＝国际版 TraeWork 分家，
  * 见 `TraeVariant::GlobalTraeCode`）。它必须与 `global` 分开：
  * 两者只差一个后缀，混用会把登录态写进错的客户端。
+ *
+ * `trae_merged` / `global_trae_merged` 是**合并后的客户端**（issue #20）。
+ * 它们与 `trae_cn` / `global_trae_code` **候选名逐字相同**但**变体不同** ——
+ * 变体是快照目录 / Key 归属 / 日志分档的派生来源，共用变体会让两条程序位的快照
+ * 挤进同一个目录（用户报障原文）。⚠️ 因此**绝不能**用「变体」反推程序位名字：
+ * 那正是「点 Trae 却提示 TraeCode」那次缺陷的成因。
  */
 export type TraeVariantId =
   | TraeRegionId
   | "trae_work"
   | "trae_cn"
   | "global_trae_code"
+  | "trae_merged"
+  | "global_trae_merged"
   | TraeProgramId;
 
 /**
- * 程序位的展示名（`TraeWork` / `TraeCode`）。
+ * 程序位的展示名（收敛后只剩合并版 `Trae`）。
  *
- * ⚠️ 与 {@link traeVariantLabel} 的区别：本函数**只接程序位标识**，返回的就是客户端
- * 自己的名字。`TraeWork` / `TraeCode` 是品牌名，中英两语相同 —— 之所以仍然过词表，
- * 是为了让「程序位有哪些、各自叫什么」只有**一处**可查，将来新增程序位时
- * `zh.ts` 的 `TranslationKey` 会编译期提醒补英文条目。
+ * ⚠️ 与 {@link traeVariantLabel} 的区别：本函数**只接程序位标识**。
+ * 之所以仍然过词表，是为了让「程序位有哪些、各自叫什么」只有**一处**可查，
+ * 将来新增程序位时 `zh.ts` 的 `TranslationKey` 会编译期提醒补英文条目。
  */
 export function traeProgramLabel(program: TraeProgramId): string {
-  return t(program === "trae_code" ? "trae.program.traeCode" : "trae.program.traeWork");
+  // 收敛后唯一可选取值。`TraeWork` / `TraeCode` 是**退役**程序位：官方已把它们
+  // 合并进 `Trae`（issue #28），界面上不再出现，返回合并版的名字才是事实。
+  void program;
+  return t("trae.program.trae");
 }
 
 /**
  * `TraeVariantId` → 展示名。
  *
- * 区域 → `国内版` / `国际版`；程序位 → 客户端的官方别名写法。
+ * 区域 → 客户端产品名；程序位 → 客户端的官方别名写法。
  * 与 Rust 侧 `TraeRegion::display_name()` / `program_spec().display_name` 同源。
+ *
+ * ★ **退役变体按其现在的落点显示**（issue #28 收敛）：`trae_work` / `trae_cn` /
+ * `global` / `global_trae_code` 这四个历史标识在**老 Key 记录 / 老网关日志**里仍有，
+ * 它们现在全部落到该区域的**合并版客户端** ⇒ 显示合并版的名字才是准确描述。
+ * 显示 `TraeWork CN` 反而会指向一个已被卸载、不再可切换的客户端。
  *
  * **什么场景用它**：手上只有标识、需要**立刻**显示名字时（例如登录弹窗要说清
  * 「正在为哪条线登录」）。能拿到后端探测结果时优先用 `variantLabel`，避免前端多维护文案。
  */
 export function traeVariantLabel(variant: TraeVariantId): string {
   switch (variant) {
+    // 区域名（Trae 侧）：客户端自己的产品名，见 `trae.region.*` 的说明。
     case "cn":
-      return t("shared.region.version.cn");
+      return t("trae.region.cn");
     case "global":
-      return t("shared.region.version.global");
+      return t("trae.region.global");
+    // 合并后的客户端：两个区域各一个。
+    case "trae_merged":
+      return t("trae.program.traeCn");
+    case "global_trae_merged":
+      return t("trae.program.traeGlobal");
+    // ⚠️ `trae` 有两种身份：作为**程序位标识**是合并版；作为**变体参数**是
+    //   改造前的国内 TraeCode 落盘标识（`TraeVariant::parse("trae")`）。两者现在
+    //   指向同一个客户端，故共用同一个展示名。
+    case "trae":
+      return t("trae.program.traeCn");
+    // 退役的国内两条：老记录里出现，一律显示合并版的名字（见函数头）。
     case "trae_cn":
     case "trae_code":
-      return t("trae.program.traeCode");
-    // 国际版 TraeCode：**不是** `trae_code` 那条（那是国内），见 `TraeVariantId`。
+    case "trae_work":
+      return t("trae.program.traeCn");
+    // 退役的国际两条：同上，落国际合并版。
     case "global_trae_code":
-      return t("trae.program.traeCodeGlobal");
+      return t("trae.program.traeGlobal");
+    // 不可达（上面的分支已覆盖 `TraeVariantId` 的全部取值）；保留旧兜底值不动。
     default:
-      return t("trae.program.traeWork");
+      return t("trae.program.trae");
   }
 }
 
@@ -116,14 +190,22 @@ export function traeVariantLabel(variant: TraeVariantId): string {
  * `TraeVariantId` → **区域**展示名（国内版 / 国际版）。
  *
  * 与 {@link traeVariantLabel} 的分工：后者回答「这个标识自己是谁」（程序位就叫程序名），
- * 本函数只回答「它落在哪个区域」。凡是**按区域分区**的展示都必须用本函数 ——
- * 目前有两处：API Key 的「归属版本」列、Token 统计的版本分档。
+ * 本函数只回答「它落在哪个区域」。
+ *
+ * ## 用途（2026-09-30 收窄）
+ *
+ * 原先它的两个用途之一是 API Key 的「归属」列 —— **那个用法已撤掉**：
+ * 程序位现在真的决定行为（`/v1/models` 列哪份清单、请求体带哪个 `function`，
+ * 见 `trae-api-key-table.tsx` 的 `PROGRAMS`），所以列里必须显示**程序位**，
+ * 显示区域会让「TraeWork 与 TraeCode 两把 Key」看起来一模一样。
+ * 现在它只服务于「只关心账号体系落在哪一档」的场景 —— 目前是 API Key 归属 badge
+ * 的 `title`（提示该 Key 走哪本账号库）。
  *
  * ⚠️ 为什么不能直接用 `traeVariantLabel`：历史上写进 Key 记录的是**改造前的产品线标识**
  * （`trae_work` / `trae_cn`），而那两个产品线**都是国内构建**。照 `traeVariantLabel`
- * 显示就会得到「TraeWork / TraeCode」两个名字，而网关对它们的行为**完全相同**
+ * 显示就会得到「TraeWork / TraeCode」两个名字，而它们在**账号库**维度上完全相同
  * （同一本国内账号库、同一个池、Token 统计里同属「国内版」一档）——
- * 界面上于是出现一处**假差异**：看起来归属不同，实际毫无区别。
+ * 本函数回答的正是那个维度。
  *
  * 未建模的组合（例如国际版程序位，本机未安装）交回 {@link traeVariantLabel}，
  * **不猜**：宁可显示它的本名，也不要替后端发明一个区域。
@@ -133,13 +215,67 @@ export function traeRegionLabelOf(variant: TraeVariantId): string {
     case "global":
     // 国际版 TraeCode 也落国际区域（它与 `global` 是同一区域的两条程序）。
     case "global_trae_code":
-      return t("shared.region.version.global");
+    // 合并版国际客户端（issue #20）同样落国际区域。
+    case "global_trae_merged":
+      return t("trae.region.global");
     case "cn":
     case "trae_work":
     case "trae_cn":
-      return t("shared.region.version.cn");
+    // 合并后的客户端 `trae` / `trae_merged` 落**国内**（后端
+    // `TraeVariant::parse("trae") == Trae`、`TraeMerged.region() == Cn`）。
+    case "trae":
+    case "trae_merged":
+      return t("trae.region.cn");
     default:
       return traeVariantLabel(variant);
+  }
+}
+
+/**
+ * `TraeVariantId` → **区域标识**（P5 T03）。
+ *
+ * ## 为什么需要它
+ *
+ * P5 把命令面按 `scope` 参数化，而 `scope` 是 `${平台}-${区域}` —— **只认区域**。
+ * 但 Trae 侧的调用方手上常常只有一个 `TraeVariantId`（它把「区域 × 程序位」合成了一个字段，
+ * 见类型注释），所以需要一个**明确的**「变体 → 区域」映射出口。
+ *
+ * ## 与 {@link traeRegionLabelOf} 的关系
+ *
+ * 两者是**同一套映射的两种输出**：那个返回展示名（给界面），本函数返回区域标识（给 scope）。
+ * ⚠️ 故意分成两个函数、而不是「返回标识再翻译」：调用方要的是不同的东西，
+ * 让每个调用点各写一遍 `.map(...)` 只会让映射散开。
+ *
+ * ## 为什么 `default` 抛错而不是猜
+ *
+ * `TraeVariantId` 是**闭合联合** ⇒ 上面已覆盖全部取值，`default` 在类型层面不可达。
+ * 留 `never` 检查是让**将来新增变体时编译期就报错**，而不是静默落进某个默认区域 ——
+ * 那会把登录态 / 账号库写进**错的区域**（`traeRegionLabelOf` 的注释也强调过「不猜」）。
+ */
+export function traeRegionOf(variant: TraeVariantId): TraeRegionId {
+  switch (variant) {
+    case "global":
+    // 国际版 TraeCode 也落国际区域（它与 `global` 是同一区域的两条程序）。
+    case "global_trae_code":
+    // 合并版国际客户端（issue #20）。
+    case "global_trae_merged":
+      return "global";
+    case "cn":
+    // `trae_work` / `trae_cn` 是改造前的产品线标识，两者**都是国内构建**。
+    case "trae_work":
+    case "trae_cn":
+    // `TraeProgramId` 的 `trae_code`：程序位不含区域，按其归属的国内库处理。
+    case "trae_code":
+    // `TraeProgramId` 的 `trae`（合并版客户端，issue #20）：同样落国内 ——
+    // 后端 `TraeVariant::parse("trae") == Trae`（`region() == Cn`），
+    // 而合并版变体 `trae_merged` 的 `region()` 也是 `Cn`。
+    case "trae":
+    case "trae_merged":
+      return "cn";
+    default: {
+      const exhaustive: never = variant;
+      throw new Error(`未知的 TraeVariantId：${String(exhaustive)}`);
+    }
   }
 }
 
@@ -150,16 +286,23 @@ export function traeRegionLabelOf(variant: TraeVariantId): string {
  * 卡片上的切换按钮就是按它渲染的（每枚按钮对应一个程序位）。
  */
 export interface TraeProgramStatus {
-  /** 程序位标识（`trae_work` / `trae_code`）。 */
+  /** 程序位标识（`trae_work` / `trae_code` / `trae`）。 */
   program: TraeProgramId;
-  /** 展示名（`TraeWork` / `TraeCode` / `TraeWork AI` / `Trae AI`）。 */
+  /**
+   * 展示名。规则 = **国内版带 ` CN` 后缀、国际版不带后缀**，六个名字两两不同：
+   * `TraeWork CN` / `TraeCode CN` / `Trae CN`（国内）· `TraeWork` / `TraeCode` / `Trae`（国际）。
+   *
+   * ★ 六个名字**逐字等于客户端自己的字符串**（`nameAlias` / `nameShort`）。
+   * ⚠️ 更正前的约定是「国际版带 `AI` 后缀」—— 错的，且 `Trae AI` 会同时指
+   * 国际 TraeCode 与国际合并版（Key 归属下拉里两个同名选项）。
+   */
   label: string;
   /** 客户端 `product.json` 的官方别名（诊断与核对用）。 */
   nameAlias: string;
   /**
    * 切换时回传的标识。
    *
-   * 自 2026-09-28（issue #3）起**四个程序位都有值**：此前 `(国际版, TraeCode)`
+   * 自 2026-09-28（issue #3）起**每个程序位都有值**：此前 `(国际版, TraeCode)`
    * 未建模，后端回 `null`、按钮必须禁用。现在四个组合都已建模，
    * `null` 这个形态不再出现 —— 类型收成非空，是为了让「忘了建模」在编译期暴露，
    * 而不是在界面上表现成一枚灰按钮。
@@ -176,6 +319,15 @@ export interface TraeProgramStatus {
    */
   dataDir: string | null;
   dataDirExists: boolean;
+  /**
+   * 该目录里**是否真的存在** `storage.json`（后端 `platform::storage_json_present`，issue #136）。
+   *
+   * 与 {@link dataDirExists} 是**两个问题**：目录在，文件不一定在。
+   * 真机现场：`%APPDATA%\Trae CN` 有 Cache / Local Storage（客户端跑过），
+   * 但 `User\globalStorage\storage.json` 从未生成 —— 此时 `dataDirExists = true`
+   * 而本字段为 `false`，界面**不得**再说「已探测的登录态目录」。
+   */
+  storageJsonExists: boolean;
   /**
    * **写侧** userData 目录（后端 `platform::detect_data_dir_for`：候选表里**首个存在**的）。
    *
@@ -201,7 +353,14 @@ export interface TraeProgramStatus {
  */
 export interface TraeVariantStatus {
   variant: TraeRegionId;
-  /** 展示名（`"国内版"` / `"国际版"`），与 Rust `TraeRegion::display_name()` 同源。 */
+  /**
+   * 区域名（`"Trae CN"` / `"Trae"`，**客户端自己的产品名**），与 Rust
+   * `TraeRegion::display_name()` 同源。
+   *
+   * ⚠️ 与 `shared.region.version.*`（`国内版` / `国际版`）**不是一回事**：后者是
+   * **跨平台**的区域**词**，用于**组合**标签（作用域芯片 = 平台 + 区域词 ⇒「Trae 国内版」），
+   * 且 WorkBuddy 也读它。两者漂了会让演示站与真机文案不同 —— 有跨层门禁钉住。
+   */
   variantLabel: string;
   /**
    * 该区域**用户看得见的那一页**所在的域，是**可直接拼 URL 的基址**。
@@ -220,6 +379,13 @@ export interface TraeVariantStatus {
   /** 主程序「最近被用过」的目录（见 {@link TraeProgramStatus.dataDir} 的告诫）。 */
   dataDir: string | null;
   dataDirExists: boolean;
+  /**
+   * 该目录里是否真的有 `storage.json`（与 {@link TraeProgramStatus.storageJsonExists} 同源）。
+   *
+   * 账号页空态用它区分「已探测的登录态目录」与「预期位置」——
+   * 用 `dataDirExists` 判会把一个**空壳目录**说成「登录态在这儿」。
+   */
+  storageJsonExists: boolean;
   /** 主程序的**写侧**目录 —— 「客户端环境」行要核对「登录态在哪」时用它。 */
   writeDataDir: string | null;
   writeDataDirExists: boolean;
@@ -262,7 +428,7 @@ export interface TraeCreditPackage {
   used: number;
   expireAt: number | null;
   expired: boolean;
-  /** 是否 7 天内到期。 */
+  /** 是否临期（窗口由后端 `EXPIRING_SOON_SECS` 决定，现为 **7 天**）。 */
   expiringSoon: boolean;
 }
 
@@ -295,10 +461,26 @@ export interface TraeAccount {
   cooldownType: string | null;
   cooldownUntil: number | null;
   cooldownReason: string | null;
+  /**
+   * 这条冷却判定**写入的时刻**（Unix **秒**）；旧数据为 `null`。
+   *
+   * issue #108 §P1-A：只给 `cooldownReason` 原文会让用户把「11 小时前失败过一次」
+   * 读成「刚才又失败了」，于是反复重登、反复重启。
+   */
+  cooldownSince: number | null;
   hasRefreshToken: boolean;
   jwtAutoRefresh: boolean;
   addedAt: string | null;
   updatedAt: string | null;
+  /**
+   * 用户自填备注（例如「DS4.1 额度 · 10/03 解禁」）；未设置时 `null`。
+   *
+   * 与 WorkBuddy 账号卡片的 `remark` 同义：**就地编辑**，空串即清空。
+   * ⚠️ 它会被**直接当 React 子节点**渲染，所以卡片侧仍过一遍 `displayText`
+   * （后端是我们自己的账号库，正常不会出现脏值；但账号库是用户可见的文件，
+   * 手改出一段 JSON 对象就能让整棵树崩掉 —— 见 `display-text.ts` 的 issue #2）。
+   */
+  remark: string | null;
 }
 
 /** 分组视图（含成员数）。 */
@@ -344,6 +526,56 @@ export interface TraeLegacyMergeReport {
   backupFailed: boolean;
   /** 本次是否真的改写了数据（`false` = 幂等空转）。 */
   changed: boolean;
+  /**
+   * 客户端**合并**（issue #20）后的登录态快照搬运报告。
+   *
+   * ## 为什么它挂在这条命令上
+   *
+   * 快照搬运与账号库合并同属「一次性遗留迁移」，因此共用同一个入口
+   * （账号页挂载时调一次，幂等）。⚠️ 两者的 `changed` **互相独立** ——
+   * 账号库早就并完了、但快照还没搬的机器上是「DB 空转 + 快照有变动」，
+   * 调用方必须两个都看（见 `TraeAccountsPage` 的挂载 effect）。
+   */
+  snapshots: TraeSnapshotCarryReport;
+}
+
+/**
+ * 登录态快照搬运报告（`trae_merge_legacy_regions().snapshots`）。
+ *
+ * 客户端把 TraeWork 与 TraeCode 合并成一个客户端后，用户在**合并前**保存的
+ * 登录态快照落在遗留程序位的槽位里，合并后的客户端槽位是空的 ⇒
+ * 「切换账号」会报「该账号的登录态快照不存在」。本报告描述那次**补齐搬运**。
+ */
+export interface TraeSnapshotCarryReport {
+  /** 实际搬运的账号槽位数。 */
+  slotsCopied: number;
+  /** 因目标槽位已有同 uid 而**跳过**（只增不改）的账号数。 */
+  slotsKept: number;
+  /** 复制的文件总数。 */
+  filesCopied: number;
+  /** 逐条搬运明细。 */
+  carried: {
+    region: string;
+    /** 来源**历史池目录名**（`profiles` / `profiles_trae_cn` / `profiles_global*`）。 */
+    from: string;
+    /** 账号槽位名（userId）。 */
+    slot: string;
+    files: number;
+  }[];
+  /** 未能搬运的槽位及原因（非空即「有东西没搬成」）。 */
+  errors: string[];
+  /** 诊断备注（为什么没搬），仅供排查。 */
+  notes: string[];
+  /** 本次是否真的搬了东西（`false` = 幂等空转）。 */
+  changed: boolean;
+  /**
+   * 本次是**首次**执行收敛迁移（后端落的一次性标记）。
+   *
+   * ★ 它**不是** `changed`：`changed` 只在真搬了东西时为真，而全新安装没有存量快照
+   * ⇒ `changed === false` 但用户**仍然需要**知道「Trae 已合并、旧程序位已退役」。
+   * 前端的一次性升级引导只认这个字段。
+   */
+  firstRun: boolean;
 }
 
 /** 单账号签到结果。 */
@@ -463,6 +695,24 @@ export interface TraeSettings {
   checkinSkipExpired: boolean;
   retry: number;
   notify: string;
+  /**
+   * 用户指定的 Trae 客户端可执行文件路径，**按区域分家**（issue #20）。
+   *
+   * 键 = {@link TraeRegionId}（`"cn"` / `"global"`），值 = exe 绝对路径；缺失 = 该区域未指定。
+   *
+   * ## 为什么不再是单个 `traePath`（issue #20）
+   *
+   * 国内版与国际版是**两个物理上不同的客户端**（`Trae CN.exe` / `Trae.exe`），
+   * 单个全局字段会让「设置国际版路径」直接覆盖国内版 —— 用户报障原话：
+   * 「设置Trae 路径国内版和国际版 两个都设置是一样的，以最后的设置为准了，没有隔离开来」。
+   */
+  traePaths: Partial<Record<TraeRegionId, string>>;
+  /**
+   * **旧版单值字段：只读回显，不要写。**
+   *
+   * 后端 `load()` 会把它单向迁移进 {@link traePaths} 并清空；前端保留它只为
+   * 「升级前设过路径」的诊断提示，**保存时不得回写**（写了会让迁移反复发生）。
+   */
   traePath: string | null;
   browserPath: string | null;
   logRetentionDays: number;
@@ -592,6 +842,22 @@ export interface TraeGatewayConfigRaw {
   max_body_mb: number;
   default_model: string;
   max_rotate: number;
+  /** 「指定账号」：优先消耗该 uid 的积分；空串 = 不指定（自动择优）。 */
+  preferred_uid: string;
+  /** 会话粘性绑定存活时长（毫秒；`<= 0` 由后端归一为 30 分钟）。 */
+  sticky_ttl_ms: number;
+  /**
+   * 对话转发抓取开关（诊断旁路，默认 `false`）。
+   *
+   * ★ 界面上**没有**这个开关，只能手改 `api_gateway.json` + 重启网关。
+   * 但它必须出现在读写两端：配置保存是「整份覆盖」，缺键就回落 `false` ——
+   * 漏带这一格会让用户手开的抓取在任意一次「保存」后被**静默关掉**。
+   */
+  capture_enabled: boolean;
+  /** Max Mode：对「目录里 max > dev」的模型注入 is_max_mode（默认 true）。 */
+  max_mode: boolean;
+  /** ★ issue #129：账号故障时自动切换（默认 `false`）。 */
+  auto_failover: boolean;
 }
 
 /** 归一化后的网关配置（前端统一用 camelCase）。 */
@@ -605,34 +871,35 @@ export interface TraeGatewayConfig {
   maxBodyMb: number;
   defaultModel: string;
   maxRotate: number;
+  /** 「指定账号」：优先消耗该 uid 的积分；空串 = 不指定（自动择优）。 */
+  preferredUid: string;
+  /** 会话粘性绑定存活时长（毫秒）。 */
+  stickyTtlMs: number;
+  /** 对话转发抓取开关（诊断旁路；无界面开关，只在配置里往返，默认 `false`）。 */
+  captureEnabled: boolean;
+  /** Max Mode：按官方目录逐模型注入 `is_max_mode`（默认开启）。 */
+  maxMode: boolean;
+  /**
+   * ★ issue #129：**账号故障时自动切换**（默认 `false`）。
+   *
+   * 开启后，流中途的账号级失败不再被「补终止标记」伪装成成功，而是先发一条
+   * **可重试**的错误帧（含 `HTTP 429` / `HTTP 502`）；失败账号同时写冷却、解绑粘性
+   * ⇒ 客户端整步重跑时必然落到另一个号。
+   */
+  autoFailover: boolean;
 }
 
 /** 账号池摘要（`pool` 字段）。 */
-export interface TraeGatewayPoolSummary {
-  total: number;
-  available: number;
-  cooling: number;
-  disabled: number;
-  expired: number;
-  zeroCredits: number;
-  totalCredits: number;
-}
+/**
+ * 池五态计数 —— **与 WorkBuddy 侧逐字同形**（管理面共用 `AccountPoolCard`）。
+ *
+ * 因此这里不重新声明字段：改形状必须改 `types.ts` 里那一份，两侧一起变。
+ */
+export type TraeGatewayPoolSummary = GatewayPoolSummary;
 
-/** 池内单个账号的可路由状态。 */
-export interface TraeGatewayAccountStatus {
-  uid: string;
-  name: string;
-  /**
-   * `free_plan`：国际版免费档——没有积分体系，`credits=0` 是正常态，
-   * 该账号**可用**（`no_credits` 仅用于国内版的真正零积分）。
-   */
-  status: "available" | "cooling" | "disabled" | "expired" | "no_credits" | "free_plan";
-  credits: number | null;
+/** 池内单个账号的可路由状态（在共用字段之外补 Trae 专有两项）。 */
+export interface TraeGatewayAccountStatus extends GatewayPoolAccount {
   creditsExpireAt: number | null;
-  cooling: boolean;
-  cooldownUntil: number | null;
-  cooldownReason: string | null;
-  disabled: boolean;
   deviceIdMasked: string | null;
 }
 
@@ -670,7 +937,10 @@ export interface TraeGatewayLogEntry {
   promptTokens?: number | null;
   completionTokens?: number | null;
   stream: boolean;
-  error?: string | null;
+  error?: string | null;  /** ★ issue #76：调用方 Key id（`null` = 无 Key；`undefined` = 升级前老条目）。 */
+  keyId?: string | null;
+  /** ★ `keyId` 的归属台账（`"trae"` / `"unified"` / `null`）。 */
+  keyScope?: string | null;
 }
 
 /** 对外暴露的模型条目（`get_trae_gateway_models`）。 */
@@ -715,6 +985,56 @@ export interface TraeClientModelGroup {
   models: TraeClientModel[];
 }
 
+/**
+ * 模型清单卡的**一个数据源**：本区域内某条**程序位**的客户端清单。
+ *
+ * ## 为什么清单要按程序位分开（issue #4 的现场）
+ *
+ * 模型清单是**客户端级**的：Trae Work 与 TraeCode 是两个客户端、两份
+ * `state.vscdb`，上游下发给它们的 function 分组与模型集合**完全不同**
+ * （实测 Trae Work = `solo_work_lite` / `solo_coder` / `agent` …，
+ * TraeCode = `builder` / `chat_v3` / `solo_agent` …）。
+ * TraeCode 专有的模型（如 `glm-5.3-flash`）**只存在于 TraeCode 那份缓存里** ——
+ * 只读区域主程序（TraeWork）时它永远不会出现，这正是用户报障
+ * 「traecode 专有的 glm-5.3-flash 没有加载出来」的原因。
+ *
+ * `variant` 是**回传给后端的程序位标识**（`trae_work` / `trae_cn` /
+ * `global` / `global_trae_code`），不是区域标识 —— 传区域只会拿到主程序那份。
+ */
+export interface TraeModelSource {
+  /** 程序位标识（直接喂给 `get_trae_client_models`）。 */
+  variant: TraeVariantId;
+  /**
+   * 程序位展示名。规则 = **国内版带 ` CN` 后缀、国际版不带后缀**：
+   * `TraeWork CN` / `TraeCode CN` / `Trae CN`（国内）· `TraeWork` / `TraeCode` / `Trae`（国际）。
+   */
+  label: string;
+  /** 该程序位的客户端清单；未取到（后端不可用）为 `null`。 */
+  data: TraeClientModelList | null;
+  /**
+   * 该程序位**网关对外清单**的逐模型上下文（`/v1/models` 的 `context_length`）。
+   * 数字来自官方模型目录，逐模型不同（不是统一 1M）；未取到为 `null`。
+   */
+  gatewayContexts?: Record<string, { dev: number | null; max: number | null }> | null;
+  /**
+   * 该程序位下**网关对外清单**的模型 id（`get_trae_gateway_models(variant)`）。
+   *
+   * 与 `data` 口径不同：`data` 是该客户端的**全部**分组（同一模型会在多个分组里重复出现），
+   * 这里只列该程序位 `function` **真能调**的那批 —— 也就是**归属该程序位的 API Key**
+   * 连本网关时，外部客户端在 `/v1/models` 实际看到的清单。`null` = 没取到。
+   *
+   * 两个用途：
+   * 1. 条数 = `gatewayNames.length`（卡片上的「网关对外 N 个」）；
+   * 2. **逐个标记**：客户端清单里有、但这里没有的模型，就是「看得见、调不动」的那批
+   *    （实测：TraeWork 全分组 27 条里 11 条不属于 `solo_work_lite`，一律 `4001`）。
+   *    卡片据此给它们打「网关不提供」标记，把同一个坑一次堵死。
+   *
+   * ⚠️ 必须**按程序位各取一次**：`/v1/models` 只列该程序位 `function` 能调的模型
+   * （见 Rust 侧 `payload::models_response_for`），两条程序位的清单**不一样**。
+   */
+  gatewayNames: string[] | null;
+}
+
 /** 客户端模型清单里的单个模型（字段已由后端归一）。 */
 export interface TraeClientModel {
   /** 模型标识（上游 `name`，如 `deepseek-v4.1-flash`）。 */
@@ -730,15 +1050,45 @@ export interface TraeClientModel {
   isBeta: boolean;
   /** 默认上下文窗口；取不到为 `null`。 */
   contextWindow: number | null;
+  /** 上限上下文窗口（`context_window_size.max`，Max Mode 口径）；取不到为 `null`。 */
+  contextWindowMax?: number | null;
   /** 单次回复上限；取不到为 `null`。 */
   promptMaxTokens: number | null;
+  /**
+   * 积分倍率（`features.consumption_rate.data.rate`）；没下发为 `null`。
+   *
+   * 这是**倍率**不是金额：`0.2` = 基准价的 0.2 倍。实测取值 0.06～1.83。
+   */
+  creditsRate?: number | null;
+  /** 支持的思考档位（`reasoning_effort_config.options`，上游原词表，保序）。 */
+  efforts?: string[];
+  /** 默认档位（`reasoning_effort_config.default_level`）。 */
+  defaultEffort?: string | null;
+  /**
+   * 上游对「思考档位」的声明状态 —— 空 `efforts` 的两种成因必须分开：
+   * `"unsupported"` = 该模型确实不能选档；`"unknown"` = 这条**程序位没下发**。
+   *
+   * TraeWork（`solo_work_lite`）实测 22 条里只有 1 条带档位 ⇒ 该列大面积是「未下发」，
+   * 不是「都不支持思考」。
+   */
+  thinking?: "supported" | "unsupported" | "unknown";
+  /**
+   * 第三方 / 自定义路由条目（上游 `provider` 非空或带 `custom_model_id`）。
+   *
+   * 网关发的是 `config_name` / `model_name` 这套字段，对它们**无效**（实测
+   * `openrouter//stealth/ox-alpha` 一律 `4001`）⇒ 网关对外清单会剔除，
+   * 界面对比「服务组」时必须同样剔除，否则两边名字集合永远对不上。
+   */
+  isBypass?: boolean;
 }
 
 /**
  * 单条 Trae API Key（`list_trae_api_keys` 的 `keys[]`）。
  *
- * **不含 hash 与明文**：服务端只下发脱敏白名单（`prefix` / `name` / `variant`…），
- * 明文仅在创建时一次性返回。
+ * **不含 hash**：服务端只下发脱敏白名单（`prefix` / `suffix` / `name` / `variant`…）。
+ * `plaintext` 只有在用户选「保存到本软件」之后才有值（没存的 Key 为 `null`，列表不出眼睛）。
+ * `suffix` 是明文的**末 4 位**，与 `prefix`（前 4 位）一样不足以还原 32 位 secret
+ * —— 它的用途是让用户在列表里**认出是哪一把**。
  *
  * `variant` 是该 Key 的**归属区域**（`"cn"` / `"global"`）—— 账号池按区域建，
  * 因此它决定这把 Key 能取到哪个区域的账号。**新 Key 一律落到区域的线上标识**；
@@ -752,21 +1102,47 @@ export interface TraeApiKeyRecord {
   /** 归属区域（`"cn"` / `"global"`；历史记录可能是 `"trae_work"` / `"trae_cn"`）。 */
   variant: TraeVariantId;
   prefix: string;
+  /**
+   * ★ 尾部 4 位（如 `"9f3c"`）。列表显示 `prefix••••••••suffix`。
+   *
+   * 与 WorkBuddy 侧 `ApiKeyRecord.suffix` **同形**（E3）：只靠前缀，同时建两把 Key 时
+   * 用户分不清哪把是哪把。旧台账 / 短 legacy Key 无此值 ⇒ 空串 ⇒ 展示层**省略尾部**
+   * （不报错、不补造）。
+   */
+  suffix?: string;
+  /**
+   * ★ 2026-11-04：完整明文。旧台账 / 改造前的 Key 没有该字段 ⇒ `null`，
+   * 列表里**不渲染眼睛按钮**。
+   */
+  plaintext?: string | null;
   createdAt: number;
   revokedAt: number | null;
   revoked: boolean;
+  /* ── 策略（issue #76）—— 与 `ApiKeyRecord` 同形同义，前端共用一套构件。
+     全部可选 ⇒ 旧台账零迁移；调用方一律先过 `policyOf` 补默认值。 ── */
+  quotaMode?: "unlimited" | "limited";
+  quotaLimit?: number;
+  quotaUnit?: "token" | "request";
+  quotaPeriod?: "none" | "daily" | "weekly" | "monthly";
+  scopeMode?: "all" | "selected";
+  scopeAccounts?: string[];
+  scopeGroups?: string[];
   lastUsedAt: number | null;
 }
 
 /**
  * 新建 Key 的返回（`create_trae_api_key`）。
  *
- * `key` 为**一次性明文**——只会出现在本次响应里，之后无从取回；界面必须提示用户立即复制。
+ * `key` 是本次创建的那把明文，只随本响应回来；用户在面板里选「保存到本软件」后
+ * 才写进台账（之后列表里能随时用眼睛查看），选「自行保存」则永远只剩掩码。
+ * `ok === false`（自定义密钥与台账里已有记录撞车）时**没有建出任何记录**，`error` 是原因。
  */
 export interface TraeApiKeyCreated {
   ok: boolean;
   key?: string;
   record?: TraeApiKeyRecord;
+  /** `ok === false` 时的原因（自定义密钥与台账里已有的 Key 撞车）。 */
+  error?: string;
 }
 
 // ---------------------------------------------------------------------------

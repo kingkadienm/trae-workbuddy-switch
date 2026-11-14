@@ -113,6 +113,43 @@ fn validate_home_override(raw: &str) -> Result<PathBuf, OverrideReject> {
     Ok(path)
 }
 
+/// **启动前护栏**：`BUDDY_SWITCH_HOME` 被设置但**不合法**时，返回一句可直接打印的拒绝理由。
+///
+/// ## 为什么需要它（2026-09-30 真实事故）
+///
+/// [`home_dir`] 的既有契约是「不合法 ⇒ 一次性警告 + **回落真实 home**」。那对
+/// 「嵌在别人进程里的库」是合理的，但对**独立服务**是**危险的默认值**：
+/// 调用方明明设了隔离目录，却因为目录还没建好而**静默**跑在真实 home 上 ——
+/// 账号、网关 Key、签到 / 积分记录全写到用户真实数据里，而唯一的提示是一行
+/// 可能被 `| head` / `| tail` 吞掉的 stderr 警告。
+///
+/// ⇒ 独立入口（`buddy-switch serve` / `status`）改用本函数做 **fail-closed**：
+/// 拒绝启动并让人去修变量，而不是替他决定「那就用真实数据吧」。
+/// **未设置该变量时行为完全不变**（正常使用真实 home）。
+///
+/// **纯函数**（入参就是取值，不读环境变量、不打印、无副作用），因此可以并行单测 ——
+/// 环境变量是进程级全局状态，在并行测试里是竞态源。
+pub fn home_override_refusal(value: Option<&str>) -> Option<String> {
+    let raw = value?;
+    if raw.trim().is_empty() {
+        // 与 [`home_dir_override`] 一致：未设置 / 空白 = 没有覆盖意图。
+        return None;
+    }
+    let reject = validate_home_override(raw).err()?;
+    Some(format!(
+        "环境变量 {BUDDY_SWITCH_HOME_ENV}={raw:?} 不合法（{}）。\n\
+         继续启动会**静默回落到真实用户主目录**，把账号 / 网关 Key / 签到与积分记录\
+         写到真实数据上（2026-09-30 踩过）。\n\
+         请修正该变量（指向一个**已存在的绝对目录**），或取消设置后重试。",
+        reject.describe()
+    ))
+}
+
+/// 读环境变量版的 [`home_override_refusal`]（独立入口的启动护栏用）。
+pub fn env_home_override_refusal() -> Option<String> {
+    home_override_refusal(std::env::var(BUDDY_SWITCH_HOME_ENV).ok().as_deref())
+}
+
 /// 保证同一进程内「[`BUDDY_SWITCH_HOME_ENV`] 被忽略」的警告**只打印一次**：否则每个
 /// 落到 `home_dir()` 的调用都会重复刷屏。
 static HOME_OVERRIDE_WARNED: Once = Once::new();
@@ -245,9 +282,149 @@ pub fn api_endpoint_for(region: crate::modules::region::Region) -> &'static str 
     }
 }
 
-
 pub fn backup_dir() -> PathBuf {
     store_dir().join("backups")
+}
+
+// ---------------------------------------------------------------------------
+// 备份目录：自动备份命名 / 保留（P7 T02 · D17 / D18）
+// ---------------------------------------------------------------------------
+//
+// ## 两类「保留集」备份与手动导出的区别（§1.8）
+//
+// - **自动备份**（D17，定时）：文件名前缀 [`AUTO_BACKUP_PREFIX`]，每日一份、保留最近
+//   [`AUTO_BACKUP_KEEP`] 份；
+// - **导入前快照**（D18，强制）：文件名前缀 [`PRE_IMPORT_SNAPSHOT_PREFIX`]，导入前自动产生；
+// - **手动导出**：用户自己保管，**不进**保留集（不会被本模块的清理逻辑删掉）。
+//
+// 保留集里两类备份**共同**受「最近 7 份」约束（超过即删最旧）—— 否则导入前快照会无界增长。
+
+/// 定时自动备份的保留份数（D17：每日一次、保留最近 7 份）。
+pub const AUTO_BACKUP_KEEP: usize = 7;
+
+/// 自动备份文件名前缀（与手动导出、导入前快照区分）。
+pub const AUTO_BACKUP_PREFIX: &str = "auto-backup-";
+
+/// 导入前快照文件名前缀（D18，强制不可关）。
+pub const PRE_IMPORT_SNAPSHOT_PREFIX: &str = "pre-import-";
+
+/// 自动备份配置文件名（默认开、可在设置里关掉，§7 #7）。
+pub fn auto_backup_config_file() -> PathBuf {
+    store_dir().join("auto_backup_config.json")
+}
+
+/// 默认自动备份配置（D17 / §7 #7：**默认开** —— 备份价值在于「出事时有」）。
+pub fn default_auto_backup_config() -> Value {
+    json!({ "enabled": true })
+}
+
+/// 读取自动备份配置（缺失 / 损坏时回落默认 = 开）。
+pub fn load_auto_backup_config() -> Value {
+    let mut cfg = default_auto_backup_config();
+    let f = auto_backup_config_file();
+    if f.exists() {
+        if let Ok(text) = std::fs::read_to_string(&f) {
+            if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&text) {
+                if let Some(enabled) = map.get("enabled").and_then(Value::as_bool) {
+                    cfg["enabled"] = json!(enabled);
+                }
+            }
+        }
+    }
+    cfg
+}
+
+/// 定时自动备份是否启用（后台任务每个周期据此决定是否产生新备份）。
+///
+/// ⚠️ **默认开、但必须能关掉**（§7 #7）：关闭后后台任务**不再产生新备份**，
+/// **已产生的保留**（不追溯删除）。
+pub fn is_auto_backup_enabled() -> bool {
+    load_auto_backup_config()
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+}
+
+/// 保存自动备份配置（只保留已知字段）。
+pub fn save_auto_backup_config(cfg: &Value) -> std::io::Result<()> {
+    let mut merged = default_auto_backup_config();
+    if let Some(enabled) = cfg.get("enabled").and_then(Value::as_bool) {
+        merged["enabled"] = json!(enabled);
+    }
+    ensure_private_dir(&store_dir())?;
+    let content = serde_json::to_string_pretty(&merged).unwrap_or_default();
+    atomic_write(&auto_backup_config_file(), &content)
+}
+
+/// 该文件名是否属于「保留集」管理的备份（自动备份 / 导入前快照）。
+///
+/// **手动导出**的文件不进保留集（那是用户自己保管的，§1.8）。
+pub fn is_managed_backup_name(name: &str) -> bool {
+    name.ends_with(".json")
+        && (name.starts_with(AUTO_BACKUP_PREFIX) || name.starts_with(PRE_IMPORT_SNAPSHOT_PREFIX))
+}
+
+/// 自动备份文件名（**每日一份、同日覆盖**）：`auto-backup-YYYY-MM-DD.json`。
+pub fn auto_backup_file_name(date: &str) -> String {
+    format!("{AUTO_BACKUP_PREFIX}{date}.json")
+}
+
+/// 导入前快照文件名（含时刻，避免同日多次导入互相覆盖）：`pre-import-<stamp>.json`。
+pub fn pre_import_snapshot_file_name(stamp: &str) -> String {
+    format!("{PRE_IMPORT_SNAPSHOT_PREFIX}{stamp}.json")
+}
+
+/// 列出保留集里的备份文件，**按修改时间升序**（最旧在前）。
+///
+/// 用 mtime 而不是文件名排序：两类前缀（`auto-backup-` / `pre-import-`）混在一起时，
+/// 按名排序会把前缀当主序，得不到真实的时间顺序。mtime 是唯一可靠的时序依据。
+pub fn managed_backup_files() -> Vec<PathBuf> {
+    let dir = backup_dir();
+    let mut files: Vec<PathBuf> = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_file()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .map(is_managed_backup_name)
+                        .unwrap_or(false)
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    files.sort_by_key(|path| backup_mtime(path));
+    files
+}
+
+/// 取文件修改时间（读不到 ⇒ UNIX_EPOCH，即视为最旧）。
+fn backup_mtime(path: &Path) -> SystemTime {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .unwrap_or(UNIX_EPOCH)
+}
+
+/// 保留最近 `keep` 份，删除更旧的；返回删除数量（**只作用于保留集**）。
+///
+/// `keep == 0` 是**空操作**（不删任何东西）：0 会被误读成「删光」，而「保留策略」的本意
+/// 绝不是清空备份目录。
+pub fn prune_managed_backups(keep: usize) -> usize {
+    if keep == 0 {
+        return 0;
+    }
+    let files = managed_backup_files();
+    if files.len() <= keep {
+        return 0;
+    }
+    let mut removed = 0;
+    for path in &files[..files.len() - keep] {
+        if std::fs::remove_file(path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 pub fn checkin_config_file() -> PathBuf {
@@ -324,7 +501,7 @@ pub fn load_workbuddy_exe_cache() -> Option<PathBuf> {
 
 /// 记住已存在的 WorkBuddy.exe，供下次未运行时启动。
 pub fn save_workbuddy_exe_cache(exe: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(store_dir())?;
+    ensure_private_dir(&store_dir())?;
     let content =
         serde_json::to_string_pretty(&json!({ "exe": exe.to_string_lossy() })).unwrap_or_default();
     atomic_write(&workbuddy_exe_cache_file(), &content)
@@ -360,7 +537,7 @@ pub fn save_workbuddy_exe_cache_for(
     region: crate::modules::region::Region,
     exe: &Path,
 ) -> std::io::Result<()> {
-    std::fs::create_dir_all(store_dir())?;
+    ensure_private_dir(&store_dir())?;
     let content =
         serde_json::to_string_pretty(&json!({ "exe": exe.to_string_lossy() })).unwrap_or_default();
     atomic_write(&workbuddy_exe_cache_file_for(region), &content)
@@ -390,7 +567,7 @@ pub fn load_codebuddy_cn_app_cache() -> Option<PathBuf> {
 }
 
 pub fn save_codebuddy_cn_app_cache(path: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(store_dir())?;
+    ensure_private_dir(&store_dir())?;
     let content =
         serde_json::to_string_pretty(&json!({ "exe": path.to_string_lossy() })).unwrap_or_default();
     atomic_write(&codebuddy_cn_app_cache_file(), &content)
@@ -450,7 +627,7 @@ pub fn load_checkin_config() -> Value {
 /// 保存签到配置（只保留已知字段）。
 pub fn save_checkin_config(cfg: &Value) -> std::io::Result<()> {
     let merged = merge_checkin_config(cfg);
-    std::fs::create_dir_all(store_dir())?;
+    ensure_private_dir(&store_dir())?;
     let content = serde_json::to_string_pretty(&merged).unwrap_or_default();
     atomic_write(&checkin_config_file(), &content)
 }
@@ -470,7 +647,7 @@ pub fn load_checkin_logs() -> Vec<Value> {
 
 fn save_checkin_logs_unlocked(logs: &[Value]) -> std::io::Result<()> {
     let kept = normalize_checkin_logs(logs, now_ms());
-    std::fs::create_dir_all(store_dir())?;
+    ensure_private_dir(&store_dir())?;
     let content = serde_json::to_string_pretty(&kept).unwrap_or_default();
     atomic_write(&checkin_logs_file(), &content)
 }
@@ -639,7 +816,7 @@ pub fn save_travel_config(cfg: &Value) -> std::io::Result<()> {
     if let Some(enabled) = cfg.get("enabled").and_then(Value::as_bool) {
         merged["enabled"] = json!(enabled);
     }
-    std::fs::create_dir_all(store_dir())?;
+    ensure_private_dir(&store_dir())?;
     let content = serde_json::to_string_pretty(&merged).unwrap_or_default();
     atomic_write(&travel_config_file(), &content)
 }
@@ -659,7 +836,7 @@ pub fn load_travel_cache() -> Value {
 
 /// 保存旅行缓存。
 pub fn save_travel_cache(cache: &Value) -> std::io::Result<()> {
-    std::fs::create_dir_all(store_dir())?;
+    ensure_private_dir(&store_dir())?;
     let content = serde_json::to_string_pretty(cache).unwrap_or_default();
     atomic_write(&travel_cache_file(), &content)
 }
@@ -714,7 +891,7 @@ pub fn save_auto_rotate_config(cfg: &Value) -> std::io::Result<()> {
             merged[k] = v.clone();
         }
     }
-    std::fs::create_dir_all(store_dir())?;
+    ensure_private_dir(&store_dir())?;
     let content = serde_json::to_string_pretty(&merged).unwrap_or_default();
     atomic_write(&auto_rotate_config_file(), &content)
 }
@@ -766,7 +943,7 @@ pub fn load_switch_config() -> Value {
 /// 保存账号切换配置（只保留已知字段）。
 pub fn save_switch_config(cfg: &Value) -> std::io::Result<()> {
     let merged = normalize_switch_config(cfg);
-    std::fs::create_dir_all(store_dir())?;
+    ensure_private_dir(&store_dir())?;
     let content = serde_json::to_string_pretty(&merged).unwrap_or_default();
     atomic_write(&switch_config_file(), &content)
 }
@@ -897,7 +1074,7 @@ pub fn save_rotate_logs(logs: &[Value]) -> std::io::Result<()> {
     if kept.len() > ROTATE_LOG_MAX_RECORDS {
         kept.drain(..kept.len() - ROTATE_LOG_MAX_RECORDS);
     }
-    std::fs::create_dir_all(store_dir())?;
+    ensure_private_dir(&store_dir())?;
     let content = serde_json::to_string_pretty(&kept).unwrap_or_default();
     atomic_write(&auto_rotate_logs_file(), &content)
 }
@@ -964,16 +1141,87 @@ pub fn utc_iso() -> String {
 
 /// 原子写文件（临时文件 + rename），对照 Python atomic_write。
 pub fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
+    atomic_write_bytes(path, content.as_bytes())
+}
+
+/// 二进制版的 [`atomic_write`]（**同一套「临时文件 + rename」纪律**）。
+///
+/// 单开一个函数而不是把上面那个泛化成 `impl AsRef<[u8]>`：那会牵动全部既有调用点的
+/// 类型推断（`&str` 与 `&[u8]` 同时可推断为泛型时，字面量调用会歧义），收益为零。
+///
+/// 用途：会话指纹缓存是**定长二进制**（25k × 512 × 8B ≈ 100 MB），
+/// 用 JSON / 文本写一遍要额外转义与编码，纯浪费。
+/// 以 `0600` 创建/覆盖一个文件（POSIX）。Windows 由 `%USERPROFILE%` 的 ACL 保证，不做处理。
+///
+/// ## 为什么必须从这里改（安全审计 P0-2）
+///
+/// `~/.buddy-switch/` 下的 `accounts.json`（含 `access_token` / `refresh_token` **明文**）、
+/// `backups/*.json`、用户导出的账号文件**全部**经由本模块落盘。此前只用
+/// `std::fs::write`，于是文件权限跟随 umask（通常是 **0644**）⇒ **同机其他用户可读**。
+/// 项目支持 macOS / Linux，这不是理论风险。
+///
+/// 两个细节：
+/// 1. 用 `OpenOptions::mode(0o600)` **创建时**就带权限，而不是写完再 `set_permissions`
+///    —— 后者在「写入 → chmod」之间留了一个真实可读窗口；
+/// 2. 仍然显式 `set_permissions` 一次：目标文件若**已存在且是 0644**（升级前的历史文件），
+///    仅靠创建参数改不了它的模式（`create` 不会重置已有文件的权限）。
+fn write_private_file(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(content)?;
+        file.flush()?;
+        drop(file);
+        // 历史文件（升级前按 umask 建的 0644）必须在这里被纠正。
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, content)
+    }
+}
+
+/// 建目录并收紧到 `0700`（POSIX）。
+///
+/// 与 [`write_private_file`] 配套：文件 0600 只挡住「读到文件内容」，目录 0700 还挡住
+/// 「枚举出有哪些文件」—— 后者本身就会泄漏「这个用户在用哪些产品线 / 有几个账号」。
+/// 目录已存在时同样纠一次权限（历史目录是 0755）。
+pub fn ensure_private_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        // 失败不致命：某些挂载点（如把 store 目录挂到 NFS / 只读卷）不允许 chmod，
+        // 此时文件级的 0600 仍然生效，不该因此让整个写入失败。
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(())
+}
+
+pub fn atomic_write_bytes(path: &Path, content: &[u8]) -> std::io::Result<()> {
     let file_name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
     let tmp = path.with_file_name(format!("{file_name}.tmp-{}", uuid::Uuid::new_v4().simple()));
-    if let Err(e) = std::fs::write(&tmp, content) {
+    if let Err(e) = write_private_file(&tmp, content) {
         eprintln!("[atomic] write tmp FAILED: {e}");
+        let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
     if let Err(e) = std::fs::rename(&tmp, path) {
+        // ★ rename 失败时**必须清掉临时文件** —— 否则目标目录里会留下一个
+        //   `xxx.tmp-<uuid>` 垃圾（实测：目标被一个**目录**占住时就会这样）。
+        //   在**用户客户端的数据目录**里留垃圾比写失败更坏：客户端可能把它当数据扫。
+        let _ = std::fs::remove_file(&tmp);
         eprintln!("[atomic] rename FAILED: {e}");
         return Err(e);
     }
@@ -1017,6 +1265,20 @@ fn http_client() -> &'static reqwest::Client {
     })
 }
 
+/// **强制直连**的客户端（忽略一切代理环境变量）。
+///
+/// 只用于「环境代理连不上」时的兜底重试 —— 见 [`http_request_with_proxy`] 的说明。
+static DIRECT_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn direct_client() -> &'static reqwest::Client {
+    DIRECT_CLIENT.get_or_init(|| {
+        http_client_builder()
+            .no_proxy()
+            .build()
+            .expect("failed to build direct reqwest client")
+    })
+}
+
 /// 通用 HTTP 请求，返回解析后的 JSON。
 ///
 /// 行为对齐 Python 版：
@@ -1041,7 +1303,8 @@ pub async fn http_request_with_proxy(
     proxy: Option<&str>,
 ) -> Value {
     let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
-    let client = match proxy.map(str::trim).filter(|value| !value.is_empty()) {
+    let explicit_proxy = proxy.map(str::trim).filter(|value| !value.is_empty());
+    let client = match explicit_proxy {
         Some(proxy) => match http_client_builder()
             .proxy(match reqwest::Proxy::all(proxy) {
                 Ok(proxy) => proxy,
@@ -1052,19 +1315,37 @@ pub async fn http_request_with_proxy(
             Ok(client) => client,
             Err(e) => return json!({"code": -1, "message": format!("代理客户端创建失败: {e}")}),
         },
-        None => http_client().clone(),
+        // ★ 未显式指定出口时也必须直连：不能因为环境里残留 HTTPS_PROXY
+        // 就让不同账号在无配置情况下共用系统代理出口。
+        None => direct_client().clone(),
     };
-    let mut req = client.request(method, url);
-    req = req.header("Content-Type", "application/json");
-    if let Some(h) = headers {
-        for (k, v) in h {
-            req = req.header(k, v);
+
+    /// 发一次（`RequestBuilder` 被 `send()` 消费，重试必须重建）。
+    async fn send_once(
+        client: &reqwest::Client,
+        method: &reqwest::Method,
+        url: &str,
+        body: Option<&Value>,
+        headers: Option<&HashMap<String, String>>,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        let mut req = client.request(method.clone(), url);
+        req = req.header("Content-Type", "application/json");
+        if let Some(h) = headers {
+            for (k, v) in h {
+                req = req.header(k, v);
+            }
         }
+        if let Some(b) = body {
+            req = req.json(b);
+        }
+        req.send().await
     }
-    if let Some(b) = body {
-        req = req.json(&b);
-    }
-    match req.send().await {
+
+    let sent = send_once(&client, &method, url, body.as_ref(), headers).await;
+    /* ★ 未显式指定出口时使用 `direct_client()`：不读环境代理、不做“代理失败后直连”
+    的隐式重试。显式代理失败也**绝不回落到直连** —— 否则同一账号的请求会在
+    另一个公网出口再出现一次，正好破坏风控隔离。 */
+    match sent {
         Ok(resp) => {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
@@ -1174,9 +1455,8 @@ pub async fn http_request_raw(
 
 /// 把响应体文本解析为 JSON；非 JSON（HTML / 空体）时包成 `{"raw": <前 500 字符>}`。
 fn parse_json_body(text: &str) -> Value {
-    serde_json::from_str(text).unwrap_or_else(|_| {
-        json!({ "raw": text.chars().take(500).collect::<String>() })
-    })
+    serde_json::from_str(text)
+        .unwrap_or_else(|_| json!({ "raw": text.chars().take(500).collect::<String>() }))
 }
 
 /// 带 token 刷新重试的**已授权**请求，返回 `(HTTP 状态码, 解析后的 JSON)`。
@@ -1311,7 +1591,10 @@ mod tests {
             http_request_with_proxy(&format!("http://{addr}/blocked"), "GET", None, None, None)
                 .await;
 
-        assert_eq!(value["code"], 401, "非 2xx 的 code 必须是真实状态码：{value}");
+        assert_eq!(
+            value["code"], 401,
+            "非 2xx 的 code 必须是真实状态码：{value}"
+        );
         let message = value["message"].as_str().expect("message 应为字符串");
         assert_eq!(
             message,
@@ -1350,7 +1633,10 @@ mod tests {
         );
         // 老配置文件里残留的这两个键也不得被透传回存盘结果（否则死字段复活）。
         let merged = merge_checkin_config(&json!({ "start_hour": 3, "end_hour": 4 }));
-        assert!(merged.get("start_hour").is_none(), "start_hour 不得再被透传");
+        assert!(
+            merged.get("start_hour").is_none(),
+            "start_hour 不得再被透传"
+        );
         assert!(merged.get("end_hour").is_none(), "end_hour 不得再被透传");
         assert_eq!(merged.get("enabled").and_then(Value::as_bool), Some(true));
     }
@@ -1556,10 +1842,9 @@ mod tests {
 
     #[test]
     fn parse_codebuddy_cn_app_cache_json_reads_exe() {
-        let path = parse_codebuddy_cn_app_cache_json(
-            r#"{ "exe": "/Applications/CodeBuddy CN.app" }"#,
-        )
-        .expect("valid cache");
+        let path =
+            parse_codebuddy_cn_app_cache_json(r#"{ "exe": "/Applications/CodeBuddy CN.app" }"#)
+                .expect("valid cache");
         assert_eq!(path.to_string_lossy(), "/Applications/CodeBuddy CN.app");
     }
 
@@ -1572,10 +1857,7 @@ mod tests {
 
     #[test]
     fn codebuddy_cn_app_cache_file_is_not_workbuddy_exe_cache() {
-        assert_ne!(
-            codebuddy_cn_app_cache_file(),
-            workbuddy_exe_cache_file()
-        );
+        assert_ne!(codebuddy_cn_app_cache_file(), workbuddy_exe_cache_file());
         assert!(codebuddy_cn_app_cache_file()
             .file_name()
             .is_some_and(|n| n == "codebuddy_cn_app.json"));
@@ -1666,7 +1948,10 @@ mod tests {
             validate_home_override("relative-buddy-switch-home"),
             Err(OverrideReject::NotAbsolute)
         );
-        assert_eq!(validate_home_override("."), Err(OverrideReject::NotAbsolute));
+        assert_eq!(
+            validate_home_override("."),
+            Err(OverrideReject::NotAbsolute)
+        );
 
         // 绝对但**不存在** → 拒绝，且不得顺手创建它。
         let missing = unique_missing_path("validate-missing");
@@ -1675,7 +1960,10 @@ mod tests {
             validate_home_override(missing.to_str().expect("utf8 missing path")),
             Err(OverrideReject::NotDir)
         );
-        assert!(!missing.exists(), "the guard must never create the rejected path");
+        assert!(
+            !missing.exists(),
+            "the guard must never create the rejected path"
+        );
 
         // 绝对但是**普通文件** → 拒绝。
         let file = unique_missing_path("validate-file");
@@ -1685,6 +1973,33 @@ mod tests {
             Err(OverrideReject::NotDir)
         );
         let _ = std::fs::remove_file(&file);
+    }
+
+    /// ★★ 独立入口的启动护栏：覆盖值**被设置但不合法**时必须给出拒绝理由。
+    ///
+    /// 反例（改坏会红）：退回「警告 + 回落真实 home」⇒ 调用方以为在隔离环境里跑，
+    /// 实际把账号 / 网关 Key / 签到与积分记录写到用户真实数据上（2026-09-30 真实事故）。
+    #[test]
+    fn home_override_refusal_only_for_set_but_invalid_values() {
+        // 未设置 / 空白：没有覆盖意图 ⇒ 放行（与改造前一致）。
+        assert!(home_override_refusal(None).is_none());
+        assert!(home_override_refusal(Some("   ")).is_none());
+
+        // 合法：已存在的绝对目录 ⇒ 放行。
+        let dir = std::env::temp_dir();
+        assert!(home_override_refusal(Some(dir.to_str().expect("utf8"))).is_none());
+
+        // 不合法 ⇒ 拒绝，理由必须点名变量、原因、后果与修法。
+        for bad in [".", "relative-home", "/no/such/dir/buddy-switch-home"] {
+            let message =
+                home_override_refusal(Some(bad)).unwrap_or_else(|| panic!("{bad} 必须被拒绝"));
+            assert!(message.contains(BUDDY_SWITCH_HOME_ENV), "{message}");
+            assert!(
+                message.contains("已存在的绝对目录"),
+                "要说清修法：{message}"
+            );
+            assert!(message.contains("真实"), "要说清后果：{message}");
+        }
     }
 
     /// F2：每种拒绝原因都有可读文案（面向用户的一次性警告）。
@@ -1788,5 +2103,44 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&base).expect("cleanup");
+    }
+
+    /// ★★ 安全审计 P0-2：凭据落盘必须是 `0600`，目录 `0700`。
+    ///
+    /// 变异验证：把 `write_private_file` 改回 `std::fs::write` ⇒ 第一条断言红
+    /// （umask 022 下得到 644，同机其他用户可读 `access_token`）。
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_creates_owner_only_files() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!(
+            "buddy-switch-perm-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        ensure_private_dir(&dir).expect("建目录");
+        let mode_of = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+        // 目录 0700：挡住「枚举出有哪几个账号文件」。
+        assert_eq!(mode_of(&dir), 0o700, "store 目录必须 0700");
+
+        let file = dir.join("accounts.json");
+        atomic_write(&file, "{\"access_token\":\"secret\"}").expect("写文件");
+        assert_eq!(mode_of(&file), 0o600, "账号库必须 0600（含明文 token）");
+
+        // 升级路径：历史文件是 0644 ⇒ 覆盖写之后必须被纠正回 0600。
+        // 这条单独断言，因为 `OpenOptions::create` **不会**重置已存在文件的模式。
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(mode_of(&file), 0o644, "前提：夹具已把权限改成 0644");
+        atomic_write(&file, "{}").expect("覆盖写");
+        assert_eq!(
+            mode_of(&file),
+            0o600,
+            "覆盖写必须把历史 0644 文件纠正成 0600"
+        );
+
+        // 反向对照：写入内容本身不受权限改动影响（不是靠「写不进去」实现的）。
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "{}");
+
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 }

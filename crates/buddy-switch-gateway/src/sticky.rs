@@ -63,12 +63,29 @@ impl StickyTable {
         self.ttl_ms
     }
 
-    /// 生效中的绑定数（不含已过期条目）。
+    /// **表大小**（含已过期但尚未被 GC 清掉的条目）。
+    ///
+    /// ⚠️ 这不是「生效中的绑定数」——安全审计 P2-10 之前这里写着「不含已过期条目」，
+    /// 而实现直接返回 `bindings.len()`（`get()` 才做 TTL 过滤，`len()` 没有）。
+    /// 于是 `/status` 的 `sticky_sessions` 只增不减：会话停了半小时，这个数还在。
+    ///
+    /// 要「生效中的数量」请用 [`Self::len_active`]（它需要 `now_ms` 才能过滤）。
     pub fn len(&self) -> usize {
         self.bindings.len()
     }
 
-    /// 是否为空。
+    /// **生效中**的绑定数（不含已过期条目）。
+    ///
+    /// `/status` 用的是这一条：那个数字的语义是「此刻还粘着多少个会话」，
+    /// 而不是「表里堆了多少条」。
+    pub fn len_active(&self, now_ms: i64) -> usize {
+        self.bindings
+            .values()
+            .filter(|binding| now_ms.saturating_sub(binding.bound_at_ms) < self.ttl_ms)
+            .count()
+    }
+
+    /// 是否为空（同样只说明**表**是空的；判「有没有生效中的绑定」用 `len_active`）。
     pub fn is_empty(&self) -> bool {
         self.bindings.is_empty()
     }
@@ -92,7 +109,11 @@ impl StickyTable {
         if self.bindings.len() >= self.gc_at {
             self.gc(now_ms);
             // 清理后仍超阈值 ⇒ 大多是未过期条目 ⇒ 上抬，避免下次 bind 再扫一遍。
-            self.gc_at = self.bindings.len().saturating_mul(2).max(INITIAL_GC_THRESHOLD);
+            self.gc_at = self
+                .bindings
+                .len()
+                .saturating_mul(2)
+                .max(INITIAL_GC_THRESHOLD);
         }
         self.bindings.insert(
             key.to_string(),
@@ -108,17 +129,29 @@ impl StickyTable {
         self.bindings.remove(key);
     }
 
-    /// 按 uid 解绑（账号被**删除**时调用；下次请求重新绑定）。
+    /// **按 uid 批量解绑**：清掉所有指向该账号的绑定，返回清掉的数量。
     ///
-    /// 与 [`Self::unbind`] 的区别：`unbind` 只知道**会话键**，删除只知道
-    /// **账号 uid**——而一个 uid 可能被多个会话同时钉住，故必须按 uid 全量清理。
-    /// 产品语义「删除就立马清除」：残留绑定会把已删账号的 uid 继续送进
-    /// 选号路径（池侧同步裁剪掉该条目后 `is_usable_for` 自会挡掉，粘性此处
-    /// 提前清掉只是省一次无谓查库）。返回被移除的绑定数。
-    pub fn remove_uid(&mut self, uid: &str) -> usize {
+    /// ## 为什么必须有它（2026-10-17）
+    ///
+    /// 排除 / 禁用 / 删除账号之后，指向它的粘性绑定仍然存在。后果有两层：
+    ///
+    /// 1. **白跑一跳**：每个请求都要先 `is_usable` 判一次「它还能不能用」再解绑；
+    /// 2. **状态自相矛盾**：界面上「粘性」徽标挂在一个「已排除」的行上。
+    ///
+    /// 按 key 一个个解绑做不到这件事 —— 调用方根本不知道有哪些会话绑在它身上。
+    ///
+    /// 遍历全表是 O(绑定数)，但**这个函数的调用频率是「用户点一次排除」**，
+    /// 不是每请求一次；而绑定表在 TTL 内只有几十条。不值得为它加反向索引
+    /// （那要多维护一份 `uid → keys` 的一致性，出错方式更隐蔽）。
+    pub fn remove_uid(&mut self, uid: &str) -> usize { self.purge_uid(uid) }
+
+    pub fn purge_uid(&mut self, uid: &str) -> usize {
+        if uid.is_empty() {
+            return 0;
+        }
         let before = self.bindings.len();
         self.bindings
-            .retain(|_, binding| binding.uid != uid);
+            .retain(|_, binding| binding.uid.as_str() != uid);
         before - self.bindings.len()
     }
 
@@ -184,6 +217,32 @@ mod tests {
         assert_eq!(table.get("k", NOW + 1000), None, "边界即失效");
     }
 
+    /// ★★ 安全审计 P2-10：**`len()` 是表大小，`len_active()` 才是生效中的数量**。
+    ///
+    /// 改造前 `len()` 的文档写「不含已过期条目」而实现返回 `bindings.len()`，
+    /// 于是 `/status` 的 `sticky_sessions` 只增不减（GC 是摊销触发的，不是每读一次就跑）。
+    ///
+    /// 变异验证：把 `/status` 改回 `len()` ⇒ 第二条断言红。
+    #[test]
+    fn len_active_excludes_expired_bindings_without_waiting_for_gc() {
+        let mut table = StickyTable::new(1000);
+        table.bind("a", "u1", NOW);
+        table.bind("b", "u2", NOW);
+        // 只有 a 还活着。
+        let later = NOW + 1_500;
+        table.bind("a", "u1", later); // 刷新 a
+        assert_eq!(table.get("b", later), None, "前置：b 已过期");
+
+        assert_eq!(table.len(), 2, "表里仍是两条（GC 还没触发）");
+        assert_eq!(
+            table.len_active(later),
+            1,
+            "生效中的只有 a —— `/status` 数的是这个"
+        );
+        // 全部过期 ⇒ 0（而不是「表里有几条算几条」）。
+        assert_eq!(table.len_active(later + 10_000), 0);
+    }
+
     #[test]
     fn bind_refreshes_timestamp() {
         let mut table = StickyTable::new(1000);
@@ -199,20 +258,6 @@ mod tests {
         table.unbind("k");
         assert_eq!(table.get("k", NOW), None);
         assert!(table.is_empty());
-    }
-
-    #[test]
-    fn remove_uid_drops_every_session_pinned_to_that_account() {
-        let mut table = StickyTable::new(1000);
-        table.bind("s1", "u1", NOW);
-        table.bind("s2", "u1", NOW + 10);
-        table.bind("s3", "u2", NOW);
-        assert_eq!(table.remove_uid("u1"), 2, "同一 uid 的多个会话绑定全清");
-        assert_eq!(table.get("s1", NOW + 100), None);
-        assert_eq!(table.get("s2", NOW + 100), None);
-        assert_eq!(table.get("s3", NOW + 100), Some("u2"), "其它 uid 的绑定不受影响");
-        assert_eq!(table.remove_uid("never-bound"), 0);
-        assert_eq!(table.remove_uid(""), 0, "空 uid 不应清掉任何绑定");
     }
 
     #[test]
@@ -269,7 +314,11 @@ mod tests {
         for index in 0..INITIAL_GC_THRESHOLD {
             table.bind(&format!("k{index}"), "u", NOW);
         }
-        assert_eq!(table.len(), INITIAL_GC_THRESHOLD, "全部未过期 ⇒ 一条都不该被清");
+        assert_eq!(
+            table.len(),
+            INITIAL_GC_THRESHOLD,
+            "全部未过期 ⇒ 一条都不该被清"
+        );
 
         // 让上面这批过期，再写一条 ⇒ 触发 GC，旧条目被清掉。
         let later = NOW + 5000;

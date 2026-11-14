@@ -10,10 +10,28 @@ export const en = {
   // =====================================================================
   // Brand names are identical in both locales; they still go through the word list
   // so that adding a program triggers a compile-time reminder to add the key.
-  "trae.program.traeWork": "TraeWork",
-  "trae.program.traeCode": "TraeCode",
-  "trae.program.traeWorkGlobal": "TraeWork AI",
-  "trae.program.traeCodeGlobal": "Trae AI",
+  // ★★ Naming rule (user-confirmed, corrected 2026-10-13): the **CN build carries a
+  // ` CN` suffix, the international build carries none**. All six names are verbatim
+  // the client's own strings (`nameAlias` / `nameShort`, measured from `product.json`),
+  // so none of them is invented:
+  //   TraeWork CN / TraeWork · TraeCode CN / TraeCode · Trae CN / Trae
+  // (The earlier "international gets an `AI` suffix" rule was wrong: it invented names
+  // the client never uses, and `Trae AI` matched both international TraeCode and the
+  // international merged client.)
+  // Merged client (issue #20): the client is literally named `Trae CN` / `Trae`.
+  // They are **separate variants** (`trae_merged` / `global_trae_merged`) — the ids
+  // and snapshot dirs differ from `traeCode*`.
+  "trae.program.trae": "Trae",
+  "trae.program.traeCn": "Trae CN",
+  "trae.program.traeGlobal": "Trae",
+
+  // Trae-side **region names** (user-confirmed 2026-10-13: use the client's own
+  // product name — `Trae CN` for the CN build, `Trae` for the international one).
+  // Distinct from `shared.region.version.*`, which is the cross-platform region
+  // *word* used in **composed** labels (`scope-chip.tsx` = product + region word)
+  // and is also read by WorkBuddy — so it must not become a Trae product name.
+  "trae.region.cn": "Trae CN",
+  "trae.region.global": "Trae",
 
   // =====================================================================
   // trae-account-card.tsx —— Trae account card
@@ -31,27 +49,47 @@ export const en = {
 
   // ---- Expiry ----
   "trae.comp.card.expiry.permanent": "No expiry",
-  "trae.comp.card.expiry.short": "Due {date}",
-  "trae.comp.card.expiry.cooldownUntil": "Cooldown until {time}",
-  "trae.comp.card.expiry.earliest": "Earliest expiry {time}",
-  "trae.comp.card.expiry.none": "No expiry time yet",
-  "trae.comp.card.expiry.noneShort": "No expiry",
+  "trae.comp.card.expiry.short": "Expires {date}",
+  // 2026-10-12: the in-card "big number row + expiring packages list" was removed to match
+  // the prototype card, so the related keys are gone.
 
   // ---- Body row labels ----
-  "trae.comp.card.label.device": "Device",
-  "trae.comp.card.label.jwtExpiry": "JWT expiry",
-  "trae.comp.card.label.addedAt": "Added",
-  "trae.comp.card.label.updatedAt": "Last updated",
-  "trae.comp.card.label.group": "Group",
 
   // ---- Status chips ----
-  "trae.comp.card.chip.checked": "Checked in",
-  "trae.comp.card.chip.unchecked": "Not checked in",
+  "trae.comp.card.chip.checked": "Checked in today",
+  "trae.comp.card.chip.toolsInUse": "{n} tools in use",
+  "trae.comp.card.chip.expired": "Credentials expired",
+  "trae.comp.card.chip.needRelogin": "Needs re-login",
+  "trae.comp.card.chip.expiring": "Closest expiry in {days} days · {amount} credits",
+  /* Within 48 hours the badge speaks in hours, so 25h and 47h stay distinguishable. */
+  "trae.comp.card.chip.expiringHours": "Closest expiry in {hours} hrs · {amount} credits",
+  /* Badge tooltip detail — same shape as WB / Qoder (one line per batch, merge by expiry,
+     no package name; package names live in the drawer's pack table).
+     Each line leads with an absolute timestamp, matching dates shown elsewhere. */
+  "trae.comp.card.expiringTipTitle": "Expiring batches ({n})",
+  "trae.comp.card.expiringTipLine": "{time} · {amount} credits",
+  "trae.comp.card.chip.priority": "Priority",
+  "trae.comp.card.chip.priorityTip": "Recommended priority",
+  "trae.comp.card.chip.unchecked": "Not checked in today",
   "trae.comp.card.chip.cooling": "Cooling down",
-  "trae.comp.card.chip.jwtAuto": "Auto-refresh JWT",
-  "trae.comp.card.chip.jwtManual": "JWT refreshable",
+  /* JWT renewal is a long-lived attribute, not a state needing attention — no badge
+     (it would crowd out the time-sensitive expiry / check-in slots). Fully surfaced in
+     the drawer's metric rows via `trae.comp.card.detail.jwtAuto*`. */
   "trae.comp.card.cooldown.until": " · until {time}",
   "trae.comp.card.cooldown.fallback": "Cooling down ({type})",
+  "trae.comp.card.chip.authRejected": "Credential rejected (self-healing)",
+  // ---- Cooldown state → user action (single source, see src/lib/trae-cooldown.ts) ----
+  "trae.comp.card.cooldown.hint.sessionDead":
+    "The upstream invalidated this session (12153). Sign in again; the marker clears itself once the credential changes. You can also use \"Clear cooldown\" in the menu.",
+  "trae.comp.card.cooldown.hint.authRejected":
+    "The upstream rejected this access token but did not invalidate the session — usually expiry. The keep-alive refresh recovers it in about 60 seconds.",
+  "trae.comp.card.cooldown.hint.planLimit": "Plan quota exhausted. Wait for the reset or use another account.",
+  "trae.comp.card.cooldown.hint.transient":
+    "Rate limited or upstream hiccup. Recovers when the cooldown expires; the first successful request clears it immediately.",
+  "trae.comp.card.cooldown.age.justNow": "just now",
+  "trae.comp.card.cooldown.age.minutes": "{minutes} min ago",
+  "trae.comp.card.cooldown.age.hours": "{minutes} h ago",
+  "trae.comp.card.cooldown.age.days": "{minutes} d ago",
 
   // ---- Program switch controls ----
   "trae.comp.card.currentOf": "Current account in {label}",
@@ -61,65 +99,63 @@ export const en = {
   "trae.comp.card.switch.aria": "Switch to {label}",
   "trae.comp.card.switch.ariaBusy": "Switching to {label}",
   "trae.comp.card.switch.busy": "Switching…",
+  // 2026-10-10: the cross-region "switch region first" strings were deleted — the CN scope
+  // no longer renders global program buttons at all (user request).
 
   // ---- Action menu ----
   "trae.comp.card.manage.aria": "Manage account {name}",
   "trae.comp.card.manage.title": "More account actions",
+  "trae.comp.card.selectAria": "Select account {name}",
   "trae.comp.card.menu.save": "Save login state",
   "trae.comp.card.menu.refreshJwt": "Refresh JWT",
+  "trae.comp.card.menu.refreshCredits": "Refresh credits",
   "trae.comp.card.menu.checkin": "Check in manually",
   "trae.comp.card.menu.thaw": "Clear cooldown",
+  "trae.comp.card.menu.remark": "Edit remark",
   "trae.comp.card.menu.delete": "Delete account",
 
   // ---- Credits section ----
   "trae.comp.card.credits.remaining": "Credits left",
-  "trae.comp.card.credits.unknown": "Credits not fetched",
-  "trae.comp.card.credits.notQueried": "No credits fetched yet. Use “Refresh JWT” in the top-right menu to try again.",
-  "trae.comp.card.credits.work": "Work",
-  "trae.comp.card.credits.general": "General",
-  "trae.comp.card.credits.workTooltip": "Work credits",
-  "trae.comp.card.credits.generalTooltip": "General credits",
-  "trae.comp.card.membership.expire": "Membership expires: {date}",
-  "trae.comp.card.membership.nextBilling": "Next billing: {date}",
-  "trae.comp.card.membership.none": "Free plan",
-  "trae.comp.card.payIdentity": "{identity}",
-  "trae.comp.card.section.expiring": "Expiring soon",
-  "trae.comp.card.section.info": "Account info",
+  "trae.comp.card.credits.notQueried": "No credits fetched yet",
+  "trae.comp.card.credits.refresh": "Refresh credits",
   "trae.comp.card.package.fallback": "Credit package",
-  "trae.comp.card.package.tip": "{name} · {remaining} / {total} left · {expiry}",
-  "trae.comp.card.package.remaining": "{credits} credits",
-  "trae.comp.card.package.empty": "No credits available",
+  // P4: "used / expiry" text for the drawer `DetailPack` (mirrors the WorkBuddy drawer).
+  "trae.comp.card.package.expired": "Expired",
 
-  // ---- Footer buttons ----
-  "trae.comp.card.action.saving": "Saving…",
+  // ---- Action explanations (used as menu-item titles) ----
+  // P4: the footer "Save login state" / "Refresh JWT" buttons moved back into the menu;
+  // their explanations live on as menu-item titles so the "why disabled" is not lost.
   "trae.comp.card.action.saveTip": "Save the client's current login state under this account (used to restore when switching); the client will be closed and reopened first",
   "trae.comp.card.action.saveNoLogin": "This account is not signed in on any Trae client — sign in on the client first, then save",
-  "trae.comp.card.action.refreshing": "Refreshing…",
   "trae.comp.card.action.refreshJwtTip": "Exchange the refresh token for a new JWT",
-  "trae.comp.card.footer.updatedAt": "Updated {time}",
-  "trae.comp.card.footer.noUpdate": "No update time recorded",
+  "trae.comp.card.action.refreshCreditsTip": "Re-query credits for this account only — no need to select all accounts and refresh in bulk",
   "trae.comp.card.footer.updatedTip": "Last time this account was updated in the local account library",
 
-  // ---- Details dialog ----
+  // ---- Card head + metrics row (prototype `.acct-top` / `.acct-metrics`) ----
+  // Same names and meaning as the WorkBuddy card: both product areas render one card shape.
+  "trae.comp.card.currentLogin": "Current login",
+  "trae.comp.card.metric.credits": "Credits",
+
+  // ---- Detail drawer sections (assembled by TraeAccountsPage) ----
+  "trae.comp.card.detail.section.account": "Account",
+  "trae.comp.card.detail.section.credits": "Credits",
+  "trae.comp.card.detail.section.credential": "Credential",
+
+  // ---- Details (P4: carried by the shared drawer `account-detail-drawer.tsx`) ----
   "trae.comp.card.detail.open": "View account details",
-  "trae.comp.card.detail.title": "Account details",
   "trae.comp.card.detail.subtitle": "{name} · UID {uid}",
   "trae.comp.card.detail.accountId": "Account ID",
-  "trae.comp.card.detail.enabledPrograms": "Enabled programs",
   "trae.comp.card.detail.creditsExpiry": "Credits expiry",
   "trae.comp.card.detail.jwtStatus": "JWT status",
   "trae.comp.card.detail.jwtAutoRefresh": "Auto-refresh JWT",
   "trae.comp.card.detail.deviceId": "Device ID",
   "trae.comp.card.detail.cooldown": "Cooldown",
-  "trae.comp.card.detail.ungrouped": "Ungrouped",
   "trae.comp.card.detail.none": "None",
   "trae.comp.card.detail.notQueried": "Not fetched",
-  "trae.comp.card.detail.jwtAutoOn": "Enabled",
-  "trae.comp.card.detail.jwtAutoOff": "Manual refresh only",
+  "trae.comp.card.detail.jwtAutoOn": "Due for renewal",
+  "trae.comp.card.detail.jwtAutoOff": "Auto-renews before expiry",
+  "trae.comp.card.detail.jwtAutoDisabled": "Off (manual refresh only)",
   "trae.comp.card.detail.noRefreshToken": "No refresh token",
-  "trae.comp.card.detail.membershipExpire": "Membership expires",
-  "trae.comp.card.detail.membershipNextBilling": "Next billing",
-  "trae.comp.card.detail.payIdentity": "Plan identity",
 
   // =====================================================================
   // trae-oauth-login-dialog.tsx —— OAuth web login
@@ -132,9 +168,6 @@ export const en = {
   "trae.comp.oauth.error.timeout": "Timed out waiting for authorization ({seconds}s). Confirm that you finished authorizing in the browser; if you did and it still timed out, the authorization page usually failed to send the callback back to the local listening port (see the port below). Close this dialog and try again; if it keeps timing out, make sure port 17388 on this machine is not taken by another program. You can also use “Import local accounts” instead.",
   "trae.comp.oauth.start": "Start {variant} web sign-in",
   "trae.comp.oauth.startBusy": "Starting sign-in for {variant}…",
-  "trae.comp.oauth.waiting": "Waiting for authorization; please finish signing in in your browser…",
-  "trae.comp.oauth.webMode": "No local client detected — signed in via web mode (synthetic device identity). Token refreshes also use web mode; no client install needed.",
-  "trae.comp.oauth.remaining": "{time} left",
   "trae.comp.oauth.callback": "Local callback listener: ",
   "trae.comp.oauth.result": "Account added: {name}",
   "trae.comp.oauth.close": "Close",
@@ -143,6 +176,17 @@ export const en = {
   "trae.comp.oauth.retryBusy": "Starting sign-in…",
   "trae.comp.oauth.launch": "Launch the {variant} client",
   "trae.comp.oauth.launchBusy": "Launching the {variant} client…",
+  // ---- Remote / client-less deployment (issue #62): the authorize page probes 127.0.0.1:17388 ----
+  "trae.comp.oauth.tunnel.title": "Remote deployment needs one extra step: the authorize page probes local port {port}",
+  "trae.comp.oauth.tunnel.desc": "While stuck on \"authorizing\", the Trae authorize page probes 127.0.0.1:{port} to confirm the client is online. A server has no such port, and the browser you click in runs on your own machine — open a port forward there first, and keep the terminal open:",
+  "trae.comp.oauth.tunnel.copy": "Copy command",
+  "trae.comp.oauth.tunnel.copied": "Copied",
+  "trae.comp.oauth.pasteCallback.title": "Callback never arrived? Paste the address bar here",
+  "trae.comp.oauth.pasteCallback.hint": "After approving, the browser jumps to 127.0.0.1:{port}/authorize?… and fails to load — copy that whole URL here and the server finishes the exchange.",
+  "trae.comp.oauth.pasteCallback.placeholder": "http://127.0.0.1:{port}/authorize?authCodeInfo=…",
+  "trae.comp.oauth.pasteCallback.submit": "Submit callback",
+  "trae.comp.oauth.pasteCallback.busy": "Exchanging…",
+  "trae.comp.oauth.keyNote": "Also: Trae signs token exchange and refresh with the icube device private key stored in the client's storage.json. Without a client on this machine there is no such key — copy storage.json from the machine that has the client to the same path here, or use \"Import backup\" (backups carry no private key, so refresh will fail and the account only lasts until the access_token expires).",
   "trae.comp.oauth.launchOk": "The {variant} client has been launched. Wait for it to write its device credential (a first launch also shows a sign-in page — sign in there once), then click “Restart sign-in”.",
 
   // =====================================================================
@@ -182,4 +226,48 @@ export const en = {
   "trae.comp.export.done": "Done",
   "trae.comp.export.cancel": "Cancel",
   "trae.comp.export.submit": "Export selected",
+
+  // fork扩展词条：保留既有功能的双语文案。
+  "trae.program.traeWork": "TraeWork",
+  "trae.program.traeCode": "TraeCode",
+  "trae.program.traeWorkGlobal": "TraeWork AI",
+  "trae.program.traeCodeGlobal": "Trae AI",
+  "trae.comp.card.expiry.cooldownUntil": "Cooldown until {time}",
+  "trae.comp.card.expiry.earliest": "Earliest expiry {time}",
+  "trae.comp.card.expiry.none": "No expiry time yet",
+  "trae.comp.card.expiry.noneShort": "No expiry",
+  "trae.comp.card.label.device": "Device",
+  "trae.comp.card.label.jwtExpiry": "JWT expiry",
+  "trae.comp.card.label.addedAt": "Added",
+  "trae.comp.card.label.updatedAt": "Last updated",
+  "trae.comp.card.label.group": "Group",
+  "trae.comp.card.chip.jwtAuto": "Auto-refresh JWT",
+  "trae.comp.card.chip.jwtManual": "JWT refreshable",
+  "trae.comp.card.credits.unknown": "Credits not fetched",
+  "trae.comp.card.credits.work": "Work",
+  "trae.comp.card.credits.general": "General",
+  "trae.comp.card.credits.workTooltip": "Work credits",
+  "trae.comp.card.credits.generalTooltip": "General credits",
+  "trae.comp.card.membership.expire": "Membership expires: {date}",
+  "trae.comp.card.membership.nextBilling": "Next billing: {date}",
+  "trae.comp.card.membership.none": "Free plan",
+  "trae.comp.card.payIdentity": "{identity}",
+  "trae.comp.card.section.expiring": "Expiring soon",
+  "trae.comp.card.section.info": "Account info",
+  "trae.comp.card.package.tip": "{name} · {remaining} / {total} left · {expiry}",
+  "trae.comp.card.package.remaining": "{credits} credits",
+  "trae.comp.card.package.empty": "No credits available",
+  "trae.comp.card.action.saving": "Saving…",
+  "trae.comp.card.action.refreshing": "Refreshing…",
+  "trae.comp.card.footer.updatedAt": "Updated {time}",
+  "trae.comp.card.footer.noUpdate": "No update time recorded",
+  "trae.comp.card.detail.title": "Account details",
+  "trae.comp.card.detail.enabledPrograms": "Enabled programs",
+  "trae.comp.card.detail.ungrouped": "Ungrouped",
+  "trae.comp.card.detail.membershipExpire": "Membership expires",
+  "trae.comp.card.detail.membershipNextBilling": "Next billing",
+  "trae.comp.card.detail.payIdentity": "Plan identity",
+  "trae.comp.oauth.waiting": "Waiting for authorization; please finish signing in in your browser…",
+  "trae.comp.oauth.webMode": "No local client detected — signed in via web mode (synthetic device identity). Token refreshes also use web mode; no client install needed.",
+  "trae.comp.oauth.remaining": "{time} left",
 };

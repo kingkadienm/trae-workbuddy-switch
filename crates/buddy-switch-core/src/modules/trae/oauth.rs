@@ -76,17 +76,17 @@ use sha2::{Digest as _, Sha256};
 use tokio::sync::Notify;
 
 use crate::modules::trae::icube::{self, DeviceIdentity};
+use crate::modules::trae::icube_base_for;
 use crate::modules::trae::oauth_client::oauth_client;
 use crate::modules::trae::oauth_result_page::{result_page, PageKind};
 use crate::modules::trae::platform::{self, ClientInstallMeta, SystemProfile};
 use crate::modules::trae::store;
-use crate::modules::trae::variant::TraeVariant;
+use crate::modules::trae::variant::{OAuthLine, TraeVariant};
 use crate::modules::trae::{
     account, device, endpoints_for, TRAE_EXCHANGE_TOKEN_LEGACY_PATH, TRAE_EXCHANGE_TOKEN_PATH,
     TRAE_OAUTH_APP_ID, TRAE_OAUTH_LOGIN_TIMEOUT_SECONDS, TRAE_PAGE_APP_VERSION,
     TRAE_PAGE_PLUGIN_VERSION,
 };
-use crate::modules::trae::{account_base_for, icube_base_for};
 
 /// 授权页路径（挂在**该变体的 `console_base`** 后面）。
 ///
@@ -172,23 +172,12 @@ fn login_sessions() -> &'static Mutex<HashMap<String, LoginSession>> {
 }
 
 /// 会话的只读快照（避免在监听循环里长时间持锁）。
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct SessionView {
     cancelled: bool,
     variant: TraeVariant,
     trace_id: String,
     pkce_verifier: String,
-}
-
-impl Default for SessionView {
-    fn default() -> Self {
-        Self {
-            cancelled: false,
-            variant: TraeVariant::default(),
-            trace_id: String::new(),
-            pkce_verifier: String::new(),
-        }
-    }
 }
 
 /// 读取会话快照；会话不存在时返回默认值（`cancelled = false`）。
@@ -338,11 +327,20 @@ fn normalize_user_jwt_expires(user_jwt: &Value) -> Option<i64> {
     let raw = user_jwt
         .get("TokenExpireAt")
         .and_then(|value| value.as_i64())
-        .or_else(|| user_jwt.get("TokenExpireAt").and_then(|value| value.as_str()).and_then(|text| text.trim().parse::<i64>().ok()))?;
+        .or_else(|| {
+            user_jwt
+                .get("TokenExpireAt")
+                .and_then(|value| value.as_str())
+                .and_then(|text| text.trim().parse::<i64>().ok())
+        })?;
     if raw <= 0 {
         return None;
     }
-    Some(if raw > 1_000_000_000_000 { raw / 1000 } else { raw })
+    Some(if raw > 1_000_000_000_000 {
+        raw / 1000
+    } else {
+        raw
+    })
 }
 
 /// 展示名候选键，按「越像人名的越优先」排列。
@@ -434,7 +432,10 @@ fn parse_callback(params: &HashMap<String, String>) -> Result<CallbackInfo, Stri
     };
 
     // ---- authCodeInfo（主路径）----
-    if let Some(raw) = params.get("authCodeInfo").filter(|raw| !raw.trim().is_empty()) {
+    if let Some(raw) = params
+        .get("authCodeInfo")
+        .filter(|raw| !raw.trim().is_empty())
+    {
         let parsed: Value = serde_json::from_str(raw.trim())
             .map_err(|e| format!("authCodeInfo 解析失败（{e}）：授权页回调格式异常"))?;
         info.auth_code = parsed
@@ -472,17 +473,14 @@ fn parse_callback(params: &HashMap<String, String>) -> Result<CallbackInfo, Stri
 
     // ---- userJwt（网页模式兜底，容错）----
     let user_jwt = extract_user_jwt(params);
-    info.refresh_token = info
-        .refresh_token
-        .clone()
-        .or_else(|| {
-            user_jwt
-                .get("RefreshToken")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-        });
+    info.refresh_token = info.refresh_token.clone().or_else(|| {
+        user_jwt
+            .get("RefreshToken")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    });
     info.user_jwt_fallback = user_jwt
         .get("Token")
         .and_then(|value| value.as_str())
@@ -566,9 +564,7 @@ fn classify_upstream(raw: &str) -> String {
             "设备校验未通过（20403）：缺少 x-cloudide-token 或设备凭证与账号不匹配。原始信息：{raw}"
         )
     } else if raw.contains("20405") {
-        format!(
-            "设备签名未通过（20405）：DeviceProof 签名格式或设备身份不匹配。原始信息：{raw}"
-        )
+        format!("设备签名未通过（20405）：DeviceProof 签名格式或设备身份不匹配。原始信息：{raw}")
     } else {
         format!("上游令牌交换失败：{raw}")
     }
@@ -604,7 +600,7 @@ fn pkce_pair() -> (String, String) {
 /// 把三者收进一个值、并让两个构造函数**只从这里取值**，就能让「两处各取一份」
 /// 在类型层面不成立 —— 与 `device_id` 那条红线同款思路。
 #[derive(Debug, Clone)]
-struct ClientFacts {
+pub(crate) struct ClientFacts {
     /// 设备身份（`device_id` 与 `publicKeyPEM` 的唯一来源）。
     identity: DeviceIdentity,
     /// 安装元数据（`manifest.json`）。取不到时为全空 ⇒ 各字段按 [`ClientInstallMeta`] 回落。
@@ -616,6 +612,16 @@ struct ClientFacts {
     /// `build_exchange_payload` 据此省略 `DevicePublicKey`；账号落库时标记
     /// `web_devices`，续期只走无签名变体。
     web_device: bool,
+    /// **产品线**（SOLO / TRAE）—— 与变体正交的一轴。
+    ///
+    /// ★ 为什么必须独立成字段（2026-10-22 真机缺陷）：
+    /// `ClientID` 与 `DeviceInfo.PlatformCode` 都随**产品线**变
+    /// （SOLO = `en1oxy7wnw8j9n` / `SOLO_PC`，TRAE = `ono9krqynydwx5` / `IDE_PC`），
+    /// 而 refresh_token 是**签发它的那把钥匙**的凭证。上游对「拿 A 线的 token 去换 B 线的
+    /// token」的回答是 `10101/040004` + `Data.__Message.error = "refresh token is not
+    /// matched to the client"` —— 连官方客户端自己也会撞上（真机日志 2026-10-20 实测）。
+    /// 因此「用哪条线」必须能被调用方显式改写，而不是只从变体推导。
+    line: OAuthLine,
 }
 
 impl ClientFacts {
@@ -630,6 +636,7 @@ impl ClientFacts {
             meta: platform::client_install_meta_for(variant).unwrap_or_default(),
             system: platform::system_profile(),
             web_device: false,
+            line: variant.oauth_line(),
         })
     }
 
@@ -660,12 +667,41 @@ impl ClientFacts {
             meta: ClientInstallMeta::default(),
             system: platform::system_profile(),
             web_device: true,
+            line: variant.oauth_line(),
         }
     }
 
-    /// 合成身份（网页模式）没有公钥：`DeviceInfo` 是否要带 `DevicePublicKey`。
-    fn has_public_key(&self) -> bool {
-        !self.identity.public_key_pem.trim().is_empty()
+    /// 从**已取到的**身份组装事实（`refresh` 路径用）。
+    ///
+    /// ## 为什么 refresh 需要它
+    ///
+    /// `ExchangeToken` 的两种用法（AuthCode / refreshToken）**共用同一个请求体骨架**：
+    /// `DeviceInfo` + `IDEVersion`。AuthCode 侧的取值全部经 [`ClientFacts`] 同源派生；
+    /// refresh 侧若另写一份 `DeviceInfo`，两条链就会各说一套机器标识与版本号 ——
+    /// 2026-10-22 的真机缺陷正是「refresh 只发了扁平的 `DeviceID`/`PlatformCode`、
+    /// 没有 `DeviceInfo`」，上游回 `10101/040004 无效参数`，自动续期整整失效 14 天。
+    ///
+    /// 因此 refresh 侧的身份**必须**来自账号绑定的那台设备（[`icube::DeviceSecret`]），
+    /// 而 `meta` / `system` 与本机其余状态一致即可。
+    pub(crate) fn from_identity(identity: DeviceIdentity) -> ClientFacts {
+        ClientFacts {
+            meta: platform::client_install_meta_for(identity.variant).unwrap_or_default(),
+            system: platform::system_profile(),
+            line: identity.variant.oauth_line(),
+            web_device: false,
+            identity,
+        }
+    }
+
+    /// 改用**另一条产品线**（`ClientID` + `PlatformCode` 一起换）。
+    ///
+    /// 唯一用途：refresh 链在「本线的钥匙被上游判为不匹配」时再试另一条线
+    /// （真机实测：官方客户端自己也撞 `refresh token is not matched to the client`）。
+    pub(crate) fn with_line(&self, line: OAuthLine) -> ClientFacts {
+        ClientFacts {
+            line,
+            ..self.clone()
+        }
     }
 
     /// `machine_id` / `x_machine_id` / `DeviceInfo.MachineID` 的**共同**取值。
@@ -679,7 +715,7 @@ impl ClientFacts {
     /// 不是 `resources/app/package.json` 的内核版本（本机 `1.107.1`）。
     /// 逐级回落：`manifest.json` → 安装目录版本 → 内置常量。**三条路都指向同一个值**，
     /// 因此不会出现「URL 与请求体各说一个数」。
-    fn app_version(&self) -> String {
+    pub(crate) fn app_version(&self) -> String {
         for candidate in [
             self.meta.app_version.as_str(),
             self.identity.app_version.as_str(),
@@ -865,37 +901,122 @@ fn build_authorize_url(
 /// 而 `icube_base`（`https://api.trae.com.cn`）是**另一台主机**。
 /// 客户端源码里 `apiHost` 的取值顺序是「回调回传的 host → `account.trae.normal`」，
 /// 从不是 iCube 基址。
-fn resolve_exchange_host(callback_host: Option<&str>, _variant: TraeVariant) -> (String, bool) {
-    match callback_host
+fn resolve_exchange_host(
+    callback_host: Option<&str>,
+    variant: TraeVariant,
+) -> (String, ExchangeHostSource) {
+    let endpoints = endpoints_for(variant);
+    let callback_host = callback_host
         .map(|host| host.trim().trim_end_matches('/'))
-        .filter(|host| !host.is_empty())
-    {
-        Some(host) => (host.to_string(), false),
-        None => (account_base_for(_variant).to_string(), true),
+        .filter(|host| !host.is_empty());
+    let Some(host) = callback_host else {
+        return (
+            endpoints.account_base.to_string(),
+            ExchangeHostSource::Missing,
+        );
+    };
+    // ★★ 安全审计 P2-12：`host` 来自**回调 URL 的查询串**（浏览器可控 / 用户可粘贴），
+    // 却直接被用来拼接兑换请求的 base URL ⇒ 等于「把 `authCode` + PKCE `code_verifier`
+    // POST 到任意地址」，同时构成无条件 SSRF。
+    //
+    // 判据刻意用**白名单**而不是黑名单：这个值只可能来自 Trae 自己的几个域
+    // （`bootConfig` 里那四台主机），枚举得完。
+    if !is_known_exchange_host(&host, endpoints) {
+        // 回落 + 留痕（不静默改写）：症状是「登录莫名失败」，留痕才查得动。
+        return (
+            endpoints.account_base.to_string(),
+            ExchangeHostSource::Rejected,
+        );
+    }
+    (host.to_string(), ExchangeHostSource::Callback)
+}
+
+/// [`resolve_exchange_host`] 的取值来源 —— 决定要不要写留痕、写什么。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExchangeHostSource {
+    /// 回调给的就是已知主机（正常路径）。
+    Callback,
+    /// 回调没给 host（上游版本差异）⇒ 回落 `account_base`。
+    Missing,
+    /// 回调给了 host，但**不在**本变体的已知主机里 ⇒ 回落并留痕。
+    Rejected,
+}
+
+impl ExchangeHostSource {
+    /// 是否需要写一条留痕。
+    pub(crate) fn used_fallback(self) -> bool {
+        !matches!(self, ExchangeHostSource::Callback)
     }
 }
 
-/// 构造 AuthCode 交换请求体（纯函数，可单测）。
+/// 把 URL 归一成「主机名小写」（去 scheme、去路径、去尾斜杠、去端口）。
+fn host_name_of(url: &str) -> String {
+    let trimmed = url.trim().trim_end_matches('/');
+    let without_scheme = trimmed.split_once("://").map_or(trimmed, |(_, rest)| rest);
+    let authority = without_scheme
+        .split('/')
+        .next()
+        .unwrap_or(without_scheme)
+        .to_ascii_lowercase();
+    // 去掉端口（Trae 的四个域都不带端口；带端口的形式归一后仍应能匹配）。
+    authority
+        .split(':')
+        .next()
+        .unwrap_or(&authority)
+        .to_string()
+}
+
+/// `host` 是否属于该变体的已知主机集合。
 ///
-/// ⚠️ AuthCode 场景**不发 DeviceProof**（那是 refreshToken 刷新场景专属结构），
-/// 因此这里只收 [`ClientFacts`]（其 `identity` 字段**没有私钥字段**，见模块头）。
-/// `DevicePublicKey` 直接取信封里的 `publicKeyPEM`，**不推导**。
+/// 四个域都算：兑换打的是 `account_base`，但上游不同版本的回调可能回传
+/// `icube_base` / `agent_host` / `console_base`（同一账号体系的兄弟域）。
+/// 把它们一起放行是为了**不误杀**既有可用路径 —— 这道校验的目标是挡掉
+/// 「完全不相干的主机」，不是收紧上游自己的域。
+fn is_known_exchange_host(
+    host: &str,
+    endpoints: &crate::modules::trae::variant::EndpointSet,
+) -> bool {
+    let name = host_name_of(host);
+    if name.is_empty() {
+        return false;
+    }
+    // 回环单独放行（不是「放宽」，而是「另一类合法场景」）：
+    // 本仓的回调联调与自建反代都跑在 `127.0.0.1:<port>` 上，上游真机不会回传它。
+    // 而本机进程本来就与用户同权限 —— 挡不住也无意义（真正要挡的是「把 authCode
+    // 发到**外部**地址」）。
+    if name == "127.0.0.1" || name == "localhost" || name == "::1" || name == "[::1]" {
+        return true;
+    }
+    [
+        endpoints.account_base,
+        endpoints.icube_base,
+        endpoints.agent_host,
+        endpoints.console_base,
+    ]
+    .iter()
+    .any(|known| host_name_of(known) == name)
+}
+
+/// 构造 `ExchangeToken` 请求体里的 `DeviceInfo`（**AuthCode 与 refresh 共用的唯一派生点**）。
 ///
-/// ★ 请求体里**每一个**与授权 URL 重叠的字段都从 `facts` 派生（唯一来源）：
+/// ★ 每个字段都从 [`ClientFacts`] 派生，调用方**没有**自由拼装的机会：
 /// `MachineID` ← [`ClientFacts::machine_id`]、`ClientVersion` / `IDEVersion`
 /// ← [`ClientFacts::app_version`]、`DeviceModel` / `OSInfo` / `OSVersion`
-/// ← `facts.system`。`PlatformCode` 由 `identity.variant.oauth_line()` 派生。
-fn build_exchange_payload(
-    client_id: &str,
-    auth_code: &str,
-    code_verifier: &str,
-    facts: &ClientFacts,
-) -> Value {
+/// ← `facts.system`、`PlatformCode` ← `identity.variant.oauth_line()`。
+///
+/// ## 为什么 refresh 也走这里（2026-10-22 真机缺陷）
+///
+/// 客户端 `out/main.js` 的 `exchangeTokenByRefreshToken` 与 `exchangeTokenByAuthCode`
+/// 发的是**同一个** `DeviceInfo`（同一个 `_buildDeviceInfo` 缓存对象）。改造前
+/// refresh 侧只发扁平 `{DeviceID, PlatformCode}`、完全没有 `DeviceInfo`，上游按
+/// 缺参拒掉（`10101/040004 无效参数`）⇒ 所有账号的自动续期静默失效，JWT 一到期
+/// 就只能重新登录。共用本函数后，两条链的 `DeviceInfo` 结构不可能再分叉。
+pub(crate) fn device_info_payload(facts: &ClientFacts) -> Value {
     let identity = &facts.identity;
     let system = &facts.system;
     // ★ 与授权 URL 的 `x_app_version` 同源（客户端三处同值）。
     let app_version = facts.app_version();
-    let mut device_info = json!({
+    let mut info = json!({
         "DeviceID": identity.device_id,
         // ★ 与授权 URL 的 `machine_id` / `x_machine_id` **同源**（唯一派生点）。
         // 改造前这里取 `storage.json` 的 `telemetry.machineId`、URL 取自造值 ⇒
@@ -904,7 +1025,9 @@ fn build_exchange_payload(
         // ★ 按**产品线**派生：SOLO 线 `SOLO_PC` / IDE 线 `IDE_PC`
         // （客户端 `k(){ return gr(product) ? "SOLO_PC" : "IDE_PC" }`）。
         // 改造前写死 `IDE_PC`（照抄参考实现的 IDE 线），SOLO 线上必然对不上。
-        "PlatformCode": identity.variant.oauth_line().platform_code(),
+        // ★ 取自 `facts.line`（**不是** `identity.variant`）：refresh 链要能用
+        //   另一条线的钥匙去试（见 `ClientFacts::with_line`）。
+        "PlatformCode": facts.line.platform_code(),
         "DeviceType": "PC",
         // 真值是「Windows 账户全名 + 本地化后缀」（本机 `Jackey的电脑`）——
         // 本实现留空，理由见 `platform::system_profile`（无稳定来源，且该字段
@@ -913,23 +1036,38 @@ fn build_exchange_payload(
         // ★ 与授权 URL 的 `x_device_brand` 同源（客户端装的是 `deviceModel`）。
         "DeviceModel": system.device_model,
         "ClientVersion": app_version,
+        "DevicePublicKey": identity.public_key_pem,
         "DeviceBrand": system.device_manufacturer,
         "DeviceCPU": system.cpu_brand,
         // ★ 与授权 URL 的 `x_device_type` / `x_os_version` 同源。
         "OSInfo": system.os_name,
         "OSVersion": system.os_version,
     });
-    // 网页模式合成身份没有公钥（无客户端私钥可签名）：**省略** `DevicePublicKey`
-    // 而不是报空串（空串会被上游当成「声明了但为空」的设备声明，语义相反）。
-    if facts.has_public_key() {
-        device_info["DevicePublicKey"] = json!(identity.public_key_pem);
+    if identity.public_key_pem.trim().is_empty() {
+        info.as_object_mut().unwrap().remove("DevicePublicKey");
     }
+    info
+}
+
+/// 构造 AuthCode 交换请求体（纯函数，可单测）。
+///
+/// ⚠️ AuthCode 场景**不发 DeviceProof**（那是 refreshToken 刷新场景专属结构），
+/// 因此这里只收 [`ClientFacts`]（其 `identity` 字段**没有私钥字段**，见模块头）。
+/// `DevicePublicKey` 直接取信封里的 `publicKeyPEM`，**不推导**。
+///
+/// `DeviceInfo` 由 [`device_info_payload`] 统一派生（与 refresh 同源）。
+fn build_exchange_payload(
+    client_id: &str,
+    auth_code: &str,
+    code_verifier: &str,
+    facts: &ClientFacts,
+) -> Value {
     json!({
         "ClientID": client_id,
         "AuthCode": auth_code,
         "CodeVerifier": code_verifier,
-        "DeviceInfo": device_info,
-        "IDEVersion": app_version,
+        "DeviceInfo": device_info_payload(facts),
+        "IDEVersion": facts.app_version(),
     })
 }
 
@@ -996,11 +1134,7 @@ async fn exchange_auth_code(
     let variants: Vec<(String, String, Value, bool)> = vec![
         (
             "ExchangeToken/DeviceInfo".to_string(),
-            format!(
-                "{}{}",
-                host.trim_end_matches('/'),
-                TRAE_EXCHANGE_TOKEN_PATH
-            ),
+            format!("{}{}", host.trim_end_matches('/'), TRAE_EXCHANGE_TOKEN_PATH),
             build_exchange_payload(&client_id, auth_code, code_verifier, facts),
             true,
         ),
@@ -1083,22 +1217,18 @@ async fn try_exchange_variant(
         // ★ 必须**存在且为空串**：缺失报 20403，带旧 token 报 20405。
         request = request.header("x-cloudide-token", "");
     }
-    let response = request
-        .json(payload)
-        .send()
-        .await
-        .map_err(|e| {
-            // 与签到/续期同一出口：展开 source 链（见 modules/net.rs）。
-            // 授权流程的失败提示往往是用户唯一的线索，不能只剩一行顶层文案。
-            //
-            // 用 `transport_error`（带码版）而不是 `describe_transport_error`：同一条文案，
-            // 额外携带 `net.transport.*` 码，前端才能按当前语言重渲染。文本逐字节相同
-            // —— 见 `net::describe_transport_error` 的委托实现。
-            format!(
-                "请求失败: {}",
-                crate::modules::net::transport_error(&e).to_wire()
-            )
-        })?;
+    let response = request.json(payload).send().await.map_err(|e| {
+        // 与签到/续期同一出口：展开 source 链（见 modules/net.rs）。
+        // 授权流程的失败提示往往是用户唯一的线索，不能只剩一行顶层文案。
+        //
+        // 用 `transport_error`（带码版）而不是 `describe_transport_error`：同一条文案，
+        // 额外携带 `net.transport.*` 码，前端才能按当前语言重渲染。文本逐字节相同
+        // —— 见 `net::describe_transport_error` 的委托实现。
+        format!(
+            "请求失败: {}",
+            crate::modules::net::transport_error(&e).to_wire()
+        )
+    })?;
 
     let status = response.status().as_u16();
     let body: Value = response
@@ -1343,13 +1473,8 @@ pub async fn login_start_for(variant: TraeVariant) -> Result<Value, String> {
     }
 
     let web_mode = facts.web_device;
-    let authorize_url = build_authorize_url(
-        variant,
-        &facts,
-        port,
-        &trace_id,
-        code_challenge.as_deref(),
-    );
+    let authorize_url =
+        build_authorize_url(variant, &facts, port, &trace_id, code_challenge.as_deref());
     let session_id = login_id.clone();
     // 客户端事实随监听任务一起搬进去：回调到达时要拿**同一份**去填 `DeviceInfo`
     // （`DeviceID` / `MachineID` / `PlatformCode` / 系统信息）。
@@ -1449,11 +1574,7 @@ pub async fn login_start_for(variant: TraeVariant) -> Result<Value, String> {
                     &["你在授权页拒绝了本次登录，可以关闭本页。".to_string()],
                 );
                 let _ = respond_html(&mut stream, &page, &method).await;
-                finish_session(
-                    &session_id,
-                    None,
-                    Some(format!("授权被拒绝: {err}")),
-                );
+                finish_session(&session_id, None, Some(format!("授权被拒绝: {err}")));
                 return;
             }
 
@@ -1468,8 +1589,27 @@ pub async fn login_start_for(variant: TraeVariant) -> Result<Value, String> {
                 continue;
             }
 
-            // CSRF：期望值来自在途会话（无会话时宽容放行）。
-            let expected = (!view.trace_id.is_empty()).then_some(view.trace_id.as_str());
+            // CSRF：期望值就是本次会话的 `trace_id`。
+            //
+            // ★★ 安全审计 P2-13：改造前这里写的是
+            // `(!view.trace_id.is_empty()).then_some(view.trace_id.as_str())`
+            // —— `trace_id` 为空时传 `None`，而 `verify_login_trace` 的语义是
+            // 「无在途会话 ⇒ 宽容放行」⇒ **CSRF 校验会静默失效**。
+            //
+            // 这与 `submit_callback`（下面那个入口）的 `if view.trace_id.is_empty() {
+            // return Err(...) }` 口径相反：同一件事两个入口，一个 fail-closed、
+            // 一个 fail-open。现在统一成 fail-closed。
+            if view.trace_id.is_empty() {
+                let page = result_page(
+                    PageKind::Failure,
+                    "登录失败",
+                    &["登录会话异常，请回到应用重新授权。".to_string()],
+                );
+                let _ = respond_html(&mut stream, &page, &method).await;
+                finish_session(&session_id, None, Some("登录会话缺少 loginTraceID".into()));
+                return;
+            }
+            let expected = Some(view.trace_id.as_str());
             if let Err(error) = verify_login_trace(&params, expected) {
                 let page = result_page(
                     PageKind::Failure,
@@ -1631,20 +1771,45 @@ async fn write_response(
 /// （查询串里带 AuthCode）；不让浏览器留副本。
 fn build_response(content_type: &str, body: &str, method: &str) -> String {
     // 预检请求不要 body，回一组头即可。
-    let (status, body) = if method.eq_ignore_ascii_case("OPTIONS") {
+    let is_preflight = method.eq_ignore_ascii_case("OPTIONS");
+    let (status, body) = if is_preflight {
         ("204 No Content", "")
     } else {
         ("200 OK", body)
+    };
+
+    // ★★ 安全审计 P2-16：**CORS 只给探测响应，不给结果页**。
+    //
+    // 改造前这条 `Access-Control-Allow-Origin: *` 对**两种**响应都生效，
+    // 而结果页里带**账号昵称**（`oauth_result_page::success_page`）⇒ 用户登录成功
+    // 后的那一小段时间里，任意网页都能 `fetch('http://127.0.0.1:17388/authorize')`
+    // 把结果页 HTML 读走。`Cache-Control: no-store` 挡不住 CORS 读取。
+    //
+    // 探测响应必须保留 `*`（理由见 `respond` 的注释：两个区域的授权页都会来探，
+    // 写死一个域会让另一个区域卡在「认证中」）—— 它没有 body、没有个人信息。
+    // 预检（OPTIONS）也保留：预检本身不带任何数据，且浏览器要靠它才能放行探测。
+    let cors = content_type.starts_with("text/plain") || is_preflight;
+    let headers = if cors {
+        "Access-Control-Allow-Origin: *\r\n\
+         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+         Access-Control-Allow-Headers: *\r\n\
+         Access-Control-Max-Age: 600\r\n"
+            .to_string()
+    } else {
+        // 结果页：不给 CORS，另加三道纵深（转义本身已经做对，这些是第二道防线）。
+        "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; \
+         base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n\
+         X-Content-Type-Options: nosniff\r\n\
+         X-Frame-Options: DENY\r\n\
+         Referrer-Policy: no-referrer\r\n"
+            .to_string()
     };
 
     format!(
         "HTTP/1.1 {status}\r\n\
          Content-Type: {content_type}\r\n\
          Cache-Control: no-store\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-         Access-Control-Allow-Headers: *\r\n\
-         Access-Control-Max-Age: 600\r\n\
+         {headers}\
          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
@@ -1658,12 +1823,6 @@ fn build_response(content_type: &str, body: &str, method: &str) -> String {
 /// `src/locales/domains/shell.zh.ts` / `shell.en.ts` 的 `app.name`。
 /// 按 i18n 约定它是**产品名，不译**。
 const APP_DISPLAY_NAME: &str = "Buddy Switch";
-
-/// 结果页里的产品名：**Trae 模块整体**（含 TraeWork 与 Trae 两条产品线）。
-///
-/// 与 `TraeVariant::display_name()`（程序位名：`Trae Work` / `Trae`）不同 ——
-/// 本页要说的是「账号进了哪个产品的库」，而两条产品线**共用同一本国内库**。
-const TRAE_PRODUCT_NAME: &str = "Trae";
 
 /// 成功结果页：账号昵称 + 落库位置（应用 → 产品 → 区域）。
 ///
@@ -1701,8 +1860,11 @@ fn success_page(account_view: &Value, variant: TraeVariant) -> String {
         &[
             format!("账号 [{name}] 登录成功"),
             format!(
-                "账号已添加到 {APP_DISPLAY_NAME} 的 {TRAE_PRODUCT_NAME}（{}）账号库，\
-                 可关闭此页面返回应用。",
+                // ⚠️ 区域名（`TraeRegion::display_name`）现在**就是客户端的产品名**
+                // （`Trae CN` / `Trae`，用户 2026-10-13 定），因此这里**不再**套
+                // 「Trae（…）」—— 那会写成「Trae（Trae CN）」。
+                // 原先那个 `TRAE_PRODUCT_NAME` 常量随之变成冗余，已删除。
+                "账号已添加到 {APP_DISPLAY_NAME} 的 {} 账号库，可关闭此页面返回应用。",
                 variant.region().display_name()
             ),
         ],
@@ -1713,6 +1875,7 @@ fn success_page(account_view: &Value, variant: TraeVariant) -> String {
 ///
 /// - **主路径**：`authCodeInfo.AuthCode` ⇒ `exchange_auth_code` ⇒ 落库；
 /// - **兼容路径**：回调直接给 `refreshToken`（老形态）⇒ 走 refresh 变体链 ⇒ 落库。
+///
 /// `identity` 由 `login_start_for` 在**发起登录时**就取好并随会话带下来：
 /// 授权 URL 的 `device_id`、`DeviceInfo.DeviceID`、`x-device-id` 必须是**同一个值**
 /// （三方同源），回调到达时再取一次就会多出一个可能不一致的来源。
@@ -1723,16 +1886,24 @@ async fn perform_login(
     facts: &ClientFacts,
 ) -> Result<Value, String> {
     let (jwt, refresh_token) = if let Some(auth_code) = callback.auth_code.as_deref() {
-        let (host, used_fallback) = resolve_exchange_host(callback.host.as_deref(), variant);
-        if used_fallback {
-            // 脱敏留痕：只有 host 与变体名，没有凭据。
+        let (host, host_source) = resolve_exchange_host(callback.host.as_deref(), variant);
+        if host_source.used_fallback() {
+            // 脱敏留痕：只有变体名与回落的基址，没有凭据。
+            let why = match host_source {
+                ExchangeHostSource::Missing => "未回传 host",
+                // ★ 安全审计 P2-12：这条曾经是**静默**的 —— 回调给了个不相干的主机，
+                //   我们要么把 authCode POST 过去（旧行为），要么悄悄回落。
+                //   现在必须留痕，否则「登录失败」查不出成因。
+                ExchangeHostSource::Rejected => "回传的 host 不在已知主机内，已拒绝",
+                ExchangeHostSource::Callback => unreachable!("used_fallback 已排除该分支"),
+            };
             store::append_log(
                 &crate::modules::trae::paths::checkin_log_file_for(variant),
                 &format!(
                     // 文案必须跟着 [`resolve_exchange_host`] 的回落值走：它已从
                     // `icube_base` 改为 `account_base`（真机客户端打的就是后者）。
                     // 留旧词会让排障的人去查一台根本没被访问的主机。
-                    "OAuth 回调未回传 host，回落【{}】的 account_base（{host}）",
+                    "OAuth 兑换地址：{why}，回落【{}】的 account_base（{host}）",
                     variant.display_name()
                 ),
             );
@@ -1752,14 +1923,9 @@ async fn perform_login(
         // 「用当前目录的那一条」变成「**无设备凭证**」—— 即从「可能签错名」变成
         // 「连签名都没有」，凭空新增一种失败模式。且那一刻绑定尚未落库，
         // `Some` 拿不到任何比 `None` 更可信的东西。
-        let exchanged = account::exchange_token_for(
-            variant,
-            refresh_token,
-            None,
-            facts.web_device,
-        )
-        .await
-        .map_err(|error| account::refresh_error_message(&error))?;
+        let exchanged = account::exchange_token_for(variant, refresh_token, None, facts.web_device)
+            .await
+            .map_err(|error| account::refresh_error_message(&error))?;
         // 上游没轮换就沿用回调给的那个（绝不写成 None：那会让刚登录的账号
         // 立刻失去自动续期能力）。
         (
@@ -1822,9 +1988,20 @@ async fn perform_login(
     );
 
     // 视图必须走 `account_view` 单点构造（两套形态的转换只允许发生在那儿）。
-    // 刚登录的账号必然无分组、无积分缓存、无冷却，`checkedToday` 也一定是 false，
-    // 故这些都是 `None` / `false`；设备标识用 `device_id` 现算，
-    // `ensure_for` 落盘发生在首次签到或刷新时，这里不提前写。
+    //
+    // ★★ issue #108 §2.2：这里**不能**再把 `cooldown` 硬编码成 `None`。
+    //
+    // 旧注释写的是「刚登录的账号必然无冷却」，这句话是错的：重新登录前若该账号因
+    // 一次 401 被写成 `SessionDead`（`until = 9_999_999_999`），那条记录仍在盘上。
+    // 硬编码 `None` 只让**登录接口这一次返回**假装正常，而页面拿到成功回调后立刻
+    // `loadAll()` 重新读磁盘 ⇒ 陈旧冷却立刻复现，用户看到「刚登录完还是需重新登录」。
+    //
+    // 现在如实读盘并交给 `account_view`：它会用**凭据指纹**（JWT `exp`）比对，
+    // 刚换的新令牌与旧判定不符 ⇒ 该条自动失效 ⇒ 视图正常。凭据没变时仍照旧显示。
+    let cooldown = crate::modules::trae::credits::load_cooldowns_for(variant)
+        .cooldowns
+        .get(&uid)
+        .cloned();
     let device_id = device::derive(&uid).device_id;
     Ok(account::account_view(
         &raw,
@@ -1833,7 +2010,7 @@ async fn perform_login(
         Some(&device_id),
         None,
         None,
-        None,
+        cooldown.as_ref(),
         false,
         None,
         None,
@@ -1851,6 +2028,96 @@ fn finish_session(login_id: &str, result: Option<Value>, error: Option<String>) 
         session.done = true;
         session.result = result;
         session.error = error;
+    }
+}
+
+/// 手工提交回调链接（远程 / 无客户端部署，issue #62）。
+///
+/// ## 为什么需要它
+///
+/// 授权页把回调打到**固定的** `127.0.0.1:17388`。容器部署时用户的浏览器在另一台机器上，
+/// 那条回调永远回不到服务端；端口转发能解决，但不是所有环境都允许。
+/// 于是留一条「把地址栏整串粘回来」的路：后端用**与监听路径完全相同的**
+/// 解析 / CSRF 校验 / 兑换 / 落库函数做完剩下的部分。
+///
+/// ## 语义与监听路径保持一致
+///
+/// - 会话不存在 / 已取消 / 已落定 ⇒ 明确报错（重复兑换会把同一个 AuthCode 用两次，上游必拒）；
+/// - CSRF：`loginTraceID` 必须等于本次会话的 `trace_id`（`verify_login_trace` 同一判据）；
+/// - 设备身份：`ClientFacts::load_for` 现取（**与发起时同源**：都要求客户端 `storage.json`；
+///   没有客户端就是没有私钥，这里必然失败 —— 如实报错，不假装成功）。
+///
+/// 成功后同时通知监听任务收工，让固定端口立刻释放。
+pub async fn submit_callback(login_id: &str, callback_url: &str) -> Result<Value, String> {
+    let view = session_view(login_id);
+    if view.trace_id.is_empty() {
+        return Err("登录请求不存在或已过期".to_string());
+    }
+    if view.cancelled {
+        return Err("本次登录已取消".to_string());
+    }
+    {
+        let sessions = login_sessions().lock().unwrap();
+        if let Some(session) = sessions.get(login_id) {
+            if session.done {
+                return Err("本次登录已结束，请重新发起".to_string());
+            }
+        }
+    }
+
+    // 允许两种粘贴形态：整串 `http://127.0.0.1:17388/authorize?…`，或只有 `?a=b&…`。
+    let trimmed = callback_url.trim();
+    if trimmed.is_empty() {
+        return Err("回调链接为空".to_string());
+    }
+    let query = trimmed
+        .split_once('?')
+        .map(|(_, rest)| rest)
+        .unwrap_or(trimmed);
+    let params = parse_query(query);
+    if params.is_empty() {
+        return Err("回调链接里没有参数（应包含 authCodeInfo 或 refreshToken）".to_string());
+    }
+
+    // 用户点了「拒绝授权」：区分出来，别报成「凭据缺失」。
+    if let Some(error) = params.get("error").filter(|value| !value.trim().is_empty()) {
+        let message = format!("授权被拒绝: {error}");
+        finish_session(login_id, None, Some(message.clone()));
+        stop_listener(login_id);
+        return Err(message);
+    }
+
+    verify_login_trace(&params, Some(view.trace_id.as_str()))
+        .map_err(|error| classify_error("csrf", &error))?;
+    let callback = parse_callback(&params)?;
+    if callback.auth_code.is_none() && callback.refresh_token.is_none() {
+        return Err(classify_error(
+            "callback",
+            "回调带了参数，但既无 AuthCode 也无 refreshToken",
+        ));
+    }
+
+    let facts = ClientFacts::load_for(view.variant)
+        .map_err(|error| classify_error("credential", &error))?;
+    match perform_login(view.variant, &callback, &view.pkce_verifier, &facts).await {
+        Ok(account_view) => {
+            finish_session(login_id, Some(account_view.clone()), None);
+            stop_listener(login_id);
+            Ok(account_view)
+        }
+        Err(error) => {
+            finish_session(login_id, None, Some(error.clone()));
+            stop_listener(login_id);
+            Err(error)
+        }
+    }
+}
+
+/// 让监听任务立刻收工（释放固定端口），而不是干等到超时。
+fn stop_listener(login_id: &str) {
+    if let Some(session) = login_sessions().lock().unwrap().get(login_id) {
+        // `notify_one`（不是 `notify_waiters`）：取消可能发生在任务开始 await 之前。
+        session.cancel.notify_one();
     }
 }
 
@@ -1925,10 +2192,26 @@ pub fn login_cancel(login_id: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    // 测试串行锁（`lock_*()`）会被**故意**持有到用例结束：它防的是多个用例同时抢占
+    // 同一个回调端口 / 全局状态。`#[tokio::test]` 默认是 current-thread 运行时，
+    // 不存在「持锁跨线程唤醒」的风险；clippy 的 await_holding_lock 在这里是误报。
+    #![allow(clippy::await_holding_lock)]
     use super::*;
     use crate::modules::trae::test_support::TempEnv;
 
     /// 造一个合成的 [`DeviceIdentity`]（无私钥字段，AuthCode 路径唯一需要的结构）。
+    /// 造一条**真实存在的**假客户端 exe（内容任意），供「自定义路径」用。
+    ///
+    /// 为什么需要它：`data_dir_missing_reason` 的文案分两支（装了但没启动过 / 根本没装），
+    /// 只有前者带「设备凭证」三个字。不钉住这一支，用例就会随**真机装没装 TraeWork**
+    /// 而时绿时红 —— 这条用例此前就栽在这上面。
+    fn fake_client_exe() -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("fake-trae-{}.exe", uuid::Uuid::new_v4().simple()));
+        std::fs::write(&path, b"fake").expect("假 exe 应能写入");
+        path
+    }
+
     fn synthetic_identity() -> DeviceIdentity {
         DeviceIdentity {
             variant: TraeVariant::TraeWork,
@@ -1938,6 +2221,77 @@ mod tests {
             public_key_pem: "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEc5xtFi4XpzYjFuYwN0sBaUzcnrds\n8NWA0zU4mSNC+HoBUNCM5VD4K2SvzuZ8JJjSUdDLpFmR+zYL3aAy7EtDQQ==\n-----END PUBLIC KEY-----".into(),
             source_app: "TRAE SOLO CN".into(),
         }
+    }
+
+    /// 手工提交回调（issue #62）：**没有会话就不兑换**。
+    ///
+    /// 这条护栏防的是「用户重启应用后，把上一个进程的回调链接贴进来」：
+    /// 没有 `pkce_verifier` 与 `trace_id` 就兑换不出 token，直接说清比静默失败好。
+    #[tokio::test]
+    async fn submit_callback_rejects_unknown_login_id() {
+        let error = submit_callback(
+            "trae_never_inserted",
+            "http://127.0.0.1:17388/authorize?code=x",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.contains("不存在") || error.contains("过期"),
+            "未知会话应明说已过期: {error}"
+        );
+    }
+
+    /// 会话存在但链接是空的 ⇒ 报「空」而不是去兑换。
+    ///
+    /// 会话由本用例自己插入（不绑端口）：本用例只校验**入参**前的那几道判定，
+    /// 不触发网络与设备凭证读取。
+    #[tokio::test]
+    async fn submit_callback_rejects_blank_url() {
+        let login_id = format!("trae_test_{}", uuid::Uuid::new_v4().simple());
+        {
+            let mut sessions = login_sessions().lock().unwrap();
+            sessions.insert(
+                login_id.clone(),
+                LoginSession {
+                    variant: TraeVariant::default(),
+                    trace_id: "trace-1".into(),
+                    pkce_verifier: "verifier-1".into(),
+                    ..Default::default()
+                },
+            );
+        }
+        let error = submit_callback(&login_id, "   ").await.unwrap_err();
+        assert!(error.contains("为空"), "空链接应点明是空的: {error}");
+
+        // 清理：不留残留会话（本仓测试共享全局表）。
+        login_sessions().lock().unwrap().remove(&login_id);
+    }
+
+    /// CSRF：回调里的 `loginTraceID` 与会话的 `trace_id` 不一致 ⇒ 拒。
+    ///
+    /// 这是**安全护栏**，不是体验问题：没有它，别人可以把自己的 AuthCode 塞进你的会话。
+    #[tokio::test]
+    async fn submit_callback_rejects_csrf_mismatch() {
+        let login_id = format!("trae_test_{}", uuid::Uuid::new_v4().simple());
+        {
+            let mut sessions = login_sessions().lock().unwrap();
+            sessions.insert(
+                login_id.clone(),
+                LoginSession {
+                    variant: TraeVariant::default(),
+                    trace_id: "expected-trace".into(),
+                    pkce_verifier: "verifier-1".into(),
+                    ..Default::default()
+                },
+            );
+        }
+        let url = "http://127.0.0.1:17388/authorize?authCodeInfo=%7B%22AuthCode%22%3A%22ac-1%22%7D&loginTraceID=other-trace";
+        let error = submit_callback(&login_id, url).await.unwrap_err();
+        assert!(
+            !error.is_empty(),
+            "CSRF 不匹配必须有明确错误（而不是继续兑换）"
+        );
+        login_sessions().lock().unwrap().remove(&login_id);
     }
 
     /// 造一个指定 `device_id` 的合成身份（授权 URL / 同源护栏用）。
@@ -1954,7 +2308,11 @@ mod tests {
     /// 而不是「本机现在是什么」。读本机会让用例随机器漂，也无法钉住取值来源。
     /// 固定值逐字取自 2026-09-24 真机抓到的客户端原文（`TRAE SOLO CN`）。
     fn synthetic_facts(identity: DeviceIdentity, web_device: bool) -> ClientFacts {
+        // ★ 产品线由**变体**派生（与 `load_for` / `from_identity` 同一条规则），
+        //   写死会让「PlatformCode 与 client_id 配错线」这类缺陷测不出来。
+        let line = identity.variant.oauth_line();
         ClientFacts {
+            line,
             identity,
             meta: ClientInstallMeta {
                 app_version: "0.1.69".into(),
@@ -1988,7 +2346,10 @@ mod tests {
     #[test]
     fn parse_query_handles_flat_params() {
         let params = parse_query("refreshToken=abc123&userInfo={\"nickname\":\"x\"}");
-        assert_eq!(params.get("refreshToken").map(String::as_str), Some("abc123"));
+        assert_eq!(
+            params.get("refreshToken").map(String::as_str),
+            Some("abc123")
+        );
     }
 
     #[test]
@@ -1997,7 +2358,10 @@ mod tests {
         // 参数名不受影响；切分发生在**解码之前**，所以值里的 `&` 不会被误切成新参数。
         let encoded = "refreshToken%3Dtok%2526x%3D1&userInfo=%7B%22nickname%22%3A%22y%22%7D";
         let params = parse_query(encoded);
-        assert_eq!(params.get("refreshToken").map(String::as_str), Some("tok&x=1"));
+        assert_eq!(
+            params.get("refreshToken").map(String::as_str),
+            Some("tok&x=1")
+        );
         assert_eq!(
             params.get("userInfo").map(String::as_str),
             Some(r#"{"nickname":"y"}"#)
@@ -2044,7 +2408,9 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("userInfo".into(), r#"{"nickname":"小明"}"#.into());
         assert_eq!(
-            extract_user_info(&params).get("nickname").and_then(|v| v.as_str()),
+            extract_user_info(&params)
+                .get("nickname")
+                .and_then(|v| v.as_str()),
             Some("小明")
         );
     }
@@ -2055,7 +2421,8 @@ mod tests {
         let mut params = HashMap::new();
         params.insert(
             "userJwt".into(),
-            r#"{"Token":"cloud-ide-jwt-x","RefreshToken":"rt-web","TokenExpireAt":1786847930141}"#.into(),
+            r#"{"Token":"cloud-ide-jwt-x","RefreshToken":"rt-web","TokenExpireAt":1786847930141}"#
+                .into(),
         );
         let info = parse_callback(&params).expect("userJwt 回调应可解析");
         assert_eq!(
@@ -2094,7 +2461,10 @@ mod tests {
         assert_eq!(info.user_jwt_expires_at, None);
 
         let mut params = HashMap::new();
-        params.insert("userJwt".into(), r#"{"Token":"t","TokenExpireAt":"not-a-number"}"#.into());
+        params.insert(
+            "userJwt".into(),
+            r#"{"Token":"t","TokenExpireAt":"not-a-number"}"#.into(),
+        );
         assert_eq!(parse_callback(&params).unwrap().user_jwt_expires_at, None);
     }
 
@@ -2141,12 +2511,23 @@ mod tests {
         let facts = synthetic_facts(identity.clone(), false);
 
         // (变体, auth_from, client_id, 是否带 hide_saas_login)
-        let cases: [(TraeVariant, &str, &str, bool); 3] = [
+        let cases: [(TraeVariant, &str, &str, bool); 5] = [
             // TRAE / IDE 线：与抓包固化值逐字一致（**零行为变化**的回归护栏）。
             (TraeVariant::Trae, "trae", "ono9krqynydwx5", false),
             // SOLO 线：CN 与 国际版**同属 SOLO 线**（`packageType` 都是 SOLO_*）。
             (TraeVariant::TraeWork, "solo", "en1oxy7wnw8j9n", true),
             (TraeVariant::Global, "solo", "en1oxy7wnw8j9n", true),
+            // ★ 两个区域**真正在用的客户端**（合并版 `Trae CN` / `Trae`，`packageType`
+            //   `TRAE_CN` / `TRAE_I18N`）走 TRAE 线。曾经的缺陷是区域标识被解析成
+            //   `Global`（TraeWork）⇒ 国际版登录打开 TraeWork 授权页，页面报
+            //   `TraeWork is currently not available in your region`（用户报障原文）。
+            (TraeVariant::TraeMerged, "trae", "ono9krqynydwx5", false),
+            (
+                TraeVariant::GlobalTraeMerged,
+                "trae",
+                "ono9krqynydwx5",
+                false,
+            ),
         ];
 
         for (variant, auth_from, client_id, hide_saas) in cases {
@@ -2232,13 +2613,64 @@ mod tests {
         }
     }
 
+    /// ★★ 回归护栏：前端只传**区域**（`cn` / `global`），授权 URL 必须落在本区域
+    /// **真正在用的客户端**那条产品线上。
+    ///
+    /// 缺陷形态（2026-10-20 用户报障）：`global` 被 `TraeVariant::parse` 认成
+    /// 国际版 TraeWork（`SOLO_I18N`）⇒ URL 带 `auth_from=solo` + `hide_saas_login=true`
+    /// ⇒ 浏览器打开 **TraeWork 授权页**，页面直接回
+    /// `TraeWork is currently not available in your region`。
+    /// 用户要授权的国际版 Trae（`Trae.exe`，`TRAE_I18N`）本身是可用的。
+    ///
+    /// 本用例把「区域标识 → 变体 → 授权页产品线/域」三段钉在一起：
+    /// 只改其中一段（例如又有人把 `parse_variant_id` 简化回 `TraeVariant::parse`）就会红。
+    #[test]
+    fn region_param_authorizes_the_regions_real_client() {
+        let facts = synthetic_facts(identity_with_device_id("dev"), false);
+        let cases = [
+            ("cn", TraeVariant::TraeMerged, "https://www.trae.cn"),
+            (
+                "global",
+                TraeVariant::GlobalTraeMerged,
+                "https://www.trae.ai",
+            ),
+        ];
+        for (raw, expected_variant, expected_console) in cases {
+            let variant = crate::modules::trae::handlers::parse_variant_id(Some(raw));
+            assert_eq!(
+                variant, expected_variant,
+                "区域标识 {raw} 必须解析到本区域的合并版客户端"
+            );
+
+            let url = build_authorize_url(variant, &facts, 12345, "trace-1", Some("challenge-1"));
+            let (base, query) = url.split_once('?').expect("授权 URL 必须带查询串");
+            assert_eq!(base, format!("{expected_console}{AUTHORIZE_PATH}"));
+            let params = parse_query(query);
+            // TRAE / IDE 线才是两个区域合并版的真实产品线。
+            assert_eq!(params.get("auth_from").map(String::as_str), Some("trae"));
+            assert_eq!(
+                params.get("client_id").map(String::as_str),
+                Some("ono9krqynydwx5")
+            );
+            // SOLO 线专属的从属参数不得出现：带上它就等于又走回 TraeWork 流程。
+            assert!(
+                !url.contains("hide_saas_login"),
+                "{raw} 不该带 hide_saas_login（那是 solo/TraeWork 专属）: {url}"
+            );
+        }
+    }
+
     /// ★★ 交换请求体的 `ClientID` 必须与授权 URL 用的**同一把钥匙**。
     ///
     /// 两处若各取各的（一处按产品线、一处写死），等于拿 A 线的钥匙去兑 B 线签发的
     /// AuthCode —— 上游只会拒绝，且错误信息不会指向这个根因。
     #[test]
     fn exchange_client_id_matches_authorize_url_key() {
-        for variant in [TraeVariant::TraeWork, TraeVariant::Trae, TraeVariant::Global] {
+        for variant in [
+            TraeVariant::TraeWork,
+            TraeVariant::Trae,
+            TraeVariant::Global,
+        ] {
             let url = build_authorize_url(
                 variant,
                 &synthetic_facts(synthetic_identity(), false),
@@ -2266,7 +2698,13 @@ mod tests {
     #[test]
     fn authorize_url_splits_by_the_right_axis() {
         let url_of = |variant| {
-            build_authorize_url(variant, &synthetic_facts(synthetic_identity(), false), 1, "t", Some("c"))
+            build_authorize_url(
+                variant,
+                &synthetic_facts(synthetic_identity(), false),
+                1,
+                "t",
+                Some("c"),
+            )
         };
         let key_of = |variant| {
             let url = url_of(variant);
@@ -2440,7 +2878,11 @@ mod tests {
     /// **任一对改回「两处各取一份」都会立刻变红**，失败信息直接给出两侧的值。
     #[test]
     fn authorize_url_and_exchange_body_share_the_same_device_facts() {
-        for variant in [TraeVariant::TraeWork, TraeVariant::Trae, TraeVariant::Global] {
+        for variant in [
+            TraeVariant::TraeWork,
+            TraeVariant::Trae,
+            TraeVariant::Global,
+        ] {
             let facts = synthetic_facts(identity_with_device_id("dev-same-source"), false);
             let url = build_authorize_url(variant, &facts, 17388, "trace-1", Some("chal-1"));
             let params = parse_query(url.split_once('?').expect("授权 URL 必须带查询串").1);
@@ -2469,17 +2911,45 @@ mod tests {
             };
 
             // ① 机器标识：`machine_id` / `x_machine_id` ↔ `DeviceInfo.MachineID`
-            assert_eq!(param("machine_id"), field("MachineID"), "{variant:?} 的 machine_id 与 MachineID 不同源");
-            assert_eq!(param("x_machine_id"), field("MachineID"), "{variant:?} 的 x_machine_id 与 MachineID 不同源");
+            assert_eq!(
+                param("machine_id"),
+                field("MachineID"),
+                "{variant:?} 的 machine_id 与 MachineID 不同源"
+            );
+            assert_eq!(
+                param("x_machine_id"),
+                field("MachineID"),
+                "{variant:?} 的 x_machine_id 与 MachineID 不同源"
+            );
             // ② 应用版本：`x_app_version` ↔ `ClientVersion` ↔ `IDEVersion`
-            assert_eq!(param("x_app_version"), field("ClientVersion"), "{variant:?} 的 x_app_version 与 ClientVersion 不同源");
-            assert_eq!(param("x_app_version"), top("IDEVersion"), "{variant:?} 的 x_app_version 与 IDEVersion 不同源");
+            assert_eq!(
+                param("x_app_version"),
+                field("ClientVersion"),
+                "{variant:?} 的 x_app_version 与 ClientVersion 不同源"
+            );
+            assert_eq!(
+                param("x_app_version"),
+                top("IDEVersion"),
+                "{variant:?} 的 x_app_version 与 IDEVersion 不同源"
+            );
             // ③ 设备型号：`x_device_brand` ↔ `DeviceInfo.DeviceModel`
-            assert_eq!(param("x_device_brand"), field("DeviceModel"), "{variant:?} 的 x_device_brand 与 DeviceModel 不同源");
+            assert_eq!(
+                param("x_device_brand"),
+                field("DeviceModel"),
+                "{variant:?} 的 x_device_brand 与 DeviceModel 不同源"
+            );
             // ④ 系统版本：`x_os_version` ↔ `DeviceInfo.OSVersion`
-            assert_eq!(param("x_os_version"), field("OSVersion"), "{variant:?} 的 x_os_version 与 OSVersion 不同源");
+            assert_eq!(
+                param("x_os_version"),
+                field("OSVersion"),
+                "{variant:?} 的 x_os_version 与 OSVersion 不同源"
+            );
             // ⑤ 操作系统名：`x_device_type` ↔ `DeviceInfo.OSInfo`
-            assert_eq!(param("x_device_type"), field("OSInfo"), "{variant:?} 的 x_device_type 与 OSInfo 不同源");
+            assert_eq!(
+                param("x_device_type"),
+                field("OSInfo"),
+                "{variant:?} 的 x_device_type 与 OSInfo 不同源"
+            );
         }
     }
 
@@ -2666,7 +3136,10 @@ mod tests {
             payload.get("IDEVersion").and_then(|v| v.as_str()),
             Some("0.1.69")
         );
-        assert_eq!(payload.get("AuthCode").and_then(|v| v.as_str()), Some("ac-1"));
+        assert_eq!(
+            payload.get("AuthCode").and_then(|v| v.as_str()),
+            Some("ac-1")
+        );
         assert_eq!(
             payload.get("CodeVerifier").and_then(|v| v.as_str()),
             Some("verifier-1")
@@ -2734,7 +3207,9 @@ mod tests {
             );
             assert!(payload.get("DeviceProof").is_none());
             assert!(payload.get("DeviceInfo").is_none());
-            assert!(!serde_json::to_string(&payload).unwrap().contains("PUBLIC KEY"));
+            assert!(!serde_json::to_string(&payload)
+                .unwrap()
+                .contains("PUBLIC KEY"));
         }
     }
 
@@ -2755,24 +3230,87 @@ mod tests {
     #[test]
     fn resolve_exchange_host_falls_back_to_variant_account_base() {
         // 正常：原样使用（只去尾斜杠）。
-        let (host, used) = resolve_exchange_host(Some("https://api.trae.cn"), TraeVariant::TraeWork);
+        let (host, source) =
+            resolve_exchange_host(Some("https://api.trae.cn"), TraeVariant::TraeWork);
         assert_eq!(host, "https://api.trae.cn");
-        assert!(!used);
-        let (host, used) = resolve_exchange_host(Some("  https://api.trae.cn/  "), TraeVariant::TraeWork);
+        assert_eq!(source, ExchangeHostSource::Callback);
+        let (host, source) =
+            resolve_exchange_host(Some("  https://api.trae.cn/  "), TraeVariant::TraeWork);
         assert_eq!(host, "https://api.trae.cn");
-        assert!(!used);
+        assert_eq!(source, ExchangeHostSource::Callback);
         // 缺失 / 空串：回落该变体的 **account_base**（真机客户端兑换打的就是它，
         // 见 `resolve_exchange_host` 的说明）。曾经回落成 `icube_base`（另一台主机）。
         for missing in [None, Some(""), Some("   ")] {
-            let (host, used) = resolve_exchange_host(missing, TraeVariant::Global);
+            let (host, source) = resolve_exchange_host(missing, TraeVariant::Global);
             assert_eq!(host, "https://grow-normal.trae.ai");
-            assert!(used, "回落必须被标记，以便留痕");
+            assert_eq!(
+                source,
+                ExchangeHostSource::Missing,
+                "回落必须被标记，以便留痕"
+            );
+            assert!(source.used_fallback());
         }
         // 阳性对照：CN 侧的 account_base 与 icube_base **不是**同一个值，
         // 否则本用例根本分不出「回落到哪一台主机」。
         let (cn, _) = resolve_exchange_host(None, TraeVariant::TraeWork);
         assert_eq!(cn, "https://api.trae.cn");
         assert_ne!(cn, endpoints_for(TraeVariant::TraeWork).icube_base);
+    }
+
+    /// ★★ 安全审计 P2-12：**回调里的 `host` 不能把 `authCode` + PKCE verifier
+    /// 送到任意地址**。
+    ///
+    /// 改造前 `Some(host) => (host.to_string(), false)` 无条件采信 —— 而 `host` 来自
+    /// 回调 URL 的查询串（浏览器可控 / 用户能粘贴），于是构成无条件 SSRF，
+    /// 且本次登录的 `code_verifier` 会跟着 POST 到攻击者的机器上。
+    ///
+    /// 变异验证：把 `is_known_exchange_host` 判据删掉 ⇒ 第一条断言立刻红。
+    #[test]
+    fn exchange_host_must_be_one_of_the_variants_known_hosts() {
+        for evil in [
+            "https://attacker.example",
+            "http://169.254.169.254",               // 云元数据地址
+            "https://api.trae.cn.attacker.example", // 后缀伪装
+            "https://10.0.0.5:8080",                // 私网地址：本机之外的一台机器
+            "http://api.trae.cn@attacker.example",  // userinfo 伪装
+        ] {
+            let (host, source) = resolve_exchange_host(Some(evil), TraeVariant::TraeWork);
+            assert_eq!(
+                host, "https://api.trae.cn",
+                "不可信 host 必须回落到本变体的 account_base：{evil}"
+            );
+            assert_eq!(
+                source,
+                ExchangeHostSource::Rejected,
+                "必须标记为「拒绝」而不是「没给」，否则留痕会写错原因：{evil}"
+            );
+            assert!(source.used_fallback(), "拒绝必须留痕");
+        }
+
+        // 反向对照：本变体自己的四个域**都要放行**（这道校验不该误杀上游兄弟域）。
+        let endpoints = endpoints_for(TraeVariant::TraeWork);
+        for known in [
+            endpoints.account_base,
+            endpoints.icube_base,
+            endpoints.agent_host,
+            endpoints.console_base,
+        ] {
+            let (host, source) = resolve_exchange_host(Some(known), TraeVariant::TraeWork);
+            assert_eq!(source, ExchangeHostSource::Callback, "{known} 应当被放行");
+            assert_eq!(host, known.trim_end_matches('/'));
+        }
+
+        // 大小写与尾斜杠不影响判定（回调里两种写法都见过）。
+        let (_, source) =
+            resolve_exchange_host(Some("HTTPS://API.TRAE.CN/"), TraeVariant::TraeWork);
+        assert_eq!(source, ExchangeHostSource::Callback);
+
+        // 回环单独放行：本仓的回调联调 / 自建反代跑在 `127.0.0.1:<port>` 上，
+        // 而本机进程与用户同权限，挡它没有意义（真正要挡的是「发到外部」）。
+        for local in ["http://127.0.0.1:17388", "http://localhost:8080"] {
+            let (_, source) = resolve_exchange_host(Some(local), TraeVariant::TraeWork);
+            assert_eq!(source, ExchangeHostSource::Callback, "{local} 应当放行");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2934,7 +3472,7 @@ mod tests {
         )
         .expect("Trae Work 账号应能落库");
         account::login_with_exchanged_tokens_for(
-            TraeVariant::Global,
+            TraeVariant::GlobalTraeMerged,
             make_jwt("cn-user"),
             None,
             Some("CN".to_string()),
@@ -2944,12 +3482,16 @@ mod tests {
         .expect("Trae CN 账号应能落库");
 
         let login_id = "test-status-variant";
-        insert_finished_session(login_id, TraeVariant::Global, json!({"userId": "cn-user"}));
+        insert_finished_session(
+            login_id,
+            TraeVariant::GlobalTraeMerged,
+            json!({"userId": "cn-user"}),
+        );
 
         let value = crate::modules::trae::handlers::oauth_login_status(login_id);
         assert_eq!(
             value.get("variant").and_then(Value::as_str),
-            Some("global")
+            Some("global_trae_merged")
         );
         let accounts = value
             .get("accounts")
@@ -2972,11 +3514,13 @@ mod tests {
         let _gate = lock_the_callback_port();
         let _env = temp_env();
 
-        let started = crate::modules::trae::handlers::oauth_login_start_for(TraeVariant::Global)
-            .await
-            .expect("发起登录不应失败");
-        assert_eq!(started["variant"].as_str(), Some("global"));
-        assert_eq!(started["variantLabel"].as_str(), Some("国际版"));
+        // ★ issue #28：国际区的**唯一**程序位是合并版（`global_trae_merged`）。
+        let started =
+            crate::modules::trae::handlers::oauth_login_start_for(TraeVariant::GlobalTraeMerged)
+                .await
+                .expect("发起登录不应失败");
+        assert_eq!(started["variant"].as_str(), Some("global_trae_merged"));
+        assert_eq!(started["variantLabel"].as_str(), Some("Trae"));
         // 授权 URL 的 `device_id` 必须与**该变体**的 icube 设备身份同源
         // （fixture 里两条产品线的候选目录给了不同 deviceId ⇒ 读错变体会露馅）。
         //
@@ -2988,7 +3532,7 @@ mod tests {
             .get("device_id")
             .cloned()
             .expect("授权 URL 必须带 device_id");
-        match icube::device_identity_for(TraeVariant::Global) {
+        match icube::device_identity_for(TraeVariant::GlobalTraeMerged) {
             Ok(identity) => {
                 // 身份可读（Windows fixture 命中）：device_id 必须与 fixture 同源。
                 assert_eq!(
@@ -3021,12 +3565,18 @@ mod tests {
     #[tokio::test]
     async fn login_start_falls_back_to_web_mode_when_device_identity_missing() {
         let _gate = lock_the_callback_port();
-        let _env = temp_env();
-        // 把该变体的候选目录全部删掉 ⇒ 模拟「客户端没启动过 / 没登录过」。
-        let appdata = std::env::var_os("APPDATA").expect("temp_env 应已设置 APPDATA");
-        for name in crate::modules::trae::platform::data_dir_names_for(TraeVariant::TraeWork) {
-            let _ = std::fs::remove_dir_all(std::path::PathBuf::from(&appdata).join(name));
-        }
+        let _env = TempEnv::empty();
+        // ★★ 判据必须**与真机状态无关**（issue #28 前这条用例依赖真机恰好没装
+        //   TraeWork，否则文案会走「已检测到客户端但从未启动过」那一支而 flaky）。
+        //   这里显式给该区域配一条**指向真实存在的假 exe** 的自定义路径，
+        //   于是 `detect_install_for` 必然命中，`data_dir_missing_reason` 必然走
+        //   「装了但从没启动过」那一支 —— 文案里就有「设备凭证」三个字。
+        let mut settings = crate::modules::trae::settings::load();
+        settings.set_path_for(
+            TraeVariant::TraeMerged.region(),
+            Some(&fake_client_exe().to_string_lossy()),
+        );
+        crate::modules::trae::settings::save(&settings).expect("自定义客户端路径应能落盘");
 
         let started = login_start_for(TraeVariant::TraeWork)
             .await
@@ -3045,12 +3595,22 @@ mod tests {
             "诊断仍要如实反映本机无客户端凭证"
         );
 
-        let login_id = started.get("loginId").and_then(|v| v.as_str()).unwrap().to_string();
+        let login_id = started
+            .get("loginId")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
         // 授权 URL 仍带一个 32 位 hex（本次登录同源的合成 device_id）。
-        let uri = started.get("verificationUri").and_then(|v| v.as_str()).unwrap();
+        let uri = started
+            .get("verificationUri")
+            .and_then(|v| v.as_str())
+            .unwrap();
         let params = parse_query(uri.split_once('?').unwrap().1);
         assert_eq!(
-            params.get("device_id").map(String::as_str).map(|id| id.len()),
+            params
+                .get("device_id")
+                .map(String::as_str)
+                .map(|id| id.len()),
             Some(32),
             "合成 device_id 应为 32 位 hex"
         );
@@ -3081,14 +3641,11 @@ mod tests {
         // 第一次轮询：终态 + 明确文案
         let first = login_poll(id);
         assert_eq!(first.get("done").and_then(|v| v.as_bool()), Some(true));
-        assert_eq!(
-            first.get("error").and_then(|v| v.as_str()),
-            Some("已取消")
-        );
+        assert_eq!(first.get("error").and_then(|v| v.as_str()), Some("已取消"));
         // 终态分支也要带出 variant。
         assert_eq!(
             first.get("variant").and_then(|v| v.as_str()),
-            Some("trae_work")
+            Some("trae_merged")
         );
 
         // 终态会被摘除，再轮询就是「不存在」——这正是前端停止轮询后的正常收尾路径。
@@ -3187,12 +3744,12 @@ mod tests {
         // 新增契约：变体、PKCE、CSRF 必须出现在响应 / 授权 URL 里。
         assert_eq!(
             started.get("variant").and_then(|v| v.as_str()),
-            Some("trae_work"),
-            "默认变体必须是 trae_work"
+            Some("trae_merged"),
+            "★ issue #28：默认变体是**合并版**（老默认 `trae_work` 指向已卸载的客户端）"
         );
         assert_eq!(
             started.get("variantLabel").and_then(|v| v.as_str()),
-            Some("Trae Work")
+            Some("Trae CN")
         );
         let params = parse_query(uri.split_once('?').unwrap().1);
         let web_mode = started
@@ -3226,10 +3783,13 @@ mod tests {
         // 刚发起时还没结果。
         let polled = login_poll(&login_id);
         assert_eq!(polled.get("done").and_then(|v| v.as_bool()), Some(false));
-        assert_eq!(polled.get("port").and_then(|v| v.as_u64()), Some(port as u64));
+        assert_eq!(
+            polled.get("port").and_then(|v| v.as_u64()),
+            Some(port as u64)
+        );
         assert_eq!(
             polled.get("variant").and_then(|v| v.as_str()),
-            Some("trae_work")
+            Some("trae_merged")
         );
 
         // 收尾，避免把监听任务留给后续用例。
@@ -3241,7 +3801,7 @@ mod tests {
     async fn login_start_response_carries_variant_and_device_credential_diagnostics() {
         let _gate = lock_the_callback_port();
         let _env = temp_env();
-        let started = login_start_for(TraeVariant::Global)
+        let started = login_start_for(TraeVariant::GlobalTraeMerged)
             .await
             .expect("发起登录不应失败");
         let login_id = started
@@ -3252,15 +3812,13 @@ mod tests {
 
         assert_eq!(
             started.get("variant").and_then(|v| v.as_str()),
-            Some("global")
+            Some("global_trae_merged")
         );
         assert_eq!(
             started.get("variantLabel").and_then(|v| v.as_str()),
-            Some("国际版")
+            Some("Trae")
         );
-        let credential = started
-            .get("deviceCredential")
-            .expect("必须带设备凭证诊断");
+        let credential = started.get("deviceCredential").expect("必须带设备凭证诊断");
         for key in [
             "available",
             "sourceApp",
@@ -3279,7 +3837,10 @@ mod tests {
         assert!(!text.contains("BEGIN"), "发起响应里出现了 PEM");
         assert!(!text.contains("PRIVATE KEY"), "发起响应里出现了私钥");
         // 授权 URL 里的 machine_id / device_id 与身份 A 同源。
-        let uri = started.get("verificationUri").and_then(|v| v.as_str()).unwrap();
+        let uri = started
+            .get("verificationUri")
+            .and_then(|v| v.as_str())
+            .unwrap();
         let params = parse_query(uri.split_once('?').unwrap().1);
         assert_eq!(
             params.get("device_id"),
@@ -3322,13 +3883,13 @@ mod tests {
             .await
             .expect("写出探测请求不应失败");
         let mut response = String::new();
-        let _ = tokio::time::timeout(
-            Duration::from_secs(3),
-            stream.read_to_string(&mut response),
-        )
-        .await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), stream.read_to_string(&mut response))
+            .await;
 
-        assert!(response.starts_with("HTTP/1.1 200"), "探测必须收到 200: {response}");
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "探测必须收到 200: {response}"
+        );
         // 跨源探测没有 CORS 头会被浏览器拦掉响应，授权页照样判「不在线」。
         assert!(
             response
@@ -3377,11 +3938,8 @@ mod tests {
             .await
             .expect("写出预检请求不应失败");
         let mut response = String::new();
-        let _ = tokio::time::timeout(
-            Duration::from_secs(3),
-            stream.read_to_string(&mut response),
-        )
-        .await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), stream.read_to_string(&mut response))
+            .await;
 
         assert!(
             response.starts_with("HTTP/1.1 204"),
@@ -3451,7 +4009,9 @@ mod tests {
                         }
                     }
                 }
-                sink.lock().unwrap().push(String::from_utf8_lossy(&buf).into_owned());
+                sink.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf).into_owned());
                 let response = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
                      content-length: {}\r\nconnection: close\r\n\r\n{}",
@@ -3510,7 +4070,10 @@ mod tests {
         // 请求体是 AuthCode 主变体（有 DeviceInfo、无 DeviceProof）。
         assert!(request.contains("\"DeviceInfo\""), "{request}");
         assert!(!request.contains("\"DeviceProof\""), "{request}");
-        assert!(request.contains("\"CodeVerifier\":\"verifier-1\""), "{request}");
+        assert!(
+            request.contains("\"CodeVerifier\":\"verifier-1\""),
+            "{request}"
+        );
 
         // ★ 三方同源（T4 验收 1b）：`DeviceInfo.DeviceID` 与请求头 `x-device-id`
         // 都必须等于授权 URL 用的那个 `identity.device_id`。
@@ -3545,7 +4108,7 @@ mod tests {
         let body = json!({"Result": {"Token": jwt, "RefreshToken": "rt-1"}}).to_string();
         let (mock_port, _captured) = mock_upstream(2, body).await;
 
-        let started = login_start_for(TraeVariant::TraeWork)
+        let started = login_start_for(TraeVariant::TraeMerged)
             .await
             .expect("发起登录不应失败");
         let login_id = started["loginId"].as_str().unwrap().to_string();
@@ -3567,11 +4130,8 @@ mod tests {
             .expect("应能连上回调端口");
         stream.write_all(request.as_bytes()).await.unwrap();
         let mut response = String::new();
-        let _ = tokio::time::timeout(
-            Duration::from_secs(5),
-            stream.read_to_string(&mut response),
-        )
-        .await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), stream.read_to_string(&mut response))
+            .await;
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
 
         // ★ 浏览器那一页必须是**渲染得出来的结果卡片**，而不是纯文本。
@@ -3584,15 +4144,16 @@ mod tests {
         assert!(response.contains("<!DOCTYPE html>"), "{response}");
         assert!(response.contains("登录成功"), "{response}");
         // 落库区域必须写在页面上（持久化轴是区域，不是程序名）。
+        // ⚠️ 区域名现在是**客户端产品名**（`Trae CN`，2026-10-13 用户定）⇒
+        // 它与合并版程序位同名，本断言因此**无法**再区分「区域」与「合并版程序位」；
+        // 但「页面点明了落库区域」这件事仍然被钉住（后端文案由
+        // `TraeRegion::display_name` 唯一提供，漂了这里会红）。
         assert!(
-            response.contains("国内版"),
+            response.contains("Trae CN"),
             "结果页必须点明账号落在哪个区域库: {response}"
         );
         // ★ 结果页**不得**出现凭据（本链路不变式：回调响应体不含凭据）。
-        assert!(
-            !response.contains(&jwt),
-            "回调响应体泄漏了 JWT: {response}"
-        );
+        assert!(!response.contains(&jwt), "回调响应体泄漏了 JWT: {response}");
         assert!(
             !response.contains("authCodeInfo") && !response.contains("refreshToken"),
             "回调响应体出现了凭据标记: {response}"
@@ -3609,7 +4170,7 @@ mod tests {
                 );
                 assert_eq!(
                     polled.get("variant").and_then(|v| v.as_str()),
-                    Some("trae_work")
+                    Some("trae_merged")
                 );
                 break;
             }
@@ -3643,7 +4204,7 @@ mod tests {
         // 三个交换变体全都会拿到这个 body：既无 Token 也无 RefreshToken ⇒ 全部失败。
         let (mock_port, _captured) = mock_upstream(3, json!({"Result": {}}).to_string()).await;
 
-        let started = login_start_for(TraeVariant::TraeWork)
+        let started = login_start_for(TraeVariant::TraeMerged)
             .await
             .expect("发起登录不应失败");
         let login_id = started["loginId"].as_str().unwrap().to_string();
@@ -3692,7 +4253,10 @@ mod tests {
                 assert!(polled.get("error").is_some(), "{polled}");
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "兑换失败没有收尾: {polled}");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "兑换失败没有收尾: {polled}"
+            );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
@@ -3708,18 +4272,26 @@ mod tests {
             TraeVariant::TraeWork,
         );
         assert!(named.contains("账号 [小明] 登录成功"), "{named}");
-        // ★ 整句逐字对拍：应用名 + 产品名 + 区域，缺一段都算「页面没说清账号进了哪」。
+        // ★ 整句逐字对拍：应用名 + 区域（区域名现在**就是客户端的产品名**，
+        // 见 `TraeRegion::display_name`，因此「产品」那一段由区域名自带）。
         // 现场（2026-09-24 用户报障）：只写「国内版」时用户读不出是哪个应用的哪个产品
         // —— 本应用的 WorkBuddy 分区同样有「国内版」。
         assert!(
-            named.contains("账号已添加到 Buddy Switch 的 Trae（国内版）账号库，可关闭此页面返回应用。"),
-            "成功页必须写全「应用 → 产品 → 区域」: {named}"
+            named.contains("账号已添加到 Buddy Switch 的 Trae CN 账号库，可关闭此页面返回应用。"),
+            "成功页必须写全「应用 → 区域（含产品名）」: {named}"
         );
-        // ★ 反面：**不得**出现程序位名（`Trae Work` / `Trae CN`）。
+        // ★ 反面：**不得**出现**程序位名**。
         // 持久化轴是区域，两条产品线共用一本国内库 ⇒ 写程序名会让另一条线的用户
         // 以为提示在骗人（见 `success_page` 的说明）。
+        //
+        // ⚠️ **本断言因区域改名而收窄**（2026-10-13）：`Trae CN` 现在是**区域名**
+        // （客户端产品名），它同时是合并版程序位的展示名 ⇒ 不能再拿它当「程序位名」的
+        // 标记（否则断言恒红）。因此标记只剩两条**不与区域同名**的程序位：
+        // `TraeWork CN` / `TraeCode CN`。
+        // ⇒ 这是「区域名用客户端产品名」这个选择的**已知成本**：合并版程序位
+        //   在文本层面再也无法与国内区域区分。要恢复强度，只能让区域名与程序位名不同。
         assert!(
-            !named.contains("Trae Work") && !named.contains("Trae CN"),
+            !named.contains("TraeWork CN") && !named.contains("TraeCode CN"),
             "成功页出现了程序位名，会让共用同一本库的另一条线用户误判: {named}"
         );
 
@@ -3731,7 +4303,7 @@ mod tests {
         assert!(empty.contains("未知账号"), "{empty}");
         // 区域随变体分家：国际版必须是「国际版」，且同样写全三段。
         assert!(
-            empty.contains("账号已添加到 Buddy Switch 的 Trae（国际版）账号库"),
+            empty.contains("账号已添加到 Buddy Switch 的 Trae 账号库"),
             "{empty}"
         );
     }
@@ -3758,9 +4330,9 @@ mod tests {
 
         assert_eq!(
             declared,
-            body.as_bytes().len(),
+            body.len(),
             "Content-Length 声明 {declared} 与正文字节数 {} 不符（写成字符数了？）",
-            body.as_bytes().len()
+            body.len()
         );
         assert_ne!(
             declared,
@@ -3774,17 +4346,73 @@ mod tests {
     /// `OPTIONS` 预检：204、空正文、长度 0，且 CORS 头照旧。
     #[test]
     fn options_preflight_response_has_no_body() {
-        let response = build_response("text/html; charset=utf-8", "<html>不该出现</html>", "OPTIONS");
-        assert!(response.starts_with("HTTP/1.1 204 No Content"), "{response}");
+        let response = build_response(
+            "text/html; charset=utf-8",
+            "<html>不该出现</html>",
+            "OPTIONS",
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 204 No Content"),
+            "{response}"
+        );
         assert!(response.contains("Content-Length: 0"), "{response}");
         assert!(!response.contains("不该出现"), "204 不该带正文: {response}");
         assert!(
-            response.to_ascii_lowercase().contains("access-control-allow-origin"),
+            response
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin"),
             "预检同样需要 CORS 头: {response}"
         );
     }
 
-    /// 结果页响应必须同时具备：`text/html`、`no-store`、CORS（探测与结果页共用组装）。
+    /// ★★ 安全审计 P2-16：结果页**不得**带 `Access-Control-Allow-Origin`。
+    ///
+    /// 结果页含账号昵称，带上 `ACAO: *` 就等于「任意网页都能读走登录结果」。
+    /// 探测响应（`text/plain`）反过来**必须**带 —— 两个区域的授权页都靠它判断客户端在线。
+    ///
+    /// 变异验证：把 `cors` 判据改回无条件 `true` ⇒ 第一条断言红。
+    #[test]
+    fn only_the_probe_response_is_readable_cross_origin() {
+        let probe = build_response("text/plain; charset=utf-8", "ok", "GET");
+        assert!(
+            probe
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin: *"),
+            "探测响应必须允许跨源读取（授权页要判断客户端在线）: {probe}"
+        );
+
+        let page = build_response("text/html; charset=utf-8", "<html>昵称</html>", "GET");
+        assert!(
+            !page
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin"),
+            "结果页含账号昵称，不得对任意源开放: {page}"
+        );
+        // 纵深：CSP / nosniff / 防嵌套 / 不泄漏 Referer。
+        assert!(
+            page.contains("Content-Security-Policy: default-src 'none'"),
+            "结果页必须有 CSP: {page}"
+        );
+        assert!(
+            page.to_ascii_lowercase()
+                .contains("x-content-type-options: nosniff"),
+            "结果页必须禁嗅探: {page}"
+        );
+        assert!(
+            page.to_ascii_lowercase().contains("x-frame-options: deny"),
+            "结果页不该被嵌套: {page}"
+        );
+        // 预检（OPTIONS）即使走 html 也保留 CORS：它没有 body、没有个人信息。
+        let preflight = build_response("text/html; charset=utf-8", "", "OPTIONS");
+        assert!(
+            preflight
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin"),
+            "预检必须带 CORS 头，否则授权页的探测连第一步都过不去: {preflight}"
+        );
+    }
+
+    /// 结果页响应必须同时具备：`text/html`、`no-store`（探测与结果页共用组装）。
     #[test]
     fn html_response_declares_html_type_and_forbids_caching() {
         let response = build_response("text/html; charset=utf-8", "<html></html>", "GET");
@@ -3793,12 +4421,18 @@ mod tests {
             "{response}"
         );
         assert!(
-            response.to_ascii_lowercase().contains("cache-control: no-store"),
+            response
+                .to_ascii_lowercase()
+                .contains("cache-control: no-store"),
             "结果页含账号昵称且 URL 一次性，不该被缓存: {response}"
         );
+        // ★ 安全审计 P2-16：结果页**不再**带 CORS（含账号昵称）。
+        // 该判据的完整对照见 `only_the_probe_response_is_readable_cross_origin`。
         assert!(
-            response.to_ascii_lowercase().contains("access-control-allow-origin"),
-            "{response}"
+            !response
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin"),
+            "结果页不得对任意源开放: {response}"
         );
     }
 
@@ -3823,11 +4457,8 @@ mod tests {
             .await
             .unwrap();
         let mut response = String::new();
-        let _ = tokio::time::timeout(
-            Duration::from_secs(3),
-            stream.read_to_string(&mut response),
-        )
-        .await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), stream.read_to_string(&mut response))
+            .await;
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -3844,7 +4475,10 @@ mod tests {
                 );
                 return;
             }
-            assert!(tokio::time::Instant::now() < deadline, "拒绝回调没有立刻收尾: {polled}");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "拒绝回调没有立刻收尾: {polled}"
+            );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
@@ -3868,11 +4502,8 @@ mod tests {
             .await
             .unwrap();
         let mut response = String::new();
-        let _ = tokio::time::timeout(
-            Duration::from_secs(3),
-            stream.read_to_string(&mut response),
-        )
-        .await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), stream.read_to_string(&mut response))
+            .await;
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         loop {
@@ -3886,10 +4517,16 @@ mod tests {
                         .contains("loginTraceID"),
                     "{polled}"
                 );
-                assert!(polled.get("account").is_none(), "被拒绝的回调不得落库: {polled}");
+                assert!(
+                    polled.get("account").is_none(),
+                    "被拒绝的回调不得落库: {polled}"
+                );
                 return;
             }
-            assert!(tokio::time::Instant::now() < deadline, "CSRF 未拒绝: {polled}");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "CSRF 未拒绝: {polled}"
+            );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
@@ -3962,16 +4599,10 @@ mod tests {
         let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .expect("应能连上回调端口");
-        stream
-            .write_all(request)
-            .await
-            .expect("写出请求不应失败");
+        stream.write_all(request).await.expect("写出请求不应失败");
         let mut response = String::new();
-        let _ = tokio::time::timeout(
-            Duration::from_secs(3),
-            stream.read_to_string(&mut response),
-        )
-        .await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), stream.read_to_string(&mut response))
+            .await;
         response
     }
 
@@ -3987,8 +4618,7 @@ mod tests {
             .expect("测试前置失败：本机 17388 已被占用，无法验证端口冲突路径");
 
         let result = login_start().await;
-        let error = result
-            .expect_err("端口被占时 login_start 必须返回 Err，绝不能回退到随机端口");
+        let error = result.expect_err("端口被占时 login_start 必须返回 Err，绝不能回退到随机端口");
 
         assert!(
             error.contains(&CALLBACK_PORT.to_string()),
@@ -4025,10 +4655,18 @@ mod tests {
             .expect("缺少 port") as u16;
 
         // 1) 根路径、无 query —— 工程师未覆盖的探测形态。
-        let root = send_raw(port, b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").await;
-        assert!(root.starts_with("HTTP/1.1 200"), "根路径探测应回 200: {root}");
+        let root = send_raw(
+            port,
+            b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        )
+        .await;
         assert!(
-            root.to_ascii_lowercase().contains("access-control-allow-origin"),
+            root.starts_with("HTTP/1.1 200"),
+            "根路径探测应回 200: {root}"
+        );
+        assert!(
+            root.to_ascii_lowercase()
+                .contains("access-control-allow-origin"),
             "根路径探测缺少 CORS 头，浏览器会拦掉响应: {root}"
         );
 
@@ -4043,7 +4681,9 @@ mod tests {
             "授权路径探测应回 200: {authorize}"
         );
         assert!(
-            authorize.to_ascii_lowercase().contains("access-control-allow-origin"),
+            authorize
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin"),
             "授权路径探测缺少 CORS 头: {authorize}"
         );
 
@@ -4059,7 +4699,9 @@ mod tests {
             "预检应回 204: {preflight}"
         );
         assert!(
-            preflight.to_ascii_lowercase().contains("access-control-allow-origin"),
+            preflight
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin"),
             "预检响应缺少 CORS 头: {preflight}"
         );
 

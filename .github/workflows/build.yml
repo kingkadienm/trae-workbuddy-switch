@@ -34,9 +34,19 @@ jobs:
           python3 - <<'PY'
           import json, os
           all_platforms = [
+              # ★ mac 宿主标签只能写 macOS 15+：GitHub 已于 **2026-11-02 退役全部
+              #   macOS 14 镜像**（actions/runner-images#15226，Arm64 没有延期）。
+              #   保留 `macos-14` 的后果不是「跑旧系统」，而是 job 在 **0 step** 内被判
+              #   `cancelled`，唯一注解是
+              #     The configuration 'macos-14-arm64-us-default' is not supported
+              #   —— 读起来像标签拼错，实际是镜像下架（v2026.11.61209 / 61417 / 61459
+              #   三个 tag 连续因此丢掉 mac 产物）。
+              #   新命名：**不带后缀 = arm64**，Intel 才加 `-intel`
+              #     macos-15 / macos-latest → arm64      macos-15-intel → x64
+              #   ⇒ 两个 mac job 现在跑在**不同架构的宿主**上，cargo 缓存必须按架构分键。
               {
                   "name": "mac-arm64",
-                  "os": "macos-14",
+                  "os": "macos-15",
                   "target": "aarch64-apple-darwin",
                   "cli_bin": "buddy-switch-darwin-arm64",
                   "platform_tag": "darwin-arm64",
@@ -47,8 +57,11 @@ jobs:
                   "update_archive_name": "BuddySwitch-macos-aarch64.app.tar.gz",
               },
               {
+                  # 原生 Intel 宿主。**不要**图省事写 `macos-15` —— 那是 arm64，
+                  # 于是这个 job 变成在 arm64 上交叉编 x86_64（dmg / codesign 仍能跑通，
+                  # 但编出来的本机可执行产物与宿主架构不符，收益为零、排错成本翻倍）。
                   "name": "mac-x64",
-                  "os": "macos-14",
+                  "os": "macos-15-intel",
                   "target": "x86_64-apple-darwin",
                   "cli_bin": "buddy-switch-darwin-x64",
                   "platform_tag": "darwin-x64",
@@ -71,13 +84,29 @@ jobs:
                   "update_archive_name": "BuddySwitch-windows-x86_64-setup.exe",
               },
               {
+                  # 桌面端只发 deb + AppImage，但**只有 AppImage 能自更新**
+                  # （tauri-plugin-updater 在 Linux 上仅支持 AppImage，deb 无法原地升级）。
+                  # update_* 四个字段必须给全：Generate updater manifest 的进入条件是
+                  # matrix.update_arch 非空串；缺一个整步就被跳过 ⇒ 不产出
+                  # latest-linux-x86_64.json ⇒ 合并出的 latest.json 里没有 linux-* 平台键
+                  # ⇒ 已安装的 Linux 客户端「检查更新」永远报
+                  #   None of the fallback platforms ["linux-x86_64-appimage","linux-x86_64"]
+                  #   were found in the response "platforms" object
                   "name": "linux-x64",
                   "os": "ubuntu-latest",
                   "target": "x86_64-unknown-linux-gnu",
                   "cli_bin": "buddy-switch-linux-x64",
                   "platform_tag": "linux-x64",
                   "bundles": "deb,appimage",
-                  "update_arch": "",
+                  "update_os": "linux",
+                  "update_arch": "x86_64",
+                  "update_bundle": "appimage",
+                  # ★ 刻意留空：Linux 的更新包**就是那个版本化的 `.AppImage` 本身**
+                  # （tauri-bundler ≥2.10 把 AppImage 归为 v2 自包含目标，不再包 tar.gz），
+                  # 而 `Stage artifacts` 步骤已经把它原样放进 dist-bin。
+                  # 留空 ⇒ 清单里的 url 用产物名（`…_<ver>_amd64.AppImage`），
+                  # 既不会 404，也不必为了一个「稳定名」再复制一份 ~98MB 的资产。
+                  "update_archive_name": "",
               },
               {
                   # ⚠️ **只编 CLI，不编桌面 App**（`bundles` 为空 ⇒ 跳过 `Build desktop app`）。
@@ -133,11 +162,13 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           target: ${{ matrix.target }}
+          # 同上：它的缓存 key 不含仓库名，改名后会把旧绝对路径的 `target/` 恢复回来。
+          cache: false
           # ⚠️ 不要在这里加 `build-warnings` —— `@v1`（tag）**没有这个输入**。
           # 2026-09-22 实测：四个 job 各报一次
           #   Unexpected input(s) 'build-warnings', valid inputs are
@@ -150,6 +181,13 @@ jobs:
           #   rustflags: "-D warnings"   或 job 级 env: CARGO_BUILD_WARNINGS: deny
           # 但两者都会波及依赖的 build script（通常被 cap-lints 兜住），
           # 先在 linux-x64 / mac-arm64 / mac-x64 三个目标上验过再开。
+          #
+          # ⚠️ **更正（2026-10-16）**：上面「无 `-D warnings`」的结论**不对** —— 该 action 的
+          # `rustflags` **默认就是 `-D warnings`**（构造日志逐字输出 `rustflags: -D warnings`，
+          # 全平台生效）⇒ 警告在所有 CI 目标上都会被升级成**编译错误**。
+          # 非 Windows 目标（linux/mac）才编到的那部分代码，本机 Windows 永远看不到它的警告 ——
+          # **发布前先跑 `scripts/check-cross.ps1`**（默认三目标；加 `-IncludeDesktop` 连 mac 桌面端），
+          # 否则只能等 CI 红。
 
       # cargo 缓存：依赖 + 编译产物，增量编译大幅提速（Cargo.lock 不变时命中）
       - name: Cache cargo
@@ -159,8 +197,19 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          # ★ key 里带仓库名：`target/` 里的 build-script 产物会**记录绝对路径**。
+          # 2026-10-17 仓库改名（trae-workbuddy-switch → qoder-trae-workbuddy-switch）后，
+          # 恢复出来的缓存里那些路径全部指向旧目录，tauri 的 build script 于是报
+          #   failed to read plugin permissions: .../target/.../app_hide.toml: No such file or directory
+          # 带仓库名之后，再改名会自动换 key，不必手工清缓存。
+          # ★ 还带 `matrix.name`：两个 mac job 现在分别是 arm64 / x64 宿主，
+          #   `target/` 里除了按 triple 分的产物，还有**宿主侧**的东西（build script 编出的
+          #   可执行文件、`target/debug` 下的 host tools）。它们跨架构不通用 ⇒ 共用一个 key
+          #   时先完成的一方会把自己的缓存写进同一份，另一方恢复后报
+          #   `Bad CPU type in executable` / 链接到错误架构。其它平台 name 各不相同，
+          #   多这一层只是让 key 更精确，不改变命中率。
+          key: ${{ runner.os }}-${{ matrix.name }}-${{ github.repository }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.name }}-${{ github.repository }}-cargo-
 
       # `gcc-aarch64-linux-gnu` 是 linux-arm64 交叉编译的链接器/交叉 C 编译器
       # （配合上面的 job env）；其余几个是 Tauri 桌面端要的，linux-arm64 用不到但装了无害。
@@ -208,6 +257,16 @@ jobs:
           VER=$(node -p "require('./package.json').version")
           echo "VER=$VER" >> "$GITHUB_ENV"
           echo "stamped version: $VER"
+          # 打包内置的「本版说明」（离线兜底，`src/data/release-notes.json`）必须跟着版本走：
+          # 它由 `docs/releases/<版本>.md` 或提交分组推导，**不重生成就是上一版的内容**
+          # （门禁 `check:scope` 会比对版本号，不重生成直接红）。
+          #
+          # ⚠️ 非 tag 触发（workflow_dispatch / 本地）时，版本号是刚按**时钟**生成的，
+          #   git 里没有同名 tag。脚本会自己退到 `HEAD` 当区间终点（`revExists()`），
+          #   千万**不要**在这里补 `--from` / `--tag` 去「修」它 —— 那只会把真实 tag
+          #   与时钟版本混在一起，产出一份版本号对不上的说明（2026-11-06 之前就是这样：
+          #   dispatch 构建一律红在 Build frontend 的版本说明断言上，一个安装包都产不出）。
+          node scripts/gen-release-notes.mjs --json src/data/release-notes.json
 
       # `tauri.conf.json` 的 `createUpdaterArtifacts: true` 使签名私钥成为**打包硬依赖**：
       # 少了它，`tauri build` 会先跑完 ~5 分钟的 Rust 编译，最后才抛一句难定位的错。
@@ -236,6 +295,10 @@ jobs:
 
       # 前端构建产物（CLI 二进制 rust-embed 嵌入 + Tauri App 使用）
       - name: Build frontend
+        # macOS ARM runner 偶发比其他平台慢，原型门禁的默认 180s 会误杀。
+        # 仅放宽该 runner；其他构建仍保留 3 分钟的挂起保护。
+        env:
+          CHECK_PROTO_TIMEOUT_MS: ${{ matrix.name == 'mac-arm64' && '600000' || '180000' }}
         run: |
           npm install
           npm run build
@@ -244,6 +307,22 @@ jobs:
       - name: Build server binary
         shell: bash
         run: |
+          # ★ Windows 上要把 **Strawberry Perl** 放到 PATH 前面。
+          #
+          #   为什么要：sqlcipher 的 `vendored-openssl` 会**从源码编译 OpenSSL**，
+          #   而它的构建脚本要跑 `perl ./Configure`。
+          #   Git Bash 自带的 perl（/usr/share/perl5）**缺 `Params/Check.pm`**
+          #   ⇒ Configure 直接失败（2026-10-29 现场：win-x64 job 挂在
+          #   `failed to run custom build command for openssl-sys`）。
+          #   runner 预装的 Strawberry Perl 是完整的。
+          #
+          #   ⚠️ 只在 Windows 上改 PATH：Linux / macOS 的 perl 是系统自带的，能用。
+          #   ⚠️ 用 POSIX 路径（/c/...）：这一步的 shell 是 bash，写 Windows 路径不生效。
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            export PATH="/c/strawberry/perl/bin:/c/strawberry/c/bin:$PATH"
+            echo "--- perl in use ---"
+            perl -v | head -3
+          fi
           cargo build -p buddy-switch-server --release --target ${{ matrix.target }}
           mkdir -p dist-bin
 
@@ -269,6 +348,8 @@ jobs:
         if: matrix.bundles != ''
         shell: bash
         env:
+          # Tauri 的 beforeBuildCommand 会再次执行 npm run build；也要传入慢 runner 的门禁超时。
+          CHECK_PROTO_TIMEOUT_MS: ${{ matrix.name == 'mac-arm64' && '600000' || '180000' }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
@@ -321,14 +402,27 @@ jobs:
           # 那样产出的安装包名与后面的断言/清单就会互相对不上。
           echo "updater bundle dir: $BUNDLE_DIR (version $VER)"
           ls -la "$BUNDLE_DIR" || true
+          # createUpdaterArtifacts 产出的「可自更新归档」各平台不同：
+          #   macos   → <Product>_<ver>_<arch>.app.tar.gz
+          #   linux   → **`.AppImage` 本身**（+ 同名 `.sig`），**没有 tar.gz**
+          #             tauri-bundler ≥2.10 把 AppImage 归为 v2 自包含目标
+          #             （`bundle.rs::has_self_contained_target`），只有 legacy v1
+          #             兼容模式才包 tar.gz。`install_appimage` 是直接把下载的字节
+          #             写成新 AppImage，不需要解包。
+          #   windows → 直接用 nsis 安装包本身，路径可推导，不必 find
           if [ "$UPDATE_OS" = "windows" ]; then
             ARCHIVE="$BUNDLE_DIR/BuddySwitch_${VER}_x64-setup.exe"
           else
-            ARCHIVE="$(find "$BUNDLE_DIR" -maxdepth 1 -type f -name '*.app.tar.gz' | sort)"
+            case "$UPDATE_OS" in
+              linux) ARCHIVE_GLOB='*.AppImage' ;;
+              *)     ARCHIVE_GLOB='*.app.tar.gz' ;;
+            esac
+            ARCHIVE="$(find "$BUNDLE_DIR" -maxdepth 1 -type f -name "$ARCHIVE_GLOB" | sort)"
             COUNT=$(printf '%s\n' "$ARCHIVE" | sed '/^$/d' | wc -l | tr -d ' ')
             if [ "$COUNT" != 1 ]; then
-              echo "error: expected exactly 1 .app.tar.gz, found $COUNT" >&2
+              echo "error: expected exactly 1 $ARCHIVE_GLOB, found $COUNT" >&2
               printf '%s\n' "$ARCHIVE" >&2
+              ls -la "$BUNDLE_DIR" >&2 || true
               exit 1
             fi
           fi
@@ -336,10 +430,16 @@ jobs:
             echo "error: missing signed updater archive ($ARCHIVE)" >&2
             exit 1
           fi
-          cp "$ARCHIVE" "dist-bin/$UPDATE_ARCHIVE_NAME"
-          cp "$ARCHIVE.sig" "dist-bin/$UPDATE_ARCHIVE_NAME.sig"
+          # 目标资产名：给了就改名（mac/win 要**稳定名**，这样 `releases/latest/download/<name>`
+          # 跨版本都指向同一个键）；没给就沿用产物名 —— Linux 的 `.AppImage` 已经是版本化名字，
+          # 而且上一步（Stage artifacts）已经把它放进 dist-bin 了，再复制一份 ~98MB 纯浪费。
+          TARGET_NAME="${UPDATE_ARCHIVE_NAME:-$(basename "$ARCHIVE")}"
+          if [ "$TARGET_NAME" != "$(basename "$ARCHIVE")" ]; then
+            cp "$ARCHIVE" "dist-bin/$TARGET_NAME"
+            cp "$ARCHIVE.sig" "dist-bin/$TARGET_NAME.sig"
+          fi
           if [ "$UPDATE_OS" = "windows" ]; then
-            cmp -s "dist-bin/$UPDATE_ARCHIVE_NAME" "dist-bin/BuddySwitch_${VER}_x64-setup.exe"
+            cmp -s "dist-bin/$TARGET_NAME" "dist-bin/BuddySwitch_${VER}_x64-setup.exe"
           fi
           UPDATE_VERSION="$VER" sh scripts/gen-update-json.sh
           MANIFEST="$BUNDLE_DIR/latest-${UPDATE_OS}-${UPDATE_ARCH}.json"
@@ -382,7 +482,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       # 只下本平台那一个 artifact（linux 那个有 ~100MB，不必全下）
       - uses: actions/download-artifact@v4
@@ -420,7 +520,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
       - name: Publish main package
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -439,7 +539,14 @@ jobs:
   release:
     name: Publish release assets
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    # ★ `always()`：macOS runner 曾被平台侧取消（无 runner 分配、0 step、
+    #   conclusion=cancelled），而 `needs: build` 默认会让整个 Release 被跳过 ——
+    #   win/linux 都构建成功也发不出来（v2026.11.61209 / v2026.11.61417 连续两版实测）。
+    #   加 always() 后，只要还有平台产物就照常发布；「一个平台都没成功」由下面的
+    #   Verify step 拦住，不会上传空壳。2026-11-06 起 mac 的平台侧取消已定位为
+    #   `macos-14` 镜像退役（标签已换新），但这层兜底仍然保留：部分平台缺产物是降级，
+    #   整轮不发布才是事故。
+    if: always() && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       # ⚠️ `fetch-depth: 0` + `fetch-tags: true` 是**生成变更说明的硬前提**。
@@ -456,12 +563,27 @@ jobs:
       # 与 `build` / `publish-*` 各 job 显式声明版本号保持一致，不吃 runner 预装版本。
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
+
+      # `always()` 的兜底：只要还有一个平台产出 updater 清单就允许发布。
+      # 缺 macOS 清单是**降级**（平台侧 runner 取消），不是事故；一个清单都没有
+      # 才是事故（build 全挂），必须响亮失败，不许上传空壳 Release。
+      - name: Verify required artifacts
+        run: |
+          shopt -s nullglob
+          manifests=(artifacts/latest-*.json)
+          if [ ${#manifests[@]} -eq 0 ]; then
+            echo "::error::没有任何平台产出 updater 清单，拒绝发布空壳 Release"
+            ls -la artifacts || true
+            exit 1
+          fi
+          echo "可用平台清单 ${#manifests[@]} 份："
+          printf '  %s\n' "${manifests[@]}"
 
       # artifact 里含一份 CLI 裸二进制（build job 的 `Stage CLI binary for npm` 放的）。
       # 它的归属取决于 npm 通道是否开启：
@@ -472,12 +594,34 @@ jobs:
       #     必须留在 Release 里让用户直接下载，否则 webui 形态等于没有发布途径。
       # ⚠️ 别改成无条件保留：桌面端走 Tauri updater，与这些裸二进制无关，
       #    而 `merge-update-manifests.py` 只 glob `latest-*.json`，留着也不会污染更新清单。
-      - name: Drop npm-only CLI payloads
-        if: vars.PUBLISH_NPM == 'true'
+      #
+      # ★ 保留时必须改名成 `buddy-switch-cli-<platform>`。原名（`buddy-switch-darwin-arm64`）
+      #   在资产列表里和 macOS 安装包**撞车**：没有扩展名、30MB 以上、名字里同时出现
+      #   `darwin` 与 `arm64`，用户会把它当成「mac 版安装包」直接下走，拿到手是一个**裸
+      #   Mach-O 可执行文件** —— 既不是 `.dmg` 也不是 `.app`，下载后还没有执行位，双击
+      #   只会报「无法打开」。加 `-cli-` 后名字自述用途，与安装包的 `BuddySwitch…`（大写开头、
+      #   带 `.dmg` / `-setup.exe` 扩展名）不再混淆。同名问题在 Windows 上一样存在
+      #   （`buddy-switch-win32-x64.exe` 看着像安装程序）。
+      #   ⚠️ 只在**发布前**改名，不动 build job 的 `cli_bin`：`publish-platform` job
+      #   按原名从 artifact 里取文件装进 npm 平台包。
+      - name: Rename or drop npm-only CLI payloads
         run: |
           ls -1 artifacts
-          rm -f artifacts/buddy-switch-*
-          echo "--- after drop ---"
+          if [ "${{ vars.PUBLISH_NPM }}" = "true" ]; then
+            rm -f artifacts/buddy-switch-*
+            echo "--- after drop（npm 通道已开，裸二进制已随平台包发布）---"
+          else
+            # `buddy-switch-<platform>` → `buddy-switch-cli-<platform>`
+            for f in artifacts/buddy-switch-*; do
+              [ -e "$f" ] || continue
+              base=$(basename "$f")
+              case "$base" in
+                buddy-switch-cli-*) continue ;;
+              esac
+              mv -f "$f" "artifacts/buddy-switch-cli-${base#buddy-switch-}"
+            done
+            echo "--- after rename（Release 里 CLI 裸二进制带 -cli- 标记）---"
+          fi
           ls -1 artifacts
 
       - name: Merge updater manifests
@@ -500,7 +644,13 @@ jobs:
       - name: Generate release notes
         env:
           TAG: ${{ github.ref_name }}
-        run: node scripts/gen-release-notes.mjs --tag "$TAG" --out release-notes.md
+        run: |
+          node scripts/gen-release-notes.mjs --tag "$TAG" --out release-notes.md
+          # 同一份内容的**结构化**版本：作为 release 资产发布，应用内「升级前弹窗」读它
+          # （`update::update_check` 抓 `releases/latest/download/release-notes.json`）。
+          # 放进 artifacts/ 才能随 `files: artifacts/*` 一起上传 —— 落在仓库根目录的
+          # `release-notes.md` 是**正文**，不是资产。
+          node scripts/gen-release-notes.mjs --tag "$TAG" --json artifacts/release-notes.json
 
       # 用 `body_path` 而不是 `body`：正文是多行 Markdown，且含 `-` 开头的行，
       # 走文件传递可完全避开 YAML / 表达式对换行与特殊字符的处理。

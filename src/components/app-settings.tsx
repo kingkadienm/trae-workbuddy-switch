@@ -1,29 +1,40 @@
-import { useEffect, useState } from "react";
-import { ArrowUpCircle, ExternalLink, Loader2, RefreshCw, Save, Settings2, Shield } from "lucide-react";
+import type { ReactNode } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { useLocation } from "react-router-dom";
+import { ArrowUpCircle, ExternalLink, Loader2, RefreshCw, Save } from "lucide-react";
+import { toast } from "sonner";
 
 import { DemoAction } from "@/components/demo-action";
 import { SettingsFieldRow, SettingsGroup } from "@/components/settings-primitives";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { CardContent } from "@/components/ui/card";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { UpdateInstallDialog } from "@/components/update-install-dialog";
-import { TotpSetupDialog } from "@/components/totp-setup-dialog";
+import { ScopeMark, scopeLabel } from "@/components/scope-chip";
 import * as api from "@/lib/api";
+import { useCreditRefreshPref } from "@/lib/credit-refresh-pref";
 import { isLocale, setLocale, useLocale, useT } from "@/lib/i18n";
-import { getThemePreference, setThemePreference, type ThemePreference } from "@/lib/theme";
+import { normalizeReleaseNotes } from "@/lib/release-notes";
+import { SCOPES, scopeOf, scopeParts, type Scope } from "@/lib/scope";
+import { planScopeShortcuts, SCOPE_SHORTCUT_LIMIT } from "@/lib/scope-shortcuts";
+import { useVisibleScopes } from "@/lib/scope-visibility";
+import { useShortcutsEnabled } from "@/lib/shortcut-preference";
+import {
+  getThemePreference,
+  isThemePreference,
+  setThemePreference,
+  THEME_LABEL_KEYS,
+  THEME_PREFERENCES,
+  type ThemePreference,
+} from "@/lib/theme";
+import { useAutoCheckUpdate } from "@/lib/update-preference";
 import type { GithubConfig, UpdateInfo } from "@/lib/types";
 import { GITHUB_RELEASE_URL, GITHUB_REPOSITORY_URL, openReleaseUrl } from "@/lib/update";
+import { platformOfPath } from "@/lib/platforms/registry";
+import { useScope } from "@/lib/use-scope";
 import { cn } from "@/lib/utils";
 import { useAccountsStore } from "@/stores/accounts";
 
@@ -34,7 +45,7 @@ import { useAccountsStore } from "@/stores/accounts";
  *
  * 它们改的是**本应用**的状态 —— 界面语言、主题偏好、系统登录项、GitHub 更新源，
  * 读的也是**本应用**的版本号（`update::APP_VERSION`），与 WorkBuddy / Trae 两条
- * 产品线无关。`docs/parity` 早已把它们定性为「应用级能力 / 全局共用项，不计为
+ * 产品线无关。`docs/specs` 早已把它们定性为「应用级能力 / 全局共用项，不计为
  * Trae 差距」（`trae-parity-matrix.md:103,231,236`、`trae-parity-design.md:225`）。
  *
  * 与 `settings-primitives.tsx` 的分工：那里共享**纯版式原语**（无取数、无判断），
@@ -53,10 +64,34 @@ import { useAccountsStore } from "@/stores/accounts";
  * 正是本模块当初要消灭的那类不一致。判据仍是「有无产品耦合」：语言完全没有。
  */
 
+/**
+ * 版式变体 —— 同一份内容有两种出口（原型里也是两处渲染）：
+ *
+ * - `card`（默认）：设置页的 `<section class="card">`，标题在 `.card-head` 里。
+ * - `plain`：顶栏齿轮抽屉的 `.dsec`，标题是 11.5px muted 的 `h4`，行直接贴抽屉底色。
+ *
+ * ★ 用参数而不是复制一份组件：这五块**含取数**（`getGithubConfig` / `getLaunchAtLoginEnabled`），
+ * 复制一份就会长成两份会各自漂移的实现 —— 正是本模块当初要消灭的病。
+ */
+export type AppSettingsVariant = "card" | "plain";
+
+/**
+ * 分组正文容器。
+ *
+ * ⚠️ `plain` 下**必须直接展开**（`<>`）：原型 `.dsec` 靠 `gap:9px` 给行距，
+ * 而 `gap` 只作用于**直接子级**。夹一层 `CardContent` 会让行距塌成 0，行与行
+ * 只剩一条分隔线贴着 —— 与抽屉里其它分区的节奏对不上。
+ */
+function GroupBody({ variant, children }: { variant: AppSettingsVariant; children: ReactNode }) {
+  if (variant === "plain") return <>{children}</>;
+  return <CardContent className="space-y-0 p-0">{children}</CardContent>;
+}
+
 /** 自动更新：检查公开 GitHub Releases 源 + 安装签名更新。 */
-function UpdateCard() {
+function UpdateCard({ variant }: { variant: AppSettingsVariant }) {
   const t = useT();
   const version = useAccountsStore((s) => s.status?.version);
+  const [autoCheck, setAutoCheck] = useAutoCheckUpdate();
   const [info, setInfo] = useState<UpdateInfo | null>(null);
   const [checking, setChecking] = useState(false);
   const [installOpen, setInstallOpen] = useState(false);
@@ -87,7 +122,8 @@ function UpdateCard() {
     setMsg(null);
     try {
       const r = await api.checkUpdate(proxyUrl, true);
-      setInfo(r);
+      /* 版本说明跨了「外部资产 → 渲染」的边界，进 state 前先按白名单归一（同 AppFooter）。 */
+      setInfo({ ...r, notes: normalizeReleaseNotes(r.notes) });
       if (!r.ok) {
         setMsg({ type: "err", text: r.message || r.error || t("appSettings.update.checkFailed") });
       }
@@ -129,18 +165,41 @@ function UpdateCard() {
     }
   }
 
+  /** 卡片形态下给「代理 / 更新源」这一组行铺一层 `--muted` 底，抽屉形态下不铺（原型 `.srow` 无底色）。 */
+  const tint = variant === "card" ? "bg-muted/25" : undefined;
+
   return (
     <SettingsGroup
       id="settings-updates"
       title={t("appSettings.update.title")}
+      variant={variant}
     >
-      <CardContent className="space-y-0 p-0">
-        <div className="border-b border-border/60 px-4 py-3 text-sm sm:px-5">
+      <GroupBody variant={variant}>
+        {/* ★ 自动检查更新：原型这一行的说明就是「每 30 分钟检查一次」
+            （`buddy-switch-prototype.html:4459`），间隔常量与轮询实现同源
+            （`lib/update-preference.ts` 的 `AUTO_CHECK_UPDATE_INTERVAL_MS` → `App.tsx` 的 AppFooter）。
+            ⚠️ 不加 `operational`：这是 localStorage 偏好，演示模式下**真的能用**，
+            遮起来反而变成假控件。 */}
+        <SettingsFieldRow
+          stacked={variant === "plain"}
+          label={t("appSettings.update.auto.label")}
+          description={t("appSettings.update.auto.description")}
+          htmlFor="update-auto-check"
+        >
+          <Switch
+            id="update-auto-check"
+            checked={autoCheck}
+            onCheckedChange={(value) => setAutoCheck(value)}
+            aria-label={t("appSettings.update.auto.label")}
+          />
+        </SettingsFieldRow>
+
+        <div className="border-b border-border px-4 py-3 text-sm">
           {t("appSettings.update.current")}
           <span className="font-mono">v{version || "?"}</span>
         </div>
 
-        <div className="flex min-w-0 items-center justify-between gap-3 border-b border-border/60 bg-muted/25 px-4 py-3 text-sm sm:px-5">
+        <div className={cn("flex min-w-0 items-center justify-between gap-3 border-b border-border px-4 py-3 text-sm", tint)}>
           <div className="min-w-0 flex-1">
             <div className="font-medium">{t("appSettings.update.source")}</div>
             <div className="truncate text-xs text-muted-foreground">{GITHUB_REPOSITORY_URL}</div>
@@ -159,12 +218,14 @@ function UpdateCard() {
           label={t("appSettings.update.proxy.label")}
           description={t("appSettings.update.proxy.description")}
           htmlFor="update-proxy"
-          className="bg-muted/25"
+          className={tint}
           operational
+          /* 抽屉形态（460px）必须纵向堆叠：`sm:` 是视口断点，在抽屉里会误判成够宽。 */
+          stacked={variant === "plain"}
         >
           <Input
             id="update-proxy"
-            className="w-full sm:w-80"
+            className={cn("w-full", variant === "card" && "sm:w-80")}
             value={proxyUrl}
             onChange={(event) => setProxyUrl(event.target.value)}
             placeholder={t("appSettings.update.proxy.placeholder")}
@@ -173,14 +234,14 @@ function UpdateCard() {
           />
         </SettingsFieldRow>
 
-        <div className="flex flex-wrap gap-2 border-b border-border/60 bg-muted/25 px-4 py-3 sm:px-5">
+        <div className={cn("flex flex-wrap gap-2 border-b border-border px-4 py-3", tint)}>
           <DemoAction><Button size="sm" variant="outline" onClick={() => void saveProxy()} disabled={proxySaving}>
             {proxySaving ? <Loader2 className="animate-spin" /> : <Save />}
             {t("appSettings.update.proxy.save")}
           </Button></DemoAction>
         </div>
 
-        <div className="flex flex-wrap gap-2 border-b-0 border-border/60 px-4 py-3 sm:px-5">
+        <div className="flex flex-wrap gap-2 border-b border-border px-4 py-3">
           <DemoAction><Button size="sm" variant="outline" onClick={check} disabled={checking}>
             {checking ? <Loader2 className="animate-spin" /> : <RefreshCw />}
             {t("appSettings.update.check")}
@@ -204,9 +265,11 @@ function UpdateCard() {
                 {info.releaseName && <span className="text-muted-foreground"> · {info.releaseName}</span>}
               </div>
               {info.hasUpdate && (
+                /* 入口文案从「立即升级」改成「查看更新内容」：点开的先是**说明**弹窗，
+                   下载要用户在里面再点一次（见 UPDATE-NOTES-ARCH.md）。 */
                 <DemoAction><Button size="sm" onClick={() => setInstallOpen(true)}>
                   <ArrowUpCircle />
-                  {t("appSettings.update.installNow")}
+                  {t("appSettings.update.viewNotes")}
                 </Button></DemoAction>
               )}
               {info.releaseUrl && (
@@ -235,17 +298,38 @@ function UpdateCard() {
           onOpenChange={setInstallOpen}
           update={info}
         />
-      </CardContent>
+      </GroupBody>
     </SettingsGroup>
   );
 }
 
-/** 开机自启（仅桌面端渲染）：开关直接反映系统自启注册状态，切换立即生效。 */
-function StartupCard() {
+/**
+ * 启动与托盘（仅桌面端渲染）—— 两行，都是「应用在窗口之外怎么活着」。
+ *
+ * - **开机时静默启动到托盘**：真值来自系统登录项（`tauri-plugin-autostart`）。
+ * - **关闭窗口时保持后台运行**：真值来自 `app_prefs.json`（`close_to_tray`）；
+ *   宿主在 `WindowEvent::CloseRequested` 里读它决定「隐藏还是退出」。
+ *
+ * ## 为什么两行同卡
+ *
+ * 原型把「开机自启」与「最小化到托盘」摆在同一列（`buddy-switch-prototype.html:4458-4460`），
+ * 两件事也确实成对：一个管「开机后进不进托盘」，一个管「关窗后留不留在托盘」。
+ * 拆成两张单行卡只会多一条分组标题。
+ *
+ * ## 两个开关的载体不同，是**刻意**的
+ *
+ * 开机自启的权威在**操作系统注册项**（应用不另存布尔值，否则会出现「系统已禁用但设置显示已开启」）；
+ * 关闭到托盘的权威在**本应用自己的偏好文件**（宿主需要读，见 `app_prefs.rs` 模块头）。
+ * 两者都用「写后回读、失败回滚」的同一种交互，但**不共用存储**。
+ */
+function StartupCard({ variant }: { variant: AppSettingsVariant }) {
   const t = useT();
   const [enabled, setEnabled] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
+  /** `close_to_tray`：与开机自启**分开**的 busy / 错误态 —— 一个失败不该锁住另一个。 */
+  const [closeToTray, setCloseToTray] = useState<boolean | null>(null);
+  const [trayBusy, setTrayBusy] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -253,6 +337,14 @@ function StartupCard() {
       .getLaunchAtLoginEnabled()
       .then((value) => {
         if (!cancelled) setEnabled(value);
+      })
+      .catch((e) => {
+        if (!cancelled) setMsg({ type: "err", text: api.asError(e) });
+      });
+    void api
+      .getAppPrefs()
+      .then((prefs) => {
+        if (!cancelled) setCloseToTray(prefs.close_to_tray);
       })
       .catch((e) => {
         if (!cancelled) setMsg({ type: "err", text: api.asError(e) });
@@ -286,16 +378,43 @@ function StartupCard() {
     }
   }
 
+  async function onToggleCloseToTray(value: boolean) {
+    if (trayBusy || closeToTray === null) return;
+    const previous = closeToTray;
+    // 乐观更新：开关必须立刻跟手（宿主是「点关闭那一刻」才读文件，中间没有状态可漂）。
+    setCloseToTray(value);
+    setTrayBusy(true);
+    setMsg(null);
+    try {
+      /* 先读回完整偏好再写：`set_app_prefs` 是按**已知键**归一化的，只传
+         `close_to_tray` 会把 `legal_consent_at`（风险确认时间）冲回默认 0 ——
+         用户点一次托盘开关就被要求重新确认风险，属于跨功能的状态破坏。 */
+      const current = await api.getAppPrefs();
+      // 按**回读值**渲染：后端会把非法值归一成默认值，回显请求值会与宿主真实行为分叉。
+      const saved = await api.setAppPrefs({ ...current, close_to_tray: value });
+      setCloseToTray(saved.close_to_tray);
+      if (saved.close_to_tray !== value) {
+        setMsg({ type: "err", text: t("appSettings.tray.saveMismatch") });
+      }
+    } catch (e) {
+      setCloseToTray(previous);
+      setMsg({ type: "err", text: api.asError(e) });
+    } finally {
+      setTrayBusy(false);
+    }
+  }
+
   const label = t("appSettings.startup.silent.label");
+  const trayLabel = t("appSettings.tray.closeToTray.label");
 
   return (
     <SettingsGroup
       id="settings-startup"
       title={t("appSettings.startup.title")}
+      variant={variant}
     >
-      <CardContent className="space-y-0 p-0">
+      <GroupBody variant={variant}>
         <SettingsFieldRow
-          className="border-b-0"
           label={label}
           description={t("appSettings.startup.silent.description")}
           htmlFor="startup-silent"
@@ -310,6 +429,22 @@ function StartupCard() {
           />
         </SettingsFieldRow>
 
+        <SettingsFieldRow
+          className="border-b-0"
+          stacked={variant === "plain"}
+          label={trayLabel}
+          description={t("appSettings.tray.closeToTray.description")}
+          htmlFor="tray-close-to-tray"
+        >
+          <Switch
+            id="tray-close-to-tray"
+            checked={closeToTray ?? true}
+            disabled={trayBusy || closeToTray === null}
+            onCheckedChange={(v) => void onToggleCloseToTray(v)}
+            aria-label={trayLabel}
+          />
+        </SettingsFieldRow>
+
         {msg && (
           <Alert
             variant={msg.type === "err" ? "destructive" : "default"}
@@ -318,18 +453,117 @@ function StartupCard() {
             <AlertDescription>{msg.text}</AlertDescription>
           </Alert>
         )}
-      </CardContent>
+      </GroupBody>
+    </SettingsGroup>
+  );
+}
+
+/**
+ * 账号授权（仅桌面端）—— 一个开关：**在应用内完成账号授权**。
+ *
+ * ## 为什么要有一个「公共」设置
+ *
+ * 三个平台（WorkBuddy / Trae / Qoder）的登录是同一形状：后端算出授权页 URL → 用户
+ * 在页面里登录并同意 → 后端轮询取回令牌入库。把「页面开在哪」抽成一处偏好，
+ * 三个登录弹窗都读它，就不会出现「某个平台忘了读设置」这种**界面上看不出来**的漂移。
+ *
+ * ## 为什么默认开
+ *
+ * 授权页是自有域名（没有第三方 OAuth 的 embedded-webview 限制），内嵌路径少一次
+ * 应用切换；而且授权窗口的登录态留在本进程里，后续查账号数据不必反复登录。
+ * ★ 它只是**默认路径**：`lib/auth-open.ts` 在开窗失败时一律退回系统浏览器 ——
+ * 一次建窗异常不该变成「登不了账号」。
+ *
+ * 载体是 `app_prefs.json`（`auth_in_app`）而不是 `localStorage`：宿主侧的授权窗命令
+ * 也要读同一份值，两边读同一处才不会「设置显示内嵌、实际跳了浏览器」。
+ */
+function AuthCard({ variant }: { variant: AppSettingsVariant }) {
+  const t = useT();
+  const [inApp, setInApp] = useState<boolean | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .getAppPrefs()
+      .then((prefs) => {
+        if (!cancelled) setInApp(prefs.auth_in_app);
+      })
+      .catch((e) => {
+        if (!cancelled) setMsg({ type: "err", text: api.asError(e) });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function onToggle(value: boolean) {
+    if (busy || inApp === null) return;
+    const previous = inApp;
+    // 乐观更新：开关必须立刻跟手（真值在文件里，下一轮登录才读）。
+    setInApp(value);
+    setBusy(true);
+    setMsg(null);
+    try {
+      /* 先读回完整偏好再写：`set_app_prefs` 按**已知键**归一化，只传 `auth_in_app`
+         会把 `legal_consent_at`（风险确认时间）和 `close_to_tray` 冲回默认值。 */
+      const current = await api.getAppPrefs();
+      const saved = await api.setAppPrefs({ ...current, auth_in_app: value });
+      // 按回读值渲染：非法值会被后端归一成默认值，回显请求值会与真实行为分叉。
+      setInApp(saved.auth_in_app);
+      if (saved.auth_in_app !== value) {
+        setMsg({ type: "err", text: t("appSettings.auth.saveMismatch") });
+      }
+    } catch (e) {
+      setInApp(previous);
+      setMsg({ type: "err", text: api.asError(e) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const label = t("appSettings.auth.inApp.label");
+
+  return (
+    <SettingsGroup id="settings-auth" title={t("appSettings.auth.title")} variant={variant}>
+      <GroupBody variant={variant}>
+        <SettingsFieldRow
+          className="border-b-0"
+          stacked={variant === "plain"}
+          label={label}
+          description={t("appSettings.auth.inApp.description")}
+          htmlFor="auth-in-app"
+        >
+          <Switch
+            id="auth-in-app"
+            checked={inApp ?? true}
+            disabled={busy || inApp === null}
+            onCheckedChange={(v) => void onToggle(v)}
+            aria-label={label}
+          />
+        </SettingsFieldRow>
+
+        {msg && (
+          <Alert
+            variant={msg.type === "err" ? "destructive" : "default"}
+            className="!w-auto mx-4 my-4 sm:mx-5"
+          >
+            <AlertDescription>{msg.text}</AlertDescription>
+          </Alert>
+        )}
+      </GroupBody>
     </SettingsGroup>
   );
 }
 
 /** 外观：主题选择（持久化到 localStorage）。 */
-function AppearanceCard() {
+function AppearanceCard({ variant }: { variant: AppSettingsVariant }) {
   const t = useT();
   const [theme, setTheme] = useState<ThemePreference>(getThemePreference);
 
   function onThemeChange(value: string) {
-    if (value !== "system" && value !== "light" && value !== "dark") return;
+    if (!isThemePreference(value)) return;
     setThemePreference(value);
     setTheme(value);
   }
@@ -338,8 +572,9 @@ function AppearanceCard() {
     <SettingsGroup
       id="settings-appearance"
       title={t("appSettings.appearance.title")}
+      variant={variant}
     >
-      <CardContent className="space-y-0 p-0">
+      <GroupBody variant={variant}>
         <SettingsFieldRow
           className="border-b-0"
           label={t("appSettings.appearance.theme.label")}
@@ -356,13 +591,15 @@ function AppearanceCard() {
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="system">{t("appSettings.theme.system")}</SelectItem>
-              <SelectItem value="light">{t("appSettings.theme.light")}</SelectItem>
-              <SelectItem value="dark">{t("appSettings.theme.dark")}</SelectItem>
+              {THEME_PREFERENCES.map((key) => (
+                <SelectItem key={key} value={key}>
+                  {t(THEME_LABEL_KEYS[key])}
+                </SelectItem>
+              ))}
             </SelectContent>
           </Select>
         </SettingsFieldRow>
-      </CardContent>
+      </GroupBody>
     </SettingsGroup>
   );
 }
@@ -377,7 +614,7 @@ function AppearanceCard() {
  * 两个选项的文案是**自名的**（`简体中文` / `English`）：语言菜单用目标语言写自己的名字，
  * 是通行做法 —— 当前界面语言看不懂时，用户仍能认出自己要去哪一项。
  */
-function LanguageCard() {
+function LanguageCard({ variant }: { variant: AppSettingsVariant }) {
   const t = useT();
   const locale = useLocale();
 
@@ -385,8 +622,9 @@ function LanguageCard() {
     <SettingsGroup
       id="settings-language"
       title={t("appSettings.language.title")}
+      variant={variant}
     >
-      <CardContent className="space-y-0 p-0">
+      <GroupBody variant={variant}>
         <SettingsFieldRow
           className="border-b-0"
           label={t("appSettings.language.label")}
@@ -413,133 +651,227 @@ function LanguageCard() {
             </SelectContent>
           </Select>
         </SettingsFieldRow>
+      </GroupBody>
+    </SettingsGroup>
+  );
+}
+
+/**
+ * 键盘快捷键（P6 §3.1）：作用域快捷键「可关闭」开关。
+ *
+ * ## 为什么降级时**不显示开关**
+ *
+ * 快捷键在「作用域 > 9 个」时降级为不绑定（`planScopeShortcuts`）。此时**没有可开启之物**
+ * —— 再摆一个开关就是假控件（§1.7）。因此 `reason === "too-many"` 时改为一句说明，
+ * 与快捷键的真实绑定状态**同源**（都读 `planScopeShortcuts` 的结果）。
+ *
+ * ## 为什么这是**应用级**设置
+ *
+ * 数字快捷键作用于整个应用的全局键（不区分 WorkBuddy / Trae），与主题 / 语言同类，
+ * 因此放在共享的 `AppSettingsGroups` 里，两个产品分区走同一份实现。
+ */
+function ShortcutsCard({ variant }: { variant: AppSettingsVariant }) {
+  const t = useT();
+  const [enabled, setEnabled] = useShortcutsEnabled();
+  const visibleScopes = useVisibleScopes((s) => s.visibleScopes);
+  const plan = useMemo(
+    () => planScopeShortcuts({ scopes: visibleScopes, enabled }),
+    [visibleScopes, enabled],
+  );
+  const isMac = typeof navigator !== "undefined" && navigator.userAgent.includes("Macintosh");
+  const label = t("shortcuts.settings.label");
+  // 降级（作用域超过上限）⇒ 无可开启之物，不显示开关。
+  const degradedByCount = plan.reason === "too-many";
+
+  return (
+    <SettingsGroup id="settings-shortcuts" title={t("shortcuts.settings.title")} variant={variant}>
+      <GroupBody variant={variant}>
+        <SettingsFieldRow
+          className="border-b-0"
+          label={label}
+          description={
+            degradedByCount
+              ? t("shortcuts.settings.degraded", { limit: SCOPE_SHORTCUT_LIMIT })
+              : t("shortcuts.settings.description", {
+                  mod: isMac ? "⌘" : "Ctrl",
+                  n: plan.bindings.size,
+                })
+          }
+          htmlFor="shortcuts-enabled"
+          operational
+        >
+          {degradedByCount ? null : (
+            <Switch
+              id="shortcuts-enabled"
+              checked={enabled}
+              onCheckedChange={(value) => setEnabled(value)}
+              aria-label={label}
+            />
+          )}
+        </SettingsFieldRow>
+      </GroupBody>
+    </SettingsGroup>
+  );
+}
+
+/**
+ * 作用域可见性设置 —— **白名单**模型（存可见的作用域）。
+ *
+ * ## 为什么是应用级设置
+ *
+ * 作用域可见性是全局偏好，与语言 / 主题属于同一层级：它影响整个应用的导航入口，
+ * 而不是某个产品线的局部行为。
+ *
+ * ## 约束规则（★ 禁用判据必须**方向敏感**，issue #85）
+ *
+ * - 至少保留 1 个可见：**只有「已可见且是最后一个可见项」**才禁用（关了就空了）；
+ * - 当前作用域可见时不可隐藏 —— 它是顶栏选择器与全局键的锚点。
+ *
+ * ## ★★ 为什么禁用判据不能与方向无关（issue #85 真因）
+ *
+ * 旧实现是 `scope === currentScope || visibleScopes.length === 1` ——
+ * 后者**与勾选状态无关**：一旦可见集合降到 1 个，**6 个开关全部 disabled**，
+ * 于是「关掉的作用域再也打不开」，而 `setVisibleScopes` 又拒绝写空集合 ⇒
+ * UI 层与 store 层互相锁死，只能清 localStorage 才能恢复。
+ *
+ * 同理 `scope === currentScope` 也不能无条件禁用：当前作用域被隐藏时（URL 直达、
+ * 或在另一产品的设置页里关掉了它），那一行就是 `disabled + off`，**永远点不回来**。
+ * 现在只在「当前作用域**已可见**」时禁用 —— 隐藏态下它必须能点回来。
+ */
+function ScopeVisibilityCard() {
+  const t = useT();
+  const location = useLocation();
+  const product = platformOfPath(location.pathname);
+  const [region] = useScope(product);
+  const currentScope = scopeOf(product, region);
+  const visibleScopes = useVisibleScopes((s) => s.visibleScopes);
+  const setVisibleScopes = useVisibleScopes((s) => s.setVisibleScopes);
+
+  function toggleScope(scope: Scope) {
+    const isCurrentlyVisible = visibleScopes.includes(scope);
+    const next = isCurrentlyVisible
+      ? visibleScopes.filter((s) => s !== scope)
+      : [...visibleScopes, scope];
+    setVisibleScopes(next);
+    // 隐藏到只剩 1 个时提示（开启方向不存在降级，无需提示）
+    if (isCurrentlyVisible && next.length === 1) {
+      toast.info(t("appSettings.scopeVisibility.onlyOneLeft"));
+    }
+  }
+
+  return (
+    <SettingsGroup id="settings-scope-visibility" title={t("appSettings.scopeVisibility.groupTitle")}>
+      <CardContent className="space-y-0 p-0">
+        {SCOPES.map((scope) => {
+          const { product: scopeProduct } = scopeParts(scope);
+          const isVisible = visibleScopes.includes(scope);
+          // ★ 方向敏感（issue #85）：只在「关掉它会破坏约束」时禁用。
+          //   - 已可见且是最后一个可见项 ⇒ 不能再关（否则可见集合为空）；
+          //   - 当前作用域**已可见** ⇒ 不可隐藏（顶栏选择器 / 全局键的锚点）。
+          //   未勾选项**一律可点** —— 这正是旧实现缺的那一半，它让关到只剩 1 个之后
+          //   其余 5 个永远打不开。当前作用域若已被隐藏，也必须允许点回来。
+          const disabled = isVisible && (visibleScopes.length === 1 || scope === currentScope);
+
+          return (
+            <SettingsFieldRow
+              key={scope}
+              label={
+                <div className="flex items-center gap-2">
+                  <ScopeMark product={scopeProduct} size={14} className="shrink-0" />
+                  <span>{scopeLabel(t, scope)}</span>
+                </div>
+              }
+              operational
+              htmlFor={`scope-visible-${scope}`}
+            >
+              <Switch
+                id={`scope-visible-${scope}`}
+                checked={isVisible}
+                disabled={disabled}
+                onCheckedChange={() => toggleScope(scope)}
+                aria-label={t("appSettings.scopeVisibility.toggleAria", { scope })}
+              />
+            </SettingsFieldRow>
+          );
+        })}
+
+        {/* 全局提示 */}
+        <p className="border-t border-border/60 px-4 py-3 text-xs text-muted-foreground">
+          {t("appSettings.scopeVisibility.hint")}
+        </p>
       </CardContent>
     </SettingsGroup>
   );
 }
 
 /**
- * 四个应用级设置块，**门禁与原先设置页逐条对齐**。
+ * 积分自动刷新 —— **「打上游」默认关**（issue #133 复核 §3 / 方案 C）。
  *
- * 门禁必须留在这里而不是交给调用方：本模块同时被侧栏（常驻）与设置页引用，
+ * ## 为什么要有这个开关
+ *
+ * 自动刷新此前是一刀切：`CREDIT_REFRESH_INTERVAL_MS` 同时管着「读本地快照」（零成本）与
+ * 「打上游」（真请求、可能被限流）。后者每 10 分钟替用户花一次上游成本，而用户从没要求过
+ * —— 与 `trae_checkin` / `qoder_checkin`（默认 `false`，理由写在 `default_schedule()`
+ * 注释里）是同一条判据：**替用户做动作要 opt-in**。
+ *
+ * 现在两类成本分开：本开关只管「打上游」那半边；只读本地快照的视图（Trae 两页）
+ * 不受影响，永远自动跟随。
+ *
+ * ⚠️ 默认关意味着升级后「余额不再自己动」。所以每个受影响的视图都必须有手动入口
+ * （WB 统计页「刷新积分」/ Qoder 积分页「重新查询」/ Qoder 账号卡「更多 → 刷新积分」），
+ * 且顶部文案要如实说「已关闭」——不能还写着「每 N 分钟自动刷新」。
+ */
+function CreditsAutoRefreshCard() {
+  const t = useT();
+  const upstreamAutoRefresh = useCreditRefreshPref((state) => state.upstreamAutoRefresh);
+  const setUpstreamAutoRefresh = useCreditRefreshPref((state) => state.setUpstreamAutoRefresh);
+
+  return (
+    <SettingsGroup id="settings-credit-auto-refresh" title={t("appSettings.creditAutoRefresh.groupTitle")}>
+      <CardContent className="space-y-0 p-0">
+        <SettingsFieldRow
+          label={t("appSettings.creditAutoRefresh.upstreamLabel")}
+          description={t("appSettings.creditAutoRefresh.upstreamDesc")}
+          htmlFor="credit-auto-upstream"
+          operational
+        >
+          <Switch
+            id="credit-auto-upstream"
+            checked={upstreamAutoRefresh}
+            onCheckedChange={setUpstreamAutoRefresh}
+          />
+        </SettingsFieldRow>
+        <p className="border-t border-border/60 px-4 py-3 text-xs text-muted-foreground">
+          {t("appSettings.creditAutoRefresh.hint")}
+        </p>
+      </CardContent>
+    </SettingsGroup>
+  );
+}
+
+/**
+ * 五个应用级设置块，**门禁与原先设置页逐条对齐**。
+ *
+ * 门禁必须留在这里而不是交给调用方：本模块同时被设置页与顶栏 ⚙「应用设置」抽屉引用，
  * 把判断写在页面上会让两条路径各写一遍 —— 这正是当初 `settings-primitives`
  * 出现漂移的同一种病。
  *
  * 顺序把**语言放在最前**：它改的是其余所有文案的语言，用户在找「设置」时最可能先要它。
- */
-
-/**
- * TOTP 两步验证测试卡片（仅桌面端）。
  *
- * 在通用设置里提供 TOTP 设置入口，方便桌面端快速测试。
+ * ★ `variant` 由调用方给：设置页传 `card`（默认），抽屉传 `plain`。**内容只有一份**，
+ * 两个出口不会各长一套。
  */
-function TotpCard() {
-  const [setupOpen, setSetupOpen] = useState(false);
-  const [enabled, setEnabled] = useState<boolean | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    void api.totpStatus().then((s) => {
-      if (!cancelled) setEnabled(s.enabled);
-    }).catch(() => {});
-    return () => { cancelled = true; };
-  }, []);
-
-  return (
-    <SettingsGroup
-      id="settings-totp"
-      title="两步验证（测试）"
-    >
-      <CardContent className="space-y-0 p-0">
-        <SettingsFieldRow
-          className="border-b-0"
-          label="状态"
-          description={enabled === null
-            ? "检查中..."
-            : enabled
-              ? "已启用"
-              : "未启用"}
-          htmlFor="totp-setup"
-          operational
-        >
-          <DemoAction><Button
-            id="totp-setup"
-            size="sm"
-            variant={enabled ? "outline" : "default"}
-            onClick={() => setSetupOpen(true)}
-          >
-            <Shield className="mr-1.5 size-3.5" />
-            {enabled ? "重新设置" : "启用两步验证"}
-          </Button></DemoAction>
-        </SettingsFieldRow>
-      </CardContent>
-      <TotpSetupDialog
-        open={setupOpen}
-        onOpenChange={setSetupOpen}
-        onSuccess={() => setEnabled(true)}
-      />
-    </SettingsGroup>
-  );
-}
-
-export function AppSettingsGroups() {
+export function AppSettingsGroups({ variant = "card" }: { variant?: AppSettingsVariant } = {}) {
   return (
     <>
-      <LanguageCard />
-      <AppearanceCard />
-      {api.isDesktop() || api.isDemoMode() ? <StartupCard /> : null}
-      {api.isDesktop() ? <TotpCard /> : null}
-      {api.isWebui() && !api.isDemoMode() ? null : <UpdateCard />}
+      <LanguageCard variant={variant} />
+      <AppearanceCard variant={variant} />
+      <ShortcutsCard variant={variant} />
+      {api.isDesktop() || api.isDemoMode() ? <StartupCard variant={variant} /> : null}
+      {api.isDesktop() || api.isDemoMode() ? <AuthCard variant={variant} /> : null}
+      {api.isWebui() && !api.isDemoMode() ? null : <UpdateCard variant={variant} />}
+      <ScopeVisibilityCard />
+      <CreditsAutoRefreshCard />
     </>
-  );
-}
-
-/**
- * 侧栏底部「通用设置」入口 —— 固定在**版本号上方**。
- *
- * ## 为什么落在这里
- *
- * 侧栏底部区块（`App.tsx` 里那个 `<section>`）是两个产品分区**唯一共用**的渲染
- * 区域：上方的导航与右侧主区域都随产品切换，只有这里是恒定的。它也不属于
- * `PRODUCT_NAV`，因此不会把「侧栏固定 5 项、路由 5:5」的约束改成 6:6。
- *
- * ## 为什么是 Dialog 而不是内联控件
- *
- * 这些块含取数（`getGithubConfig` / `getLaunchAtLoginEnabled`）与更新相关的
- * 轮询，常驻挂载会让每次启动都多付一次 IPC；Dialog 是**懒挂载**，不开就不取数。
- * 侧栏 220px 也放不下「更新代理地址」这类字段行。
- *
- * ⚠️ `UpdateCard` 内含 `UpdateInstallDialog`，所以这里是**嵌套 Dialog**。
- * Radix 的 `DismissableLayer` 维护层栈，Esc 只关最上层，行为正确 —— 但不要
- * 把「点升级时先关外层」当优化：外层一关，`UpdateCard` 会随之卸载，
- * 升级弹窗的 `installOpen` 状态就丢了。
- */
-export function AppSettingsEntry() {
-  const t = useT();
-  const [open, setOpen] = useState(false);
-
-  return (
-    <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger asChild>
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          className="h-8 w-full justify-start gap-2 rounded-lg px-2 text-xs font-normal text-sidebar-foreground/70 hover:bg-foreground/[0.04] hover:text-sidebar-foreground"
-        >
-          <Settings2 className="size-3.5" aria-hidden="true" />
-          {t("appSettings.entry")}
-        </Button>
-      </DialogTrigger>
-      <DialogContent className="sm:max-w-2xl">
-        <DialogHeader>
-          <DialogTitle>{t("appSettings.title")}</DialogTitle>
-          <DialogDescription>{t("appSettings.description")}</DialogDescription>
-        </DialogHeader>
-        <div className="max-h-[70vh] space-y-6 overflow-y-auto pr-1">
-          <AppSettingsGroups />
-        </div>
-      </DialogContent>
-    </Dialog>
   );
 }

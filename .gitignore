@@ -11,6 +11,11 @@ node_modules
 dist
 dist-*
 dist-ssr
+# ★ 带**点**的旧构建产物目录（如 `dist.old-1794213163/`）：`dist-*` 匹配不到
+#   （点不是短横线），曾以未跟踪文件的形式躺在工作树里，有被 `git add -A` 带进
+#   仓库的风险（4.9MB 的构建输出）。这类目录是**构建脚本改名留下的旧产物**，
+#   不进版本库。
+dist.old-*
 *.local
 
 # Rust / Tauri 构建产物（workspace target）
@@ -25,8 +30,6 @@ accounts.json
 backups/
 
 # Editor directories and files
-.vscode/*
-!.vscode/extensions.json
 .idea
 .DS_Store
 *.suo
@@ -47,9 +50,14 @@ npm/platform/*/bin/
 .grok/
 /.workbuddy/
 /.workbuddy-ai/
+.vscode
+.trae
 
 # CodeGraph 索引数据库（体积大且可重建）
 .codegraph/
+
+# 外部参考项目（只用于干活，不进仓库）
+reference/
 
 # 发布交付物（含 exe 安装包与设计文档草稿）
 deliverables/
@@ -65,6 +73,17 @@ deliverables/
 .qa-tmp/
 .debug-tmp/
 .playwright-mcp/
+# README 截图脚本（scripts/gen-readme-shots.mjs）的临时目录与探针图：
+# 前者是一次性 playwright 安装（500+ 文件），后者是取景用的中间产物 —— 都不该进仓库。
+.tmp-pcli/
+# 一次性调查 / 探针产物（多 Agent 协作时落在仓库根的临时笔记与脚本）。
+# ⚠️ `git add -A` 会把它们一起提交 —— 用 `git add <具体文件>`，或在清理前先看这里。
+.tmp-*
+# 本地试验目录（构建产物、探针脚本、便携版工具链）。2026-10-28 加入：
+# 内置解密要编 vendored OpenSSL，本地缺 perl 时把 Strawberry 便携版解到这里（1.5GB 级）。
+# 无此条时它会以 `?? .tmp/` 出现在 git status 里，很容易被 `git add -A` 带进提交。
+.tmp/
+docs/images/.probe/
 _*.txt
 _*.py
 _*.png
@@ -76,3 +95,7 @@ _*.cjs
 /release-notes.md
 
 .key
+
+# Agent 运行时状态（本机工具目录，不入库）
+.omc/
+.claude-flow/

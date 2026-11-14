@@ -178,7 +178,7 @@ impl LogEntry {
 ///
 /// 历史标识 `work` / `trae_work` / `trae_cn` **一律归入国内版**（它们都是国内构建），
 /// 因此历史日志与老链接既不会变成「未标注」，也不会串到国际版去。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TraeTokenScope {
     /// 仅**国内版**（`variant` 属于国内区域的任何取值）。
     Cn,
@@ -187,13 +187,8 @@ pub enum TraeTokenScope {
     /// 仅**未标注**（旧日志：无 `variant` 键）。
     Unlabeled,
     /// 全部（国内 ∪ 国际 ∪ 未标注）。
+    #[default]
     All,
-}
-
-impl Default for TraeTokenScope {
-    fn default() -> Self {
-        Self::All
-    }
 }
 
 impl TraeTokenScope {
@@ -280,7 +275,11 @@ fn cutoff_ms(days: Option<i64>) -> Option<i64> {
 /// 毫秒时间戳 → 本地日期 `YYYY-MM-DD`。
 fn local_date(ts_ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ts_ms)
-        .map(|utc| utc.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
+        .map(|utc| {
+            utc.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d")
+                .to_string()
+        })
         .unwrap_or_else(|| "未知".to_string())
 }
 
@@ -291,6 +290,37 @@ fn local_hour(ts_ms: i64) -> String {
         .unwrap_or_else(|| "--".to_string())
 }
 
+/// 毫秒时间戳 → 本地**星期** `0`..`6`（**周一 = 0**，与前端 `HeatmapMatrix.cells[weekday][hour]`
+/// 及原型的 `WEEKDAYS = ["周一".."周日"]` 同一口径）。
+///
+/// 用 `num_days_from_monday()` 而不是 `%u`：后者的 1..7 还要再减一，
+/// 而 `num_days_from_monday()` 的语义**就是**本函数要的「距周一几天」。
+fn local_weekday(ts_ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ts_ms)
+        .map(|utc| {
+            use chrono::Datelike;
+            utc.with_timezone(&chrono::Local)
+                .weekday()
+                .num_days_from_monday()
+                .to_string()
+        })
+        .unwrap_or_else(|| "-".to_string())
+}
+
+/// 毫秒时间戳 → **「星期-小时」槽位** `"{weekday}-{HH}"`（如 `"0-09"`）。
+///
+/// ## 为什么是「星期 × 小时」而不是单纯的「小时」
+///
+/// 原型的「使用时段分布」是一张 **7 行（周一..周日）× 24 列**的热力图
+/// （`demo-app.js` 的 `heatmap(e.hourly, WEEKDAYS, …)`）。只按小时聚合只能画出 24 列，
+/// 丢掉「工作日 vs 周末」这个真正有用的维度。
+///
+/// 键的**字符串升序**即「周 → 小时」的自然顺序（`"0-00" < "0-09" < "1-00"`），
+/// 因此下游沿用既有的 `ascending(...)` 排序即可，不需要额外排序键。
+fn local_slot(ts_ms: i64) -> String {
+    format!("{}-{}", local_weekday(ts_ms), local_hour(ts_ms))
+}
+
 /// Trae Token 统计（`days` 为统计窗口天数，`None` 表示全部历史；`scope` 为变体范围）。
 ///
 /// 返回体形状与 WorkBuddy 的 `get_statistics` **刻意不同**：那边是「多源 + 会话/项目维度」，
@@ -299,6 +329,7 @@ fn local_hour(ts_ms: i64) -> String {
 /// 新增（本轮）：
 /// - `variantCounts: { work, cn, unlabeled, all }`：**时间窗口内**各档条数（供范围条徽标）；
 /// - `modelDaily: [{ date, model, total, input, output, records }]`：按天×模型的堆叠柱数据源；
+/// - `hours: [{ key: "{weekday}-{HH}", … }]`：**周 × 小时**槽位（周一=0），供 7×24 热力图；
 /// - `unsupported: [ { capability, label, supportedOn, reason } ]`：平台做不到的维度（置灰卡）。
 ///
 /// `scope` 只影响**展示聚合**（summary/models/accounts/daily/hours/statuses/modelDaily），
@@ -352,7 +383,8 @@ pub fn get_statistics(days: Option<i64>, scope: TraeTokenScope) -> Value {
             .or_default()
             .add(entry);
         by_date.entry(local_date(entry.ts)).or_default().add(entry);
-        by_hour.entry(local_hour(entry.ts)).or_default().add(entry);
+        // 键 = `"{weekday}-{HH}"`（见 `local_slot` 的说明）：供前端直接构造 7×24 热力矩阵。
+        by_hour.entry(local_slot(entry.ts)).or_default().add(entry);
         *by_status.entry(entry.status.to_string()).or_insert(0) += 1;
         coverage_start = Some(coverage_start.map_or(entry.ts, |current| current.min(entry.ts)));
         coverage_end = Some(coverage_end.map_or(entry.ts, |current| current.max(entry.ts)));
@@ -371,9 +403,7 @@ pub fn get_statistics(days: Option<i64>, scope: TraeTokenScope) -> Value {
         })
         .collect();
 
-    let models = descending(by_model, |key, bucket| {
-        bucket.group_value(key, json!(null))
-    });
+    let models = descending(by_model, |key, bucket| bucket.group_value(key, json!(null)));
     let accounts = descending(by_account, |key, bucket| {
         let name = names.get(key).cloned().unwrap_or_else(|| key.to_string());
         let tail = key.get(key.len().saturating_sub(8)..).unwrap_or(key);
@@ -502,9 +532,120 @@ fn ascending<F>(map: BTreeMap<String, Bucket>, build: F) -> Vec<Value>
 where
     F: Fn(&str, &Bucket) -> Value,
 {
-    map.iter()
-        .map(|(key, bucket)| build(key, bucket))
-        .collect()
+    map.iter().map(|(key, bucket)| build(key, bucket)).collect()
+}
+
+/// 网关日志默认保留条数（`api_gateway.json` 的 `logKeep` 缺省值，与网关侧 `state`/`trae` 同值）。
+const DEFAULT_LOG_KEEP: usize = 200;
+
+/// 读网关配置里的 `logKeep`（读不到 / 非法 ⇒ [`DEFAULT_LOG_KEEP`]）。
+///
+/// 只用来判定「今天的日志是否可能已被挤出」——**不要**在这里做任何写入。
+fn gateway_log_keep() -> usize {
+    std::fs::read_to_string(paths::api_gateway_file())
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|value| {
+            value
+                .get("logKeep")
+                .and_then(Value::as_u64)
+                .map(|keep| keep as usize)
+        })
+        .filter(|keep| *keep > 0)
+        .unwrap_or(DEFAULT_LOG_KEEP)
+}
+
+/// 「今日 · 按账号」的网关桶（**纯函数**，便于单测）。
+///
+/// 判据三件套，缺一条都会把别的账号 / 别的日子的量算进来：
+/// 1. `ts` 落在**本地日期** `day`（与签到日志 / 积分事件同口径）；
+/// 2. `account`（网关写入的就是 **uid**）属于该区域 —— 用「账号库里存在」**或**
+///    「日志自带的变体属于该区域」两条并集：前者兜住旧日志缺 `variant`，
+///    后者兜住「账号已被删除、但今天的调用确实发生过」（删号不该抹掉用量）；
+/// 3. 空 `account`（无法归属）不进任何账号桶。
+fn today_gateway_buckets(
+    entries: &[LogEntry],
+    day: &str,
+    region: super::region::TraeRegion,
+    known: &std::collections::HashSet<String>,
+) -> BTreeMap<String, (u64, u64)> {
+    let mut buckets: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    for entry in entries {
+        if entry.ts <= 0 || entry.account.is_empty() || local_date(entry.ts) != day {
+            continue;
+        }
+        let belongs =
+            known.contains(&entry.account) || entry.variant.map(|v| v.region()) == Some(region);
+        if !belongs {
+            continue;
+        }
+        let slot = buckets.entry(entry.account.clone()).or_insert((0, 0));
+        slot.0 = slot.0.saturating_add(entry.prompt_tokens);
+        slot.1 = slot.1.saturating_add(entry.completion_tokens);
+    }
+    buckets
+}
+
+/// 「今日 Token · 按账号」（`get_trae_account_token_today`；**只读**，issue #47）。
+///
+/// ## 形状照抄 WorkBuddy，但**客户端一档不可得**
+///
+/// 返回体与 `get_account_token_today`（WB）同构，四个字段一个不少 —— 前端三平台共用
+/// 同一套渲染。但数据源只有本机网关日志（Trae 没有可解析的客户端会话落盘，见模块头），
+/// 因此：
+///
+/// - `clientIn` / `clientOut` 恒为 `0`，并**额外下发 `clientSource: "unavailable"`** ——
+///   前端据此把「客户端」渲染成「不可得」而不是真实 `0`（否则会把「没测到」说成「没用」）；
+/// - `unknownClient` 恒为 `{in:0,out:0}`（网关日志每条都带 uid，不存在归属不明的客户端量）；
+/// - `gatewayTruncated = true` 表示**日志文件已到 `logKeep` 上限** ⇒ 今日部分可能已被
+///   昨天的流量挤出 ⇒ 网关数只是**下界**（前端渲染 `≥N`）。判据刻意选「文件满」而不是
+///   「今天条目数到上限」：前者只会在真的可能被裁时报警。
+///
+/// ## 缺席 ≠ 0
+///
+/// `accounts` 里**没有**某账号 = 今天没有经过本网关的调用（**不是** 0）。真实 `0`
+/// 只有一种情况：今天有该账号的记录但 token 都是 0（失败请求），此时会显式出现 `0`。
+///
+/// `force` 仅为契约保留：本接口读的是本地文件（≤ `logKeep` 条），重读成本远低于一次
+/// IPC / HTTP，因此**不设 TTL 缓存**，`force` 在这里恒等。
+pub fn account_token_today(variant: TraeVariant, force: bool) -> Value {
+    let _ = force;
+    let now = chrono::Local::now().timestamp_millis();
+    let day = local_date(now);
+    let keep = gateway_log_keep();
+    let (entries, _) = load_entries();
+    // 「文件已满」= 今日部分可能被挤出（保守判据，见函数文档）。
+    let truncated = entries.len() >= keep;
+
+    let known: std::collections::HashSet<String> = account::list_account_views_for(variant)
+        .iter()
+        .filter_map(|view| view.get("userId").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect();
+
+    let buckets = today_gateway_buckets(&entries, &day, variant.region(), &known);
+    let accounts: Vec<Value> = buckets
+        .into_iter()
+        .map(|(uid, (input, output))| {
+            json!({
+                "uid": uid,
+                // 客户端一档不可得（见函数文档）：这里给 0 只为形状同构，
+                // 语义由 `clientSource` 决定，前端**不得**把它当真实 0。
+                "clientIn": 0,
+                "clientOut": 0,
+                "gatewayIn": input,
+                "gatewayOut": output,
+            })
+        })
+        .collect();
+
+    json!({
+        "date": day,
+        "accounts": accounts,
+        "unknownClient": { "in": 0, "out": 0 },
+        "gatewayTruncated": truncated,
+        "clientSource": "unavailable",
+    })
 }
 
 #[cfg(test)]
@@ -562,7 +703,10 @@ mod tests {
             );
         }
         assert_eq!(TraeTokenScope::parse("global"), TraeTokenScope::Global);
-        assert_eq!(TraeTokenScope::parse("unlabeled"), TraeTokenScope::Unlabeled);
+        assert_eq!(
+            TraeTokenScope::parse("unlabeled"),
+            TraeTokenScope::Unlabeled
+        );
         assert_eq!(TraeTokenScope::parse("all"), TraeTokenScope::All);
         // 缺失 / 未知 → All（宽容失败方向）。
         assert_eq!(TraeTokenScope::parse(""), TraeTokenScope::All);
@@ -581,14 +725,16 @@ mod tests {
         counts.bump(None);
         assert_eq!(counts.cn, 2, "两条国内程序位同属国内版");
         assert_eq!(counts.global, 1);
-        assert_eq!(counts.unlabeled, 1, "旧日志（无 variant）必须计入「未标注」");
+        assert_eq!(
+            counts.unlabeled, 1,
+            "旧日志（无 variant）必须计入「未标注」"
+        );
         assert_eq!(counts.all, 4, "All = 三档之和");
     }
 
     #[test]
     fn entry_parse_reads_variant_or_none() {
-        let work =
-            LogEntry::parse(&json!({"ts": 1, "variant": "trae_work"})).expect("解析 work");
+        let work = LogEntry::parse(&json!({"ts": 1, "variant": "trae_work"})).expect("解析 work");
         assert_eq!(work.variant, Some(TraeVariant::TraeWork));
         let cn = LogEntry::parse(&json!({"ts": 1, "variant": "trae_cn"})).expect("解析 cn");
         assert_eq!(cn.variant, Some(TraeVariant::Trae));
@@ -626,8 +772,14 @@ mod tests {
         assert_eq!(all["variantCounts"]["unlabeled"], 1);
         assert_eq!(all["variantCounts"]["all"], 4);
         assert_eq!(all["summary"]["records"], 4, "All 应计入全部三档");
-        assert!(all["modelDaily"].as_array().map(|v| !v.is_empty()).unwrap_or(false));
-        assert!(all["unsupported"].as_array().map(|v| !v.is_empty()).unwrap_or(false));
+        assert!(all["modelDaily"]
+            .as_array()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false));
+        assert!(all["unsupported"]
+            .as_array()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false));
 
         let cn = get_statistics(None, TraeTokenScope::Cn);
         assert_eq!(
@@ -647,6 +799,143 @@ mod tests {
         assert_eq!(
             unlabeled["summary"]["records"], 1,
             "旧日志（无 variant）在 Unlabeled 下必须可见，不得被静默丢弃（R9）"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// 今日桶：只认「今天 + 本区域 + 有 uid」，跨日 / 跨区域 / 空 uid 一条都不许进。
+    #[test]
+    fn today_gateway_buckets_filters_day_region_and_empty_account() {
+        let now = chrono::Local::now().timestamp_millis();
+        let yesterday = now - 24 * 60 * 60 * 1000;
+        let mut known = std::collections::HashSet::new();
+        known.insert("u-known".to_string());
+
+        let entries = vec![
+            entry(now, "m", "u-known", 10, 5),        // 今天 + 在账号库 ⇒ 计入
+            entry(now, "m", "u-gone", 1, 1),          // 今天但不在库、也无变体 ⇒ 不计入
+            entry(yesterday, "m", "u-known", 99, 99), // 昨天 ⇒ 不计入
+            entry(now, "m", "", 7, 7),                // 空 uid ⇒ 不计入
+        ];
+        let buckets = today_gateway_buckets(
+            &entries,
+            &local_date(now),
+            super::super::region::TraeRegion::Cn,
+            &known,
+        );
+        assert_eq!(
+            buckets.len(),
+            1,
+            "只有「今天 + 本区域 + 有 uid」那一条：{buckets:?}"
+        );
+        assert_eq!(buckets.get("u-known"), Some(&(10, 5)));
+
+        // 变体命中区域 ⇒ 即使账号已被删除（不在库里）也要计入（删号不该抹掉已发生的用量）。
+        let mut deleted = entry(now, "m", "u-deleted", 3, 4);
+        deleted.variant = Some(TraeVariant::TraeWork);
+        let buckets = today_gateway_buckets(
+            &[deleted],
+            &local_date(now),
+            super::super::region::TraeRegion::Cn,
+            &known,
+        );
+        assert_eq!(buckets.get("u-deleted"), Some(&(3, 4)));
+
+        // 国际版日志不得混进国内版（同一 uid 在两区是不同账号）。
+        let mut global = entry(now, "m", "u-global", 1, 1);
+        global.variant = Some(TraeVariant::Global);
+        let buckets = today_gateway_buckets(
+            &[global],
+            &local_date(now),
+            super::super::region::TraeRegion::Cn,
+            &known,
+        );
+        assert!(buckets.is_empty(), "国际版调用不得计入国内版");
+    }
+
+    /// `account_token_today`：缺席 ≠ 0，且客户端一档必须自报「不可得」。
+    #[test]
+    fn account_token_today_omits_absent_accounts_and_flags_client_unavailable() {
+        let home = std::env::temp_dir().join(format!("trae-token-today-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".buddy-switch").join("trae")).expect("创建隔离目录");
+        let _guard = crate::modules::config::HomeOverrideGuard::set(&home);
+
+        let now = chrono::Local::now().timestamp_millis();
+        let entries = json!([
+            { "ts": now, "model": "m", "account": "u1", "status": 200, "promptTokens": 10, "completionTokens": 2, "stream": true, "variant": "trae_work" },
+            { "ts": now, "model": "m", "account": "u1", "status": 200, "promptTokens": 5, "completionTokens": 1, "stream": true, "variant": "trae_work" },
+            // 今天有记录、但 token 全 0（失败请求）⇒ 必须**显式**出现 0，而不是缺席。
+            { "ts": now, "model": "m", "account": "u2", "status": 429, "promptTokens": 0, "completionTokens": 0, "stream": false, "variant": "trae_work" },
+            // 昨天 ⇒ 不进今日桶。
+            { "ts": now - 86_400_000, "model": "m", "account": "u3", "status": 200, "promptTokens": 99, "completionTokens": 99, "stream": true, "variant": "trae_work" },
+        ]);
+        std::fs::write(paths::api_gateway_log_file(), entries.to_string()).expect("写入日志");
+
+        let value = account_token_today(TraeVariant::TraeWork, false);
+        assert_eq!(
+            value["clientSource"], "unavailable",
+            "Trae 没有客户端会话落盘 ⇒ 必须自报不可得，前端据此不渲染成真实 0"
+        );
+        assert_eq!(value["date"], local_date(now));
+        assert_eq!(value["unknownClient"]["in"], 0);
+        assert_eq!(
+            value["gatewayTruncated"], false,
+            "日志远未到上限 ⇒ 不是下界"
+        );
+
+        let accounts = value["accounts"].as_array().expect("accounts 是数组");
+        let uids: Vec<&str> = accounts
+            .iter()
+            .filter_map(|item| item["uid"].as_str())
+            .collect();
+        assert_eq!(uids, vec!["u1", "u2"], "只列今天的账号（u3 是昨天）");
+        let u1 = accounts
+            .iter()
+            .find(|item| item["uid"] == "u1")
+            .expect("u1");
+        assert_eq!(u1["gatewayIn"], 15, "同一账号多条必须累加");
+        assert_eq!(u1["gatewayOut"], 3);
+        assert_eq!(u1["clientIn"], 0);
+        let u2 = accounts
+            .iter()
+            .find(|item| item["uid"] == "u2")
+            .expect("u2");
+        assert_eq!(u2["gatewayIn"], 0, "今天的真实 0 必须显式给出");
+        assert!(
+            accounts.iter().all(|item| item["uid"] != "u4"),
+            "从未出现的账号不得被凭空造出 0"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// 日志文件已到 `logKeep` 上限 ⇒ 今日部分是下界（`gatewayTruncated`）。
+    #[test]
+    fn account_token_today_marks_truncated_when_log_is_full() {
+        let home = std::env::temp_dir().join(format!("trae-token-trunc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".buddy-switch").join("trae")).expect("创建隔离目录");
+        let _guard = crate::modules::config::HomeOverrideGuard::set(&home);
+
+        // 配置里把 logKeep 调到 2，再写 2 条 ⇒ 视为「可能已被挤出」。
+        std::fs::write(
+            paths::api_gateway_file(),
+            json!({ "logKeep": 2 }).to_string(),
+        )
+        .expect("写入网关配置");
+        let now = chrono::Local::now().timestamp_millis();
+        let entries = json!([
+            { "ts": now, "model": "m", "account": "u1", "status": 200, "promptTokens": 1, "completionTokens": 1, "variant": "trae_work" },
+            { "ts": now, "model": "m", "account": "u1", "status": 200, "promptTokens": 1, "completionTokens": 1, "variant": "trae_work" },
+        ]);
+        std::fs::write(paths::api_gateway_log_file(), entries.to_string()).expect("写入日志");
+
+        let value = account_token_today(TraeVariant::TraeWork, true);
+        assert_eq!(
+            value["gatewayTruncated"], true,
+            "文件已满 ⇒ 今日可能被裁，必须如实报下界"
         );
 
         let _ = std::fs::remove_dir_all(&home);
@@ -715,9 +1004,37 @@ mod tests {
         let ts = chrono::Local::now().timestamp_millis();
         assert_eq!(local_date(ts).len(), 10, "YYYY-MM-DD");
         assert_eq!(local_hour(ts).len(), 2, "HH");
+        // ★ 热力槽位 = `"{weekday}-{HH}"`：星期 **0..6（周一=0）**、小时 **00..23**。
+        //   前端 `heatmapMatrix` 按 `-` 拆键，任一档越界都会**静默丢格子**，故钉死。
+        let slot = local_slot(ts);
+        let (weekday, hour) = slot.split_once('-').expect("槽位必须是 `{weekday}-{HH}`");
+        assert!(
+            (0..=6).contains(&weekday.parse::<i64>().expect("星期是数字")),
+            "{slot}"
+        );
+        assert_eq!(hour.len(), 2, "{slot}");
+        assert!(
+            (0..=23).contains(&hour.parse::<i64>().expect("小时是数字")),
+            "{slot}"
+        );
         // 极端时间戳不 panic，退化为占位符。
         assert_eq!(local_date(i64::MIN), "未知");
         assert_eq!(local_hour(i64::MIN), "--");
+        assert_eq!(local_weekday(i64::MIN), "-");
+    }
+
+    #[test]
+    fn slot_keys_sort_by_weekday_then_hour() {
+        // 键的**字符串升序**必须等于「周 → 小时」的自然顺序：下游沿用 `ascending()` 排序，
+        // 顺序错了热力图的行列就会错位（且不会有任何报错）。
+        let mut keys = vec![
+            "1-00".to_string(),
+            "0-23".to_string(),
+            "0-00".to_string(),
+            "6-09".to_string(),
+        ];
+        keys.sort();
+        assert_eq!(keys, vec!["0-00", "0-23", "1-00", "6-09"]);
     }
 
     #[test]

@@ -13,8 +13,12 @@
 //! 新增字段一律给 `#[serde(default = "...")]`：字段缺失会回落默认值而非报错，
 //! 使旧版本配置文件在升级后仍可读。
 
+use std::collections::BTreeMap;
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 
+use super::region::TraeRegion;
 use crate::modules::trae::{paths, store, TRAE_DEFAULT_API_PORT, TRAE_DEFAULT_PROXY_PORT};
 
 /// Trae 模块设置。
@@ -51,7 +55,31 @@ pub struct TraeSettings {
     /// 通知方式：`toast` / `system` / `none`。
     #[serde(default = "default_notify")]
     pub notify: String,
-    /// 用户指定的 Trae 客户端可执行文件路径（覆盖自动探测）。
+    /// 用户指定的 Trae 客户端可执行文件路径（覆盖自动探测），**按区域分家**（issue #20）。
+    ///
+    /// 键 = 区域稳定标识（[`TraeRegion::as_str`]：`"cn"` / `"global"`），值 = exe 绝对路径。
+    /// 缺失的键 = 该区域未指定 ⇒ 回落自动探测。
+    ///
+    /// ## 为什么必须按区域分家（用户报障原话）
+    ///
+    /// 「设置Trae 路径国内版和国际版 两个都设置是一样的，以最后的设置为准了，没有隔离开来」。
+    ///
+    /// 国内版与国际版是**两个物理上不同的客户端**（`Trae CN.exe` / `Trae.exe`，
+    /// 各有独立安装目录），单个全局字段必然让后设置的那条覆盖前一条。
+    /// 用 [`BTreeMap`] 而非 `HashMap`：落盘键序稳定 ⇒ 同一份设置两次序列化字节相同
+    /// （便于 diff 与「设置未变」判定），与仓库其它落盘结构一致。
+    #[serde(default)]
+    pub trae_paths: BTreeMap<String, String>,
+    /// 用户指定的 Trae 客户端可执行文件路径（**旧版单值字段：兼容读，不得删除**）。
+    ///
+    /// ## 为什么保留（与 [`Self::api_key`] 同一类处理）
+    ///
+    /// 旧版 `settings.json` 只存了这一个值，且**无法区分区域**。删掉本字段会让老用户在
+    /// 升级后**静默丢掉已配置的路径**（表现为「明明设置过，升级后却说没设置」）。
+    ///
+    /// [`load`] 会把它**单向迁移**进 [`Self::trae_paths`]（区域按 exe 名反推，推不出落
+    /// 国内版）并就地清空；下一次 `patch()` 写回时把它落盘成 `null`。
+    /// 因此本字段**只被读、不再被写路径更新**。
     #[serde(default)]
     pub trae_path: Option<String>,
     /// 用户指定的浏览器可执行文件路径（浏览器提取 JWT 用）。
@@ -143,6 +171,7 @@ impl Default for TraeSettings {
             checkin_skip_expired: default_true(),
             retry: default_retry(),
             notify: default_notify(),
+            trae_paths: BTreeMap::new(),
             trae_path: None,
             browser_path: None,
             log_retention_days: default_log_retention_days(),
@@ -169,7 +198,12 @@ impl TraeSettings {
 
     /// 判断某主机是否属于需要 MITM 解密的域名。
     pub fn should_intercept(&self, host: &str) -> bool {
-        let host = host.split(':').next().unwrap_or(host).trim().to_ascii_lowercase();
+        let host = host
+            .split(':')
+            .next()
+            .unwrap_or(host)
+            .trim()
+            .to_ascii_lowercase();
         if host.is_empty() {
             return false;
         }
@@ -182,6 +216,84 @@ impl TraeSettings {
     }
 }
 
+impl TraeSettings {
+    /// 把旧版单值 `traePath` **单向迁移**进按区域分家的 [`Self::trae_paths`]（幂等）。
+    ///
+    /// 区域判据 = exe 文件名经 [`variant_of_name`] 反推出的变体的区域；反推不出时落
+    /// **国内版**（与 [`TraeRegion::default`] 一致 —— 升级前默认变体 `trae_work` 也是国内）。
+    ///
+    /// 迁移后**就地清空** `trae_path`：它已是死字段，留着只会让「设置页显示哪个值」
+    /// 出现第二个来源。清空后由 `patch()` 的下一次写回落盘。
+    ///
+    /// `or_insert` 而非 `insert`：若目标区域**已有**显式配置（用户在新版里设过），
+    /// 旧值不得覆盖新值 —— 迁移只补空缺。
+    fn migrate_legacy_trae_path(&mut self) {
+        let Some(legacy) = self
+            .trae_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let region = legacy_region(&legacy);
+        self.trae_paths
+            .entry(region.as_str().to_string())
+            .or_insert(legacy);
+        self.trae_path = None;
+    }
+
+    /// 取某区域配置的客户端路径（已去空白；空串视为未配置）。
+    pub fn path_for(&self, region: TraeRegion) -> Option<&str> {
+        self.trae_paths
+            .get(region.as_str())
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+    }
+
+    /// 全部**已配置**路径（按区域稳定顺序：`cn` 在 `global` 前）。
+    ///
+    /// 供**跨区域**探测使用（[`super::platform::env_status`] / `detected_variant`）——
+    /// 那两处问的是「本机装的是哪一条线」，不能只看单一区域。
+    pub fn all_paths(&self) -> Vec<String> {
+        TraeRegion::all()
+            .into_iter()
+            .filter_map(|region| self.path_for(region).map(str::to_string))
+            .collect()
+    }
+
+    /// 按区域**就地**写入/清除客户端路径（`None` 或空白 = 清除该区域）。
+    ///
+    /// 设置页走这里而非直接改 `trae_paths`：它保证「清除」与「写入」不会留下空串键
+    /// （空串键会在 `path_for` 里被过滤成「未配置」，但会让落盘文件出现无意义条目）。
+    pub fn set_path_for(&mut self, region: TraeRegion, path: Option<&str>) {
+        let key = region.as_str().to_string();
+        match path.map(str::trim).filter(|path| !path.is_empty()) {
+            Some(path) => {
+                self.trae_paths.insert(key, path.to_string());
+            }
+            None => {
+                self.trae_paths.remove(&key);
+            }
+        }
+    }
+}
+
+/// 从 exe 路径反推它属于哪个区域（迁移用）。
+///
+/// 反推不出（文件名不认识）时落国内版：旧版单值字段的用户绝大多数是国内版，
+/// 且国际版用户重设一次路径的成本远低于国内版用户升级后「配置凭空消失」。
+fn legacy_region(path: &str) -> TraeRegion {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(super::variant::variant_of_name)
+        .map(super::variant::TraeVariant::region)
+        .unwrap_or(TraeRegion::Cn)
+}
+
 /// 读取设置；文件缺失或损坏时回落全默认值。
 pub fn load() -> TraeSettings {
     let mut settings: TraeSettings = store::read_json(&paths::settings_file());
@@ -189,6 +301,7 @@ pub fn load() -> TraeSettings {
     if settings.proxy_domains.trim().is_empty() {
         settings.proxy_domains = default_proxy_domains();
     }
+    settings.migrate_legacy_trae_path();
     settings
 }
 
@@ -252,7 +365,15 @@ mod tests {
         // 关键护栏：磁盘、Tauri 响应、HTTP 响应必须是同一套字段名。
         let settings = TraeSettings::default();
         let wire = serde_json::to_value(&settings).unwrap();
-        for key in ["proxyPort", "autoStartProxy", "traePath", "proxyDomains", "apiPort", "apiKey"] {
+        for key in [
+            "proxyPort",
+            "autoStartProxy",
+            "traePath",
+            "traePaths",
+            "proxyDomains",
+            "apiPort",
+            "apiKey",
+        ] {
             assert!(wire.get(key).is_some(), "缺少 camelCase 字段 {key}");
         }
         // snake_case 不得出现（会让前端 TraeSettings 类型映射成 undefined）
@@ -285,8 +406,10 @@ mod tests {
 
     #[test]
     fn proxy_domain_list_trims_and_lowercases() {
-        let mut settings = TraeSettings::default();
-        settings.proxy_domains = " Trae.CN , , api.trae.com.cn ,".into();
+        let settings = TraeSettings {
+            proxy_domains: " Trae.CN , , api.trae.com.cn ,".into(),
+            ..Default::default()
+        };
         assert_eq!(
             settings.proxy_domain_list(),
             vec!["trae.cn", "api.trae.com.cn"]
@@ -295,8 +418,10 @@ mod tests {
 
     #[test]
     fn should_intercept_matches_domain_and_subdomains_only() {
-        let mut settings = TraeSettings::default();
-        settings.proxy_domains = "trae.cn,trae.com.cn".into();
+        let settings = TraeSettings {
+            proxy_domains: "trae.cn,trae.com.cn".into(),
+            ..Default::default()
+        };
         // 精确域名与子域命中
         assert!(settings.should_intercept("trae.cn"));
         assert!(settings.should_intercept("api.trae.cn"));
@@ -314,9 +439,179 @@ mod tests {
 
     #[test]
     fn empty_proxy_domains_intercepts_nothing() {
-        let mut settings = TraeSettings::default();
-        settings.proxy_domains = String::new();
+        let settings = TraeSettings {
+            proxy_domains: String::new(),
+            ..Default::default()
+        };
         assert!(settings.proxy_domain_list().is_empty());
         assert!(!settings.should_intercept("api.trae.cn"));
+    }
+
+    // -----------------------------------------------------------------------
+    // 按区域分家的客户端路径（issue #20）
+    // -----------------------------------------------------------------------
+
+    /// ★ 区域必须**互相隔离**：给一个区域设路径不得影响另一个。
+    ///
+    /// 用户报障原话：「设置Trae 路径国内版和国际版 两个都设置是一样的，
+    /// 以最后的设置为准了，没有隔离开来」。这条就是那句话的回归护栏 ——
+    /// 若退回单个全局字段，本用例必红。
+    #[test]
+    fn trae_paths_are_isolated_per_region() {
+        let mut settings = TraeSettings::default();
+        settings.set_path_for(TraeRegion::Cn, Some(r"D:\A\Trae CN.exe"));
+
+        assert_eq!(settings.path_for(TraeRegion::Cn), Some(r"D:\A\Trae CN.exe"));
+        assert_eq!(
+            settings.path_for(TraeRegion::Global),
+            None,
+            "★ 给国内版设路径不得让国际版也变成已配置"
+        );
+
+        // 再设国际版：国内版的值必须**原样保留**（这正是旧实现的缺陷所在）。
+        settings.set_path_for(TraeRegion::Global, Some(r"D:\B\Trae.exe"));
+        assert_eq!(settings.path_for(TraeRegion::Cn), Some(r"D:\A\Trae CN.exe"));
+        assert_eq!(
+            settings.path_for(TraeRegion::Global),
+            Some(r"D:\B\Trae.exe")
+        );
+
+        // 清除一个区域不影响另一个。
+        settings.set_path_for(TraeRegion::Cn, None);
+        assert_eq!(settings.path_for(TraeRegion::Cn), None);
+        assert_eq!(
+            settings.path_for(TraeRegion::Global),
+            Some(r"D:\B\Trae.exe")
+        );
+    }
+
+    /// 空白路径视为「未配置」；`set_path_for` 不得留下空串键。
+    #[test]
+    fn blank_path_is_treated_as_unset() {
+        let mut settings = TraeSettings::default();
+        settings.set_path_for(TraeRegion::Cn, Some("   "));
+        assert_eq!(settings.path_for(TraeRegion::Cn), None);
+        assert!(
+            settings.trae_paths.is_empty(),
+            "空白路径不得留下空串键（会让落盘文件出现无意义条目）"
+        );
+
+        // 手工塞一个空串（模拟外部写坏的文件）也必须被 `path_for` 过滤。
+        settings
+            .trae_paths
+            .insert(TraeRegion::Cn.as_str().to_string(), "  ".into());
+        assert_eq!(settings.path_for(TraeRegion::Cn), None);
+    }
+
+    /// `all_paths` 按**区域稳定顺序**（`cn` 在 `global` 前）返回已配置项。
+    #[test]
+    fn all_paths_is_region_ordered_and_skips_unset() {
+        let mut settings = TraeSettings::default();
+        settings.set_path_for(TraeRegion::Global, Some(r"D:\B\Trae.exe"));
+        settings.set_path_for(TraeRegion::Cn, Some(r"D:\A\Trae CN.exe"));
+
+        assert_eq!(
+            settings.all_paths(),
+            vec![
+                r"D:\A\Trae CN.exe".to_string(),
+                r"D:\B\Trae.exe".to_string()
+            ],
+            "顺序必须稳定为 cn → global（BTreeMap 落盘键序也据此）"
+        );
+
+        settings.set_path_for(TraeRegion::Cn, None);
+        assert_eq!(settings.all_paths(), vec![r"D:\B\Trae.exe".to_string()]);
+    }
+
+    /// 旧版单值 `traePath` 必须**单向迁移**进按区域字段，且区域按 exe 名反推。
+    #[test]
+    fn legacy_trae_path_migrates_into_its_region() {
+        // 路径**统一用正斜杠**：盘符路径只是字符串，`Path::file_name()` 在 Unix 上
+        // 不按 `\` 切分（整串会被当成文件名，`variant_of_name` 认不出 ⇒ 落默认区域），
+        // 断言就会在 macOS / Linux 上红（issue #37 的第 6 条）。正斜杠三平台都能切。
+        // 国际版 exe（`Trae.exe` 精确命中国际 TraeCode）⇒ 落 global。
+        let mut settings = TraeSettings {
+            trae_path: Some("D:/Apps/Trae/Trae.exe".into()),
+            ..TraeSettings::default()
+        };
+        settings.migrate_legacy_trae_path();
+        assert_eq!(
+            settings.path_for(TraeRegion::Global),
+            Some("D:/Apps/Trae/Trae.exe"),
+            "`Trae.exe` 属于国际版，迁移必须落 global"
+        );
+        assert_eq!(settings.path_for(TraeRegion::Cn), None);
+        assert_eq!(settings.trae_path, None, "迁移后旧字段必须就地清空");
+
+        // 国内版 exe ⇒ 落 cn。
+        let mut settings = TraeSettings {
+            trae_path: Some("D:/Apps/Trae CN/Trae CN.exe".into()),
+            ..TraeSettings::default()
+        };
+        settings.migrate_legacy_trae_path();
+        assert_eq!(
+            settings.path_for(TraeRegion::Cn),
+            Some("D:/Apps/Trae CN/Trae CN.exe")
+        );
+        assert_eq!(settings.path_for(TraeRegion::Global), None);
+
+        // 名字认不出 ⇒ 落国内版（默认区域），且不得丢值。
+        let mut settings = TraeSettings {
+            trae_path: Some("D:/Weird/whatever.exe".into()),
+            ..TraeSettings::default()
+        };
+        settings.migrate_legacy_trae_path();
+        assert_eq!(
+            settings.path_for(TraeRegion::Cn),
+            Some("D:/Weird/whatever.exe"),
+            "认不出区域时落默认（国内版），绝不能把用户的路径丢掉"
+        );
+    }
+
+    /// 迁移**只补空缺**：目标区域已有显式配置时，旧值不得覆盖它。
+    #[test]
+    fn legacy_migration_does_not_clobber_existing_value() {
+        let mut settings = TraeSettings {
+            trae_path: Some(r"D:\Old\Trae CN.exe".into()),
+            ..TraeSettings::default()
+        };
+        settings.set_path_for(TraeRegion::Cn, Some(r"D:\New\Trae CN.exe"));
+
+        settings.migrate_legacy_trae_path();
+
+        assert_eq!(
+            settings.path_for(TraeRegion::Cn),
+            Some(r"D:\New\Trae CN.exe"),
+            "新版里已显式设置的值优先于旧字段"
+        );
+    }
+
+    /// 迁移必须**幂等**：跑两次结果相同（`load()` 每次都会跑它）。
+    #[test]
+    fn legacy_migration_is_idempotent() {
+        let mut settings = TraeSettings {
+            trae_path: Some(r"D:\Apps\Trae\Trae.exe".into()),
+            ..TraeSettings::default()
+        };
+        settings.migrate_legacy_trae_path();
+        let once = settings.clone();
+        settings.migrate_legacy_trae_path();
+        assert_eq!(settings, once, "迁移必须幂等（load 每次都会调用它）");
+    }
+
+    /// 没有旧值时迁移不得凭空造出条目。
+    #[test]
+    fn legacy_migration_noop_without_legacy_value() {
+        let mut settings = TraeSettings::default();
+        settings.migrate_legacy_trae_path();
+        assert!(settings.trae_paths.is_empty());
+
+        // 空白旧值同样不得造出条目。
+        let mut settings = TraeSettings {
+            trae_path: Some("   ".into()),
+            ..TraeSettings::default()
+        };
+        settings.migrate_legacy_trae_path();
+        assert!(settings.trae_paths.is_empty());
     }
 }

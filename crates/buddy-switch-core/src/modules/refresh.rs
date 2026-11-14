@@ -78,9 +78,53 @@ fn try_unlock(region: Region, account: Value) -> Value {
     }
 }
 
+/// 刷新失败是否属于「暂时性」：网络层错误（-1）/ HTTP 5xx 错误页（body 不可解析 ⇒
+/// `http_request` 把 status 当 code）都**不能证明凭据坏了**。业务拒绝码（12153
+/// invalid_grant、401/403）不在此列 —— 那些才是需要重新登录的信号。
+///
+/// 契约见 `config::http_request`：网络错误 `{"code": -1}`，HTTP 错误且 body 不可解析
+/// `{"code": <status>}`，服务端业务响应则原样返回 body 的 `code`。
+fn is_transient_refresh_failure(code: i64) -> bool {
+    code < 0 || (500..=599).contains(&code)
+}
+
+/// 把一次刷新失败写进账号返回值；返回**是否落了** `needs_relogin`（保活三态判据）。
+///
+/// ★ 暂时性失败**只挂返回值**（`refresh_transient_error`），不动标记语义、不落盘临时字段；
+///   业务拒绝码照旧落 `needs_relogin` + 原因。抽成纯函数是为了让「断网 / 5xx 不误标」
+///   能被单测直接断言，不必起网络（issue #171）。
+fn apply_refresh_failure(account: &mut Value, code: i64, message: &str) -> bool {
+    let reason = format!("刷新失败(code={code}): {message}");
+    if is_transient_refresh_failure(code) {
+        account["refresh_transient_error"] = json!(reason);
+        false
+    } else {
+        account["needs_relogin"] = json!(true);
+        account["needs_relogin_reason"] = json!(reason);
+        true
+    }
+}
+
+/// 保活单账号结果的三态判据：`transient` 优先于 `failed`（账号可能带着历史误标，
+/// 但这一轮只是断网 / 5xx，不该再被记成「凭据被拒」）。抽成纯函数供单测直接断言。
+fn refresh_result_status(fresh: &Value) -> &'static str {
+    if fresh
+        .get("refresh_transient_error")
+        .and_then(|v| v.as_str())
+        .is_some()
+    {
+        "transient"
+    } else if fresh.get("needs_relogin").and_then(|v| v.as_bool()) == Some(true) {
+        "failed"
+    } else {
+        "ok"
+    }
+}
+
 /// 刷新单账号 token（POST `{billing_base}/v2/plugin/auth/token/refresh`），成功则落盘并返回新账号。
 ///
-/// 刷新失败（refresh token 失效等）时给账号标记 needs_relogin，避免无限重试。
+/// 刷新失败按「暂时性 / 凭据被拒」分流（见 [`apply_refresh_failure`]）：只有后者
+/// 给账号标记 needs_relogin，避免网络抖动把健康账号判死、徽章一挂一整天（issue #171）。
 pub async fn refresh_account_token_for(region: Region, mut account: Value) -> Value {
     // ★ 先解锁再判空：信封是**对象**，`as_str()` 取不到值。不先解锁就会把
     //   「已加密」当成「缺少 refresh token」——用户照着「去补导入」查也查不出东西
@@ -110,6 +154,20 @@ pub async fn refresh_account_token_for(region: Region, mut account: Value) -> Va
         let _ = upsert_account_for(region, &account);
         return account;
     }
+    let uid = account.get("uid").and_then(Value::as_str).unwrap_or("");
+    let _risk_permit = match crate::modules::risk_control::admit_platform_request(
+        "workbuddy",
+        region.as_str(),
+        uid,
+    )
+    .await
+    {
+        Ok(permit) => permit,
+        Err(error) => {
+            account["refresh_transient_error"] = json!(format!("风控准入拦截：{error}"));
+            return account;
+        }
+    };
 
     let mut headers = build_auth_headers(&account);
     headers.insert("X-Refresh-Token".to_string(), rt.clone());
@@ -126,16 +184,36 @@ pub async fn refresh_account_token_for(region: Region, mut account: Value) -> Va
     );
     let resp = http_request(&url, "POST", Some(json!({})), Some(&headers)).await;
     let code = resp.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+    let reason = resp
+        .get("message")
+        .or_else(|| resp.get("msg"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let _ = crate::modules::risk_control::record_platform_response(
+        "workbuddy",
+        region.as_str(),
+        uid,
+        code,
+        reason,
+    );
     if code != 0 && code != 200 {
-        account["needs_relogin"] = json!(true);
-        account["needs_relogin_reason"] = json!(format!(
-            "刷新失败(code={code}): {}",
-            resp.get("message")
-                .or_else(|| resp.get("msg"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("未知错误")
-        ));
-        let _ = upsert_account_for(region, &account);
+        let message = resp
+            .get("message")
+            .or_else(|| resp.get("msg"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("未知错误");
+        let transient = !apply_refresh_failure(&mut account, code, message);
+        // 失败详情只挂返回值：落盘副本先摘掉临时字段；仍要 upsert，否则
+        // `try_unlock` 解出的明文白解了（见函数头注释）。暂时性分支不动标记语义。
+        let mut on_disk = account.clone();
+        if transient {
+            on_disk
+                .as_object_mut()
+                .unwrap()
+                .remove("refresh_transient_error");
+        }
+        let _ = upsert_account_for(region, &on_disk);
         return account;
     }
 
@@ -184,9 +262,7 @@ pub async fn refresh_account_token_for(region: Region, mut account: Value) -> Va
     }
     let new_rt_exp = match new_rt_exp {
         Some(v) => Some(v),
-        None => {
-            sane_relative_seconds(data.get("refreshExpiresIn")).map(|e| now_ms() + e * 1000)
-        }
+        None => sane_relative_seconds(data.get("refreshExpiresIn")).map(|e| now_ms() + e * 1000),
     };
     if let Some(v) = new_rt_exp {
         account["refreshExpiresAt"] = json!(v);
@@ -195,6 +271,8 @@ pub async fn refresh_account_token_for(region: Region, mut account: Value) -> Va
     let map = account.as_object_mut().unwrap();
     map.remove("needs_relogin");
     map.remove("needs_relogin_reason");
+    // 成功时顺手清掉返回值上的临时字段，防止调用方复用返回值落盘时残留。
+    map.remove("refresh_transient_error");
     let _ = upsert_account_for(region, &account);
     // Windows 不执行 apiKeyHelper；当前 CLI 账号刷新后同步 settings env。
     // 同步失败不阻断 WorkBuddy 保活；状态接口会根据 settings 与账号库是否
@@ -283,12 +361,28 @@ pub async fn run_keepalive_cycle_for(region: Region) -> Value {
             let reason = envelope
                 .clone()
                 .unwrap_or_else(|| "缺少 refresh token，无法保活，需重新登录".to_string());
-            acc["needs_relogin"] = json!(true);
-            acc["needs_relogin_reason"] = json!(reason.clone());
-            let _ = upsert_account_for(region, &acc);
+            // ★ 已带同一条标记的账号：链条没变，别每晚重写一次 accounts.json、
+            //   也别往排程日志里塞一条长得一模一样的失败。标记与原因都没变才跳过；
+            //   原因变了（例如「刷新失败」变成「信封解不开」）仍要落盘更新。
+            //   有明文 refresh_token 的账号不在此列 —— 那类失败可能只是上游临时抖动，
+            //   保活继续试，刷新成功时 `refresh_account_token_for` 会清掉标记。
+            let already_flagged = acc.get("needs_relogin").and_then(|v| v.as_bool()) == Some(true)
+                && acc.get("needs_relogin_reason").and_then(|v| v.as_str())
+                    == Some(reason.as_str());
+            if !already_flagged {
+                acc["needs_relogin"] = json!(true);
+                acc["needs_relogin_reason"] = json!(reason.clone());
+                let _ = upsert_account_for(region, &acc);
+            }
             results.push(json!({
                 "email": crate::modules::account::account_display_name(&acc),
-                "status": if envelope.is_some() { "envelope_rt" } else { "missing_rt" },
+                "status": if already_flagged {
+                    "skipped"
+                } else if envelope.is_some() {
+                    "envelope_rt"
+                } else {
+                    "missing_rt"
+                },
                 // 带上原因：排程日志里只看到 `envelope_rt` 是没法排障的，
                 // 且这条与上面 `failed` 分支的字段形状保持一致。
                 "error": reason,
@@ -296,11 +390,19 @@ pub async fn run_keepalive_cycle_for(region: Region) -> Value {
             continue;
         }
         let fresh = refresh_account_token_for(region, acc).await;
+        // ★ 三态（issue #171）：暂时性失败优先于 `failed` —— 账号可能带着历史误标，
+        //   但这一轮只是断网 / 5xx，不该再被记成「凭据被拒」。
+        let transient = fresh
+            .get("refresh_transient_error")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         let failed = fresh.get("needs_relogin").and_then(|v| v.as_bool()) == Some(true);
         results.push(json!({
             "email": crate::modules::account::account_display_name(&fresh),
-            "status": if failed { "failed" } else { "ok" },
-            "error": if failed {
+            "status": refresh_result_status(&fresh),
+            "error": if let Some(reason) = transient {
+                Some(reason)
+            } else if failed {
                 fresh.get("needs_relogin_reason").and_then(|v| v.as_str()).map(|s| s.to_string())
             } else {
                 None
@@ -312,6 +414,10 @@ pub async fn run_keepalive_cycle_for(region: Region) -> Value {
 
 #[cfg(test)]
 mod tests {
+    // 测试串行锁（`lock_*()`）会被**故意**持有到用例结束：它防的是多个用例同时抢占
+    // 同一个回调端口 / 全局状态。`#[tokio::test]` 默认是 current-thread 运行时，
+    // 不存在「持锁跨线程唤醒」的风险；clippy 的 await_holding_lock 在这里是误报。
+    #![allow(clippy::await_holding_lock)]
     use super::*;
 
     /// 触及保活全局状态的用例必须**串行**：`KEEPALIVE_RUNNING_CN` 是**进程级**全局标志，
@@ -321,7 +427,9 @@ mod tests {
 
     fn keepalive_lock() -> std::sync::MutexGuard<'static, ()> {
         // 吞掉中毒：单个用例 panic 不该连带其它用例全红。
-        KEEPALIVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        KEEPALIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// `expiresIn` 只接受「正数且不超过 10 年」；缺失、0、负数、荒谬大数一律拒绝。
@@ -333,11 +441,22 @@ mod tests {
     fn relative_expiry_seconds_rejects_missing_and_out_of_range() {
         // 合法：正常时长
         assert_eq!(sane_relative_seconds(Some(&json!(3600))), Some(3600));
-        assert_eq!(sane_relative_seconds(Some(&json!(60 * 86400))), Some(60 * 86400));
+        assert_eq!(
+            sane_relative_seconds(Some(&json!(60 * 86400))),
+            Some(60 * 86400)
+        );
         // 缺失 / 非数值形态
         assert_eq!(sane_relative_seconds(None), None);
-        assert_eq!(sane_relative_seconds(Some(&json!("3600"))), None, "字符串不是合法秒数");
-        assert_eq!(sane_relative_seconds(Some(&json!(true))), None, "布尔不得当 1 用");
+        assert_eq!(
+            sane_relative_seconds(Some(&json!("3600"))),
+            None,
+            "字符串不是合法秒数"
+        );
+        assert_eq!(
+            sane_relative_seconds(Some(&json!(true))),
+            None,
+            "布尔不得当 1 用"
+        );
         assert_eq!(sane_relative_seconds(Some(&json!(null))), None);
         // 越界：0 与负数会把 expiresAt 写到「此刻或过去」
         assert_eq!(sane_relative_seconds(Some(&json!(0))), None);
@@ -521,10 +640,68 @@ mod tests {
 
         // 落盘的原因也必须是信封文案（界面读的是账号库，不是本次返回值）。
         let saved = load_accounts_for(Region::Cn);
-        let saved_reason = saved[0]["needs_relogin_reason"].as_str().unwrap_or_default();
+        let saved_reason = saved[0]["needs_relogin_reason"]
+            .as_str()
+            .unwrap_or_default();
         assert!(saved_reason.contains("加密信封"), "{saved_reason}");
+
+        // 第二轮：标记与原因都没变 ⇒ 不再重复落盘，排程日志记 `skipped`。
+        // 保活每天跑一次，同一个死账号不该每晚重写一遍 accounts.json。
+        let out2 = run_keepalive_cycle_for(Region::Cn).await;
+        let entry2 = out2["refreshed"]
+            .as_array()
+            .and_then(|list| list.first())
+            .cloned()
+            .expect("应有第二轮保活结果");
+        assert_eq!(
+            entry2["status"],
+            json!("skipped"),
+            "已标记的账号不该每晚重写一轮：{entry2}"
+        );
 
         drop(guard);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// issue #171：断网 / HTTP 5xx 错误页不能证明凭据坏了 ⇒ 不落 `needs_relogin`；
+    /// 业务拒绝码（12153 / 401 / 403）仍要落标记；保活结果三态同时自证。
+    #[test]
+    fn transient_refresh_failures_do_not_flag_relogin() {
+        for code in [-1, 500, 502, 503, 504] {
+            assert!(is_transient_refresh_failure(code), "code={code} 应判暂时性");
+            let mut acc = json!({ "id": "a1", "access_token": "at", "refresh_token": "rt" });
+            let flagged = apply_refresh_failure(&mut acc, code, "boom");
+            assert!(!flagged, "code={code} 不该落标记");
+            assert!(
+                acc.get("needs_relogin").is_none(),
+                "code={code} 误标了：{acc}"
+            );
+            assert!(
+                acc.get("refresh_transient_error")
+                    .and_then(|v| v.as_str())
+                    .is_some(),
+                "code={code} 缺可读原因：{acc}"
+            );
+            assert_eq!(refresh_result_status(&acc), "transient");
+        }
+        for code in [401, 403, 12153] {
+            assert!(
+                !is_transient_refresh_failure(code),
+                "code={code} 是业务拒绝"
+            );
+            let mut acc = json!({ "id": "a1", "access_token": "at", "refresh_token": "rt" });
+            let flagged = apply_refresh_failure(&mut acc, code, "invalid_grant");
+            assert!(flagged, "code={code} 应落标记");
+            assert_eq!(acc["needs_relogin"], json!(true));
+            assert_eq!(refresh_result_status(&acc), "failed");
+        }
+        assert_eq!(
+            refresh_result_status(&json!({ "access_token": "new" })),
+            "ok"
+        );
+        // 历史误标 + 本轮暂时性失败 ⇒ 仍报 transient，不冒充「凭据被拒」。
+        let mut mixed = json!({ "needs_relogin": true });
+        mixed["refresh_transient_error"] = json!("刷新暂时失败");
+        assert_eq!(refresh_result_status(&mixed), "transient");
     }
 }

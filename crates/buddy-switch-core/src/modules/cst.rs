@@ -54,18 +54,30 @@ pub fn cst_naive(now_ms: i64) -> NaiveDateTime {
 /// 连登断档只可能发生在「上一个自然日」（今日尚未结算），故补签判据固定盯昨日。
 pub fn cst_yesterday_str(now_ms: i64) -> String {
     let today = cst_date(now_ms);
-    today.pred_opt().unwrap_or(today).format("%Y-%m-%d").to_string()
+    today
+        .pred_opt()
+        .unwrap_or(today)
+        .format("%Y-%m-%d")
+        .to_string()
 }
 
-/// 夜猫窗口判定：CST `hour >= 23 || hour < 8`（即 23:00–08:00）。
+/// 夜猫窗口判定：CST 23:00–08:00。
 pub fn in_night_window(now_ms: i64) -> bool {
     let hour = cst_hour(now_ms);
-    hour >= 23 || hour < 8
+    !(8..23).contains(&hour)
 }
 
 /// 某 CST 自然日某个整点（`hour:00:00`）的毫秒时间戳；`hour` 越界（>23）返回 `None`。
 pub fn cst_hour_ms(date: NaiveDate, hour: u32) -> Option<i64> {
-    let naive = date.and_hms_opt(hour, 0, 0)?;
+    cst_hm_ms(date, hour, 0)
+}
+
+/// 某 CST 自然日某个「时:分」（`hour:minute:00`）的毫秒时间戳；任一越界返回 `None`。
+///
+/// 排程需要分钟粒度（issue #27）后新增：`cst_hour_ms` 只能表达整点，直接补一个 `minute`
+/// 参数比在调用方手工加偏移更不容易错（手加偏移会绕过 `and_hms_opt` 的边界校验）。
+pub fn cst_hm_ms(date: NaiveDate, hour: u32, minute: u32) -> Option<i64> {
+    let naive = date.and_hms_opt(hour, minute, 0)?;
     cst_offset()
         .from_local_datetime(&naive)
         .single()
@@ -88,9 +100,7 @@ pub fn next_day_4am(now_ms: i64) -> i64 {
     } else {
         today.succ_opt().unwrap_or(today)
     };
-    let naive = target
-        .and_hms_opt(4, 0, 0)
-        .expect("04:00:00 是合法时刻");
+    let naive = target.and_hms_opt(4, 0, 0).expect("04:00:00 是合法时刻");
     cst_offset()
         .from_local_datetime(&naive)
         .single()
@@ -156,6 +166,18 @@ mod tests {
         let date = cst_date(cst_ms(2026, 9, 16, 0, 0));
         assert_eq!(cst_hour_ms(date, 23), Some(cst_ms(2026, 9, 16, 23, 0)));
         assert_eq!(cst_hour_ms(date, 24), None);
+    }
+
+    /// 分钟粒度：整点只是 `minute == 0` 的特例，且越界分必须被拒（而不是静默进到下一小时）。
+    #[test]
+    fn cst_hm_ms_honours_minute_and_rejects_out_of_range() {
+        let date = cst_date(cst_ms(2026, 9, 16, 0, 0));
+        assert_eq!(cst_hm_ms(date, 9, 37), Some(cst_ms(2026, 9, 16, 9, 37)));
+        assert_eq!(cst_hm_ms(date, 9, 0), cst_hour_ms(date, 9));
+        // 边界：23:59 合法，24:00 / 09:60 非法（后者若被放行会被 chrono 进位成 10:00）。
+        assert_eq!(cst_hm_ms(date, 23, 59), Some(cst_ms(2026, 9, 16, 23, 59)));
+        assert_eq!(cst_hm_ms(date, 24, 0), None);
+        assert_eq!(cst_hm_ms(date, 9, 60), None);
     }
 
     #[test]

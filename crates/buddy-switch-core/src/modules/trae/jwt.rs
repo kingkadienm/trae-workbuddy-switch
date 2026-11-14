@@ -156,7 +156,10 @@ mod tests {
     fn parse_tolerates_prefixes_and_padding() {
         let jwt = make_jwt("999", 10 * 3600);
         // 带 Bearer 前缀
-        assert_eq!(parse(&format!("Bearer {jwt}")).user_id.as_deref(), Some("999"));
+        assert_eq!(
+            parse(&format!("Bearer {jwt}")).user_id.as_deref(),
+            Some("999")
+        );
         // 带 Cloud-IDE-JWT 前缀（裸 token 再包一层）
         let bare = normalize(&jwt).to_string();
         assert_eq!(
@@ -171,8 +174,8 @@ mod tests {
     fn parse_accepts_padded_base64_payload() {
         // 某些签发方会补 `=`，必须仍能解析。
         let payload = serde_json::json!({ "data": { "id": "42" } });
-        let padded = base64::engine::general_purpose::URL_SAFE
-            .encode(serde_json::to_vec(&payload).unwrap());
+        let padded =
+            base64::engine::general_purpose::URL_SAFE.encode(serde_json::to_vec(&payload).unwrap());
         let jwt = format!("h.{padded}.s");
         assert_eq!(parse(&jwt).user_id.as_deref(), Some("42"));
     }
@@ -182,12 +185,18 @@ mod tests {
         let payload = serde_json::json!({ "auth_id": "auth-1" });
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(&payload).unwrap());
-        assert_eq!(parse(&format!("h.{b64}.s")).user_id.as_deref(), Some("auth-1"));
+        assert_eq!(
+            parse(&format!("h.{b64}.s")).user_id.as_deref(),
+            Some("auth-1")
+        );
 
         let payload = serde_json::json!({ "sub": "sub-1" });
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(&payload).unwrap());
-        assert_eq!(parse(&format!("h.{b64}.s")).user_id.as_deref(), Some("sub-1"));
+        assert_eq!(
+            parse(&format!("h.{b64}.s")).user_id.as_deref(),
+            Some("sub-1")
+        );
     }
 
     #[test]
@@ -213,15 +222,30 @@ mod tests {
     #[test]
     fn status_thresholds_match_reference() {
         assert_eq!(
-            TraeJwt { user_id: None, exp_hours: Some(25.0), exp_timestamp: None }.status(),
+            TraeJwt {
+                user_id: None,
+                exp_hours: Some(25.0),
+                exp_timestamp: None
+            }
+            .status(),
             "ok"
         );
         assert_eq!(
-            TraeJwt { user_id: None, exp_hours: Some(24.0), exp_timestamp: None }.status(),
+            TraeJwt {
+                user_id: None,
+                exp_hours: Some(24.0),
+                exp_timestamp: None
+            }
+            .status(),
             "warn"
         );
         assert_eq!(
-            TraeJwt { user_id: None, exp_hours: Some(-0.5), exp_timestamp: None }.status(),
+            TraeJwt {
+                user_id: None,
+                exp_hours: Some(-0.5),
+                exp_timestamp: None
+            }
+            .status(),
             "expired"
         );
         assert_eq!(TraeJwt::default().status(), "unknown");
@@ -230,7 +254,10 @@ mod tests {
     #[test]
     fn authorization_header_normalizes_once() {
         assert_eq!(authorization_header("abc"), "Cloud-IDE-JWT abc");
-        assert_eq!(authorization_header("Cloud-IDE-JWT abc"), "Cloud-IDE-JWT abc");
+        assert_eq!(
+            authorization_header("Cloud-IDE-JWT abc"),
+            "Cloud-IDE-JWT abc"
+        );
         assert_eq!(authorization_header("  Bearer abc  "), "Cloud-IDE-JWT abc");
         // 不重复加前缀（回归：曾出现 Cloud-IDE-JWT Cloud-IDE-JWT 双前缀）
         assert_eq!(

@@ -37,48 +37,11 @@ use serde_json::{json, Value};
 use crate::modules::trae::paths;
 use crate::modules::trae::store;
 
-/// 平台受限能力：说明「哪个能力、在哪些平台可用、当前平台为什么不行」。
-///
-/// 字段刻意带上 `supported_on` 与 `reason`：前端可直接渲染成一条可操作的提示，
-/// 而不是让用户面对「不支持」三个字去猜。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Unsupported {
-    /// 能力标识，例 `machine_guid_reset`。
-    pub capability: &'static str,
-    /// 能力的人类可读名称。
-    pub label: &'static str,
-    /// 该能力可用的平台。
-    pub supported_on: &'static str,
-    /// 当前平台不可用的具体原因。
-    pub reason: String,
-}
-
-impl Unsupported {
-    /// 构造一条受限能力说明。
-    pub fn new(
-        capability: &'static str,
-        label: &'static str,
-        supported_on: &'static str,
-        reason: impl Into<String>,
-    ) -> Self {
-        Self {
-            capability,
-            label,
-            supported_on,
-            reason: reason.into(),
-        }
-    }
-
-    /// 线上形态（camelCase）。
-    pub fn to_json(&self) -> Value {
-        json!({
-            "capability": self.capability,
-            "label": self.label,
-            "supportedOn": self.supported_on,
-            "reason": self.reason,
-        })
-    }
-}
+// 平台受限能力的说明形状**已上提到** [`crate::modules::capability`]：WorkBuddy 侧的
+// 「打开数据目录」要用同一个形状（前端据此用同一段分支渲染），两处各拼一遍 JSON
+// 迟早让字段名漂移（`supportedOn` vs `supported_on`）。这里只做转发，
+// **本模块及 Trae 侧所有调用点保持原路径不变**。
+pub use crate::modules::capability::Unsupported;
 
 /// 当前平台标识。
 pub fn platform_tag() -> &'static str {
@@ -126,7 +89,8 @@ pub(crate) fn hidden_command(program: &str) -> std::process::Command {
 /// ## 值来自**程序位表**（`region::all_program_specs`），顺序按「区域 → 程序」
 ///
 /// 摊平口径在 2026-09-28（issue #3）从 [`TraeVariant::all`]（**只含国内两条**）
-/// 换成 [`super::region::all_program_specs`]（**四个程序位全覆盖**）。
+/// 换成 [`super::region::all_program_specs`]（**全部程序位**，issue #20 后为
+/// 3 程序 × 2 区域 = 6 条）。
 /// 换口径的直接后果：国际版 TraeCode 的 `Trae.exe` / `Trae` 仍留在候选里，
 /// 却**不再**冒充国内 TraeCode 的次候选（那条静默跨区误判已修，见
 /// [`super::variant::GLOBAL_TRAE_CODE_SPEC`] 与 `TRAE_CN_SPEC` 的说明）。
@@ -141,15 +105,15 @@ pub(crate) fn hidden_command(program: &str) -> std::process::Command {
 /// [`VariantSpec::exe_names`]: super::variant::VariantSpec::exe_names
 #[cfg(windows)]
 const EXE_NAMES: &[&str] = &[
-    "TRAE SOLO CN.exe",
+    // ★ issue #28：跨变体 exe 候选同样收敛为**两个合并客户端**
+    //   （`TRAE SOLO*` 那两条客户端已被官方合并卸载）。
     "Trae CN.exe",
-    "TRAE SOLO.exe",
     "Trae.exe",
 ];
 
 /// 非 Windows：可执行文件名不带 `.exe`（macOS 是 bundle 内的裸二进制名）。
 #[cfg(not(windows))]
-const EXE_NAMES: &[&str] = &["TRAE SOLO CN", "Trae CN", "TRAE SOLO", "Trae"];
+const EXE_NAMES: &[&str] = &["Trae CN", "Trae"];
 
 fn exe_names() -> &'static [&'static str] {
     EXE_NAMES
@@ -158,8 +122,14 @@ fn exe_names() -> &'static [&'static str] {
 /// userData 目录名候选（与 [`exe_names`] 一一对应，首项为兜底主候选）。
 ///
 /// 同 [`exe_names`]：值来自程序位表，这里只做摊平。
-fn data_dir_names() -> &'static [&'static str] {
-    &["TRAE SOLO CN", "Trae CN", "TRAE SOLO", "Trae"]
+///
+/// ★ `pub(crate)` 而不是私有：测试夹具要按**同一张表**铺目录，否则夹具里写死的
+/// 目录名一漂，用例就会在「目录不存在」上假红（此前就栽过：`TRAE SOLO CN` 硬编码）。
+pub(crate) fn data_dir_names() -> &'static [&'static str] {
+    // ★ issue #28：跨变体摊平表同样收敛为**两个合并客户端**。
+    //   收敛前这里还有 `TRAE SOLO CN` / `TRAE SOLO`（两条已退役的客户端），
+    //   它们留在跨变体探测里会让「本机装的是哪个 Trae」答出一条**不存在的**产品线。
+    &["Trae CN", "Trae"]
 }
 
 /// 取某个变体的可执行文件名候选（Windows 带 `.exe`）。
@@ -181,6 +151,10 @@ pub fn exe_names_for(variant: super::variant::TraeVariant) -> &'static [&'static
             super::variant::TraeVariant::Global => &["TRAE SOLO"],
             // 国际版 TraeCode：裸名（与 `TRAE SOLO` 同款「国内带 CN 后缀」规则）。
             super::variant::TraeVariant::GlobalTraeCode => &["Trae"],
+            // 合并后的客户端（issue #20）：与各自遗留线**同名**（客户端复用了目录名），
+            // 但标识与快照目录各自独立。
+            super::variant::TraeVariant::TraeMerged => &["Trae CN"],
+            super::variant::TraeVariant::GlobalTraeMerged => &["Trae"],
         }
     }
 }
@@ -194,26 +168,31 @@ pub fn data_dir_names_for(variant: super::variant::TraeVariant) -> &'static [&'s
 ///
 /// 与 [`detect_install`] 的区别：后者接受一个自定义路径并横跨全部变体按最近活跃挑，
 /// 只适合回答"本机装的是哪个 Trae"。本函数回答的是"**这一条**产品线装了吗"，
-/// 因为界面上要**并排**显示两条产品线的独立状态（对齐 WorkBuddy 的三个图标）。
+/// 因为界面上要**并排**显示各程序位的独立状态。
 ///
-/// `custom` 仅在它确实属于该变体时才生效 —— 用户在设置里指定的路径
-/// 不应该让"另一条产品线"也显示成已安装。
+/// ## ★ 自定义路径按**区域**归属判，不按变体精确相等（issue #28）
+///
+/// `custom` 取**该变体所属区域**的那一条（设置页按区域渲染，见 [`TraeSettings::path_for`]），
+/// 归属判据因此也只能是**区域**：合并版 `Trae CN` 与遗留 TraeCode 的候选名**逐字相同**
+/// （同一个客户端），原先的「文件名反查变体必须精确等于本变体」会把同一区域内的
+/// 另一条程序位判成「未检测到」—— 而那条按钮已经退役、用户根本点不到，
+/// 症状却是「点 Trae 提示未检测到 TraeCode CN」（issue #28 报障原文）。
+///
+/// ⚠️ 但**跨区域**仍然必须拦住：国内路径填进国际区域会让国际页显示成已安装
+/// （实测过：国内版页签显示国际版客户端 `v1.107.1` + `…\TRAE SOLO`）。
 pub fn detect_install_for(variant: super::variant::TraeVariant) -> InstallProbe {
     let settings = crate::modules::trae::settings::load();
-    if let Some(custom) = settings
-        .trae_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-    {
+    if let Some(custom) = settings.path_for(variant.region()) {
         let path = PathBuf::from(custom);
-        // 只有自定义路径确实指向该变体时才采纳，否则它会让两条产品线都显示"已安装"。
-        let belongs = path
+        // 只接受**本区域**的 Trae 客户端（含已退役的老客户端名）——
+        // 「指向另一个区域」这条必须拦住，「指向本区域的另一代」则放行。
+        let belongs_to_region = path
             .file_name()
             .and_then(|n| n.to_str())
             .and_then(super::variant::variant_of_name)
-            == Some(variant);
-        if belongs && path.is_file() {
+            .map(|found| found.region() == variant.region())
+            .unwrap_or(false);
+        if belongs_to_region && path.is_file() {
             return InstallProbe {
                 installed: true,
                 version: version_from_exe(&path),
@@ -228,7 +207,14 @@ pub fn detect_install_for(variant: super::variant::TraeVariant) -> InstallProbe 
     // `E0425 cannot find function windows_install_roots in this scope`
     // （CI 的 mac-arm64 / mac-x64 / linux-x64 三个 job 就是这样红的）。
     // 三平台共用一份装配逻辑后，这类「只在 Windows 定义」的缺口不可能再出现在此处。
-    for candidate in candidate_paths_for(data_dir_names_for(variant), exe_names_for(variant)) {
+    // ★ macOS：候选表只覆盖「包名 == 可执行体名」的已知名字，再补一层 bundle 扫描
+    //   （issue #82：macOS 上国内版 bundle 实测叫 `Trae Code.app`，候选表里没有它）。
+    //   `unused_mut` 只在非 macOS 出现，CI 的 `-D warnings` 会因此变红，故显式放行。
+    #[allow(unused_mut)]
+    let mut candidates = candidate_paths_for(data_dir_names_for(variant), exe_names_for(variant));
+    #[cfg(target_os = "macos")]
+    candidates.extend(macos_bundle_scan(Some(variant.region())));
+    for candidate in candidates {
         if candidate.is_file() {
             return InstallProbe {
                 installed: true,
@@ -307,9 +293,9 @@ pub fn is_running_for(variant: super::variant::TraeVariant) -> bool {
     }
     #[cfg(not(windows))]
     {
-        for name in exe_names_for(variant) {
+        for name in process_names_for(variant) {
             let ok = hidden_command("pgrep")
-                .args(["-x", name])
+                .args(["-x", name.as_str()])
                 .output()
                 .map(|output| output.status.success() && !output.stdout.is_empty())
                 .unwrap_or(false);
@@ -319,6 +305,35 @@ pub fn is_running_for(variant: super::variant::TraeVariant) -> bool {
         }
         false
     }
+}
+
+/// 该变体的**进程名候选**：写死的候选表 + **实际探测到的可执行体名**。
+///
+/// ## ★ 为什么必须补上后者（issue #82）
+///
+/// [`exe_names_for`] 是写死的候选表（国内 = `Trae CN`）。而 macOS 上国内版的可执行体
+/// 实测叫 `Trae Code`（bundle 名与可执行体名都与 Windows 不同）。只认 `Trae CN` 会让
+/// [`is_running_for`] **恒为 false**，于是切换流程跳过「先关闭客户端」这一步 ——
+/// 客户端退出时用内存态回写，把刚恢复的登录态覆盖掉，症状是「提示切换成功但账号没变」。
+///
+/// 探测到的名字排在**最前**（它是真机上真的存在的那个），候选表兜底。
+#[cfg(not(windows))]
+fn process_names_for(variant: super::variant::TraeVariant) -> Vec<String> {
+    let mut names: Vec<String> = exe_names_for(variant)
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    let detected = detect_install_for(variant).exe.and_then(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+    });
+    if let Some(detected) = detected {
+        if !names.iter().any(|existing| existing == &detected) {
+            names.insert(0, detected);
+        }
+    }
+    names
 }
 
 /// **全部变体**的环境状态（线上形态，数组）。
@@ -358,7 +373,8 @@ fn region_status(region: super::region::TraeRegion) -> Value {
     let programs: Vec<Value> = super::region::programs_of(region)
         .iter()
         .map(|spec| {
-            // ★ 四个程序位**全部已建模**（2026-09-28，issue #3）：本函数不再有
+            // ★ 全部程序位**都已建模**（2026-09-28，issue #3；2026-10-13 issue #20
+            //   增合并版 Trae）：本函数不再有
             //   「未建模 ⇒ 报未安装」的分支。所以探测结果就是事实，
             //   不存在「程序位存在但拿不到标识」这种中间态。
             let target = variant_for_program(spec.region, spec.program);
@@ -386,7 +402,7 @@ fn region_status(region: super::region::TraeRegion) -> Value {
                 "program": spec.program.as_str(),
                 "label": spec.display_name,
                 "nameAlias": spec.name_alias,
-                // 前端「切换到此程序」时回传的标识。**四个程序位都有值**
+                // 前端「切换到此程序」时回传的标识。**每个程序位都有值**
                 // （`null` 只在「未建模」时代出现过，见上方说明）。
                 "variant": target.as_str(),
                 "installed": installed,
@@ -395,6 +411,13 @@ fn region_status(region: super::region::TraeRegion) -> Value {
                 "path": path,
                 "dataDir": data_dir,
                 "dataDirExists": data_dir.as_deref().map(|p| std::path::Path::new(p).is_dir()).unwrap_or(false),
+                // ★ 登录态**真的在不在**（issue #136）：`dataDirExists` 只回答「目录在不在」。
+                //   两者必须分开下发 —— 前端拿 `dataDirExists` 去写「已探测的登录态目录」，
+                //   在「目录是空壳」的机器上会把用户引向「文件在、只是读不出」的错方向。
+                "storageJsonExists": data_dir
+                    .as_deref()
+                    .map(|p| storage_json_present(std::path::Path::new(p)))
+                    .unwrap_or(false),
                 // 写侧目录（见上面 `write_data_dir` 的注释）。前端「客户端环境」行必须用它：
                 // 那一行的用途是让用户核对「切换器正在操作哪个目录、登录态在哪」。
                 "writeDataDir": write_data_dir,
@@ -412,9 +435,11 @@ fn region_status(region: super::region::TraeRegion) -> Value {
             .iter()
             .any(|item| item.get(key).and_then(Value::as_bool).unwrap_or(false))
     };
-    let primary = programs
-        .iter()
-        .find(|item| item.get("installed").and_then(Value::as_bool).unwrap_or(false));
+    let primary = programs.iter().find(|item| {
+        item.get("installed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    });
     let field = |key: &str| {
         primary
             .and_then(|item| item.get(key).cloned())
@@ -437,6 +462,8 @@ fn region_status(region: super::region::TraeRegion) -> Value {
         "path": field("path"),
         "dataDir": field("dataDir"),
         "dataDirExists": field("dataDirExists"),
+        // 登录态文件是否真的存在（与主程序的 `storageJsonExists` 同源，见程序位里那条注释）。
+        "storageJsonExists": field("storageJsonExists"),
         // 写侧目录（与主程序的 `writeDataDir` 同源）。
         // ⚠️ 与 `dataDir` **不是同一个问题**：前者是「切换器在操作哪个」，
         // 后者是「客户端最近在用哪个」。两者在本机不同值，别互相顶替。
@@ -447,28 +474,23 @@ fn region_status(region: super::region::TraeRegion) -> Value {
     })
 }
 
-/// 程序位 → 客户端建模标识。
+/// 程序位 → 变体（**持久化身份**）。
 ///
-/// **四个程序位全部已建模**（2026-09-28，issue #3 收尾）：国际版 TraeCode 补上
-/// [`TraeVariant::GlobalTraeCode`] 之后，本函数不再返回 `None`。
+/// ★ issue #28 收敛后**每个区域只有一个程序位** ⇒ 本函数返回的就是该区域的
+/// **合并版变体**（`trae_merged` / `global_trae_merged`）。
 ///
-/// ## 返回值为什么不是 `Option` 的旧形状
-///
-/// 曾经 `(Global, TraeCode) => None`，调用方据此把该程序位报成「未安装」。
-/// 那条分支现在没了 —— 留着它等于把「已建模」这件事降级成运行期判断。
-/// 若将来又出现未建模的程序位，**在编译期**让本函数返回 `Option` 更安全，
-/// 但当前四个组合已闭合，`match` 本身就把这件事钉住了（新增程序线会编译不过）。
+/// 遗留程序位（`TraeWork` / `TraeCode`）**解析到同一区域的合并版**（而不是 `None`）：
+/// 它们已从「可选程序位」表里移除，但老参数、老记录仍会带着它们进来，
+/// 返回 `None` 会把调用点逼出一堆兜底分支。区域决定一切、程序轴只剩一个取值 —— 这条
+/// 事实在这里落一次即可。恒等映射是它的不变量，有单测钉住。
 fn variant_for_program(
     region: super::region::TraeRegion,
-    program: super::region::TraeProgram,
+    _program: super::region::TraeProgram,
 ) -> super::variant::TraeVariant {
-    use super::region::{TraeProgram, TraeRegion};
     use super::variant::TraeVariant;
-    match (region, program) {
-        (TraeRegion::Cn, TraeProgram::TraeWork) => TraeVariant::TraeWork,
-        (TraeRegion::Cn, TraeProgram::TraeCode) => TraeVariant::Trae,
-        (TraeRegion::Global, TraeProgram::TraeWork) => TraeVariant::Global,
-        (TraeRegion::Global, TraeProgram::TraeCode) => TraeVariant::GlobalTraeCode,
+    match region {
+        super::region::TraeRegion::Cn => TraeVariant::TraeMerged,
+        super::region::TraeRegion::Global => TraeVariant::GlobalTraeMerged,
     }
 }
 
@@ -478,12 +500,23 @@ fn variant_for_program(
 /// 一旦漂移就会出现「某个程序位的 exe 永远探测不到」这类静默故障。
 /// 编译期无法校验（`cfg` 分支 + 静态切片），故放一条测试。
 ///
-/// ## 摊平基准是**程序位表**（4 个），不是 [`TraeVariant::all`]（2 个）
+/// ## 摊平基准是**程序位表**（6 条 = 3 程序 × 2 区域），不是 [`TraeVariant::all`]（2 个）
 ///
 /// 2026-09-28（issue #3）换的基准：`all()` 只含国内两条程序位，
 /// 用它当基准会让两个国际程序位的名字（`TRAE SOLO.exe` / `Trae.exe`）
 /// **在跨变体探测里凭空消失** —— 症状是「国际版客户端在跑，'关闭全部 Trae'
 /// 却说没有」。程序位表才是完整口径。
+///
+/// ## ⚠️ 必须**按序去重**再比对（issue #20）
+///
+/// 表里合并版 `Trae` 与遗留 `TraeCode` 的候选名**逐字相同**（同一个客户端，
+/// 见 `region` 模块头）⇒ 直接摊平会得到 6 个名字、而 `exe_names()` 只有 4 个。
+/// 去重是**语义正确**的：跨变体探测要的是「本机可能叫哪些名字」的集合，
+/// 重复项没有任何意义。
+///
+/// 但去重会让这条护栏**变松**（表里少写一条、多写一条重复项都看不出来），
+/// 因此另有一条用例专门钉「合并版与遗留 TraeCode 指向同一客户端」
+/// （`region::tests::合并版与遗留traecode指向同一客户端`）。
 ///
 /// [`TraeVariant::all`]: super::variant::TraeVariant::all
 #[cfg(test)]
@@ -492,13 +525,40 @@ fn flattened_candidates_match_variant_table() {
     let mut from_table_exe: Vec<&str> = Vec::new();
     let mut from_table_dir: Vec<&str> = Vec::new();
     for spec in super::region::all_program_specs() {
-        from_table_dir.extend(spec.data_dir_names.iter().copied());
-        from_table_exe.extend(spec.exe_names.iter().copied());
+        for name in spec.data_dir_names {
+            if !from_table_dir.contains(name) {
+                from_table_dir.push(name);
+            }
+        }
+        for name in spec.exe_names {
+            if !from_table_exe.contains(name) {
+                from_table_exe.push(name);
+            }
+        }
     }
-    assert_eq!(data_dir_names(), from_table_dir.as_slice(), "userData 目录名候选与程序位表漂移");
+    // ★ issue #28 收敛后**没有任何重复候选名**（每区域一个程序位，`Trae CN` 与 `Trae`
+    //   互不为子串）。断言「零重复」比断言「恰好 N 条重复」更强：
+    //   有人把退役程序位塞回表里 ⇒ 立刻多出重复项 ⇒ 变红。
+    assert_eq!(
+        super::region::all_program_specs()
+            .iter()
+            .map(|s| s.exe_names.len())
+            .sum::<usize>(),
+        from_table_exe.len(),
+        "收敛后可选程序位之间不应有重复的 exe 候选"
+    );
+    assert_eq!(
+        data_dir_names(),
+        from_table_dir.as_slice(),
+        "userData 目录名候选与程序位表漂移"
+    );
     // exe 名只在 Windows 上与表逐字相同（非 Windows 去过 `.exe`）。
     if cfg!(target_os = "windows") {
-        assert_eq!(exe_names(), from_table_exe.as_slice(), "exe 名候选与程序位表漂移");
+        assert_eq!(
+            exe_names(),
+            from_table_exe.as_slice(),
+            "exe 名候选与程序位表漂移"
+        );
     }
 }
 
@@ -553,7 +613,9 @@ fn version_from_install_dir(dir: &Path) -> Option<String> {
         &["resources", "app", "product.json"],
     ];
     for relative in relative_candidates {
-        let path = relative.iter().fold(dir.to_path_buf(), |acc, part| acc.join(part));
+        let path = relative
+            .iter()
+            .fold(dir.to_path_buf(), |acc, part| acc.join(part));
         if let Ok(text) = std::fs::read_to_string(&path) {
             if let Ok(value) = serde_json::from_str::<Value>(&text) {
                 if let Some(version) = value.get("version").and_then(|v| v.as_str()) {
@@ -736,7 +798,13 @@ pub struct InstallProbe {
 
 /// 在给定候选路径中探测 Trae 客户端。
 ///
-/// `custom` 为用户在设置里显式指定的路径，**优先级最高**。
+/// `custom` 为用户在设置里显式指定的路径列表（**按区域各一条**，见
+/// `TraeSettings::all_paths`），**优先级最高**、按传入顺序取第一个真实存在的文件。
+///
+/// ## 为什么是**列表**而不是单个值（issue #20）
+///
+/// 设置里的客户端路径已按区域分家。本函数回答的是「**本机装的是哪一条** Trae」，
+/// 横跨全部区域 —— 因此必须把每个区域配置的路径都试一遍，只看一条会漏掉另一区域。
 ///
 /// 自动探测（[`candidate_exe_paths`]）覆盖 `%LOCALAPPDATA%\Programs`、三个
 /// `ProgramFiles` 变体，以及非系统盘上的 `<盘符>:\Programs` —— 最后一项是必需的：
@@ -745,9 +813,13 @@ pub struct InstallProbe {
 ///
 /// 仍然覆盖不到的只剩「装在任意自定义目录」（例如 `D:\Apps\Trae\`），
 /// 该场景由 `custom` 兜底，且报错文案会主动提示这一点。
-pub fn detect_install(custom: Option<&str>) -> InstallProbe {
-    if let Some(custom) = custom.map(str::trim).filter(|path| !path.is_empty()) {
-        let path = PathBuf::from(custom);
+pub fn detect_install(custom: &[String]) -> InstallProbe {
+    for raw in custom {
+        let path = raw.trim();
+        if path.is_empty() {
+            continue;
+        }
+        let path = PathBuf::from(path);
         if path.is_file() {
             return InstallProbe {
                 installed: true,
@@ -757,7 +829,12 @@ pub fn detect_install(custom: Option<&str>) -> InstallProbe {
         }
     }
 
-    for candidate in candidate_exe_paths() {
+    // ★ macOS bundle 扫描（issue #82）：跨变体场景不过滤区域，名字含 `trae` 即收。
+    #[allow(unused_mut)]
+    let mut candidates = candidate_exe_paths();
+    #[cfg(target_os = "macos")]
+    candidates.extend(macos_bundle_scan(None));
+    for candidate in candidates {
         if candidate.is_file() {
             return InstallProbe {
                 installed: true,
@@ -890,6 +967,78 @@ fn macos_bundle_exe(root: &Path, name: &str, exe: &str) -> PathBuf {
         .join(exe)
 }
 
+/// macOS：**扫描 `.app` bundle 目录**，用 `Info.plist` 的 `CFBundleExecutable` 定位可执行体。
+///
+/// ## ★ 为什么必须有这一层（issue #82「trae 国内版切换账号未检测到」）
+///
+/// 上表的候选路径是 `<包名>.app/Contents/MacOS/<包名>` —— 它**假设包名 == 可执行体名**。
+/// 本仓在别处已经吃过这个假设的亏（[`crate::modules::identity::read_bundle_executable`]
+/// 的文档：两个 WorkBuddy bundle 的可执行体都是 `Electron`，按包名拼出来的路径不存在，
+/// 且该错误表现为「客户端未安装」而不是「启动失败」）。
+///
+/// macOS 上国内版 Trae 的 bundle 实测叫 **`Trae Code.app`**，而候选表里只有
+/// `Trae CN.app` / `Trae.app` ⇒ 探测恒为 `installed = false` ⇒ 账号卡切换胶囊、
+/// 空态卡、设置页「安装」行全部显示「未检测到」。这条一直是错的，只是 macOS 用户少。
+///
+/// 这一层**不认识任何具体名字**：枚举 `/Applications`、`/System/Applications`、
+/// `~/Applications` 下名字含 `trae` 的 `.app`，读 plist 拿真实可执行体名。
+/// 客户端下次改名/换 bundle 也不需要再改代码。
+///
+/// `region` 为 `Some` 时**按区域过滤**（跨区域必须拦住：`/Applications/Trae.app`
+/// 是国际版，不能因为「名字含 trae」就算国内版已安装 —— 同 [`detect_install_for`]
+/// 自定义路径分支的纪律）。
+#[cfg(target_os = "macos")]
+fn macos_bundle_scan(region: Option<super::region::TraeRegion>) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = vec![
+        PathBuf::from("/Applications"),
+        PathBuf::from("/System/Applications"),
+    ];
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.join("Applications"));
+    }
+
+    let mut out: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        // 目录不存在 / 无权限读 ⇒ 跳过这一层，不当作错误（探测必须永不 panic）。
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let bundle = entry.path();
+            if bundle.extension().and_then(|ext| ext.to_str()) != Some("app") {
+                continue;
+            }
+            let Some(name) = bundle.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            if !name.to_ascii_lowercase().contains("trae") {
+                continue;
+            }
+            if let Some(wanted) = region {
+                let belongs = super::variant::variant_of_name(name)
+                    .map(|found| found.region() == wanted)
+                    // 反查不到（全新名字）：**放行** —— 名字含 `trae` 已经是强信号，
+                    // 拦掉会让「客户端改名」重新变回「未检测到」，正是本层要解决的问题。
+                    .unwrap_or(true);
+                if !belongs {
+                    continue;
+                }
+            }
+            let exe = crate::modules::identity::read_bundle_executable(
+                &bundle.join("Contents").join("Info.plist"),
+            )
+            .unwrap_or_else(|| name.to_string());
+            let candidate = bundle.join("Contents").join("MacOS").join(exe);
+            if candidate.is_file() {
+                out.push(candidate);
+            }
+        }
+    }
+    // 排序只为了让结果**确定**（多份并存时行为可复现，便于测试与排查）。
+    out.sort();
+    out
+}
+
 /// **全部变体**的可执行文件候选路径（跨平台）。
 ///
 /// 平台差异全部收在 [`candidate_paths_for`]；本函数只负责把「按最近活跃排序的
@@ -986,7 +1135,7 @@ pub fn select_data_dir_for(variant: super::variant::TraeVariant) -> Option<PathB
 /// （`Option` 的 `Ord` 里 `None < Some(_)`，故反转比较）。
 ///
 /// 供 [`select_data_dir_for`] 取首项；`icube` 侧**遍历全部候选**时也用它
-/// （[`crate::modules::trae::icube::device_credential_by_device_id`] 按 `deviceId` 精确取、
+/// （[`crate::modules::trae::icube::device_secret_by_device_id`] 按 `deviceId` 精确取、
 /// [`crate::modules::trae::icube::login_state_dir_for`] 找「装着登录态的那个目录」）——
 /// 这两个场景都需要「按变体限定的全部存在候选」，而不是单个目录。
 pub(crate) fn data_dirs_by_activity_for(variant: super::variant::TraeVariant) -> Vec<PathBuf> {
@@ -1003,7 +1152,7 @@ pub(crate) fn data_dirs_by_activity_for(variant: super::variant::TraeVariant) ->
         })
         .collect();
 
-    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    scored.sort_by_key(|s| std::cmp::Reverse(s.1));
     scored.into_iter().map(|(dir, _)| dir).collect()
 }
 
@@ -1028,8 +1177,81 @@ fn data_dir_names_by_activity() -> Vec<&'static str> {
 
     // 降序：`Option` 的 `Ord` 里 `None < Some(_)`，所以反过来比就是
     // 「有活跃时间的在前、新的在前、没有的垫底」。
-    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    scored.sort_by_key(|s| std::cmp::Reverse(s.1));
     scored.into_iter().map(|(name, _)| name).collect()
+}
+
+/// userData 目录里 `storage.json` 的**唯一**拼法（设备凭证 / 登录态都在这个文件里）。
+///
+/// 抽成函数是为了让「活跃度判据」「登录态存在性判据」「读取路径」共用同一份拼装 ——
+/// 三处各写一遍，改一处就会让「目录算活跃」与「说它有登录态」指向不同的文件。
+///
+/// 逐段 `join` 而**不是**一次 `join("User/globalStorage/storage.json")`：后者在 Windows 上
+/// 会拼出 `…\Trae CN/User/globalStorage/storage.json` 这种混合分隔符，虽然能打开，
+/// 但错误文案要把它原样显示给用户，混合分隔符会让人怀疑「路径是不是拼错了」。
+pub fn storage_json_path(dir: &Path) -> PathBuf {
+    dir.join("User").join("globalStorage").join("storage.json")
+}
+
+/// 该 userData 目录里是否**真的存在** `storage.json`。
+///
+/// ## 为什么必须与 `is_dir()` 分开（issue #136）
+///
+/// 目录存在 ≠ 登录态存在。真机报障现场：`%APPDATA%\Trae CN` 目录存在（客户端启动过、
+/// 写过 Cache / Local Storage），但 `User\globalStorage\storage.json` 从未生成 ——
+/// 此时 `dataDirExists = true`，界面就把**一个没有凭据的目录**说成「已探测的登录态目录」，
+/// 后端则在读文件那一步抛 `os error 2`，文案还劝用户「关闭客户端后重试」。
+/// 用户照着做了十几轮，问题与他的动作完全无关。
+///
+/// 判据用 `is_file()` 而不是 `exists()`：同名目录也能让 `exists()` 为真，
+/// 而那同样读不出内容。
+pub fn storage_json_present(dir: &Path) -> bool {
+    storage_json_path(dir).is_file()
+}
+
+/// 本机**其它** Trae userData 目录里是否有一份 `storage.json`（「你可能装的是另一条线」的线索）。
+///
+/// ## 为什么需要它（issue #136）
+///
+/// 用户报障「网页版登录、客户端登录都捕捉不到凭证」。真机上常见的两种成因**看起来
+/// 一模一样**（本变体目录缺 `storage.json`）：
+///
+/// 1. 这条产品线的客户端确实没启动过；
+/// 2. 用户装的是**另一条**产品线的客户端（国内 `Trae CN` / 国际 `Trae` 是两个独立客户端、
+///    两套 userData），而界面停在了错的区域页上。
+///
+/// 第 2 种光靠「请启动一次客户端」永远好不了 —— 用户明明启动过、也登录过。
+/// 本函数把「别处有凭据」这条事实取出来，让文案能直接指向真正的出路
+/// （切区域 / 装那条线），而不是让用户反复重启。
+///
+/// ## ★ 必须用 `all_known_specs()`，不能用 [`data_dir_names`]
+///
+/// [`data_dir_names`] 是**收敛后**的摊平表（只剩 `Trae CN` / `Trae` 两个合并客户端），
+/// 而用户机器上**已退役客户端的 userData 目录依然在磁盘上**（卸载客户端不删 userData）。
+/// 只扫收敛表就会漏掉「凭据在 `TRAE SOLO CN` 里」这种最常见的情形 —— 那正好是
+/// 「我明明登录过」的用户。`all_known_specs()` 含全部 6 个程序位的目录名，才是完整口径。
+///
+/// 返回**目录路径**（不含文件名），取规格表顺序里第一个命中的；都没有则 `None`。
+/// 只读探测，不创建任何目录。
+pub fn other_line_storage_hint(variant: super::variant::TraeVariant) -> Option<String> {
+    let base = data_dir_base()?;
+    let own = data_dir_names_for(variant);
+    let mut seen: Vec<&str> = Vec::new();
+    for spec in super::variant::all_known_specs() {
+        for name in spec.data_dir_names {
+            // 排除本变体自己的目录（那是「本该有却没有」的那个），并按名去重
+            // （合并版与遗留 TraeCode 的候选名逐字相同，扫两遍没有信息增益）。
+            if own.iter().any(|mine| mine == name) || seen.contains(name) {
+                continue;
+            }
+            seen.push(name);
+            let dir = base.join(name);
+            if storage_json_present(&dir) {
+                return Some(dir.to_string_lossy().to_string());
+            }
+        }
+    }
+    None
 }
 
 /// userData 目录的「最近活跃时间」。
@@ -1040,8 +1262,8 @@ fn data_dir_names_by_activity() -> Vec<&'static str> {
 /// 都拿不到则返回 `None`（该候选按「从未使用」处理）。
 fn data_dir_activity(dir: &Path) -> Option<SystemTime> {
     // 每次启动或登录都会被写到的文件，跨渠道/版本都比较稳定。
+    // `storage.json` 单独走 [`storage_json_path`]（唯一拼法），其余在这里。
     const MARKERS: &[&str] = &[
-        "User/globalStorage/storage.json",
         "aha/TinyStorage",
         "Local Storage",
         "Network/Cookies",
@@ -1050,7 +1272,9 @@ fn data_dir_activity(dir: &Path) -> Option<SystemTime> {
 
     MARKERS
         .iter()
-        .filter_map(|marker| std::fs::metadata(dir.join(marker)).ok())
+        .map(|marker| dir.join(marker))
+        .chain(std::iter::once(storage_json_path(dir)))
+        .filter_map(|path| std::fs::metadata(path).ok())
         .filter_map(|meta| meta.modified().ok())
         .max()
         .or_else(|| {
@@ -1061,21 +1285,40 @@ fn data_dir_activity(dir: &Path) -> Option<SystemTime> {
 }
 
 /// userData 的父目录（平台约定）。
+///
+/// ## 覆盖优先级：`APPDATA` → 平台默认
+///
+/// `APPDATA` 在 Windows 上本来就是平台约定（`...\AppData\Roaming`）；在 macOS / Linux 上
+/// 它**不是**约定变量，但它是**唯一**能被测试注入「userData 父目录」的口子
+/// （[`super::test_support::TempEnv`] 同时隔离 `BUDDY_SWITCH_HOME` 与 `APPDATA`，
+/// fixture 就铺在 `APPDATA` 下）。
+///
+/// 不认它的时候，macOS / Linux 上的用例会去读**真机**客户端目录：
+/// 真机恰好登着账号 ⇒ 断言红；失败输出里还会带上真机的 `userId` / `deviceId`。
+/// 这就是 issue #37 的 5 条失败（`profile::overview_*` / `oauth::*`）。
+/// 更危险的是写路径（`restore_from_slot_for` → `snapshot_data_dir_for`）同样经过本函数，
+/// 用例一旦走到那里就会**真的写进真机目录** —— 所以这里按「根因」修，而不是逐个用例打补丁。
 fn data_dir_base() -> Option<PathBuf> {
+    // 覆盖优先：三平台同一条链。真机 macOS / Linux 上没有 `APPDATA`，这一支不会生效；
+    // Windows 上这一支就是原来的行为（环境变量优先于 `dirs::config_dir()` 兜底）。
+    let overridden = std::env::var("APPDATA")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from);
+    if overridden.is_some() {
+        return overridden;
+    }
+
     #[cfg(windows)]
     {
-        // 优先环境变量；缺失时用 `dirs::config_dir()`（Windows 上就是 `%APPDATA%`，
+        // 缺失时用 `dirs::config_dir()`（Windows 上就是 `%APPDATA%`，
         // 即 `C:\Users\<用户>\AppData\Roaming`）。
         //
         // 这层兜底不多余：`APPDATA` 属于「通常有、但不保证有」的变量，
         // 某些终端、CI、被裁剪过的启动环境里就是没有。缺了它 `detect_data_dir()`
         // 会直接返回 `None`，表现成「登录态快照与账号切换整体不可用」，
         // 而根因仅仅是取不到一个目录 —— 排查成本极高。
-        std::env::var("APPDATA")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .map(PathBuf::from)
-            .or_else(dirs::config_dir)
+        dirs::config_dir()
     }
     #[cfg(target_os = "macos")]
     {
@@ -1093,6 +1336,25 @@ fn data_dir_base() -> Option<PathBuf> {
     {
         None
     }
+}
+
+/// 某个**程序位**（区域 × 程序）的 userData 目录：`%APPDATA%\<data_dir_names[0]>`。
+///
+/// 与 [`detect_data_dir_for`] 的区别（**不可互换**）：本函数按
+/// [`super::region::program_spec`] 精确取**该程序位自己声明的唯一目录名**，
+/// **不做候选回落**；而 `detect_data_dir_for` 走的是**变体**候选表，
+/// `TRAE_WORK` 那张表里混着 `TRAE SOLO`（**国际版客户端**），缺席时会静默落到它 ——
+/// 取「这个程序位的 settings.json 在哪」必须用本函数。
+///
+/// 目录**不保证存在**；调用方据 `is_file()` / `is_dir()` 判「是否已安装」。
+pub fn user_data_dir_for_program(
+    region: super::region::TraeRegion,
+    program: super::region::TraeProgram,
+) -> Option<PathBuf> {
+    let base = data_dir_base()?;
+    let spec = super::region::program_spec(region, program);
+    let name = *spec.data_dir_names.first()?;
+    Some(base.join(name))
 }
 
 // 这里刻意**没有**「Trae 客户端进程名」这样的单值函数。
@@ -1154,9 +1416,21 @@ pub fn is_running() -> bool {
     #[cfg(not(windows))]
     {
         // 用可执行文件基名匹配，避免 pid 被别的进程复用；`-x` 要求精确进程名。
-        for name in exe_names() {
+        //
+        // ★ 除写死的候选名，还要算上 **macOS bundle 扫描到的真实可执行体名**
+        //   （issue #82）：国内版在 macOS 上是 `Trae Code`，只认 `Trae CN` 会把
+        //   「客户端正在跑」判成未运行。
+        #[allow(unused_mut)]
+        let mut names: Vec<String> = exe_names().iter().map(|name| (*name).to_string()).collect();
+        #[cfg(target_os = "macos")]
+        names.extend(macos_bundle_scan(None).iter().filter_map(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+        }));
+        for name in names {
             let ok = hidden_command("pgrep")
-                .args(["-x", name])
+                .args(["-x", name.as_str()])
                 .output()
                 .map(|output| output.status.success() && !output.stdout.is_empty())
                 .unwrap_or(false);
@@ -1273,14 +1547,14 @@ pub fn kill_client_for(variant: super::variant::TraeVariant) -> Result<bool, Str
         if killed || !is_running_for(variant) {
             return Ok(true);
         }
-        return Err(format!(
+        Err(format!(
             "结束客户端进程失败: {}",
             if last_error.is_empty() {
                 "需要手动关闭 Trae".to_string()
             } else {
                 last_error
             }
-        ));
+        ))
     }
     #[cfg(not(windows))]
     {
@@ -1288,8 +1562,10 @@ pub fn kill_client_for(variant: super::variant::TraeVariant) -> Result<bool, Str
         // 三平台上都被用到，不必靠 `#[cfg]` 去门（漏门会让非 Windows 构建因
         // 「未使用的常量」直接失败，2026-09-29 CI 实测过）。
         // 一级：优雅关闭（`pkill` 不带信号 = SIGTERM）。
-        for name in exe_names_for(variant) {
-            let _ = hidden_command("pkill").args(["-x", name]).output();
+        // ★ 走 `process_names_for`（含**实际探测到的可执行体名**，issue #82）：
+        //   只认写死的 `Trae CN` 会让 macOS 上的 `Trae Code` 永远杀不掉。
+        for name in process_names_for(variant) {
+            let _ = hidden_command("pkill").args(["-x", name.as_str()]).output();
         }
         if wait_until_gone(variant, GRACEFUL_CLOSE_WAIT_SECS) {
             return Ok(true);
@@ -1297,9 +1573,9 @@ pub fn kill_client_for(variant: super::variant::TraeVariant) -> Result<bool, Str
 
         // 二级：强杀。
         let mut killed = false;
-        for name in exe_names_for(variant) {
+        for name in process_names_for(variant) {
             let output = hidden_command("pkill")
-                .args(["-KILL", "-x", name])
+                .args(["-KILL", "-x", name.as_str()])
                 .output()
                 .map_err(|e| format!("结束客户端进程失败: {e}"))?;
             if output.status.success() {
@@ -1361,18 +1637,14 @@ pub fn launch_client_for(
 /// CLI/IDE、会话/记忆迁移…）。它们与操作系统无关，故**无条件**下发，`supported_on`
 /// 标为「WorkBuddy」以说明「这条能力在哪有」，界面据此渲染为置灰说明而不造假控件。
 pub fn capabilities() -> Value {
-    let mut unsupported: Vec<Value> = Vec::new();
-
     // ---- 产品级：WorkBuddy 有、Trae 无（与平台无关，故无条件列出）----
-    unsupported.push(
-        Unsupported::new(
-            "auto_travel",
-            "自动旅行（派猫猫）",
-            "WorkBuddy",
-            "Trae 客户端没有该活动接口，本工具也无对应后端实现。",
-        )
-        .to_json(),
-    );
+    let mut unsupported: Vec<Value> = vec![Unsupported::new(
+        "auto_travel",
+        "自动旅行（派猫猫）",
+        "WorkBuddy",
+        "Trae 客户端没有该活动接口，本工具也无对应后端实现。",
+    )
+    .to_json()];
     unsupported.push(
         Unsupported::new(
             "codebuddy_cli",
@@ -1443,17 +1715,57 @@ pub fn capabilities() -> Value {
 /// 所以界面必须能说出「挑中的是谁」。这两个字段就是那个答案：
 ///
 /// - `variant`：稳定标识（`"trae_work"` / `"trae_cn"`），供程序判定；
-/// - `variantLabel`：展示名（`"Trae Work"` / `"Trae CN"`），直接上界面。
+/// - `variantLabel`：展示名（`"TraeWork CN"` / `"Trae CN"`），直接上界面。
 ///
 /// 判定依据是 [`detect_data_dir`] 的目录名（唯一的权威来源 —— 它是 `%APPDATA%\<产品名>`
 /// 逐字拼出来的）；目录不存在时退到安装路径的 exe 名。
 /// **两者都推不出来时为 `null`**，调用方应省略该标签而不是显示一个猜测值。
 pub fn env_status() -> Value {
     let settings = crate::modules::trae::settings::load();
-    let probe = detect_install(settings.trae_path.as_deref());
+    // 跨区域探测：每个区域配置的路径都要试（只看一条会漏掉另一区域，issue #20）。
+    let probe = detect_install(&settings.all_paths());
     let data_dir = detect_data_dir();
 
     let variant = detected_variant();
+
+    // 「设置里填的客户端路径现在还指向一个真实文件吗」（issue #20）。
+    //
+    // ## 为什么必须单独下发这个布尔值
+    //
+    // [`detect_install`] 在自定义路径失效时会**静默回落**到自动探测 —— 这是刻意的：
+    // 客户端合并/升级会搬走甚至卸载旧 exe（本机 `D:\Programs\TRAE SOLO CN\` 现在就只剩
+    // 一个 debug.log），不该因此卡住启动。但用户需要知道「我填的那个路径已经没用了」，
+    // 否则设置页会一直显示一个不存在的路径、而界面同时说「已检测到」——
+    // 两边对不上，正是 issue #20 报障原话「设置了启动 exe 已经无法找到」的形态。
+    //
+    // 判据用**存盘值原样**判存在性，与 `detect_install` 的采纳逻辑**分开**：
+    // 后者还要求路径归属该变体，混在一起会把「路径存在但不属于这条产品线」
+    // 也说成「失效」，那是另一回事（`detect_install_for` 的 `belongs` 分支负责）。
+    //
+    // ## ★ 为什么下发**两个映射**而不是单值（issue #20）
+    //
+    // 设置里的路径已按区域分家，而本命令是**全局**视角（「自动挑中的是哪一条」）。
+    // 设置页按区域渲染，需要拿到**本区域**那一条 —— 用检测到的变体所属区域去取会张冠李戴
+    // （用户在国际版页面上却看到国内版的路径）。因此把每个区域的值都下发，
+    // 由前端按当前区域取。`configuredPath` / `configuredPathExists` 保留为
+    // 「**检测到的那条线**所属区域」的值，供不关心区域的旧调用点继续读。
+    let mut configured_paths = serde_json::Map::new();
+    let mut configured_paths_exist = serde_json::Map::new();
+    for region in super::region::TraeRegion::all() {
+        let path = settings.path_for(region);
+        configured_paths.insert(region.as_str().to_string(), json!(path));
+        configured_paths_exist.insert(
+            region.as_str().to_string(),
+            json!(path
+                .map(|path| std::path::Path::new(path).is_file())
+                .unwrap_or(false)),
+        );
+    }
+
+    let configured_path = variant.and_then(|variant| settings.path_for(variant.region()));
+    let configured_path_exists = configured_path
+        .map(|path| std::path::Path::new(path).is_file())
+        .unwrap_or(false);
 
     json!({
         "installed": probe.installed,
@@ -1463,7 +1775,13 @@ pub fn env_status() -> Value {
         "dataDir": data_dir.as_ref().map(|p| p.to_string_lossy().to_string()),
         "dataDirExists": data_dir.map(|p| p.is_dir()).unwrap_or(false),
         "platform": platform_tag(),
-        "configuredPath": settings.trae_path,
+        "configuredPath": configured_path,
+        // `configuredPath` 为空时恒 `false` —— 前端只在「填了且失效」时才提示，
+        // 见 `TraeSettingsPage` 的客户端路径一栏。
+        "configuredPathExists": configured_path_exists,
+        // ★ 按区域分家的完整视图（键 = `TraeRegion::as_str()`）。
+        "configuredPaths": Value::Object(configured_paths),
+        "configuredPathsExist": Value::Object(configured_paths_exist),
         "variant": variant.map(|v| v.as_str()),
         "variantLabel": variant.map(|v| v.display_name()),
     })
@@ -1485,7 +1803,9 @@ pub fn detected_variant() -> Option<super::variant::TraeVariant> {
         .and_then(|dir| dir.file_name().and_then(|n| n.to_str()))
         .and_then(super::variant::variant_of_name)
         .or_else(|| {
-            detect_install(settings.trae_path.as_deref())
+            // 自定义路径**逐个区域**试（issue #20：只看单值会漏掉另一区域）。
+            // `detect_install` 已按传入顺序取第一个存在的文件，故这里直接取它的 exe 名反查。
+            detect_install(&settings.all_paths())
                 .exe
                 .as_ref()
                 .and_then(|exe| exe.file_name().and_then(|n| n.to_str()))
@@ -1571,7 +1891,10 @@ pub fn reset_device_identity_for(variant: super::variant::TraeVariant) -> Result
     }
 
     // 2 + 3. storage.json（点号扁平键，不是嵌套对象）
-    let storage_file = data_dir.join("User").join("globalStorage").join("storage.json");
+    let storage_file = data_dir
+        .join("User")
+        .join("globalStorage")
+        .join("storage.json");
     if storage_file.is_file() {
         match rewrite_storage_json(&storage_file, &machine_id, &guid) {
             Ok(changed) => {
@@ -1697,11 +2020,7 @@ pub fn reset_device_identity_for(variant: super::variant::TraeVariant) -> Result
 /// 而不是嵌套对象。这是 Trae/VS Code 系的存储约定，按嵌套结构去改会静默失败。
 ///
 /// 返回是否真的发生了替换。
-fn rewrite_storage_json(
-    path: &Path,
-    machine_id: &str,
-    guid: &str,
-) -> Result<bool, String> {
+fn rewrite_storage_json(path: &Path, machine_id: &str, guid: &str) -> Result<bool, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("读取失败: {e}"))?;
     let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
         return Err("不是合法的 JSON，已跳过".into());
@@ -1885,7 +2204,9 @@ mod tests {
     #[test]
     fn data_dir_names_include_primary_candidate() {
         // 主候选必须排第一，否则 detect_data_dir 的兜底返回值会变成次要名字。
-        assert_eq!(data_dir_names()[0], "TRAE SOLO CN");
+        // ★ issue #28：主候选是 **CN 合并版** `Trae CN`（收敛前是 `TRAE SOLO CN`，
+        //   那条客户端已被官方合并卸载，继续当主候选就是「指向不存在的客户端」）。
+        assert_eq!(data_dir_names()[0], "Trae CN");
     }
 
     #[test]
@@ -1895,7 +2216,7 @@ mod tests {
         let exe = temp.join(exe_names()[0]);
         std::fs::write(&exe, b"stub").unwrap();
 
-        let probe = detect_install(Some(&exe.to_string_lossy()));
+        let probe = detect_install(&[exe.to_string_lossy().to_string()]);
         assert!(probe.installed);
         assert_eq!(probe.exe.as_deref(), Some(exe.as_path()));
 
@@ -1905,7 +2226,7 @@ mod tests {
     #[test]
     fn detect_install_ignores_invalid_custom_path() {
         // 自定义路径不存在时不能直接报「已安装」，应继续走自动探测。
-        let probe = detect_install(Some("/definitely/not/here/trae"));
+        let probe = detect_install(&["/definitely/not/here/trae".to_string()]);
         assert!(!probe.installed || probe.exe.is_some());
         if !probe.installed {
             assert!(probe.exe.is_none());
@@ -1914,7 +2235,7 @@ mod tests {
 
     #[test]
     fn detect_install_blank_custom_path_does_not_error() {
-        let probe = detect_install(Some("   "));
+        let probe = detect_install(&["   ".to_string()]);
         // 空/空白自定义路径应被忽略而不是当成路径 ""
         if let Some(exe) = probe.exe {
             assert!(!exe.to_string_lossy().trim().is_empty());
@@ -1985,13 +2306,119 @@ mod tests {
             "dataDirExists",
             "platform",
             "configuredPath",
+            "configuredPathExists",
+            "configuredPaths",
+            "configuredPathsExist",
         ] {
             assert!(value.get(key).is_some(), "缺少线上字段 {key}");
         }
         // 不能泄漏 snake_case 形式
         assert!(value.get("data_dir").is_none());
+        assert!(value.get("configured_path_exists").is_none());
         assert!(value.get("running").unwrap().is_boolean());
         assert!(value.get("installed").unwrap().is_boolean());
+        assert!(value.get("configuredPathExists").unwrap().is_boolean());
+    }
+
+    /// ★ `configuredPathExists` 必须如实反映「设置里填的那个路径**还在不在**」（issue #20）。
+    ///
+    /// ## 为什么这条非钉不可
+    ///
+    /// issue #20 的报障原话是「设置了启动 exe 已经无法找到」：客户端合并/升级后
+    /// 旧 exe 被搬走甚至整个目录被卸载（本机 `D:\Programs\TRAE SOLO CN\` 现在只剩 debug.log），
+    /// 而设置里仍存着旧路径。`detect_install` 会**静默回落**（这是对的），
+    /// 于是界面显示「已检测到」、设置页却摆着一个不存在的路径 —— 用户无从知道该改。
+    ///
+    /// 反例（改坏会红）：
+    /// - 把它写成「探测到的路径存在」⇒ 几乎恒为 `true`，提示永远不出现；
+    /// - 干脆不判存在性、恒 `true` ⇒ 同上。
+    #[test]
+    fn configured_path_existence_reflects_saved_value() {
+        let env = crate::modules::trae::test_support::TempEnv::with_device_fixture();
+        let dir = std::env::temp_dir().join(format!(
+            "buddy-switch-configured-path-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("临时目录应能创建");
+
+        // 1) 没填 → 两个区域都 false（前端据此**不**提示）。
+        crate::modules::trae::settings::patch(serde_json::json!({ "traePaths": {} }))
+            .expect("清空 traePaths 应成功");
+        let value = env_status();
+        for region in ["cn", "global"] {
+            assert_eq!(
+                value
+                    .get("configuredPathsExist")
+                    .and_then(|map| map.get(region))
+                    .and_then(|v| v.as_bool()),
+                Some(false),
+                "未配置路径时 {region} 不得报 true"
+            );
+        }
+
+        // 2) **只**给国内版填一个**存在**的文件 → cn=true、global 仍 false。
+        //    ★ 这一对断言就是 issue #20 的回归护栏：旧实现是单个全局字段，
+        //    给任一区域设置都会让两边同时变 true（「以最后的设置为准」）。
+        let real = dir.join("Trae CN.exe");
+        std::fs::write(&real, b"x").expect("应能写临时 exe");
+        crate::modules::trae::settings::patch(serde_json::json!({
+            "traePaths": { "cn": real.to_string_lossy() }
+        }))
+        .expect("设置 traePaths 应成功");
+        let value = env_status();
+        let exist = value
+            .get("configuredPathsExist")
+            .expect("应有 configuredPathsExist");
+        assert_eq!(
+            exist.get("cn").and_then(|v| v.as_bool()),
+            Some(true),
+            "国内版存在的路径必须报 true"
+        );
+        assert_eq!(
+            exist.get("global").and_then(|v| v.as_bool()),
+            Some(false),
+            "★ 区域必须隔离：给国内版设路径不得让国际版也变成已配置"
+        );
+        assert_eq!(
+            value
+                .get("configuredPaths")
+                .and_then(|map| map.get("cn"))
+                .and_then(|v| v.as_str()),
+            Some(real.to_string_lossy().as_ref()),
+            "configuredPaths.cn 必须原样回显存盘值"
+        );
+        assert!(
+            value
+                .get("configuredPaths")
+                .and_then(|map| map.get("global"))
+                .map(|v| v.is_null())
+                .unwrap_or(false),
+            "未配置的区域必须为 null 而不是空串"
+        );
+
+        // 3) 填了一个**已失效**的路径（客户端合并/升级搬走了 exe）→ false，
+        //    且探测必须仍然跑完（回落自动探测，不因失效路径报错/卡死）。
+        let dead = dir.join("TRAE SOLO CN.exe");
+        crate::modules::trae::settings::patch(serde_json::json!({
+            "traePaths": { "cn": dead.to_string_lossy() }
+        }))
+        .expect("设置失效 traePaths 应成功");
+        let value = env_status();
+        assert_eq!(
+            value
+                .get("configuredPathsExist")
+                .and_then(|map| map.get("cn"))
+                .and_then(|v| v.as_bool()),
+            Some(false),
+            "失效路径必须如实报 false —— 设置页据此提示用户重新选择"
+        );
+        assert!(
+            value.get("installed").unwrap().is_boolean(),
+            "回落探测必须仍然给出 installed，不得因失效路径中断"
+        );
+
+        drop(env);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2121,8 +2548,8 @@ mod tests {
         assert_eq!(seen.len(), 2, "区域标识重复: {seen:?}");
     }
 
-    /// ★★ 四个程序位**全部已建模**，且每个程序位回传的 `variant` 都能反解回
-    /// 「同一个区域 + 同一个程序」（2026-09-28，issue #3）。
+    /// ★★ 全部程序位**已建模**，且每个程序位回传的 `variant` 都能反解回
+    /// 「同一个区域 + 同一个程序」（2026-09-28 issue #3；2026-10-13 issue #20 增合并版）。
     ///
     /// ## 这条是 issue #3 的直接验收
     ///
@@ -2130,15 +2557,19 @@ mod tests {
     /// ⇒ 国际版页签上的 TraeCode 程序位 `variant: null`、`installed: false`，
     /// 前端把它渲染成**禁用按钮**，用户看到的就是「不支持」。
     ///
-    /// 现在四个组合都有值。断言三件事：
+    /// 现在全部组合都有值。断言三件事：
     /// 1. **没有一个程序位的 `variant` 是 `null`**（这正是当时那条分支的痕迹）；
     /// 2. 回传的 `variant` 反解后的**区域**等于它所在的区域条目；
     /// 3. 回传的 `variant` 反解后的**程序**等于该程序位的 `program`。
     ///
     /// 第 2、3 条合起来才排得掉「值有、但指向另一个客户端」这种更坏的形态
     /// （切换会把登录态写进错的 userData，而界面上一切正常）。
+    ///
+    /// ⚠️ 第 3 条在 issue #20 之后**不再是「同一区域内的唯一解」**：合并版 `Trae`
+    /// 与遗留 `TraeCode` 共享同一个变体（`trae_cn` / `global_trae_code`），
+    /// 两者都能通过 `variant_for_program` 的往返 —— 这是刻意的（同一个客户端）。
     #[test]
-    fn 四个程序位全部已建模且自洽() {
+    fn 全部程序位已建模且自洽() {
         use super::super::region::{TraeProgram, TraeRegion};
         use super::super::variant::TraeVariant;
 
@@ -2154,17 +2585,17 @@ mod tests {
                 let program_id = program.get("program").and_then(|v| v.as_str()).unwrap();
                 let expected_program = TraeProgram::parse(program_id)
                     .unwrap_or_else(|| panic!("程序位标识无法反解: {program_id}"));
-                let raw = program.get("variant").unwrap_or_else(|| {
-                    panic!("程序位 {region:?}/{program_id} 缺少 variant 键")
-                });
+                let raw = program
+                    .get("variant")
+                    .unwrap_or_else(|| panic!("程序位 {region:?}/{program_id} 缺少 variant 键"));
                 let raw = raw.as_str().unwrap_or_else(|| {
                     panic!(
                         "程序位 {region:?}/{program_id} 的 variant 为 null —— \
                          即 issue #3 的「未建模」形态，必须已修"
                     )
                 });
-                let target = TraeVariant::parse(raw)
-                    .unwrap_or_else(|| panic!("variant 值无法反解: {raw}"));
+                let target =
+                    TraeVariant::parse(raw).unwrap_or_else(|| panic!("variant 值无法反解: {raw}"));
                 assert_eq!(
                     target.region(),
                     region,
@@ -2177,8 +2608,9 @@ mod tests {
                 );
             }
         }
-        // 前置：必须真的把 4 个程序位都过了一遍，否则本用例会**恒真**。
-        assert_eq!(checked, 4, "应有 4 个程序位（2 区域 × 2 程序）");
+        // ★ issue #28：每区域**只有一个**程序位（合并版）⇒ 全表 2 条。
+        //   前置：必须真的把可选程序位都过了一遍，否则本用例会**恒真**。
+        assert_eq!(checked, 2, "应有 2 个可选程序位（2 区域 × 1）");
     }
 
     /// 区域状态带出的「站点域」（`consoleBase`）必须**按区域分家**，且与授权页域**同源**。
@@ -2278,11 +2710,19 @@ mod tests {
         let changed = rewrite_storage_json(&path, "NEWMACHINE", "NEW-GUID").unwrap();
         assert!(changed);
 
-        let after: Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(after.get("telemetry.machineId").unwrap().as_str(), Some("NEWMACHINE"));
-        assert_eq!(after.get("telemetry.sqmId").unwrap().as_str(), Some("NEW-GUID"));
-        assert_eq!(after.get("aha.device.device_id").unwrap().as_str(), Some("NEWMACHINE"));
+        let after: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            after.get("telemetry.machineId").unwrap().as_str(),
+            Some("NEWMACHINE")
+        );
+        assert_eq!(
+            after.get("telemetry.sqmId").unwrap().as_str(),
+            Some("NEW-GUID")
+        );
+        assert_eq!(
+            after.get("aha.device.device_id").unwrap().as_str(),
+            Some("NEWMACHINE")
+        );
         // 标记位必须被删除，否则客户端会跳过设备 ID 重新上报
         assert!(after.get("has_device_id_updated_to_aha").is_none());
         // 无关键必须原样保留
@@ -2299,7 +2739,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&base);
         let path = base.join("storage.json");
         std::fs::write(&path, r#"{"unrelated":1}"#).unwrap();
-        assert_eq!(rewrite_storage_json(&path, "m", "g").unwrap(), false);
+        assert!(!rewrite_storage_json(&path, "m", "g").unwrap());
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -2345,17 +2785,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    // ---------- 多渠道（TRAE SOLO CN / Trae CN 并存）相关 ----------
+    // ---------- 两个区域各一个客户端（CN / 国际）相关 ----------
 
+    /// ★ 跨变体 exe 候选必须**两个区域的合并客户端都在**（issue #28 收敛后共 2 条）。
+    ///
+    /// 漏掉任一个 → 「明明装了却提示未安装」，以及在跑的那个被判成未运行。
     #[test]
-    fn exe_names_cover_the_trae_cn_product_line() {
-        // `Trae CN` 与 `TRAE SOLO CN` 是可以并存的两条产品线（实测同机各装一份）。
-        // 漏掉它 → 「明明装了却提示未安装」，以及在跑的那个被判成未运行。
+    fn exe_names_cover_both_merged_clients() {
         let names = exe_names();
-        let suffix = if cfg!(target_os = "windows") { ".exe" } else { "" };
-        for expected in ["TRAE SOLO CN", "Trae CN"] {
+        let suffix = if cfg!(target_os = "windows") {
+            ".exe"
+        } else {
+            ""
+        };
+        for expected in ["Trae CN", "Trae"] {
             let full = format!("{expected}{suffix}");
-            assert!(names.contains(&full.as_str()), "候选名缺少 {full}：{names:?}");
+            assert!(
+                names.contains(&full.as_str()),
+                "候选名缺少 {full}：{names:?}"
+            );
+        }
+        // ★ 退役客户端的名字**不得**再出现在跨变体候选里。
+        for retired in ["TRAE SOLO CN", "TRAE SOLO"] {
+            let full = format!("{retired}{suffix}");
+            assert!(
+                !names.contains(&full.as_str()),
+                "退役客户端 {full} 仍在跨变体探测候选里"
+            );
         }
     }
 
@@ -2369,14 +2825,20 @@ mod tests {
     /// 而区域页必须用本区域的目录；且**本区域**里也还得选对来源 ——
     /// 「最近活跃」与「首个存在」在本机不是同一个目录。
     ///
-    /// ## 反例（改坏会红）
+    /// ## ★ issue #28 后这条用例拆成两半
     ///
-    /// 把 `writeDataDir` 也接到 `select_data_dir_for`（即与 `dataDir` 同源）⇒ 第 2 条断言红。
+    /// 「活跃 ≠ 首个存在」这个前提来自 `TraeWork` 的**两个候选目录**
+    /// （`TRAE SOLO CN` / `TRAE SOLO` —— 那条跨区重叠缺陷）。收敛后每个区域只有一个
+    /// 程序位、一个候选目录 ⇒ 在线状态上**构造不出**分叉。
+    /// ⇒ ① 分叉判据改到函数层（`select_data_dir_for` vs `detect_data_dir_for`，
+    ///    仍用退役的 `TraeWork`，那份重叠数据仍在 `all_known_specs` 的候选名里）；
+    /// ② 「状态响应里的 `writeDataDir` 必须等于写侧取值」这条线上契约仍在。
     #[cfg(windows)]
     #[test]
-    fn variants_status_exposes_the_write_side_dir_next_to_the_active_one() {
+    fn write_side_dir_is_the_first_existing_candidate_not_the_most_active() {
         let exp = chrono::Utc::now().timestamp() + 3600;
         let env = crate::modules::trae::test_support::TempEnv::empty();
+        // 退役变体仍有 2 个候选目录 —— 这正是本用例要的「活跃 ≠ 首个存在」形态。
         let variant = crate::modules::trae::variant::TraeVariant::TraeWork;
         let names = data_dir_names_for(variant);
         assert!(
@@ -2394,21 +2856,22 @@ mod tests {
             &cells,
             exp,
         );
-        assert!(grid.selectors_diverge, "前置：两个选择器必须分叉，否则本用例证明不了什么");
+        assert!(
+            grid.selectors_diverge,
+            "前置：两个选择器必须分叉，否则本用例证明不了什么"
+        );
 
-        let value = variants_status();
-        let cn = value["variants"]
-            .as_array()
-            .expect("variants 应是数组")
-            .iter()
-            .find(|item| item["variant"].as_str() == Some("cn"))
-            .expect("应有 cn 区域");
-        let program = cn["programs"]
-            .as_array()
-            .expect("programs 应是数组")
-            .iter()
-            .find(|item| item["variant"].as_str() == Some(variant.as_str()))
-            .expect("cn 区域应有 TraeWork 程序位");
+        // ① 两个选择器在同一个变体上确实分叉（活跃度 ≠ 首个存在）。
+        let active = select_data_dir_for(variant).expect("候选都在，应能选出活跃目录");
+        let write_side = detect_data_dir_for(variant).expect("候选都在，应能选出写侧目录");
+        assert_ne!(
+            active, write_side,
+            "前置：两个选择器必须分叉，否则本用例证明不了任何事"
+        );
+
+        // ② 线上契约：`variants_status` 的每个程序位都必须带**写侧**目录，
+        //    且它等于写侧取值点 `detect_data_dir_for`（收敛后每个区域只有一个候选目录）。
+        let merged = crate::modules::trae::variant::TraeVariant::TraeMerged;
 
         // 只比 basename：绝对路径前缀依赖临时目录，比较它只会让断言更脆。
         let basename = |item: &Value, key: &str| -> String {
@@ -2419,20 +2882,27 @@ mod tests {
                 .unwrap_or_default()
                 .to_string()
         };
-        assert_eq!(
-            basename(program, "dataDir"),
-            names[names.len() - 1],
-            "dataDir 的语义是「最近活跃」那一份（保持既有含义不变）"
-        );
+        // 合并版的 userData 目录也必须存在，否则 `writeDataDirExists` 恒为 false。
+        let merged_dir = env.appdata().join("Trae CN");
+        std::fs::create_dir_all(&merged_dir).expect("合并版 userData 应能创建");
+        let value = variants_status();
+        let cn = value["variants"]
+            .as_array()
+            .expect("variants 应是数组")
+            .iter()
+            .find(|item| item["variant"].as_str() == Some("cn"))
+            .expect("应有 cn 区域");
+        let program = &cn["programs"]
+            .as_array()
+            .expect("programs 应是数组")
+            .iter()
+            .find(|item| item["variant"].as_str() == Some(merged.as_str()))
+            .expect("cn 区域应有合并版程序位")
+            .clone();
         assert_eq!(
             basename(program, "writeDataDir"),
-            names[0],
+            "Trae CN",
             "writeDataDir 必须是写侧（首个存在的候选）—— 区域页核对「登录态在哪」用的是它"
-        );
-        assert_ne!(
-            basename(program, "dataDir"),
-            basename(program, "writeDataDir"),
-            "前置：本 fixture 下两个目录必须分叉"
         );
         assert_eq!(
             program["writeDataDirExists"],
@@ -2448,8 +2918,8 @@ mod tests {
             names.contains(&"Trae CN"),
             "userData 候选缺少 Trae CN：{names:?}"
         );
-        // 主候选必须仍是 TRAE SOLO CN：它是「一个候选都不存在」时的兜底返回值。
-        assert_eq!(names[0], "TRAE SOLO CN");
+        // ★ issue #28：主候选改为 CN 合并版（它是「一个候选都不存在」时的兜底返回值）。
+        assert_eq!(names[0], "Trae CN");
     }
 
     #[test]
@@ -2465,7 +2935,10 @@ mod tests {
         // 隔开一点再写 fresh，确保两者 mtime 明确不同（NTFS 精度远高于 20ms）
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(
-            fresh.join("User").join("globalStorage").join("storage.json"),
+            fresh
+                .join("User")
+                .join("globalStorage")
+                .join("storage.json"),
             br#"{"touched":1}"#,
         )
         .unwrap();
@@ -2730,10 +3203,7 @@ mod tests {
         let running = running_processes();
         eprintln!("[trae] running_processes -> {running:?}");
         for name in &running {
-            assert!(
-                exe_names().contains(name),
-                "返回了未登记的进程名：{name}"
-            );
+            assert!(exe_names().contains(name), "返回了未登记的进程名：{name}");
         }
     }
 
@@ -2741,7 +3211,7 @@ mod tests {
     fn detect_install_returns_a_registered_exe_name_when_installed() {
         // 命中安装时，返回的必须是候选表里的文件名（防止拼出错误路径）。
         // 同时把结果打出来，便于用 `--nocapture` 核对本机真实探测结果。
-        let probe = detect_install(None);
+        let probe = detect_install(&[]);
         eprintln!(
             "[trae] detect_install -> installed={} exe={:?} version={:?}",
             probe.installed,
@@ -2775,7 +3245,7 @@ mod tests {
         let exe = temp.join(exe_names()[0]);
         std::fs::write(&exe, b"stub").unwrap();
 
-        let probe = detect_install(Some(&exe.to_string_lossy()));
+        let probe = detect_install(&[exe.to_string_lossy().to_string()]);
         assert!(probe.installed);
         assert_eq!(probe.version.as_deref(), Some("9.9.9"));
         assert_eq!(probe.exe.as_deref(), Some(exe.as_path()));

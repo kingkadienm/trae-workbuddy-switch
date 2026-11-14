@@ -8,7 +8,10 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::modules::config::{atomic_write, now_ms};
-use crate::modules::region::{accounts_file_for, region_of, region_spec, Region};
+use crate::modules::product::{scope_of_wb_region, Scope};
+use crate::modules::region::{
+    accounts_file_for, accounts_trash_file_for, region_of, region_spec, Region,
+};
 
 fn load_accounts_from_path(path: &Path) -> Vec<Value> {
     if let Ok(text) = std::fs::read_to_string(path) {
@@ -27,24 +30,35 @@ fn save_accounts_to_path(path: &Path, accounts: &[Value]) -> std::io::Result<()>
     atomic_write(path, &content)
 }
 
+/// ★ 账号匹配的**唯一谓词出口**：`id` **或** `uid` 命中即算命中（P5 §2.5 第 (3) 条）。
+///
+/// # 为什么必须是「唯一出口」（真实缺陷形态）
+///
+/// 改造前，**查找 / 备注**按 `id` **或** `uid` 匹配（[`find_account_in`] /
+/// `set_remark_in_path`），而**删除**只按 `id` 匹配。于是「按 uid 选中一批账号再删」
+/// 会**静默空转**：
+///
+/// ```text
+/// 选择集里存的是 uid  →  retain(仅 id) 一个都不命中  →  报「成功」但一条没删
+/// ```
+///
+/// 看起来执行了、实际什么都没发生 —— 比报错坏得多。P5 的软删除（[`trash_account_for`]）/
+/// 恢复（[`restore_account_for`]）/ 永久删除（[`purge_account_for`]）**三者都必须**
+/// 走这个谓词，否则会把同一缺陷原样带进回收站（更隐蔽）。
+///
+/// ⚠️ 本函数是 `id`/`uid` 匹配的**唯一出口**：`find_account_in` /
+/// `trash_account_for` / `restore_account_for` / `purge_account_for` /
+/// `set_remark_in_path` 一律调它，**不得**再各写一遍条件。
+pub fn resolve_account_key(account: &Value, key: &str) -> bool {
+    account.get("id").and_then(Value::as_str) == Some(key)
+        || account.get("uid").and_then(Value::as_str) == Some(key)
+}
+
 fn find_account_in(accounts: &[Value], account_id: &str) -> Option<Value> {
     accounts
         .iter()
-        .find(|account| {
-            account.get("id").and_then(Value::as_str) == Some(account_id)
-                || account.get("uid").and_then(Value::as_str) == Some(account_id)
-        })
+        .find(|account| resolve_account_key(account, account_id))
         .cloned()
-}
-
-fn delete_account_from_path(path: &Path, account_id: &str) -> Result<(), String> {
-    let mut accounts = load_accounts_from_path(path);
-    let before = accounts.len();
-    accounts.retain(|account| account.get("id").and_then(Value::as_str) != Some(account_id));
-    if accounts.len() == before {
-        return Err("账号不存在".to_string());
-    }
-    save_accounts_to_path(path, &accounts).map_err(|error| error.to_string())
 }
 
 /// 读取账号库（CN）；文件缺失或损坏返回空列表。
@@ -263,8 +277,14 @@ pub fn account_meta(acc: &Value) -> Value {
         "refreshExpiresAt": acc.get("refreshExpiresAt"),
         "refreshedAt": acc.get("refreshedAt"),
         "createdAt": acc.get("createdAt"),
+        // 最近一次「实际使用该账号」（切换 / 启动）的时间戳。与上一行同为**数字**
+        // （[`now_ms`]，epoch 毫秒）—— 由 [`touch_last_used_for`] 写入，缺失时为 `null`。
+        "lastUsedAt": acc.get("lastUsedAt"),
         "needsRelogin": acc.get("needs_relogin").and_then(|v| v.as_bool()) == Some(true),
         "needsReloginReason": display_str(acc, "needs_relogin_reason"),
+        // 暂时性刷新失败（断网 / 5xx）：**只挂在刷新返回值上**，不落账号库（issue #171）。
+        // 账号列表读不到时为 null；webui 侧下发 raw Value，前端 `normalizeAccountMeta` 兼容两种键。
+        "refreshTransientError": display_str(acc, "refresh_transient_error"),
         // 用户备注：自由文本，可能缺失或为 null。前端按「有值才渲染」处理。
         //
         // ⚠️ 这里**没有**「凭据是否加密信封」这个字段：那条判据挂在**失败结果**上
@@ -274,6 +294,10 @@ pub fn account_meta(acc: &Value) -> Value {
         "remark": display_str(acc, "remark"),
         // 账号是否已停用：停用的账号不会在网关池中被选中，但仍在账号库中保留。
         "deactivated": acc.get("deactivated").and_then(|v| v.as_bool()) == Some(true),
+        // 用户自定义分组名：自由文本，可能缺失或为 null（缺省 = 未分组）。
+        // 与 `remark` 同为**本地标注**：采集/导入时**不会**出现在采集结果里，
+        // 由 [`upsert_collected_account`] 保留、[`set_account_group_for`] 维护。
+        "groupName": display_str(acc, "groupName"),
     })
 }
 
@@ -475,6 +499,14 @@ pub fn upsert_collected_account(accounts: &mut Vec<Value>, mut collected: Value)
         if let Some(remark) = existing.get("remark").cloned() {
             collected["remark"] = remark;
         }
+        // 同上：自定义分组与「最近使用」也是**本地标注**（采集结果里没有），
+        // 不显式带回就会丢 —— UI 每次自动 `importLocal` 都会重采集同一 uid，
+        // 丢掉分组 / 最近使用会让「自定义分组」与「最近使用」排序静默失效。
+        for key in ["groupName", "lastUsedAt"] {
+            if let Some(value) = existing.get(key).cloned() {
+                collected[key] = value;
+            }
+        }
 
         for index in matching_indexes.into_iter().rev() {
             accounts.remove(index);
@@ -635,10 +667,7 @@ pub fn build_chat_headers(region: Region, account: &Value) -> HashMap<String, St
     );
     headers.insert("Accept-Language".to_string(), accept_language.to_string());
     headers.insert("X-CodeBuddy-Request".to_string(), "1".to_string());
-    headers.insert(
-        "X-Agent-Purpose".to_string(),
-        "conversation".to_string(),
-    );
+    headers.insert("X-Agent-Purpose".to_string(), "conversation".to_string());
     headers.insert("X-Requested-With".to_string(), "XMLHttpRequest".to_string());
     headers.insert("Origin".to_string(), origin.to_string());
     headers.insert("Referer".to_string(), format!("{origin}/"));
@@ -754,7 +783,11 @@ mod tests {
         });
 
         // 1) 信封 + 快照命中 ⇒ 显示明文名字（本次修复的目标行为）。
-        write_client_snapshot(Region::Cn, "15bf784e-877b-43dd-904c-853dde62b84c", json!("Andev"));
+        write_client_snapshot(
+            Region::Cn,
+            "15bf784e-877b-43dd-904c-853dde62b84c",
+            json!("Andev"),
+        );
         assert_eq!(
             account_display_name(&cn_account),
             "Andev",
@@ -778,7 +811,11 @@ mod tests {
             "nickname": envelope,
             "domain": "www.workbuddy.ai",
         });
-        write_client_snapshot(Region::Global, "2fa83368-ebd6-4efe-8cd7-4f43b1c31571", json!("nextagentx"));
+        write_client_snapshot(
+            Region::Global,
+            "2fa83368-ebd6-4efe-8cd7-4f43b1c31571",
+            json!("nextagentx"),
+        );
         assert_eq!(
             account_display_name(&global_account),
             "nextagentx",
@@ -792,12 +829,20 @@ mod tests {
 
         // 4) `domain` 缺失 ⇒ `region_of(\"\")` 判为 CN；此时读不到名字，如实回落 uid，
         //    **不会**把 CN 快照里别人的名字挂上去。
-        write_client_snapshot(Region::Cn, "15bf784e-877b-43dd-904c-853dde62b84c", json!("Andev"));
+        write_client_snapshot(
+            Region::Cn,
+            "15bf784e-877b-43dd-904c-853dde62b84c",
+            json!("Andev"),
+        );
         let no_domain = json!({
             "uid": "15bf784e-877b-43dd-904c-853dde62b84c",
             "nickname": envelope,
         });
-        assert_eq!(account_display_name(&no_domain), "Andev", "缺 domain 时按 CN 处理");
+        assert_eq!(
+            account_display_name(&no_domain),
+            "Andev",
+            "缺 domain 时按 CN 处理"
+        );
 
         // 5) 阳性对照（**这条防的是「无条件覆盖」**）：记录里有明文昵称时，
         //    快照与账号库都不得覆盖它 —— 否则老客户端用户会看到过期的旧名字。
@@ -883,11 +928,23 @@ mod tests {
         });
         let headers = build_chat_headers(Region::Cn, &acc);
         assert_eq!(headers.get("X-User-Id").map(String::as_str), Some("u1"));
-        assert_eq!(headers.get("X-Domain").map(String::as_str), Some("www.codebuddy.cn"));
-        assert_eq!(headers.get("X-No-Enterprise-Id").map(String::as_str), Some("1"));
+        assert_eq!(
+            headers.get("X-Domain").map(String::as_str),
+            Some("www.codebuddy.cn")
+        );
+        assert_eq!(
+            headers.get("X-No-Enterprise-Id").map(String::as_str),
+            Some("1")
+        );
         assert_eq!(headers.get("X-Product").map(String::as_str), Some("SaaS"));
-        assert_eq!(headers.get("Origin").map(String::as_str), Some("https://www.codebuddy.cn"));
-        assert_eq!(headers.get("Authorization").map(String::as_str), Some("Bearer AT"));
+        assert_eq!(
+            headers.get("Origin").map(String::as_str),
+            Some("https://www.codebuddy.cn")
+        );
+        assert_eq!(
+            headers.get("Authorization").map(String::as_str),
+            Some("Bearer AT")
+        );
         // 安全红线：chat 头绝不携带 refresh token。
         assert!(!headers.contains_key("X-Refresh-Token"));
         assert!(!headers.values().any(|v| v == "SECRET_REFRESH"));
@@ -898,9 +955,18 @@ mod tests {
         let acc = json!({"access_token": "AT"});
         let headers = build_chat_headers(Region::Global, &acc);
         assert_eq!(headers.get("X-No-User-Id").map(String::as_str), Some("1"));
-        assert_eq!(headers.get("X-No-Enterprise-Id").map(String::as_str), Some("1"));
-        assert_eq!(headers.get("X-No-Department-Info").map(String::as_str), Some("1"));
-        assert_eq!(headers.get("Origin").map(String::as_str), Some("https://www.workbuddy.ai"));
+        assert_eq!(
+            headers.get("X-No-Enterprise-Id").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            headers.get("X-No-Department-Info").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            headers.get("Origin").map(String::as_str),
+            Some("https://www.workbuddy.ai")
+        );
     }
 
     fn account(id: &str, uid: Option<&str>, nickname: &str, email: Option<&str>) -> Value {
@@ -1257,7 +1323,8 @@ mod tests {
 
         // ★ 只有 refresh_token 是信封时**不**拦：刷新链路会自己报「需重新登录」，
         //   在这里一并封死会把「还能靠 refresh 救回来」的账号误伤。
-        let refresh_only = json!({"id": "a4", "access_token": "SECRET", "refresh_token": envelope("r")});
+        let refresh_only =
+            json!({"id": "a4", "access_token": "SECRET", "refresh_token": envelope("r")});
         assert!(
             envelope_token_error(&refresh_only).is_none(),
             "只有 refresh_token 是信封时不得短路"
@@ -1291,7 +1358,8 @@ mod tests {
 
         // 2) 只有 refresh_token 是信封（access_token 是明文）⇒ 同样报信封。
         //    这条是**边界**：`envelope_token_error` 刻意不管它，刷新链路必须管。
-        let refresh_only = json!({"id": "a2", "access_token": "SECRET", "refresh_token": envelope("r")});
+        let refresh_only =
+            json!({"id": "a2", "access_token": "SECRET", "refresh_token": envelope("r")});
         assert!(envelope_refresh_error(&refresh_only).is_some());
 
         // 3) 阳性对照：明文 refresh_token 不得误报（否则会把可刷新的账号拦死）。
@@ -1305,7 +1373,9 @@ mod tests {
         //    两类原因必须能区分开，否则修法完全不同。
         assert!(envelope_refresh_error(&json!({"id": "a4"})).is_none());
         assert!(envelope_refresh_error(&json!({"id": "a5", "refresh_token": ""})).is_none());
-        assert!(envelope_refresh_error(&json!({"id": "a6", "refresh_token": {"zh": "脏值"}})).is_none());
+        assert!(
+            envelope_refresh_error(&json!({"id": "a6", "refresh_token": {"zh": "脏值"}})).is_none()
+        );
     }
 
     /// ★ 信封不得覆盖**未过期**的明文 token。
@@ -1357,7 +1427,10 @@ mod tests {
         );
 
         assert_eq!(accounts.len(), 1);
-        assert!(is_envelope(&saved, "access_token"), "过期的明文应让信封接管");
+        assert!(
+            is_envelope(&saved, "access_token"),
+            "过期的明文应让信封接管"
+        );
         assert_eq!(saved["id"], "a-1");
     }
 
@@ -1422,7 +1495,10 @@ mod tests {
             }),
         );
 
-        assert!(is_envelope(&saved, "access_token"), "过期的明文应让信封接管");
+        assert!(
+            is_envelope(&saved, "access_token"),
+            "过期的明文应让信封接管"
+        );
         assert_eq!(saved["nickname"], "明文昵称");
         assert_eq!(saved["email"], "keep@example.com");
         assert_eq!(saved["enterpriseName"], "某公司");
@@ -1465,13 +1541,16 @@ mod tests {
         assert_eq!(accounts.len(), 2);
     }
 
+    /// 同名账号可独立查找 / 软删除（走 region 入口，隔离 home）。
     #[test]
     fn persisted_same_name_accounts_can_be_found_and_deleted_independently() {
         let test_dir = std::env::temp_dir().join(format!(
             "buddy-switch-same-name-{}",
             uuid::Uuid::new_v4().simple()
         ));
-        let path = test_dir.join("accounts.json");
+        std::fs::create_dir_all(&test_dir).expect("create dir");
+        let guard = crate::modules::config::HomeOverrideGuard::set(&test_dir);
+
         let mut accounts = vec![];
         upsert_collected_account(
             &mut accounts,
@@ -1481,9 +1560,9 @@ mod tests {
             &mut accounts,
             account("account-2", Some("uid-2"), "同名用户", None),
         );
-        save_accounts_to_path(&path, &accounts).expect("same-name accounts should persist");
+        save_accounts_for(Region::Cn, &accounts).expect("same-name accounts should persist");
 
-        let persisted = load_accounts_from_path(&path);
+        let persisted = load_accounts_for(Region::Cn);
         assert_eq!(
             find_account_in(&persisted, "account-1").unwrap()["uid"],
             "uid-1"
@@ -1493,17 +1572,208 @@ mod tests {
             "uid-2"
         );
 
-        delete_account_from_path(&path, "account-1").expect("first account should delete");
-        let after_first_delete = load_accounts_from_path(&path);
+        delete_account_for(Region::Cn, "account-1").expect("first account should delete");
+        let after_first_delete = load_accounts_for(Region::Cn);
         assert!(find_account_in(&after_first_delete, "account-1").is_none());
         assert_eq!(
             find_account_in(&after_first_delete, "account-2").unwrap()["uid"],
             "uid-2"
         );
+        assert_eq!(
+            load_trash_for(Region::Cn).len(),
+            1,
+            "软删除后回收站应恰好 1 条"
+        );
 
-        delete_account_from_path(&path, "account-2").expect("second account should delete");
-        assert!(load_accounts_from_path(&path).is_empty());
-        std::fs::remove_dir_all(&test_dir).expect("temporary account store should clean up");
+        delete_account_for(Region::Cn, "account-2").expect("second account should delete");
+        assert!(load_accounts_for(Region::Cn).is_empty());
+        assert_eq!(load_trash_for(Region::Cn).len(), 2);
+
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    /// ★ 按 **uid** 软删除必须真的移入回收站（P5 §2.5 第 (3) 条 · 验收 12）。
+    ///
+    /// 现场缺陷：删除只匹配 `id`，而查找 / 备注匹配 `id|uid` ⇒ 用 uid 选中批删会
+    /// **静默空转**（报成功、实际 0 条）。本用例钉住修复：软删除 / 恢复 / 永久删除 /
+    /// 查找 / 备注**共用** `resolve_account_key`（`id` **或** `uid`）。
+    ///
+    /// 可证伪：把 `trash_account_for` 的 `resolve_account_key` 换回「仅 `id`」，
+    /// 本用例即红（uid 移不动，`is_err()` 与 `len()` 断言双双失败）。
+    #[test]
+    fn delete_by_uid_matches_the_same_predicate_as_find() {
+        let dir = std::env::temp_dir().join(format!(
+            "buddy-switch-delete-by-uid-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let guard = crate::modules::config::HomeOverrideGuard::set(&dir);
+
+        let accounts = vec![
+            account("id-a", Some("uid-a"), "甲", None),
+            account("id-b", Some("uid-b"), "乙", None),
+        ];
+        save_accounts_for(Region::Cn, &accounts).expect("seed accounts");
+
+        // 谓词本身：id 与 uid 都能命中（这是「统一」的定义）。
+        assert!(resolve_account_key(&accounts[0], "id-a"));
+        assert!(resolve_account_key(&accounts[0], "uid-a"));
+        assert!(!resolve_account_key(&accounts[0], "uid-b"));
+
+        // 查找按 uid 命中，软删除也必须按 uid 命中 —— 两者同源。
+        assert!(find_account_in(&load_accounts_for(Region::Cn), "uid-a").is_some());
+        delete_account_for(Region::Cn, "uid-a").expect("按 uid 删除必须成功，不能静默空转");
+
+        let after = load_accounts_for(Region::Cn);
+        assert_eq!(after.len(), 1, "按 uid 软删除后 live 应恰好剩 1 条");
+        assert!(
+            find_account_in(&after, "id-a").is_none(),
+            "被删的那条必须真的移出 live"
+        );
+        assert!(
+            find_account_in(&after, "uid-b").is_some(),
+            "另一条不得被误删"
+        );
+        // ★ 关键：移入回收站的**条数 == 1**（不是「移 0 条却报成功」）。
+        let trash = load_trash_for(Region::Cn);
+        assert_eq!(trash.len(), 1, "按 uid 软删除必须真的移入 1 条");
+        assert!(resolve_account_key(&trash[0].account, "uid-a"));
+
+        // 删不存在的 key ⇒ 如实报错（不是静默成功）。
+        assert!(delete_account_for(Region::Cn, "uid-404").is_err());
+
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ 软删除 → 恢复**往返无损**（P5 §2.7 · 验收 11）：记录 / 凭据原样回 live。
+    ///
+    /// 可证伪：把 `trash_account_for` 改成硬删除（`retain` + 不写 trash）⇒ 本用例变红。
+    #[test]
+    fn soft_delete_then_restore_round_trips_losslessly() {
+        let dir = std::env::temp_dir().join(format!(
+            "buddy-switch-trash-roundtrip-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let guard = crate::modules::config::HomeOverrideGuard::set(&dir);
+
+        save_accounts_for(
+            Region::Cn,
+            &[json!({
+                "id": "a1", "uid": "u1", "nickname": "甲",
+                "access_token": "AT", "refresh_token": "RT",
+            })],
+        )
+        .expect("seed");
+
+        delete_account_for(Region::Cn, "a1").expect("软删除");
+        assert!(load_accounts_for(Region::Cn).is_empty(), "live 应清空");
+        assert_eq!(load_trash_for(Region::Cn).len(), 1, "回收站应有 1 条");
+
+        restore_account_for(Region::Cn, "a1").expect("恢复");
+        let live = load_accounts_for(Region::Cn);
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0]["access_token"], "AT", "凭据必须无损");
+        assert_eq!(live[0]["refresh_token"], "RT");
+        assert_eq!(live[0]["nickname"], "甲");
+        assert!(load_trash_for(Region::Cn).is_empty(), "恢复后回收站应清空");
+
+        // live 已有同 key 时恢复必须报错（不覆盖、不丢数据）。
+        delete_account_for(Region::Cn, "a1").expect("再次软删除");
+        save_accounts_for(Region::Cn, &[account("a1", Some("u1"), "占用", None)]).expect("占位");
+        assert!(
+            restore_account_for(Region::Cn, "a1").is_err(),
+            "live 已存在该账号时必须拒绝恢复"
+        );
+
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ 永久删除（purge）从回收站真删；留存 sweep 清过期 + 裁上限（先到先出）。
+    #[test]
+    fn purge_removes_and_sweep_enforces_retention_and_cap() {
+        let dir = std::env::temp_dir().join(format!(
+            "buddy-switch-purge-sweep-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let guard = crate::modules::config::HomeOverrideGuard::set(&dir);
+
+        save_accounts_for(
+            Region::Cn,
+            &[
+                account("a1", Some("u1"), "甲", None),
+                account("a2", Some("u2"), "乙", None),
+            ],
+        )
+        .expect("seed");
+        delete_account_for(Region::Cn, "a1").expect("软删除 a1");
+        delete_account_for(Region::Cn, "a2").expect("软删除 a2");
+        assert_eq!(load_trash_for(Region::Cn).len(), 2);
+
+        purge_account_for(Region::Cn, "a1").expect("永久删除");
+        let trash = load_trash_for(Region::Cn);
+        assert_eq!(trash.len(), 1, "purge 后应只剩 1 条");
+        assert!(!resolve_account_key(&trash[0].account, "a1"));
+        // purge 不存在的 key ⇒ 报错。
+        assert!(purge_account_for(Region::Cn, "u1").is_err());
+
+        // 留存：过期条目被清。
+        let now = now_ms();
+        let mut entries = vec![
+            TrashEntry {
+                account: account("old", Some("u-old"), "旧", None),
+                deleted_at: now - TRASH_RETENTION_MS - 1,
+                expires_at: now - 1,
+                origin_scope: Scope::WbCn,
+            },
+            TrashEntry {
+                account: account("fresh", Some("u-fresh"), "新", None),
+                deleted_at: now,
+                expires_at: now + TRASH_RETENTION_MS,
+                origin_scope: Scope::WbCn,
+            },
+        ];
+        assert_eq!(
+            sweep_trash_entries(&mut entries, now),
+            1,
+            "过期条目应被清理"
+        );
+        assert_eq!(entries.len(), 1);
+        assert!(resolve_account_key(&entries[0].account, "u-fresh"));
+
+        // 上限：超过 200 条时先到先出（删最旧的）。
+        let mut many: Vec<TrashEntry> = (0..TRASH_MAX_ENTRIES + 5)
+            .map(|i| TrashEntry {
+                account: account(&format!("k{i}"), None, "x", None),
+                deleted_at: i as i64,
+                expires_at: now + TRASH_RETENTION_MS,
+                origin_scope: Scope::WbCn,
+            })
+            .collect();
+        let removed = sweep_trash_entries(&mut many, now);
+        assert_eq!(removed, 5, "超出上限的 5 条应被裁掉");
+        assert_eq!(many.len(), TRASH_MAX_ENTRIES);
+        // 最旧的 5 条（deleted_at = 0..4）被删，最旧保留项是 k5。
+        assert!(resolve_account_key(&many[0].account, "k5"));
+
+        // 清空回收站返回删除条数（此刻回收站里只剩 a2）。
+        assert_eq!(clear_trash_for(Region::Cn), 1, "清空应返回被删条数");
+        assert!(
+            load_trash_for(Region::Cn).is_empty(),
+            "清空后回收站必须为空"
+        );
+
+        save_accounts_for(Region::Cn, &[account("z", Some("uz"), "z", None)]).expect("seed z");
+        delete_account_for(Region::Cn, "uz").expect("软删除 z");
+        assert_eq!(clear_trash_for(Region::Cn), 1);
+        assert!(load_trash_for(Region::Cn).is_empty());
+
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 两版账号库必须落到**不同文件**（PRD D2 头号硬约束）。
@@ -1541,7 +1811,10 @@ mod tests {
 
         // 同一 store 目录，仅文件名不同。
         assert_eq!(cn.parent(), global.parent());
-        assert_eq!(cn, crate::modules::config::store_dir().join("accounts.json"));
+        assert_eq!(
+            cn,
+            crate::modules::config::store_dir().join("accounts.json")
+        );
         assert_eq!(
             global,
             crate::modules::config::store_dir().join("accounts.global.json")
@@ -1564,7 +1837,10 @@ mod tests {
             "access_token": "OLD",
             "remark": "DS4.1 · 10/03 解禁",
         })];
-        upsert_collected_account(&mut accounts, account("generated", Some("uid-1"), "新名称", None));
+        upsert_collected_account(
+            &mut accounts,
+            account("generated", Some("uid-1"), "新名称", None),
+        );
 
         assert_eq!(accounts.len(), 1);
         assert_eq!(
@@ -1595,7 +1871,8 @@ mod tests {
         )
         .expect("seed accounts");
 
-        let meta = set_remark_in_path(Region::Cn, &path, "a1", Some("  10/03 解禁  ")).expect("set remark");
+        let meta = set_remark_in_path(Region::Cn, &path, "a1", Some("  10/03 解禁  "))
+            .expect("set remark");
         assert_eq!(meta["remark"], "10/03 解禁", "备注应去首尾空白");
         assert!(meta.get("access_token").is_none(), "meta 不得泄露 token");
 
@@ -1616,16 +1893,324 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
+
+    /// `account_meta` 必须下发 `lastUsedAt` / `groupName` 两个新键；**缺失时为 `null`**
+    /// （形状恒定，前端按「有值才渲染」处理，缺键与 `null` 必须等价）。
+    #[test]
+    fn account_meta_exposes_last_used_and_group_name() {
+        let meta = account_meta(&json!({
+            "id": "a1",
+            "lastUsedAt": 1_700_000_000_000i64,
+            "groupName": "工作",
+        }));
+        assert_eq!(meta["lastUsedAt"], json!(1_700_000_000_000i64));
+        assert_eq!(meta["groupName"], "工作");
+
+        let empty = account_meta(&json!({ "id": "a2" }));
+        assert_eq!(empty["lastUsedAt"], Value::Null);
+        assert_eq!(empty["groupName"], Value::Null);
+
+        // 底线：新键不得泄露凭据（与本模块既有口径一致）。
+        assert!(meta.get("access_token").is_none(), "meta 不得泄露 token");
+    }
+
+    /// 切换 / 启动写入的「最近使用」时间戳必须**可解析为数字**，且**只改一个键**。
+    ///
+    /// 可证伪：把 `touch_last_used_in_path` 改成写 ISO 字符串（`"2026-…"`）⇒
+    /// `as_i64()` 断言即红 —— 前端 `types.ts` 声明这一族为 `number | null`。
+    #[test]
+    fn touch_last_used_stamps_a_numeric_timestamp_without_touching_tokens() {
+        let dir = std::env::temp_dir().join(format!(
+            "buddy-switch-last-used-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("accounts.json");
+        save_accounts_to_path(
+            &path,
+            &[json!({
+                "id": "a1", "uid": "u1", "nickname": "小明",
+                "access_token": "AT", "refresh_token": "RT",
+            })],
+        )
+        .expect("seed accounts");
+
+        let before = now_ms();
+        let meta = touch_last_used_in_path(Region::Cn, &path, "a1").expect("touch");
+        let after = now_ms();
+        let stamp = meta["lastUsedAt"]
+            .as_i64()
+            .expect("lastUsedAt 必须是数字（epoch 毫秒），不能是字符串");
+        assert!(
+            stamp >= before && stamp <= after,
+            "时间戳应落在 [before, after] 内"
+        );
+
+        let raw = load_accounts_from_path(&path);
+        assert!(raw[0]["lastUsedAt"].as_i64().is_some(), "落盘后仍是数字");
+        assert_eq!(raw[0]["access_token"], "AT", "token 不得被抹掉");
+        assert_eq!(raw[0]["refresh_token"], "RT", "token 不得被抹掉");
+
+        // uid 也能定位；不存在 ⇒ 报错（不静默成功）。
+        assert!(touch_last_used_in_path(Region::Cn, &path, "u1").is_ok());
+        assert!(touch_last_used_in_path(Region::Cn, &path, "nope").is_err());
+
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// `set_account_group` 能更新 / 清空分组，且**只动分组一个键**。
+    ///
+    /// 可证伪：删掉 `set_group_in_path` 里的 `record.remove("groupName")` ⇒
+    /// 「清空后字段仍在」那条断言红。
+    #[test]
+    fn set_account_group_updates_and_clears_without_touching_tokens() {
+        let dir = std::env::temp_dir().join(format!(
+            "buddy-switch-group-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("accounts.json");
+        save_accounts_to_path(
+            &path,
+            &[json!({
+                "id": "a1", "uid": "u1", "nickname": "小明",
+                "access_token": "AT", "refresh_token": "RT",
+            })],
+        )
+        .expect("seed accounts");
+
+        // 设置（去首尾空白）；meta 与原始记录都更新，token 不动。
+        let meta = set_group_in_path(Region::Cn, &path, "a1", Some("  工作  ")).expect("set group");
+        assert_eq!(meta["groupName"], "工作");
+        let raw = load_accounts_from_path(&path);
+        assert_eq!(raw[0]["groupName"], "工作");
+        assert_eq!(raw[0]["access_token"], "AT", "token 不得被抹掉");
+        assert_eq!(raw[0]["refresh_token"], "RT", "token 不得被抹掉");
+
+        // 空分组 = 删除该键（缺省即「未分组」，不留空串）。
+        set_group_in_path(Region::Cn, &path, "a1", Some("   ")).expect("clear group");
+        let cleared = load_accounts_from_path(&path);
+        assert!(cleared[0].get("groupName").is_none(), "空分组应删除字段");
+        assert_eq!(cleared[0]["access_token"], "AT");
+
+        assert!(set_group_in_path(Region::Cn, &path, "u1", Some("按 uid 定位")).is_ok());
+        assert!(set_group_in_path(Region::Cn, &path, "nope", Some("x")).is_err());
+
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
 }
 
-/// 删除账号（按 id，CN）。
+// ---------------------------------------------------------------------------
+// 软删除 + 回收站（P5 §2.7）—— 破坏性操作的**可恢复**落点
+// ---------------------------------------------------------------------------
+//
+// 删除不再从账号库直接抹掉，而是**移入** `accounts.trash.<region>.json`（附
+// `deleted_at` / `expires_at` / `origin_scope`）。恢复把记录移回 live；永久删除
+// （purge）才是**唯一不可逆步**。留存策略：30 天自动清理 + 上限 200 条（先到先出），
+// 由 `BackgroundTask::StartupMaintenance` 跑 [`sweep_all_trash`]（不新增调度器）。
+//
+// ⚠️ **两条硬约束**（P5 §2.7）：
+// 1. trash 路径经 `enum → table` 派生（[`accounts_trash_file_for`]），raw scope 字符串
+//    **从不**进 `PathBuf`；
+// 2. 软删除 / 恢复 / 永久删除**共用** [`resolve_account_key`]（`id` **或** `uid`）谓词 ——
+//    否则「按 uid 批删」会**移 0 条却报成功**，软删除会把这个静默缺陷带进回收站。
+
+/// 回收站留存窗口（毫秒）：30 天。
+pub const TRASH_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
+/// 回收站条数上限（先到先出）：防「批量导入 → 批量删除」把文件撑爆。
+pub const TRASH_MAX_ENTRIES: usize = 200;
+
+/// 回收站条目（持久化形态）。`account` 原样保留 ⇒ 恢复无损。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TrashEntry {
+    /// 原账号记录（原样保留，恢复时原样移回 live）。
+    pub account: Value,
+    /// 删除时间（ms）。
+    pub deleted_at: i64,
+    /// 到期时间（ms）= `deleted_at + TRASH_RETENTION_MS`。
+    pub expires_at: i64,
+    /// 冗余存作用域，便于跨 scope 审计（恢复不依赖它）。
+    pub origin_scope: Scope,
+}
+
+fn load_trash_from_path(path: &Path) -> Vec<TrashEntry> {
+    if let Ok(text) = std::fs::read_to_string(path) {
+        if let Ok(entries) = serde_json::from_str::<Vec<TrashEntry>>(&text) {
+            return entries;
+        }
+    }
+    Vec::new()
+}
+
+fn save_trash_to_path(path: &Path, entries: &[TrashEntry]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let content = serde_json::to_string_pretty(entries).unwrap_or_default();
+    atomic_write(path, &content)
+}
+
+/// 留存策略（**纯函数**，可单测）：清过期条目 + 裁上限（先到先出）。
+///
+/// 返回被清理的条数。上限裁剪按 `deleted_at` 升序删最旧的 —— 回收站**含凭据**，
+/// 不能无限增长（安全：已删账号的 token 不应无限期留存）。
+pub fn sweep_trash_entries(entries: &mut Vec<TrashEntry>, now: i64) -> usize {
+    let before = entries.len();
+    entries.retain(|entry| entry.expires_at > now);
+    if entries.len() > TRASH_MAX_ENTRIES {
+        entries.sort_by_key(|entry| entry.deleted_at);
+        let excess = entries.len() - TRASH_MAX_ENTRIES;
+        entries.drain(0..excess);
+    }
+    before - entries.len()
+}
+
+/// 软删除：把账号从 live **移入**回收站（谓词 `id` **或** `uid`）。
+///
+/// 账号不存在 ⇒ `Err`（**不静默成功**）。凭据内嵌在记录里，随记录一起搬移 ⇒ 恢复无损。
+pub fn trash_account_for(region: Region, key: &str) -> Result<(), String> {
+    let live_path = accounts_file_for(region);
+    let trash_path = accounts_trash_file_for(region);
+    let mut accounts = load_accounts_from_path(&live_path);
+    let Some(index) = accounts
+        .iter()
+        .position(|account| resolve_account_key(account, key))
+    else {
+        return Err("账号不存在".to_string());
+    };
+    let account = accounts.remove(index);
+
+    let now = now_ms();
+    let mut trash = load_trash_from_path(&trash_path);
+    trash.push(TrashEntry {
+        account,
+        deleted_at: now,
+        expires_at: now + TRASH_RETENTION_MS,
+        origin_scope: scope_of_wb_region(region),
+    });
+    sweep_trash_entries(&mut trash, now);
+
+    save_accounts_to_path(&live_path, &accounts).map_err(|error| error.to_string())?;
+    save_trash_to_path(&trash_path, &trash).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// 恢复：把账号从回收站**移回** live（谓词 `id` **或** `uid`）。
+///
+/// live 已存在同 key 记录 ⇒ `Err`（**不覆盖**，避免把现有账号冲掉而丢数据）。
+pub fn restore_account_for(region: Region, key: &str) -> Result<(), String> {
+    let live_path = accounts_file_for(region);
+    let trash_path = accounts_trash_file_for(region);
+    let mut trash = load_trash_from_path(&trash_path);
+    let Some(index) = trash
+        .iter()
+        .position(|entry| resolve_account_key(&entry.account, key))
+    else {
+        return Err("回收站中没有该账号".to_string());
+    };
+    let mut accounts = load_accounts_from_path(&live_path);
+    if accounts
+        .iter()
+        .any(|account| resolve_account_key(account, key))
+    {
+        return Err("账号库中已存在该账号，无法恢复".to_string());
+    }
+    let entry = trash.remove(index);
+    accounts.push(entry.account);
+    save_accounts_to_path(&live_path, &accounts).map_err(|error| error.to_string())?;
+    save_trash_to_path(&trash_path, &trash).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// 永久删除（**唯一不可逆步**）：从回收站真删。
+///
+/// WB 侧凭据（`access_token` / `refresh_token`）**内嵌在记录里**，随记录一并销毁 ⇒
+/// 无需额外处理（区别于 Trae 侧需另删登录态快照目录）。前端必须走 danger 二次确认。
+pub fn purge_account_for(region: Region, key: &str) -> Result<(), String> {
+    let trash_path = accounts_trash_file_for(region);
+    let mut trash = load_trash_from_path(&trash_path);
+    let before = trash.len();
+    trash.retain(|entry| !resolve_account_key(&entry.account, key));
+    if trash.len() == before {
+        return Err("回收站中没有该账号".to_string());
+    }
+    save_trash_to_path(&trash_path, &trash).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// 读取某 region 的回收站（文件缺失 / 损坏 ⇒ 空表）。
+pub fn load_trash_for(region: Region) -> Vec<TrashEntry> {
+    load_trash_from_path(&accounts_trash_file_for(region))
+}
+
+/// 清空某 region 的回收站，返回删除条数（**不可逆**）。
+pub fn clear_trash_for(region: Region) -> usize {
+    let trash_path = accounts_trash_file_for(region);
+    let before = load_trash_from_path(&trash_path).len();
+    if before > 0 {
+        let _ = save_trash_to_path(&trash_path, &[]);
+    }
+    before
+}
+
+/// 留存清理（单 region）：清过期 + 裁上限。返回被清理条数。
+pub fn sweep_trash_for(region: Region, now: i64) -> usize {
+    let trash_path = accounts_trash_file_for(region);
+    let mut trash = load_trash_from_path(&trash_path);
+    let removed = sweep_trash_entries(&mut trash, now);
+    if removed > 0 {
+        let _ = save_trash_to_path(&trash_path, &trash);
+    }
+    removed
+}
+
+/// 全部 WB region 的回收站留存清理（`StartupMaintenance` 调用，§2.7 留存策略）。
+pub fn sweep_all_trash() -> usize {
+    let now = now_ms();
+    Region::all()
+        .iter()
+        .map(|region| sweep_trash_for(*region, now))
+        .sum()
+}
+
+/// 回收站条目的**线上形态**（camelCase，供前端渲染）。
+///
+/// `key` 是恢复 / 永久删除要回传的账号标识：优先 `id`、其次 `uid`
+/// （与 [`resolve_account_key`] 的谓词同源 —— 回传哪个都能命中）。
+fn trash_entry_view(entry: &TrashEntry) -> Value {
+    let account = &entry.account;
+    let id = get_str(account, "id");
+    let uid = get_str(account, "uid");
+    json!({
+        "key": id.clone().or_else(|| uid.clone()).unwrap_or_default(),
+        "id": id,
+        "uid": uid,
+        "name": account_display_name(account),
+        "deletedAt": entry.deleted_at,
+        "expiresAt": entry.expires_at,
+        "originScope": entry.origin_scope.as_str(),
+    })
+}
+
+/// 回收站列表的线上形态：`{ scope, entries }`（按删除时间**倒序**，最新在前）。
+pub fn trash_list_value(region: Region) -> Value {
+    let mut entries = load_trash_for(region);
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.deleted_at));
+    let views: Vec<Value> = entries.iter().map(trash_entry_view).collect();
+    json!({ "scope": scope_of_wb_region(region).as_str(), "entries": views })
+}
+
+/// 删除账号（CN）—— **软删除**：移入回收站，可恢复（P5 §2.7）。
 pub fn delete_account(account_id: &str) -> Result<(), String> {
     delete_account_for(Region::Cn, account_id)
 }
 
-/// 按 region 删除账号（按 id）。
+/// 按 region 删除账号 —— **软删除**（移入 `accounts.trash.<region>.json`，可恢复）。
+///
+/// 谓词 `id` **或** `uid`（[`resolve_account_key`]）：按 uid 批删不再静默空转。
 pub fn delete_account_for(region: Region, account_id: &str) -> Result<(), String> {
-    delete_account_from_path(&accounts_file_for(region), account_id)
+    trash_account_for(region, account_id)
 }
 
 /// 就地修改**原始记录**里的备注（字段级更新），返回更新后的脱敏元数据。
@@ -1645,10 +2230,11 @@ fn set_remark_in_path(
     remark: Option<&str>,
 ) -> Result<Value, String> {
     let mut accounts = load_accounts_from_path(path);
-    let Some(index) = accounts.iter().position(|account| {
-        account.get("id").and_then(Value::as_str) == Some(account_id)
-            || account.get("uid").and_then(Value::as_str) == Some(account_id)
-    }) else {
+    // 走**统一谓词**（`id` 或 `uid`）—— 与删除 / 查找同源，避免三处各写一份条件而漂移。
+    let Some(index) = accounts
+        .iter()
+        .position(|account| resolve_account_key(account, account_id))
+    else {
         return Err("账号不存在".to_string());
     };
 
@@ -1708,17 +2294,118 @@ pub fn set_account_remark_for(
 /// 按 region 停用账号（按 id 或 uid 定位）。
 /// 停用的账号仍保留在账号库中，但不会在网关池中被选中。
 pub fn deactivate_account_for(region: Region, account_id: &str) -> Result<Value, String> {
-    set_field_in_path(region, &accounts_file_for(region), account_id, "deactivated", Value::Bool(true))
+    set_field_in_path(
+        region,
+        &accounts_file_for(region),
+        account_id,
+        "deactivated",
+        Value::Bool(true),
+    )
 }
 
 /// 按 region 启用账号（按 id 或 uid 定位）。
 pub fn reactivate_account_for(region: Region, account_id: &str) -> Result<Value, String> {
-    set_field_in_path(region, &accounts_file_for(region), account_id, "deactivated", Value::Bool(false))
+    set_field_in_path(
+        region,
+        &accounts_file_for(region),
+        account_id,
+        "deactivated",
+        Value::Bool(false),
+    )
 }
 
 /// 设置 CN 账号备注。
 pub fn set_account_remark(account_id: &str, remark: Option<&str>) -> Result<Value, String> {
     set_account_remark_for(Region::Cn, account_id, remark)
+}
+
+/// 就地修改**原始记录**里的自定义分组（字段级更新），返回更新后的脱敏元数据。
+///
+/// 与 [`set_remark_in_path`] **同款**：读原始记录、只改一个键、再原子写回 ——
+/// 绝不让调用方拿脱敏 `meta` 整条写回（那会把两个 token 一并抹掉）。
+/// 分组传空（或全空白）时**删除该键**而不是写空串（缺省即「未分组」）。
+fn set_group_in_path(
+    region: Region,
+    path: &Path,
+    account_id: &str,
+    group: Option<&str>,
+) -> Result<Value, String> {
+    let mut accounts = load_accounts_from_path(path);
+    // 走**统一谓词**（`id` 或 `uid`）—— 与删除 / 查找 / 备注同源。
+    let Some(index) = accounts
+        .iter()
+        .position(|account| resolve_account_key(account, account_id))
+    else {
+        return Err("账号不存在".to_string());
+    };
+
+    let record = accounts[index]
+        .as_object_mut()
+        .ok_or_else(|| "账号记录格式异常".to_string())?;
+    match group.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(text) => {
+            record.insert("groupName".to_string(), json!(text));
+        }
+        None => {
+            record.remove("groupName");
+        }
+    }
+
+    let updated = accounts[index].clone();
+    save_accounts_to_path(path, &accounts).map_err(|error| error.to_string())?;
+    Ok(account_meta_for(region, &updated))
+}
+
+/// 按 region 设置账号自定义分组（按 id 或 uid 定位；空值 = 移出分组）。
+pub fn set_account_group_for(
+    region: Region,
+    account_id: &str,
+    group: Option<&str>,
+) -> Result<Value, String> {
+    set_group_in_path(region, &accounts_file_for(region), account_id, group)
+}
+
+/// 设置 CN 账号自定义分组。
+pub fn set_account_group(account_id: &str, group: Option<&str>) -> Result<Value, String> {
+    set_account_group_for(Region::Cn, account_id, group)
+}
+
+/// 就地写入**最近使用**时间戳（字段级更新），返回更新后的脱敏元数据。
+///
+/// ## 为什么单独一个函数（而不是各调用点各写一遍读改写）
+///
+/// 「账号被实际使用」有两个位置（切换、启动），都必须落这一条事实；若各写一遍
+/// load/modify/save，很容易一处漏改、或写成「再读一次盘再写一次」的**第二趟写盘**。
+/// 收成一处：**一次**读改写，只改 `lastUsedAt` 一个键，绝不碰 token。
+///
+/// ## 时间戳口径（**沿用既有格式，不新造**）
+///
+/// 与账号库里 `createdAt` / `refreshedAt` 完全一致 —— [`now_ms`]（epoch **毫秒**，数字），
+/// 对照 `auth_file::imported_account_from_root` 的 `"createdAt": now_ms()` 与
+/// `refresh.rs` 的 `account["refreshedAt"] = json!(now_ms())`。**刻意不是 ISO-8601 字符串**：
+/// 前端 `types.ts` 把这一族声明为 `number | null`，字符串化会破坏比较与格式化。
+fn touch_last_used_in_path(region: Region, path: &Path, account_id: &str) -> Result<Value, String> {
+    let mut accounts = load_accounts_from_path(path);
+    let Some(index) = accounts
+        .iter()
+        .position(|account| resolve_account_key(account, account_id))
+    else {
+        return Err("账号不存在".to_string());
+    };
+
+    let record = accounts[index]
+        .as_object_mut()
+        .ok_or_else(|| "账号记录格式异常".to_string())?;
+    record.insert("lastUsedAt".to_string(), json!(now_ms()));
+
+    let updated = accounts[index].clone();
+    save_accounts_to_path(path, &accounts).map_err(|error| error.to_string())?;
+    Ok(account_meta_for(region, &updated))
+}
+
+/// 按 region 记录账号「最近一次使用」（切换 / 启动）的时刻。
+pub fn touch_last_used_for(region: Region, account_id: &str) -> Result<Value, String> {
+    touch_last_used_in_path(region, &accounts_file_for(region), account_id)
 }
 
 /// 导入本机当前账号（从认证文件读取，CN）。

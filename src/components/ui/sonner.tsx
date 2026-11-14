@@ -17,23 +17,28 @@ export function Toaster(props: ToasterProps) {
       icons={{
         success: <CheckCircle2 className="size-4 text-brand" />,
         info: <Info className="size-4 text-brand" />,
-        warning: <AlertTriangle className="size-4 text-amber-600" />,
+        warning: <AlertTriangle className="size-4 text-warning" />,
         error: <XCircle className="size-4 text-destructive" />,
         loading: <Loader2 className="size-4 animate-spin text-brand" />,
       }}
       toastOptions={{
         classNames: {
+          /* 逐值对齐原型 `.toast`（`demo.css:522-535`）：
+             `gap11` / `px13` / `py11` / `r12` / 底 `--popover` / `max-width:380px` / 最高档阴影。
+             ⚠️ `max-w-[380px]` 是关键 —— 诊断类错误文案很长，不限宽会拉满屏宽。*/
           toast:
-            "!gap-2.5 !rounded-lg !border-slate-200/90 !bg-popover !px-3 !py-2.5 !text-popover-foreground !shadow-[0_8px_24px_rgba(15,23,42,.09)]",
+            "!max-w-[380px] !gap-2.5 !rounded-lg !border-border !bg-popover !px-3 !py-2.5 !text-popover-foreground !shadow-overlay",
           content: "!gap-0.5",
+          /* 原型 `.toast .t b`：`font-weight:550`（`demo.css:534`） */
           title: "!text-[13px] !font-medium !leading-5",
           // `!whitespace-pre-line`：诊断类错误是**多行**文案（说清产品线 / 缺失来源 /
           // 下一步动作，见 `trae::profile::diagnose_missing_credential`）。默认
           // `white-space: normal` 会把换行折叠成空格，整段挤成一坨，反而读不出重点。
-          description: "!text-xs !leading-5 !text-muted-foreground !whitespace-pre-line",
+          /* 原型 `.toast .t span`：`11.5px` / muted（`demo.css:535`） */
+          description: "!text-[11.5px] !leading-5 !text-muted-foreground !whitespace-pre-line",
           icon: "!mr-0 !self-start !pt-0.5",
           closeButton:
-            "!size-5 !border-slate-200 !bg-popover !text-muted-foreground !shadow-sm hover:!bg-accent hover:!text-foreground focus-visible:!ring-2 focus-visible:!ring-brand/30",
+            "!size-5 !border-border !bg-popover !text-muted-foreground !shadow-sm hover:!bg-accent hover:!text-foreground focus-visible:!ring-2 focus-visible:!ring-brand/30",
           actionButton: "!h-7 !rounded-md !bg-brand !px-2.5 !text-xs !text-brand-foreground",
           cancelButton: "!h-7 !rounded-md !bg-muted !px-2.5 !text-xs !text-muted-foreground",
         },

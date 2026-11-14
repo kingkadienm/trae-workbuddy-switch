@@ -65,12 +65,7 @@ pub fn region_app_stems(region: Region) -> &'static [&'static str] {
 pub(crate) fn region_image_stems(region: Region) -> &'static [&'static str] {
     match region {
         Region::Cn => &["WorkBuddy", "CodeBuddy"],
-        Region::Global => &[
-            "WorkBuddyAI",
-            "CodeBuddyAI",
-            "WorkBuddy AI",
-            "CodeBuddy AI",
-        ],
+        Region::Global => &["WorkBuddyAI", "CodeBuddyAI", "WorkBuddy AI", "CodeBuddy AI"],
     }
 }
 
@@ -97,12 +92,49 @@ pub(crate) fn cmd_builder(program: impl AsRef<std::ffi::OsStr>) -> Command {
 /// 64KB 管道缓冲时死锁（`ps -axo` 全量输出在进程多的机器上很容易超过），
 /// 子进程写满阻塞永不退出，最终被超时 kill 并返回 None。
 pub(crate) fn run_cmd_timeout(program: &str, args: &[&str], timeout_secs: u64) -> Option<Output> {
-    let mut child = cmd_builder(program)
+    run_cmd_timeout_full(program, args, None, None, timeout_secs)
+}
+
+/// [`run_cmd_timeout`] 的**完整形态**：额外支持从 stdin 灌入固定字节、并指定工作目录。
+///
+/// ## 为什么需要它（而不是让调用方自己 `Command::new`）
+///
+/// 「超时 + 并发读取 stdout/stderr」这套编排在本仓只有这一份实现，而它踩过的坑
+/// （先 wait 后 read ⇒ 管道写满死锁）**每重写一遍都会再踩一次**。Qoder 的原生风控桥
+/// （`modules/qoder/native.rs`）需要 stdin（`{"account": …}`）与 cwd（组件按自身目录找
+/// 依赖），所以这里把两件事做成**参数**，而不是让调用方复制一份读线程编排。
+///
+/// `stdin_bytes = None` ⇒ 不给子进程 stdin（与 [`run_cmd_timeout`] 等价）。
+pub(crate) fn run_cmd_timeout_full(
+    program: impl AsRef<std::ffi::OsStr>,
+    args: &[&str],
+    stdin_bytes: Option<&[u8]>,
+    cwd: Option<&Path>,
+    timeout_secs: u64,
+) -> Option<Output> {
+    use std::io::Write;
+
+    let mut command = cmd_builder(program);
+    command
         .args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::piped());
+    if stdin_bytes.is_some() {
+        command.stdin(Stdio::piped());
+    }
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+    let mut child = command.spawn().ok()?;
+
+    // stdin 必须**立刻写完并关闭**：组件读到 EOF 才会开始干活，不关就会等到超时。
+    if let Some(bytes) = stdin_bytes {
+        if let Some(mut sink) = child.stdin.take() {
+            let _ = sink.write_all(bytes);
+            // sink 在此 drop ⇒ 关闭管道。
+        }
+    }
+
     let mut stdout = child.stdout.take()?;
     let mut stderr = child.stderr.take()?;
 
@@ -296,15 +328,7 @@ fn windows_fallback_exe_candidates_for(
         let root = format!("{letter}:");
         if let Some(user) = user {
             for &dir in install_dirs {
-                push_win_dir(&[
-                    &root,
-                    "Users",
-                    user,
-                    "AppData",
-                    "Local",
-                    "Programs",
-                    dir,
-                ]);
+                push_win_dir(&[&root, "Users", user, "AppData", "Local", "Programs", dir]);
             }
         }
         for &dir in install_dirs {
@@ -566,7 +590,11 @@ fn windows_running_pids() -> Option<std::collections::HashSet<u32>> {
 #[cfg(target_os = "windows")]
 fn alive_pids_from(pids: &[u32], running: Option<&std::collections::HashSet<u32>>) -> Vec<u32> {
     match running {
-        Some(set) => pids.iter().copied().filter(|pid| set.contains(pid)).collect(),
+        Some(set) => pids
+            .iter()
+            .copied()
+            .filter(|pid| set.contains(pid))
+            .collect(),
         None => pids.to_vec(),
     }
 }
@@ -774,7 +802,10 @@ fn macos_quit_bundle_id(region: Region) -> &'static str {
 #[cfg(target_os = "macos")]
 fn macos_main_literal_suffixes(region: Region) -> &'static [&'static str] {
     match region {
-        Region::Cn => &["WorkBuddy.app/Contents/MacOS", "CodeBuddy.app/Contents/MacOS"],
+        Region::Cn => &[
+            "WorkBuddy.app/Contents/MacOS",
+            "CodeBuddy.app/Contents/MacOS",
+        ],
         Region::Global => &[
             "WorkBuddy AI.app/Contents/MacOS",
             "CodeBuddy AI.app/Contents/MacOS",
@@ -831,7 +862,11 @@ fn ps_row_matches_any(args: &str, patterns: &[String]) -> bool {
 /// 结果按 pid 去重。残留误杀面仅剩「用户进程的 args 主动引用目标 .app 路径」
 /// 这一刻意场景（对齐 Windows 契约记录的残余风险）。
 #[cfg(target_os = "macos")]
-pub(crate) fn filter_ps_rows(stdout: &str, patterns: &[String], self_pid: u32) -> Vec<(u32, String)> {
+pub(crate) fn filter_ps_rows(
+    stdout: &str,
+    patterns: &[String],
+    self_pid: u32,
+) -> Vec<(u32, String)> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for line in stdout.lines() {
@@ -935,6 +970,25 @@ pub(crate) fn extract_app_bundle_from_args(args: &str) -> Option<PathBuf> {
 #[cfg(target_os = "macos")]
 pub(crate) fn is_app_bundle(path: &Path) -> bool {
     path.is_dir() && path.join("Contents").join("Info.plist").is_file()
+}
+
+/// `.app` 内可执行体的真实路径（macOS）。
+///
+/// 名称取自 `Info.plist` 的 `CFBundleExecutable`。该键与包名**不同**：实测两个
+/// WorkBuddy bundle 的可执行体均为 `Electron`，按包名拼接得到的路径不存在。
+/// 此错误不表现为子进程启动失败，而是被 [`crate::modules::at_rest::fetch_build_key`]
+/// 首行的 `exe.exists()` 判为 `ClientMissing`。
+///
+/// plist 不可读时返回 `None`，由调用方决定回落。
+#[cfg(target_os = "macos")]
+pub(crate) fn bundle_executable(app: &Path) -> Option<PathBuf> {
+    let plist = app.join("Contents").join("Info.plist");
+    let name = crate::modules::identity::read_bundle_executable(&plist)?;
+    let exe = app.join("Contents").join("MacOS").join(&name);
+    // plist 属外部输入。含路径分隔符或 `.` / `..` 的名称会拼出 `Contents/MacOS`
+    // 之外的路径；`starts_with` 是词法比较，对 `MacOS/../../x` 仍判真，不可用作护栏。
+    let safe = !name.contains('/') && !name.contains('\\') && name != "." && name != "..";
+    safe.then_some(exe)
 }
 
 /// 该 region 的 app bundle 名（含 CodeBuddy 变体）。
@@ -1126,7 +1180,11 @@ fn close_workbuddy_macos_for(region: Region, timeout_secs: i64) -> Result<(), St
     let resolved = macos_workbuddy_app_path_resolved_for(region);
     let main_patterns = macos_main_patterns_for(region, resolved.as_deref());
     let bundle_patterns = macos_bundle_patterns_for(region, resolved.as_deref());
-    let remaining = || timeout.saturating_sub(started.elapsed()).max(Duration::from_millis(100));
+    let remaining = || {
+        timeout
+            .saturating_sub(started.elapsed())
+            .max(Duration::from_millis(100))
+    };
 
     // 1) 优雅退出
     let quit_script = format!("quit app id \"{}\"", macos_quit_bundle_id(region));
@@ -1215,10 +1273,7 @@ fn validate_macos_startup_for(
                             .unwrap_or(true);
                     if due {
                         last_beat = Some(now);
-                        say(&format!(
-                            "已稳定运行 {}s / 10s…",
-                            since_seen.as_secs()
-                        ));
+                        say(&format!("已稳定运行 {}s / 10s…", since_seen.as_secs()));
                     }
                 }
             }
@@ -1241,7 +1296,10 @@ fn validate_macos_startup_for(
 ///
 /// progress 可选：清杀/启动/存活确认阶段推送心跳（见 `validate_macos_startup_for`）。
 #[cfg(target_os = "macos")]
-fn launch_workbuddy_macos_for(region: Region, progress: Option<&dyn Fn(&str)>) -> Result<(), String> {
+fn launch_workbuddy_macos_for(
+    region: Region,
+    progress: Option<&dyn Fn(&str)>,
+) -> Result<(), String> {
     let say = |msg: &str| {
         if let Some(p) = progress {
             p(msg);
@@ -1277,7 +1335,10 @@ fn launch_workbuddy_macos_for(region: Region, progress: Option<&dyn Fn(&str)>) -
             } else {
                 reason
             };
-            return Err(format!("启动 WorkBuddy 失败: {reason}（路径: {}）", app.display()));
+            return Err(format!(
+                "启动 WorkBuddy 失败: {reason}（路径: {}）",
+                app.display()
+            ));
         }
         None => {
             return Err(format!(
@@ -1319,6 +1380,143 @@ pub fn is_workbuddy_running_for(region: Region) -> bool {
         match cmd_builder("pgrep").args(["-f", "workbuddy"]).output() {
             Ok(out) => out.status.success() && !out.stdout.is_empty(),
             Err(_) => false,
+        }
+    }
+}
+
+/// 通用「某个**映像名**的客户端进程是否在运行」。
+///
+/// ## 用途
+///
+/// **非 WorkBuddy** 客户端的**写前进程守卫**（Claude Code / CodeBuddy CLI 的
+/// `settings.json`，见 `client_settings` 的 `SlotKind::HomeFile`）。这些客户端不像
+/// WorkBuddy / Trae 那样「退出时把内存态整体写回」，但用户完全可能在另一个终端里
+/// 正在改同一个文件 —— 守卫的价值不变。
+///
+/// ## ★ 语义：**查询失败视为「在运行」**
+///
+/// 与 [`alive_pids_from`] 同一条纪律：本函数唯一的调用方是**写入前的守卫**，
+/// 把一次 `tasklist` 抖动当成「已退出」会让我们去改客户端可能正在写的文件；
+/// 误判成「在运行」的代价只是用户重试一次。
+///
+/// `image` 是**完整映像名**（如 `claude.exe`）；Windows 上映像名大小写不敏感。
+/// 空映像名 ⇒ 判不出来 ⇒ 保守返回 `true`（守卫拒绝写入）。
+pub fn is_image_running(image: &str) -> bool {
+    let image = image.trim();
+    if image.is_empty() {
+        return true;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        match run_cmd_timeout(
+            "tasklist",
+            &["/FI", &format!("IMAGENAME eq {image}"), "/FO", "CSV", "/NH"],
+            5,
+        ) {
+            Some(out) => windows_rows_match_image(
+                &parse_tasklist_csv(&String::from_utf8_lossy(&out.stdout)),
+                image,
+            ),
+            // 查询失败 ⇒ 保守视为在运行（见文档）。
+            None => true,
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // macOS / Linux：`pgrep -x` 按**完整进程名**匹配（那里不带 `.exe`）。
+        let stem = image.strip_suffix(".exe").unwrap_or(image);
+        match cmd_builder("pgrep").args(["-x", stem]).output() {
+            Ok(out) => out.status.success(),
+            Err(_) => true,
+        }
+    }
+}
+
+/// tasklist 行里有没有映像名匹配的（**纯函数**，单测据此钉住大小写不敏感 + 精确匹配）。
+#[cfg(target_os = "windows")]
+fn windows_rows_match_image(rows: &[WindowsProcessRow], image: &str) -> bool {
+    rows.iter().any(|row| row.name.eq_ignore_ascii_case(image))
+}
+
+/// 按**映像名**关闭某个客户端（写前守卫的「关闭并继续」路径）。
+///
+/// ## 与 [`is_image_running`] 同一口径
+///
+/// `image` 是**完整映像名**（`Qoder CN.exe`），Windows 上大小写不敏感、精确匹配；
+/// 判据必须是同一个，否则会出现「守卫说在跑、关闭说没在跑」这种自相矛盾的组合。
+///
+/// ## 顺序（不可调换）
+///
+/// ① `taskkill /PID … /T`（**不带 `/F`**，等同正常退出，让客户端自己收尾）→
+/// ② 等待至多 `timeout_secs` 预算内的一半（≤8s）→ ③ 仍存活则 `/F` 强杀 →
+/// ④ 再等剩余预算 → ⑤ 仍存活 ⇒ `Err`（附残余 PID，用户可手动结束）。
+///
+/// ## 为什么必须「先关掉、确认消失、再去写」
+///
+/// 这类 Electron 客户端退出时会把内存里的登录态整体写回磁盘。若在它退出前就写完凭据，
+/// 它随后那次回写会**覆盖**我们的写入 —— 表现为「切换成功但客户端还是旧账号」。
+///
+/// 映像名不存在 ⇒ 直接 `Ok(())`（本来就没在跑），调用方不必先判一次。
+pub fn close_image(image: &str, timeout_secs: u64) -> Result<(), String> {
+    let image = image.trim();
+    if image.is_empty() {
+        // 空映像名判不出来 ⇒ 拒绝关闭（关错进程比关不掉更坏）。
+        return Err("映像名为空 —— 无法确定要关闭哪个客户端。".to_string());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let rows = windows_tasklist_image_rows(image);
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let pids: Vec<u32> = rows.iter().map(|row| row.pid).collect();
+        for pid in &pids {
+            let pid_s = pid.to_string();
+            let _ = run_cmd_timeout("taskkill", &["/PID", &pid_s, "/T"], 10);
+        }
+        let started = Instant::now();
+        let timeout = Duration::from_secs(timeout_secs.max(1));
+        let graceful = Duration::from_secs(8).min(timeout);
+        let remaining = wait_windows_pids_gone(&pids, graceful);
+        if remaining.is_empty() {
+            return Ok(());
+        }
+        for pid in &remaining {
+            let pid_s = pid.to_string();
+            let _ = run_cmd_timeout("taskkill", &["/PID", &pid_s, "/T", "/F"], 10);
+        }
+        let rest = timeout
+            .saturating_sub(started.elapsed())
+            .max(Duration::from_secs(1));
+        let leftover = wait_windows_pids_gone(&remaining, rest);
+        if leftover.is_empty() {
+            return Ok(());
+        }
+        let list: Vec<String> = leftover.iter().map(|pid| pid.to_string()).collect();
+        Err(format!("进程无法关闭（残留 PID: {}）", list.join(", ")))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // macOS / Linux：`pkill -x` 按**完整进程名**匹配（那里不带 `.exe`），与
+        // `pgrep -x` 同一口径。
+        let stem = image.strip_suffix(".exe").unwrap_or(image);
+        let _ = run_cmd_timeout("pkill", &["-TERM", "-x", stem], 10);
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs.max(1));
+        while Instant::now() < deadline {
+            if !is_image_running(image) {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let _ = run_cmd_timeout("pkill", &["-KILL", "-x", stem], 10);
+        // 复查交给调用方（`is_image_running` 的 fail-closed 语义在那里统一收口）。
+        std::thread::sleep(Duration::from_millis(200));
+        if is_image_running(image) {
+            Err("进程无法关闭".to_string())
+        } else {
+            Ok(())
         }
     }
 }
@@ -1465,9 +1663,145 @@ pub fn launch_workbuddy_for(region: Region, progress: Option<&dyn Fn(&str)>) -> 
     }
 }
 
+// ---------------------------------------------------------------------------
+// 悬浮窗「点击条目 → 聚焦来源客户端」（P9 ✅ #1）
+// ---------------------------------------------------------------------------
+
+/// 把来源客户端窗口带到前台（**OS 级 bring-to-front**，best-effort）。
+///
+/// ## 语义（P9 ✅ #1）
+///
+/// 悬浮窗是**只读**的：点击某行**只**把来源客户端带到前台 ——
+/// **不切账号、不导航主窗口、不删改任何数据**。它只「把你带到那儿」。
+///
+/// ## 未运行 ⇒ 可理解的错误（**不静默失败**）
+///
+/// 客户端没在跑就没有可聚焦的窗口。这里返回**一整句可读的错误**（含产品名），
+/// 由调用方渲染成明确反馈 —— 绝不「点了没反应」。
+pub fn focus_workbuddy_for(region: Region) -> Result<(), String> {
+    if !is_workbuddy_running_for(region) {
+        return Err(format!(
+            "{} 客户端未运行，请先启动客户端后再试",
+            region_app_stems(region)[0]
+        ));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        focus_workbuddy_windows_for(region)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        focus_workbuddy_macos_for(region)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        focus_workbuddy_linux_for(region)
+    }
+}
+
+/// Windows：用 PowerShell 的 `WScript.Shell.AppActivate(pid)` 把主窗口带到前台。
+///
+/// ## 为什么走 PowerShell 而不是 `windows` crate
+///
+/// 项目现有的 `windows` 依赖只开了 `Win32_Foundation` / `Win32_Security_Cryptography`
+/// 两个 feature；聚焦窗口需要 `Win32_UI_WindowsAndMessaging` + `Win32_System_Threading`
+/// —— 为一次用户触发的动作引入一批 `unsafe` FFI 并不划算。`AppActivate` 是 OS 级的
+/// bring-to-front，语义一致。
+#[cfg(target_os = "windows")]
+fn focus_workbuddy_windows_for(region: Region) -> Result<(), String> {
+    // 用**映像名**（[`region_image_stems`]，非产品名）匹配进程：国际版映像无空格
+    // （`WorkBuddyAI`），拿产品名（`WorkBuddy AI`）会匹配不到。
+    let names = region_image_stems(region)
+        .iter()
+        .map(|stem| format!("'{stem}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let script = format!(
+        "$p = Get-Process -Name {names} -ErrorAction SilentlyContinue | \
+         Where-Object {{ $_.MainWindowHandle -ne 0 }} | Select-Object -First 1; \
+         if (-not $p) {{ exit 3 }}; \
+         if (-not (New-Object -ComObject WScript.Shell).AppActivate($p.Id)) {{ exit 4 }}; \
+         exit 0"
+    );
+    let status = cmd_builder("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .status()
+        .map_err(|error| format!("唤起客户端失败: {error}"))?;
+    match status.code() {
+        Some(0) => Ok(()),
+        Some(3) => Err("客户端没有可聚焦的窗口（可能还在启动，或最小化到了托盘）".to_string()),
+        Some(4) => Err("无法把客户端窗口带到前台，请手动切换".to_string()),
+        _ => Err("唤起客户端失败，请手动切换".to_string()),
+    }
+}
+
+/// macOS：`open -a <app>` 会**激活已运行实例**（不会新开一个）。
+#[cfg(target_os = "macos")]
+fn focus_workbuddy_macos_for(region: Region) -> Result<(), String> {
+    let app = macos_workbuddy_app_path_for(region);
+    let status = cmd_builder("open")
+        .arg("-a")
+        .arg(&app)
+        .status()
+        .map_err(|error| format!("唤起客户端失败: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("无法把客户端窗口带到前台，请手动切换".to_string())
+    }
+}
+
+/// Linux：`wmctrl -a <名称>`（best-effort；未安装 wmctrl ⇒ 可理解错误）。
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn focus_workbuddy_linux_for(region: Region) -> Result<(), String> {
+    let title = region_app_stems(region)[0];
+    let status = cmd_builder("wmctrl")
+        .args(["-a", title])
+        .status()
+        .map_err(|_| "未安装 wmctrl，无法聚焦客户端窗口".to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("未找到客户端窗口，请手动切换".to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 测试用**假 pid 基址**：必须远大于真实 pid 上限（macOS 默认 `kern.maxproc` 下
+    /// 的 pid 上限是 99999）。
+    ///
+    /// ## 为什么不能写死 5001 这类小数字（2026-11-03 CI 实测）
+    ///
+    /// `macos_ps_filter_*` 两条用例把「自身 pid」与一组写死的假 pid 拼进同一份 `ps`
+    /// 输出，再断言「除自身外都保留」。**刚开机的 macOS runner 上，测试进程自己的 pid
+    /// 就可能落在 5001** —— 于是那行假数据被「排除自身」规则剔掉，断言变成
+    /// `left: [5004]` / `right: [5001, 5004]`，main 随机变红。
+    ///
+    /// ⇒ 假 pid 一律从本常量派生（90 万级，真实进程不可能占用）。
+    const FAKE_PID_BASE: u32 = 900_000;
+
+    /// ★ 假 pid 必须与**本进程真实 pid** 拉开距离（2026-11-03 main 变红的根因）。
+    ///
+    /// 这条在**所有平台**都跑：它挡的是「测试数据撞上运行环境」这一类错误 ——
+    /// macOS 那两条用例本身是 `cfg(macos)`，在 Windows 上编译不到，只有这条能兜住。
+    #[test]
+    fn fake_pids_never_collide_with_the_real_one() {
+        let self_pid = std::process::id();
+        assert!(
+            FAKE_PID_BASE > 99_999,
+            "假 pid 基址必须高于 macOS 的 pid 上限（99999）"
+        );
+        for offset in 0..32 {
+            assert_ne!(
+                FAKE_PID_BASE + offset,
+                self_pid,
+                "假 pid 撞上真实 pid ⇒ 该行会被「排除自身」规则剔掉，macOS 用例随机变红"
+            );
+        }
+    }
 
     #[test]
     fn region_app_stems_differ_by_region() {
@@ -1480,13 +1814,25 @@ mod tests {
 
     #[test]
     fn global_image_names_match_only_ai_variants() {
-        assert!(is_workbuddy_image_name_for(Region::Global, "WorkBuddy AI.exe"));
+        assert!(is_workbuddy_image_name_for(
+            Region::Global,
+            "WorkBuddy AI.exe"
+        ));
         assert!(is_workbuddy_image_name_for(Region::Global, "CodeBuddy AI"));
-        assert!(is_workbuddy_image_name_for(Region::Global, "WORKBUDDY AI.EXE"));
+        assert!(is_workbuddy_image_name_for(
+            Region::Global,
+            "WORKBUDDY AI.EXE"
+        ));
         // 国内版映像不得被国际版匹配（反之亦然），避免跨版本误杀。
-        assert!(!is_workbuddy_image_name_for(Region::Global, "WorkBuddy.exe"));
+        assert!(!is_workbuddy_image_name_for(
+            Region::Global,
+            "WorkBuddy.exe"
+        ));
         assert!(!is_workbuddy_image_name_for(Region::Cn, "WorkBuddy AI.exe"));
-        assert!(!is_workbuddy_image_name_for(Region::Global, "workbuddy-switch.exe"));
+        assert!(!is_workbuddy_image_name_for(
+            Region::Global,
+            "workbuddy-switch.exe"
+        ));
     }
 
     #[test]
@@ -1590,7 +1936,9 @@ mod tests {
         );
         // 国内版映像不得出现在国际版候选里。
         assert!(
-            !cands.iter().any(|p| p.to_string_lossy().ends_with(r"WorkBuddy\WorkBuddy.exe")),
+            !cands
+                .iter()
+                .any(|p| p.to_string_lossy().ends_with(r"WorkBuddy\WorkBuddy.exe")),
             "CN exe leaked into global candidates: {cands:?}"
         );
     }
@@ -1619,10 +1967,8 @@ mod tests {
 2004|crashpad_handler|C:\\x\\crashpad_handler.exe
 2005|CodeBuddy AI|
 ";
-        let kept = filter_windows_workbuddy_rows_for(
-            Region::Global,
-            &parse_windows_process_rows(stdout),
-        );
+        let kept =
+            filter_windows_workbuddy_rows_for(Region::Global, &parse_windows_process_rows(stdout));
         let pids: Vec<u32> = kept.iter().map(|r| r.pid).collect();
         assert_eq!(pids, vec![2002, 2005]);
     }
@@ -1652,8 +1998,66 @@ INFO: No tasks are running which match the specified criteria.
         assert_eq!(kept.iter().map(|r| r.pid).collect::<Vec<_>>(), vec![1234]);
     }
 
-    /// P0-1 的语义护栏：**枚举失败不得被当成「进程已退出」**。
+    /// ★ 通用映像名匹配（[`is_image_running`] 的纯逻辑部分）：
+    /// **大小写不敏感 + 精确匹配**，且**不**把 `claude-code.exe` 认成 `claude.exe`。
     ///
+    /// 可证伪性：把 `eq_ignore_ascii_case` 换成 `contains` ⇒ 第三条断言变红
+    /// （`claude-helper.exe` 会被当成 `claude.exe` 在运行 —— 守卫会永远拒绝写入）。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn image_matching_is_case_insensitive_and_exact() {
+        let csv = "\
+\"CLAUDE.EXE\",\"1234\",\"Console\",\"1\",\"50,123 K\"
+\"claude-code.exe\",\"1235\",\"Console\",\"1\",\"40,000 K\"
+INFO: No tasks are running which match the specified criteria.
+";
+        let rows = parse_tasklist_csv(csv);
+        assert!(
+            windows_rows_match_image(&rows, "claude.exe"),
+            "映像名大小写不敏感"
+        );
+        assert!(windows_rows_match_image(&rows, "CLAUDE.EXE"));
+        assert!(
+            !windows_rows_match_image(&rows, "claude"),
+            "不带扩展名不得匹配（精确匹配，不是前缀）"
+        );
+        assert!(
+            !windows_rows_match_image(&rows, "claude-code"),
+            "不得把别的映像名当成目标（`contains` 实现会在这里变红）"
+        );
+        assert!(!windows_rows_match_image(&rows, "codex.exe"));
+        assert!(
+            !windows_rows_match_image(&[], "claude.exe"),
+            "空表 = 没在跑"
+        );
+    }
+
+    /// ★ 空映像名 ⇒ 判不出来 ⇒ 保守视为「在运行」（守卫据此**拒绝写入**）。
+    ///
+    /// 可证伪性：把 `is_image_running` 开头的空串分支删掉 ⇒ 变红
+    /// （空映像名会走到 `tasklist` 分支并返回「没在跑」，于是一个配置写错的槽位
+    /// 会**绕过进程守卫**）。
+    #[test]
+    fn blank_image_name_is_treated_as_running() {
+        assert!(is_image_running(""));
+        assert!(is_image_running("   "));
+    }
+
+    /// ★ 空映像名 ⇒ **拒绝关闭**（不是「什么都没关就报成功」）。
+    ///
+    /// 可证伪性：把 `close_image` 开头的空串分支删掉 ⇒ 变红。这条与
+    /// [`blank_image_name_is_treated_as_running`] 是同一枚硬币的两面：
+    /// 判不出在不在跑时，守卫**不写**，关闭**不动手**。
+    ///
+    /// ⚠️ 本用例**不**碰真实进程：`close_image` 只在映像名非空时才去 `tasklist` /
+    /// `pkill`，空串在这里就直接返回，不会误杀开发机上正在跑的客户端。
+    #[test]
+    fn blank_image_name_cannot_be_closed() {
+        assert!(close_image("", 1).is_err());
+        assert!(close_image("   ", 1).is_err());
+    }
+
+    /// P0-1 的语义护栏：**枚举失败不得被当成「进程已退出」**。    ///
     /// 修前这条逻辑散在 `wait_windows_pids_gone` 的 `is_windows_pid_running` 里
     /// （`None => true`），无法单独测；抽成纯函数后可以把三条分支都钉死。
     #[cfg(target_os = "windows")]
@@ -1692,8 +2096,14 @@ INFO: No tasks are running which match the specified criteria.
 ";
         let rows = parse_tasklist_csv(full);
         assert_eq!(
-            rows.iter().map(|r| (r.pid, r.name.as_str())).collect::<Vec<_>>(),
-            vec![(0, "System Idle Process"), (1234, "WorkBuddy.exe"), (5678, "explorer.exe")],
+            rows.iter()
+                .map(|r| (r.pid, r.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, "System Idle Process"),
+                (1234, "WorkBuddy.exe"),
+                (5678, "explorer.exe")
+            ],
             "全量输出必须按 `\"name\",\"pid\"` 两列解析"
         );
     }
@@ -1731,9 +2141,7 @@ C:\Users\Zhou\AppData\Local\Programs\workbuddy-switch\workbuddy-switch.exe
             .collect();
         assert_eq!(
             s,
-            vec![
-                r"D:\Users\Zhou\AppData\Local\Programs\WorkBuddy AI\WorkBuddy AI.exe".to_string(),
-            ]
+            vec![r"D:\Users\Zhou\AppData\Local\Programs\WorkBuddy AI\WorkBuddy AI.exe".to_string(),]
         );
     }
 
@@ -1746,9 +2154,18 @@ C:\Users\Zhou\AppData\Local\Programs\workbuddy-switch\workbuddy-switch.exe
         // 本机真值：国际版进程映像 / 可执行文件为无空格 `WorkBuddyAI`
         // （产品名才是有空格的 `WorkBuddy AI`）。
         assert!(is_workbuddy_image_name_for(Region::Global, "WorkBuddyAI"));
-        assert!(is_workbuddy_image_name_for(Region::Global, "WorkBuddyAI.exe"));
-        assert!(is_workbuddy_image_name_for(Region::Global, "WORKBUDDYAI.EXE"));
-        assert!(is_workbuddy_image_name_for(Region::Global, "CodeBuddyAI.exe"));
+        assert!(is_workbuddy_image_name_for(
+            Region::Global,
+            "WorkBuddyAI.exe"
+        ));
+        assert!(is_workbuddy_image_name_for(
+            Region::Global,
+            "WORKBUDDYAI.EXE"
+        ));
+        assert!(is_workbuddy_image_name_for(
+            Region::Global,
+            "CodeBuddyAI.exe"
+        ));
         assert!(is_workbuddy_image_name_for(
             Region::Global,
             r"D:\Program Files\WorkBuddyAI\WorkBuddyAI.exe"
@@ -1764,7 +2181,10 @@ C:\Users\Zhou\AppData\Local\Programs\workbuddy-switch\workbuddy-switch.exe
     fn global_image_name_excludes_cn_image() {
         // 防回归关键：国际版绝不把国内版映像 `WorkBuddy` 判为己方（避免两版串味）。
         assert!(!is_workbuddy_image_name_for(Region::Global, "WorkBuddy"));
-        assert!(!is_workbuddy_image_name_for(Region::Global, "WorkBuddy.exe"));
+        assert!(!is_workbuddy_image_name_for(
+            Region::Global,
+            "WorkBuddy.exe"
+        ));
         assert!(!is_workbuddy_image_name_for(Region::Global, "CodeBuddy"));
     }
 
@@ -1937,21 +2357,29 @@ C:\\Users\\X\\Programs\\workbuddy-switch\\workbuddy-switch.exe
     #[test]
     fn macos_ps_filter_matches_case_sensitively_and_excludes_self() {
         let self_pid = std::process::id();
-        // 5002 用小写目录：pgrep -f 大小写不敏感会命中，这里必须不命中。
-        // 5003 全大写引用：旧的 pgrep -f 不敏感匹配的典型反例，这里必须不命中。
-        // 5005 args 含 buddy-switch：非自身 pid 也按自排除规则剔除。
+        // 假 pid 一律从 [`FAKE_PID_BASE`] 派生（写死小数字会撞上 runner 自己的 pid）。
+        // +1 正常大写目录（应保留）；+2 小写目录（`pgrep -f` 不敏感会误命中，这里必须不命中）；
+        // +3 全大写引用（旧实现大小写不敏感的典型反例）；+4 CodeBuddy（应保留）；
+        // +5 args 含 buddy-switch（非自身 pid 也按自排除规则剔除）。
+        let (kept_a, lower, shouty, kept_b, selfish) = (
+            FAKE_PID_BASE + 1,
+            FAKE_PID_BASE + 2,
+            FAKE_PID_BASE + 3,
+            FAKE_PID_BASE + 4,
+            FAKE_PID_BASE + 5,
+        );
         let stdout = format!(
             "{self_pid} /Applications/workbuddy-switch.app/Contents/MacOS/buddy-switch\n\
-             5001 /Applications/WorkBuddy.app/Contents/MacOS/WorkBuddy --foo\n\
-             5002 /Applications/workbuddy.app/Contents/MacOS/WorkBuddy\n\
-             5003 /bin/zsh -c 'echo WORKBUDDY.APP/CONTENTS/MACOS mention'\n\
-             5004 /Applications/CodeBuddy.app/Contents/MacOS/CodeBuddy\n\
-             5005 /opt/tool/buddy-switch/helper run\n"
+             {kept_a} /Applications/WorkBuddy.app/Contents/MacOS/WorkBuddy --foo\n\
+             {lower} /Applications/workbuddy.app/Contents/MacOS/WorkBuddy\n\
+             {shouty} /bin/zsh -c 'echo WORKBUDDY.APP/CONTENTS/MACOS mention'\n\
+             {kept_b} /Applications/CodeBuddy.app/Contents/MacOS/CodeBuddy\n\
+             {selfish} /opt/tool/buddy-switch/helper run\n"
         );
         let patterns = macos_main_patterns(None);
         let kept = filter_ps_rows(&stdout, &patterns, self_pid);
         let pids: Vec<u32> = kept.iter().map(|(pid, _)| *pid).collect();
-        assert_eq!(pids, vec![5001, 5004]);
+        assert_eq!(pids, vec![kept_a, kept_b]);
     }
 
     #[cfg(target_os = "macos")]
@@ -1959,25 +2387,34 @@ C:\\Users\\X\\Programs\\workbuddy-switch\\workbuddy-switch.exe
     fn macos_bundle_filter_keeps_bundle_daemons_and_drops_self() {
         let self_pid = std::process::id();
         // 包内任意进程：主进程 + Contents/Resources 下守护 + 引用 bundle 的自家进程。
-        // 5012 用小写目录名（对应字面量全小写变体）。5014 是无关 .app，不误杀。
+        // +12 用小写目录名（对应字面量全小写变体）。+14 是无关 .app，不误杀。
+        // 假 pid 一律从 [`FAKE_PID_BASE`] 派生（同 `macos_ps_filter_*` 的理由）。
+        let (main_proc, lower, daemon, other) = (
+            FAKE_PID_BASE + 11,
+            FAKE_PID_BASE + 12,
+            FAKE_PID_BASE + 13,
+            FAKE_PID_BASE + 14,
+        );
         let stdout = format!(
             "{self_pid} /Applications/workbuddy-switch.app/Contents/MacOS/workbuddy-switch\n\
-             5011 /Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/vendor/sandbox/5.5.5/sandbox-center --config x\n\
-             5012 /Applications/workbuddy.app/Contents/Resources/.../sandbox-center\n\
-             5013 node ~/.workbuddy/binaries/cliguard-daemon --app_bundle /Applications/WorkBuddy.app\n\
-             5014 /Applications/SomeOther.app/Contents/MacOS/SomeOther\n"
+             {main_proc} /Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/vendor/sandbox/5.5.5/sandbox-center --config x\n\
+             {lower} /Applications/workbuddy.app/Contents/Resources/.../sandbox-center\n\
+             {daemon} node ~/.workbuddy/binaries/cliguard-daemon --app_bundle /Applications/WorkBuddy.app\n\
+             {other} /Applications/SomeOther.app/Contents/MacOS/SomeOther\n"
         );
         let patterns = macos_bundle_patterns(None);
         let kept = filter_ps_rows(&stdout, &patterns, self_pid);
         let pids: Vec<u32> = kept.iter().map(|(pid, _)| *pid).collect();
-        assert_eq!(pids, vec![5011, 5012, 5013]);
+        assert_eq!(pids, vec![main_proc, lower, daemon]);
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_extract_app_bundle_from_args() {
         assert_eq!(
-            extract_app_bundle_from_args("/Applications/WorkBuddy.app/Contents/MacOS/WorkBuddy --foo"),
+            extract_app_bundle_from_args(
+                "/Applications/WorkBuddy.app/Contents/MacOS/WorkBuddy --foo"
+            ),
             Some(PathBuf::from("/Applications/WorkBuddy.app"))
         );
         assert_eq!(
@@ -1992,7 +2429,10 @@ C:\\Users\\X\\Programs\\workbuddy-switch\\workbuddy-switch.exe
     #[test]
     fn macos_app_bundle_candidates_order() {
         let cands = app_bundle_candidates(Path::new("/Users/tester"));
-        let s: Vec<String> = cands.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        let s: Vec<String> = cands
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
         assert_eq!(
             s,
             vec![
@@ -2008,7 +2448,10 @@ C:\\Users\\X\\Programs\\workbuddy-switch\\workbuddy-switch.exe
     #[test]
     fn macos_global_app_bundle_candidates_order() {
         let cands = app_bundle_candidates_for(Region::Global, Path::new("/Users/tester"));
-        let s: Vec<String> = cands.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        let s: Vec<String> = cands
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
         assert_eq!(
             s,
             vec![
@@ -2040,6 +2483,57 @@ C:\\Users\\X\\Programs\\workbuddy-switch\\workbuddy-switch.exe
         assert!(!is_app_bundle(&plain)); // 无 Info.plist
 
         assert!(!is_app_bundle(&dir.join("missing.app"))); // 不存在
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 回归：可执行体名取自 plist，与包名无关（两个 WorkBuddy bundle 均为 `Electron`）。
+    ///
+    /// 可证伪：`bundle_executable` 改为按包名拼接时，第一条断言得到 `WorkBuddy AI`，
+    /// 与期望的 `Electron` 不符。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bundle_executable_comes_from_the_plist_not_the_bundle_name() {
+        let dir = std::env::temp_dir().join(format!(
+            "buddy-switch-bundle-exe-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let app = dir.join("WorkBuddy AI.app");
+        std::fs::create_dir_all(app.join("Contents").join("MacOS")).unwrap();
+        std::fs::write(
+            app.join("Contents").join("Info.plist"),
+            "<plist><dict><key>CFBundleExecutable</key><string>Electron</string></dict></plist>",
+        )
+        .unwrap();
+
+        assert_eq!(
+            bundle_executable(&app),
+            Some(app.join("Contents").join("MacOS").join("Electron"))
+        );
+
+        // 无 plist 或键缺失时返回 None，不猜测名称。
+        std::fs::remove_file(app.join("Contents").join("Info.plist")).unwrap();
+        assert_eq!(bundle_executable(&app), None);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// plist 中的名称含路径分隔符时，不得拼出 `Contents/MacOS` 之外的路径。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bundle_executable_rejects_names_that_escape_contents_macos() {
+        let dir = std::env::temp_dir().join(format!(
+            "buddy-switch-bundle-escape-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let app = dir.join("WorkBuddy AI.app");
+        std::fs::create_dir_all(app.join("Contents").join("MacOS")).unwrap();
+        std::fs::write(
+            app.join("Contents").join("Info.plist"),
+            "<plist><dict><key>CFBundleExecutable</key><string>../../../bin/sh</string></dict></plist>",
+        )
+        .unwrap();
+
+        assert_eq!(bundle_executable(&app), None);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -79,7 +79,9 @@ impl PromptSettings {
                 }),
                 Some(path) => std::fs::read_to_string(path)
                     .map(|text| Self { mode, text })
-                    .map_err(|error| format!("读取 prompt.file 失败（{}）：{error}", path.display())),
+                    .map_err(|error| {
+                        format!("读取 prompt.file 失败（{}）：{error}", path.display())
+                    }),
             },
         }
     }
@@ -115,10 +117,7 @@ pub fn rewrite_system_prompt(source: &str, system_prompt: &str) -> String {
                     Some("system") | Some("developer")
                 )
             });
-            messages.insert(
-                0,
-                json!({ "role": "system", "content": system_prompt }),
-            );
+            messages.insert(0, json!({ "role": "system", "content": system_prompt }));
         }
         _ => {
             obj.insert(
@@ -205,7 +204,11 @@ mod tests {
     fn passthrough_loads_no_text() {
         let settings = PromptSettings::load(PromptMode::Passthrough, None).unwrap();
         assert!(settings.text.is_empty());
-        assert_eq!(settings.active_text(false), None, "passthrough 非降级期不改写");
+        assert_eq!(
+            settings.active_text(false),
+            None,
+            "passthrough 非降级期不改写"
+        );
     }
 
     #[test]
@@ -237,8 +240,7 @@ mod tests {
             {"role":"user","content":"hi"},
             {"role":"assistant","content":"yo"}
         ]}"#;
-        let rewritten: Value =
-            serde_json::from_str(&rewrite_system_prompt(source, "NEW")).unwrap();
+        let rewritten: Value = serde_json::from_str(&rewrite_system_prompt(source, "NEW")).unwrap();
         let messages = rewritten["messages"].as_array().expect("数组");
         assert_eq!(messages.len(), 3, "两条旧提示词消息应被删除");
         assert_eq!(messages[0]["role"], "system");

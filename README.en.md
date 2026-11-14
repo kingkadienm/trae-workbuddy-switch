@@ -1,360 +1,494 @@
+> Maintained fork: [kingkadienm](https://github.com/kingkadienm/trae-workbuddy-switch); upstream: [NextAgentX](https://github.com/NextAgentX/qoder-trae-workbuddy-switch). This fork retains TOTP, growth tasks, Doubao, Panel auths imports, account deactivation, earliest-expiry routing and its own update channel alongside upstream Qoder, unified scopes, backups and risk controls.
+
 <p align="center">
-  <img src="public/icon-transparent.png" alt="Buddy Switch icon" width="128" />
+  <img src="public/icon-transparent.png" alt="Buddy Switch" width="120" />
+</p>
+
+<h1 align="center">Buddy Switch</h1>
+
+<p align="center">
+  <b>WorkBuddy · CodeBuddy · TraeWork · Qoder multi-account workbench</b><br />
+  Turn “which account am I signed in with?” into one click
 </p>
 
 <p align="center">
-  <strong>Buddy Switch</strong><br />
-  Account switcher for WorkBuddy / CodeBuddy / Trae
+  <img alt="Platforms" src="https://img.shields.io/badge/Platforms-macOS_%7C_Windows_%7C_Linux-2ea043" />
+  <a href="https://github.com/kingkadienm/trae-workbuddy-switch/releases/latest"><img alt="Latest" src="https://img.shields.io/github/v/release/NextAgentX/qoder-trae-workbuddy-switch?label=Latest" /></a>
+  <a href="./LICENSE"><img alt="License" src="https://img.shields.io/badge/License-PolyForm_Noncommercial-4c8bf5" /></a>
+  <a href="https://github.com/NextAgentX/qoder-trae-workbuddy-switch/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/NextAgentX/qoder-trae-workbuddy-switch?style=social" /></a>
 </p>
 
 <p align="center">
-  <a href="README.md">简体中文</a> · <strong>English</strong>
+  <a href="README.md">简体中文</a> ·
+  <strong>English</strong>
 </p>
 
 # Buddy Switch
 
-**A multi-account manager for WorkBuddy / TraeWork**: OAuth QR-code sign-in, one-click login-state switching, credit-expiry monitoring with automatic check-in, token usage statistics — and it can expose your model quota to other local tools through an OpenAI / Anthropic compatible endpoint.
+A **local-first** multi-account workbench: it gathers accounts from four product lines — **WorkBuddy / CodeBuddy / TraeWork / Qoder** — and **6 scopes** into one place. QR / device-code sign-in, one-click login-state switching, check-in and credits, usage analytics, session-replica syncing — plus exposing your model quota to other local AI tools through OpenAI / Anthropic compatible endpoints.
 
-> ⚠️ **Disclaimer**: this project is an **unofficial, third-party tool released under a noncommercial license** (source-available). It is not affiliated with, authorized by, sponsored by or endorsed by WorkBuddy, CodeBuddy, Trae / TraeWork or their respective rights holders. It reads and writes authentication data of third-party clients on your machine, sends automated requests on the schedule you configure, and can forward your model quota to other tools through a local endpoint. Before using it, read the [Disclaimer](docs/DISCLAIMER.en.md) in full, assess the risks yourself and make sure your usage complies with the applicable terms of service.
-
-One interface, three forms:
-
-| Form | How to get it | Notes |
-| --- | --- | --- |
-| **Desktop app** | Download the installer from [GitHub Releases](https://github.com/kingkadienm/trae-workbuddy-switch/releases/latest) | Packaged with Tauri; recommended for daily use |
-| **webui (browser)** | Build from source, see [webui form](#webui-form-build-from-source) | The same frontend bundle as the desktop app, served over a local HTTP channel |
-| **Online demo** | [GitHub Pages](https://kingkadienm.github.io/trae-workbuddy-switch/) | Read-only demo; accounts, credits and request records are fictional data and all business actions are disabled |
-
-> **No npm distribution yet**: the npm package `@kingkadienm/buddy-switch` has not been published, so `npm i -g …` will not install it yet.
-> For the webui form, follow [Build from source](#webui-form-build-from-source) below; the install command will be added here once it is published.
-
-## Two product sections
-
-Switch product sections at the top of the sidebar. The two sections are **fully independent**: separate account stores, separate clients and separate configuration, with no effect on each other.
-
-| Section | Clients managed | Regions |
-| --- | --- | --- |
-| **WorkBuddy** | WorkBuddy desktop client, CodeBuddy CLI, CodeBuddy CN IDE | CN (WorkBuddy) / Global (WorkBuddy AI) |
-| **TraeWork** | Trae Work (clients `TRAE SOLO CN` / `TRAE SOLO`), Trae IDE (`Trae CN` / `Trae`) | CN / Global |
-
-The pages under both sections are **structurally identical, item for item**: Accounts, Token Stats, Credit Stats, API Service, Settings.
-
-> **Regions and client variants on the Trae side**: Trae has two product lines that can coexist on one machine (Trae Work and Trae IDE; the clients self-identify as `TraeWork CN` / `TraeCode CN`). They are switched **inside** the Trae section and do not occupy the sidebar. The variant is carried by the `?line=` URL parameter, so refreshing, sharing links and going back/forward all keep your current position.
-
-## Quick start
-
-### Desktop app
-
-Download the installer for your platform from [GitHub Releases](https://github.com/kingkadienm/trae-workbuddy-switch/releases/latest):
-
-| Platform | Installer | Installation |
-| --- | --- | --- |
-| macOS Apple Silicon (M-series, arm64) | `BuddySwitch_<version>_aarch64.dmg` | Open the DMG and drag `BuddySwitch.app` into Applications |
-| macOS Intel (x86_64) | `BuddySwitch_<version>_x86_64.dmg` | Open the DMG and drag `BuddySwitch.app` into Applications |
-| Windows x64 | `BuddySwitch_<version>_x64-setup.exe` | Run the installer and follow the prompts |
-| Linux x64 | `BuddySwitch_<version>_amd64.deb` / `BuddySwitch_<version>_amd64.AppImage` | Install the `.deb` on Debian/Ubuntu; on other distributions mark the AppImage executable and run it directly |
-
-On macOS, if the first launch reports that the developer cannot be verified, Control-click the app in Finder and choose **Open**, or go to **System Settings → Privacy & Security** and choose **Open Anyway**. Only when the installer came from the official Releases above and the system still reports it as damaged, run:
-
-```bash
-xattr -rd com.apple.quarantine "/Applications/BuddySwitch.app"
-```
-
-If the app starts but reports a permission error when switching accounts, see [macOS permissions](#macos-permissions) below.
-
-### webui form (build from source)
-
-This project is not distributed through npm yet, so the webui form has to be compiled locally. **Mind the order**: the frontend bundle is embedded into the server binary at **compile time** (`rust-embed`), so you must build the frontend first and the server second:
-
-```bash
-npm install
-npm run build                                    # 1) build the frontend → dist/
-cargo build --release -p buddy-switch-server     # 2) build the server (embeds dist/)
-./target/release/buddy-switch                    # 3) start the local service + open the browser (buddy-switch.exe on Windows)
-```
-
-Subcommands available after building:
-
-```bash
-buddy-switch              # start the local service and open the browser
-buddy-switch serve        # start the service only, without opening a browser (--port to set the port)
-buddy-switch status       # print the current account in the terminal
-buddy-switch version      # print the version
-```
-
-The webui listens on `127.0.0.1:57890` by default. The interface is identical to the desktop app — the same frontend bundle, with the desktop app going through the Tauri command channel and the webui through a local HTTP channel.
-
-> If you change the frontend without rebuilding the server, the UI will not change (the embedded bundle is stale). Stop any running `buddy-switch` before rebuilding, otherwise linking fails on Windows because the binary is locked.
-
-## Features
-
-### WorkBuddy section
-
-| Module | Description |
+|  |  |
 | --- | --- |
-| Accounts | OAuth QR-code sign-in, import from this machine, import from a backup file, add a token manually, delete accounts, export account backups |
-| Account switching | Back up the auth file → close WorkBuddy → write the target account → restart, with live progress feedback throughout the switch |
-| Session cloning | Copy the sessions selected on the current account to the target account under new ids (jsonl content + `workbuddy.db` index + edge-sync registration) |
-| Automatic check-in | Enabled by default; checks on startup and catches up on a schedule; supports check-in all and a check-in log |
-| Automatic travel | Automatically dispatches and claims the "Cat Travel" task |
-| Token keep-alive | Lazy refresh (refresh only when the remaining lifetime is below a threshold before an operation) plus a daily keep-alive (one unconditional refresh per day by default), preventing refresh-token expiry |
-| Credit expiry lookup | Query every account's credit grants, remaining amounts and expiry times; grants expiring within 7 days are highlighted and sorted by urgency, with the most urgent marked "use first" |
-| Credit statistics | Aggregate official WorkBuddy request usage with daily trends, model breakdown, per-account consumption and request details; when official data is unavailable it clearly falls back to observing local balance snapshots |
-| Token statistics | Separate overviews for WorkBuddy, CodeBuddy CLI and CodeBuddy IDE; input, output and cache read/write shown in K/M/B, with composition ratios, an activity heatmap, project/model top 10 and session ranking |
-| CodeBuddy CLI | Reuses the same account store as WorkBuddy but keeps a separate default account; on macOS/Linux through `apiKeyHelper`, on Windows through `env.CODEBUDDY_AUTH_TOKEN` in `settings.json` for subsequent sessions |
-| CodeBuddy CN IDE | Reuses the same account store; injects Safe Storage credentials into the `CodeBuddy CN` desktop client and restarts the IDE |
-| Automatic rotation | A background job periodically sets the CodeBuddy CLI's account for subsequent launches to the account with the most urgent credit expiry; the current session keeps its original account |
-| Scheduled tasks | Six task types — check-in, Cat Travel, Activity Map, token keep-alive, Back-to-School and Night Owl — each with its own toggle and configurable execution hour |
-| Migrate data on switch | Merge the current account's long-term memory and connector configuration into the target account (same-name entries merged recursively, deduplicated by content), with same-version and cross-version migration supported; the original content is backed up before being rewritten |
-| Permission check | macOS authorization walkthrough (App Management / Full Disk Access drag-to-authorize plus automatic detection) |
-| Auto-update | Check GitHub Releases for new versions; full-package updates are signature-verified (tauri-updater) |
+| 🪪 **6 scopes, one place** | Three product lines × CN / Global, each with its own account store. Switching shows live progress and rolls back automatically on a failed write. |
+| ✅ **The to-do list writes itself** | Overview lists what needs attention — re-login, today's check-in, expiring credits, client not running — each with an inline action. |
+| 📊 **Usage and rate limits, visible** | Tokens, credits, per-account model limits, and which session replica lags or diverged — all on one screen. |
+| 🔌 **Feed the quota to your other tools** | Expose it as an OpenAI / Anthropic compatible endpoint and drop it into Cursor, Claude Code or OpenWebUI. |
 
-### TraeWork section
+> **Scope and intended use**
+>
+> This project is the author's **personal, self-use and learning** work — written to solve their own multi-account switching friction. **You are welcome to read, fork and improve it, but it comes with no maintenance commitment**: no commercial support, no SLA, and no guarantee of compatibility with any specific client version.
+>
+> Licensed under **PolyForm Noncommercial 1.0.0**: **personal, noncommercial use only — any commercial use is prohibited** (including internal commercial projects, SaaS / hosted services, resale and bundled distribution). Commercial use requires prior written permission from the author.
 
-| Module | Description |
-| --- | --- |
-| Accounts | OAuth web sign-in (browser callback), paste `Cloud-IDE-JWT` manually, import from this machine, import from a backup file, delete accounts, export account backups |
-| Groups | Accounts can be grouped, and the list can be filtered by group |
-| Check-in | One-click check-in with credit refresh; supports "skip accounts already checked in today" and automatic renewal; account cards show check-in status and cooldown |
-| Credits | Per-account remaining credits, per-package breakdown and expiry times; 7-day totals / earned / consumed trends |
-| Token statistics | Token and call-count statistics over 7-day / 30-day / 90-day / all-history windows |
-| Login-state switching | Write the selected account into the Trae client's login state (`profiles/`), with an automatic backup before switching; takes effect after restarting the client |
-| Login-state snapshots | Save / restore / delete client login-state snapshots for easy rollback |
-| JWT refresh | Refresh an account's JWT manually and see the remaining validity period (highlighted when close to expiry) |
-| Device identifier | View and reset the device identifier |
-| Environment detection | Automatically detect the installed product lines, client versions, running state and userData directories |
-| Runtime logs | Client data directories, gateway request logs and operation logs viewed in one place |
-
-### API gateway (independent per section)
-
-Expose the current account's model quota to other local AI tools (Cursor, Claude Code, OpenWebUI, …) through **compatible endpoints**. Keys and account pools are isolated per product section and per region.
-
-| Capability | Description |
-| --- | --- |
-| Compatible protocols | OpenAI-compatible (`/v1/models`, `/v1/chat/completions`) and Anthropic-compatible (`/v1/messages`), both supporting SSE streaming |
-| Listen configuration | Binds to `127.0.0.1` only by default; changing it to `0.0.0.0` requires an explicit second risk confirmation |
-| Default ports | WorkBuddy gateway `57891`; Trae gateway `7864` (Trae also has a local MITM proxy port `8899`, which login-state capture depends on) |
-| API keys | Multiple keys can be created, each belonging to a specific region; the list shows only the prefix and **never stores plaintext or echoes the hash**; keys can be revoked and deleted |
-| Model catalog | Fetch and display the available model list, with manual refresh |
-| Account policy | Configure the account-selection strategy and the account-pool balance refresh interval |
-| Request log | Record the model, account, tokens and status of every request; can be cleared |
-
-## Usage
-
-### WorkBuddy
-
-1. **Add an account**: Accounts page → "Add via OAuth QR" (device flow), "Import local account" or "Import backup"
-   - Since client 5.6, the login-state tokens are stored encrypted. **"Import local account" automatically calls the local client to unwrap that encryption** (requires the WorkBuddy desktop app to be installed), so check-in / credits / token stats work right after importing. If the client is missing or has changed its encryption scheme, the account is **still imported** but can only be used for "Switch"; click "Refresh token" on the account to retry unwrapping
-2. **Switch accounts**: account card → "Switch"; you can optionally copy the current account's sessions along and merge long-term memory and connector configuration into the target account (for cross-version migration you can choose the data source region)
-3. **Automatic check-in / Cat Travel**: toggle them directly at the top of the Accounts page; the Settings page lets you tune parameters, run a check-in immediately and view logs
-4. **Check credit expiry**: the Accounts page automatically queries each account's credit grants; click "Refresh credits" to update manually — grants approaching expiry are highlighted and sorted by urgency
-5. **View credit statistics**: sidebar → "Credit Stats" — overview, 30-day trend, model breakdown, per-account consumption and request details; changing the account or date filter does not re-hit the official API, only "Refresh statistics" collects again
-6. **View token statistics**: sidebar → "Token Stats"; choose WorkBuddy, CodeBuddy CLI or CodeBuddy IDE to see input, output, cache read/write and call counts
-7. **Connect CodeBuddy CLI**: one-click connect / update authentication on the Accounts page. "Switch CodeBuddy" only updates the default account used by **sessions loaded afterwards**; the currently running session is not switched — reload the session from ACP, or restart CodeBuddy CLI for it to take effect
-8. **Switch CodeBuddy CN IDE**: switch the CN desktop client (www.codebuddy.cn) with one click from an account card. Switching closes and restarts CodeBuddy CN; before the first use, open and sign in to it manually once so that the Keychain Safe Storage entry is created
-9. **Automatic rotation**: Settings → CodeBuddy CLI auto-rotation (policy below)
-10. **Updates**: the app automatically checks the public GitHub Releases and lets you upgrade directly from the bottom-left corner
-
-### TraeWork
-
-1. **Add an account**: Accounts page → "OAuth web sign-in" (the browser completes authorization and then calls back) or "Paste JWT"; you can also use "Import local account" / "Import backup"
-2. **Choose region and product line**: switch CN / Global at the top of the page; on an account card, switch the client variant to operate (TraeWork / TraeCode)
-3. **Check-in**: "Check in and refresh credits" on the Accounts page, or per account; enable "Skip already checked in" to avoid duplicate requests
-4. **Switch login state**: account card → "Switch", which writes the selected client's login state and restarts the client; a snapshot is saved automatically before switching
-5. **Snapshot rollback**: Settings → "Login-state snapshots" to save / restore / delete
-6. **API service**: sidebar → "API Service"; create a key and follow the integration guide on the page to configure it in your tool
-
-### Automatic rotation policy (WorkBuddy)
-
-The goal of automatic rotation is to avoid wasting credits by letting them expire: a background job periodically checks every account's credit expiry and sets the CodeBuddy CLI's default account for subsequent sessions to the **most urgent** one (earliest expiry that still has credits remaining). Neither the `apiKeyHelper` on macOS/Linux nor the settings env on Windows replaces the token a running session already holds; the rotation takes effect after ACP reloads the session or the CLI restarts. To avoid the default account changing too often, every check decides in this order:
-
-1. **Eligible accounts**: only accounts that queried successfully, are not expired and still have credits remaining can be selected as the target
-2. **Urgency check**: if every account expires far in the future (the most urgent one has more than `min_urgency_hours` left, default 72 hours) → do not switch
-3. **Already the target**: if the CLI's default account already is the most urgent one → do not switch
-4. **Cooldown**: do not switch again within `cooldown_minutes` (default 120) of the last switch
-5. **Activity guard**: if a CLI session wrote within the last `active_guard_minutes` (default 30), i.e. a conversation is in progress → do not switch
-6. **Value filter**: if the target account's remaining credits are below `min_remaining_credits` it is not worth switching (default 0, disabled; every check logs each account's remaining credits so you can tune this)
-7. **Debounce**: if the target expires earlier than the current account but by less than `min_gap_hours` (default 24) → do not switch
-
-> **Scope**: automatic rotation only updates the default account used by subsequent restore/load operations; it does not hot-switch the current session. On macOS/Linux the next helper run reads the latest account; on Windows the latest token is written into settings. A running session keeps the account it obtained at startup or load time — reload the session from ACP, or restart CodeBuddy CLI.
-
-Configuration keys: `check_interval_minutes` (check interval, default 5), `cooldown_minutes`, `min_urgency_hours`, `active_guard_minutes`, `min_remaining_credits`, `min_gap_hours`. Adjust them on the Settings page, or edit `~/.buddy-switch/auto_rotate_config.json` directly.
+> ⚠️ **Unofficial · Noncommercial**: not affiliated with, authorized, sponsored or endorsed by WorkBuddy, CodeBuddy, TraeWork, Qoder or their rights holders; **commercial use is not permitted**. It reads and writes local clients' authentication data, sends automated requests on the schedule you configure, and can forward your quota through a local port. Read the **[Disclaimer](docs/policies/DISCLAIMER.en.md)** before use.
 
 ## Screenshots
 
-### WorkBuddy accounts
-
-Account cards show login state, check-in state, credit balance and near-expiry grants in one place; the region switcher at the top toggles between WorkBuddy CN and Global, whose account stores are isolated from each other.
-
 <table>
   <thead>
-    <tr>
-      <th>Light mode</th>
-      <th>Dark mode</th>
-    </tr>
+    <tr><th>Overview (light)</th><th>Overview (dark)</th></tr>
   </thead>
   <tbody>
     <tr>
-      <td><img src="docs/images/workbuddy-accounts-light.png" alt="WorkBuddy Accounts page (light mode, demo data)" /></td>
-      <td><img src="docs/images/workbuddy-accounts-dark.png" alt="WorkBuddy Accounts page (dark mode, demo data)" /></td>
+      <td><img src="docs/images/overview-light.png" alt="Overview, light" /></td>
+      <td><img src="docs/images/overview-dark.png" alt="Overview, dark" /></td>
     </tr>
   </tbody>
 </table>
 
-### Credit statistics
-
-Shows official request usage, daily trends, model breakdown and per-account consumption, and clearly labels the data source and update time; the top of the page switches between CN, Global and a merged view.
-
 <table>
   <thead>
-    <tr>
-      <th>Light mode</th>
-      <th>Dark mode</th>
-    </tr>
+    <tr><th>WorkBuddy accounts (light)</th><th>WorkBuddy accounts (dark)</th></tr>
   </thead>
   <tbody>
     <tr>
-      <td><img src="docs/images/credit-stats-light.png" alt="Credit Stats page (light mode, demo data)" /></td>
-      <td><img src="docs/images/credit-stats-dark.png" alt="Credit Stats page (dark mode, demo data)" /></td>
+      <td><img src="docs/images/workbuddy-accounts-light.png" alt="WorkBuddy accounts, light" /></td>
+      <td><img src="docs/images/workbuddy-accounts-dark.png" alt="WorkBuddy accounts, dark" /></td>
     </tr>
   </tbody>
 </table>
 
-### TraeWork accounts
-
-Switch CN / Global at the top; the status bar shows client version, running state, today's check-in, available credits and JWT expiry status; account cards offer client-variant switching, check-in, login-state switching and cooldown clearing.
-
 <table>
   <thead>
-    <tr>
-      <th>Light mode</th>
-      <th>Dark mode</th>
-    </tr>
+    <tr><th>Usage · trend (light)</th><th>Usage · trend (dark)</th></tr>
   </thead>
   <tbody>
     <tr>
-      <td><img src="docs/images/trae-accounts-light.png" alt="TraeWork Accounts page (light mode, demo data)" /></td>
-      <td><img src="docs/images/trae-accounts-dark.png" alt="TraeWork Accounts page (dark mode, demo data)" /></td>
+      <td><img src="docs/images/usage-trend-light.png" alt="Usage trend, light" /></td>
+      <td><img src="docs/images/usage-trend-dark.png" alt="Usage trend, dark" /></td>
     </tr>
   </tbody>
 </table>
 
-### API service
-
-Base URLs and representative keys are listed per region, and the key list supports creation, revocation and deletion; below it you will find the model catalog, account policy, integration guide and request log.
-
 <table>
   <thead>
-    <tr>
-      <th>Light mode</th>
-      <th>Dark mode</th>
-    </tr>
+    <tr><th>Gateway (light)</th><th>Gateway (dark)</th></tr>
   </thead>
   <tbody>
     <tr>
-      <td><img src="docs/images/api-service-light.png" alt="API Service page (light mode, demo data)" /></td>
-      <td><img src="docs/images/api-service-dark.png" alt="API Service page (dark mode, demo data)" /></td>
+      <td><img src="docs/images/api-service-light.png" alt="Gateway, light" /></td>
+      <td><img src="docs/images/api-service-dark.png" alt="Gateway, dark" /></td>
     </tr>
   </tbody>
 </table>
 
-> The screenshots above are taken from a demo build; accounts, credits and request records are all fictional data.
+<table>
+  <thead>
+    <tr><th>Qoder gateway (light)</th><th>Qoder gateway (dark)</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><img src="docs/images/qoder-gateway-light.png" alt="Qoder gateway (light)" /></td>
+      <td><img src="docs/images/qoder-gateway-dark.png" alt="Qoder gateway (dark)" /></td>
+    </tr>
+  </tbody>
+</table>
 
-## Data and privacy
+<details>
+<summary><b>More screenshots (sessions / settings / TraeWork / Qoder)</b></summary>
 
-- All data is stored locally under `~/.buddy-switch/` and is never uploaded to any third-party service
-- Account stores: WorkBuddy uses `accounts.json` (CN) / `accounts.global.json` (Global); Trae uses `trae/checkin_accounts.json` (CN) / `trae/checkin_accounts.global.json` (Global)
-- Auth files: WorkBuddy uses `workbuddy-desktop.info` / `workbuddy-desktop-ai.info`
-- The original auth file is backed up before switching accounts; Trae saves a snapshot before switching login state
-- Gateway API keys are stored as prefix and hash only; the plaintext is returned once at creation time
-- Local data is never committed to the repository; a token-pattern scan (`ghp_` / `npm_` / `gho_` etc.) runs before release
+<table>
+  <thead>
+    <tr><th>Sessions (light)</th><th>Sessions (dark)</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><img src="docs/images/sessions-light.png" alt="Sessions (light)" /></td>
+      <td><img src="docs/images/sessions-dark.png" alt="Sessions (dark)" /></td>
+    </tr>
+  </tbody>
+</table>
 
-## macOS permissions
+<table>
+  <thead>
+    <tr><th>Settings (light)</th><th>Settings (dark)</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><img src="docs/images/settings-light.png" alt="Settings (light)" /></td>
+      <td><img src="docs/images/settings-dark.png" alt="Settings (dark)" /></td>
+    </tr>
+  </tbody>
+</table>
 
-Switching accounts writes to WorkBuddy's auth file, which macOS gates behind **App Management** (or **Full Disk Access**) authorization:
+<table>
+  <thead>
+    <tr><th>TraeWork accounts (light)</th><th>TraeWork accounts (dark)</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><img src="docs/images/trae-accounts-light.png" alt="TraeWork accounts (light)" /></td>
+      <td><img src="docs/images/trae-accounts-dark.png" alt="TraeWork accounts (dark)" /></td>
+    </tr>
+  </tbody>
+</table>
 
-1. If the first switch reports "no permission", click "Open System Settings"
-2. Prefer enabling the BuddySwitch switch under **App Management**; if it is not listed there, go to **Full Disk Access** and drag BuddySwitch into the list
-3. Restart this app for the authorization to take effect; "Permission check" on the Settings page lets you verify it at any time
+<table>
+  <thead>
+    <tr><th>Qoder accounts (light)</th><th>Qoder accounts (dark)</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><img src="docs/images/qoder-accounts-light.png" alt="Qoder accounts (light)" /></td>
+      <td><img src="docs/images/qoder-accounts-dark.png" alt="Qoder accounts (dark)" /></td>
+    </tr>
+  </tbody>
+</table>
 
-> webui mode: permissions are those of the terminal process that started the service; if that terminal already has Full Disk Access, no extra steps are needed.
+</details>
 
-## Development
+> Generated by `scripts/gen-readme-shots.mjs` from the demo build (`VITE_DEMO_MODE=1`); accounts, credits and request records are fictional. Re-run it once after a UI change.
 
-Environment requirements, build commands, release process and directory layout are documented in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md). In brief:
+## The big picture
+
+```mermaid
+flowchart TB
+    subgraph SRC["3 product lines · 6 scopes"]
+        direction LR
+        WB["WorkBuddy<br/>CN / Global"]
+        TR["TraeWork<br/>CN / Global"]
+        QD["Qoder<br/>CN / Global"]
+    end
+    subgraph CORE["Local core · ~/.buddy-switch/"]
+        direction LR
+        AC["Account stores<br/>credentials · recycle bin"]
+        AU["Automation<br/>check-in · keepalive · rotation"]
+        US["Usage<br/>tokens / credits"]
+        SE["Session replicas<br/>content fingerprint · additive sync"]
+        GW["Quota gateway<br/>OpenAI / Anthropic compatible"]
+    end
+    WB --> AC
+    TR --> AC
+    QD --> AC
+    AC --- AU --- US --- SE
+    US --> GW
+    GW --> OUT["Other local AI tools<br/>Cursor · Claude Code · OpenWebUI"]
+```
+
+**Three hard rules** hold everywhere: data stays on this machine, credentials are only written into client login state (no proxy login, no upstream protocol hacks), and every write is backed up first.
+
+## Four forms
+
+| Form | How to get it | Notes |
+| --- | --- | --- |
+| **Desktop app** | Download from [GitHub Releases](https://github.com/kingkadienm/trae-workbuddy-switch/releases/latest) | Packaged with Tauri; recommended for daily use |
+| **webui** | [CLI binary from Releases](docs/guides/LINUX-WEBUI-FALLBACK.md) or build from source (below) | Same frontend bundle as the desktop app, served over local HTTP |
+| **Docker** | Pull the prebuilt image `ghcr.io/nextagentx/buddy-switch` (amd64 / arm64) | The container runs the **headless server** (webui + API gateways), **not** the desktop switcher; see [Docker deployment](docs/guides/DOCKER.md) |
+| **Online demo** | [GitHub Pages](https://nextagentx.github.io/qoder-trae-workbuddy-switch/) | Read-only demo; accounts and usage are fictional |
+
+> Linux desktop **Create API Key** dialog not showing? See the [local WebUI fallback guide](docs/guides/LINUX-WEBUI-FALLBACK.md) (Chinese).
+>
+> The npm package is not published yet, so `npm i -g` will not install it; use a prebuilt CLI binary from Releases or the source build steps below for webui.
+>
+> The Docker form is **server-only**: switching client login state, launching the client, the tray and the floating window all need a **graphical client on the same machine**, so none of them work inside the container.
+
+## Quick start
+
+**Desktop app**: download the installer for your platform from Releases.
+
+| Platform | Installer | Install |
+| --- | --- | --- |
+| macOS Apple Silicon (arm64) | `BuddySwitch_<version>_aarch64.dmg` | Open the DMG, drag `BuddySwitch.app` into Applications |
+| macOS Intel (x86_64) | `BuddySwitch_<version>_x86_64.dmg` | Same as above |
+| Windows x64 | `BuddySwitch_<version>_x64-setup.exe` | Run the installer |
+| Linux x64 | `BuddySwitch_<version>_amd64.deb` / `.AppImage` | Install the `.deb`, or make the AppImage executable and run it |
+
+> **Picked the wrong file?** The release also ships `buddy-switch-cli-*` — those are the **command-line (webui) binaries**, **not installers**. They have no extension and are ~30 MB; double-clicking does nothing (the download drops the execute bit). To use one, `chmod +x` it first — see [local WebUI fallback](docs/guides/LINUX-WEBUI-FALLBACK.md). Desktop installers always carry a `.dmg` / `-setup.exe` / `.deb` / `.AppImage` extension.
+
+**webui (build from source)**: the frontend bundle is embedded into the server **at compile time** (`rust-embed`), so the order matters.
 
 ```bash
 npm install
-npm run tauri dev     # desktop development mode
-npm run build         # build the frontend (dist/)
-npm run check:api     # verify the frontend API contract matches the backend
+npm run build                                    # 1) frontend → dist/
+cargo build --release -p buddy-switch-server     # 2) build the server (embeds dist/)
+./target/release/buddy-switch                    # 3) serve + open browser (127.0.0.1:57890)
 ```
 
-The repository is a Rust workspace plus a Vite/React frontend:
+```bash
+buddy-switch              # serve + open browser
+buddy-switch serve        # serve only (--port to override)
+buddy-switch status       # print the current account in the terminal
+buddy-switch version      # version
+```
+
+<details>
+<summary><b>macOS: "app is damaged" / "cannot verify developer" / "no permission" when switching</b></summary>
+
+- **"BuddySwitch is damaged and can't be opened"** — Gatekeeper says this (not "cannot verify developer") for a downloaded, unsigned app.
+  After dragging it into Applications, run `xattr -dr com.apple.quarantine /Applications/BuddySwitch.app` and open it normally.
+  The command only removes the "downloaded from the internet" flag; it does not modify the app.
+- Cannot verify developer: in Finder, Control-click the app → Open, or go to System Settings → Privacy & Security → "Open Anyway".
+- Switching accounts writes the client's auth file: grant BuddySwitch **App Management** (or **Full Disk Access**) in System Settings → Privacy & Security, then restart the app. The in-app "permission check" verifies it any time.
+- In webui form, permissions follow the terminal process that started the service.
+- **macOS keeps asking to allow Keychain access** — the client's (Qoder / CodeBuddy IDE) Safe Storage master key lives in the login keychain, so the first read always needs one approval; choose "Always Allow". It is read once per process (cached, see issue #104).
+  If it prompts on every action, the app was probably moved or reinstalled and its signing identity changed — delete the item in Keychain Access, then reopen the client and BuddySwitch once to re-authorize.
+
+</details>
+
+## 6 scopes (platform × region)
+
+The scope selector at the top-left decides which set of accounts you are managing. The scope lives in the URL (`/s/wb-cn/accounts`), so refresh, sharing and back/forward all stay put; `⌘K` / `Ctrl+K` searches across scopes, `⌘1`–`⌘6` switches directly.
+
+| Scope | Platform | Region | Clients managed |
+| --- | --- | --- | --- |
+| `wb-cn` | WorkBuddy | CN | WorkBuddy desktop, CodeBuddy CN IDE / CLI, CodeBuddy plugins for VS Code / JetBrains |
+| `wb-global` | WorkBuddy | Global | Same clients (global builds) |
+| `trae-cn` | TraeWork | CN | Trae CN |
+| `trae-global` | TraeWork | Global | Trae |
+| `qoder-cn` | Qoder | CN | Qoder CN desktop / CLI |
+| `qoder-global` | Qoder | Global | Qoder desktop / CLI |
+
+The six scopes are **fully independent**: separate account stores, separate clients, separate config, separate gateway keys. Trae's two legacy program lines (TraeWork / TraeCode) were merged upstream into one client; the old ids remain for compatibility only.
+
+## 6 sidebar destinations
+
+Identical item for item across all three platforms: **Overview · Accounts · Usage · Sessions · Gateway · Settings**. Entries are gated by **capability** (not by platform branch): no capability, no entry — and a direct URL still yields a structured empty state.
+
+| Destination | In one line |
+| --- | --- |
+| **Overview** | Things needing attention (re-login / today's check-in / expiring credits / client not running) + stat cards + 14-day token chart + a glance at other scopes |
+| **Accounts** | Card and table views, program slots, QR or device-code sign-in, local import, check-in, recycle bin (30 days), client rate-limit ledger (WorkBuddy only) |
+| **Usage** | One workbench, four views: trend · models · sessions · credits; a single parameter bar (range + data source) |
+| **Sessions** | Replicas of the same session across accounts: who lags, who diverged, sync to whom (**WorkBuddy only**) |
+| **Gateway** | Independent gateways (one per scope) and the unified gateway (one provider across scopes) |
+| **Settings** | Nine sections: general · account & login · check-in & credits · gateway · schedules · client · permissions & diagnostics · logs · backup & restore |
+
+### Capability matrix
+
+| Capability | WorkBuddy | TraeWork | Qoder |
+| --- | :---: | :---: | :---: |
+| Account store / sign-in / local import | ✅ QR + import | ✅ Web login + JWT | ✅ Device code + PAT |
+| Program slots | ✅ 5 (4 switchable + 1 read-only probe) | ✅ 1 (merged client) | ✅ 2 (desktop / CLI) |
+| Check-in / credits | ✅ incl. auto-travel, auto-rotation | ✅ | ✅ daily check-in + plan / quota |
+| Usage analytics | ✅ tokens + credits | ✅ tokens + credits | ✅ credits only — the client stores token counts as 0 |
+| Session replica sync | ✅ content fingerprint + additive | — | — |
+| Quota gateway | ✅ `:57891` | ✅ `:57894` | ✅ `:57895` |
+
+## How switching an account works
+
+```mermaid
+flowchart LR
+    A["Pick an account"] --> B["Back up current login state"] --> C["Quit the client"] --> D["Write target account"] --> E["Verify and restart"]
+    D -->|"optional"| F["Also: copy sessions<br/>merge memory and connectors"]
+```
+
+- **Backup before write**: auth files, Trae login snapshots and session overwrites all leave a rollback copy first.
+- **Verify after write**: a failed write is reverted automatically; a running client is refused, so it cannot write its in-memory state back over yours.
+- **Delete is soft**: accounts go to the recycle bin for 30 days and can be restored; permanent deletion also removes credentials and snapshots.
+
+## Model quota gateway
+
+Expose the current account's quota to local tools: OpenAI compatible (`/v1/models`, `/v1/chat/completions`, `/v1/responses`) and Anthropic compatible (`/v1/messages`), both with SSE streaming. Loopback-only by default.
+
+```mermaid
+flowchart LR
+    C["Local AI tools"] -->|"sk-wb-…"| G1[":57891<br/>WorkBuddy gateway"]
+    C -->|"sk-trae-…"| G2[":57894<br/>Trae gateway"]
+    C -->|"sk-qoder-…"| G3[":57895<br/>Qoder gateway"]
+    C -->|"sk-uni-…"| G4[":57892<br/>Unified gateway"]
+    G1 --> P1["wb-cn / wb-global pools"]
+    G2 --> P2["trae-cn / trae-global pools"]
+    G3 --> P3["qoder-cn / qoder-global pools"]
+    G4 -->|"model name carries a namespace prefix"| P1
+    G4 --> P2
+    G4 --> P3
+```
+
+- **Four independent listeners**: ports form one **`5789x` block** — `57890` UI · `57891` WorkBuddy · `57892` unified · `57893` session hook · `57894` Trae · `57895` Qoder. Turning the unified gateway off affects no existing client; the `/v1/*` routes overlap verbatim, so they **cannot** be merged into one Router.
+- **Key prefixes are one family**: `sk-wb-` · `sk-trae-` · **`sk-qoder-`** · `sk-uni-` — the prefix alone tells you which port to configure.
+- **Key lifecycle**: revoke · restore · delete (only revoked keys can be deleted). The plaintext is returned once at creation; the store keeps sha256 plus the first/last 4 characters.
+- **Key quota & allowlist**: each key can cap its consumption (limit × reset window — unit is either tokens or request count; window: none / daily / weekly / calendar month) and be restricted to a chosen set of accounts (whole groups can be picked at once). Over-quota returns 429 `quota_exceeded`; when every allowlisted account is unavailable it returns 401 `no_credential` (same code as an empty pool; the `message` states how many accounts the allowlist covers and why they are unusable) and **does not fall back to the full pool**.
+- **Account pool**: picks accounts by balance and rate-limit state, can exclude unusable ones, probes "account × model" limits, and revives them with one click.
+
+The **unified gateway** solves "the same model name overwriting itself across platforms": model names become `<namespace>:<model-id>`, where namespaces derive from the scope registry (currently six: `wb-cn` / `wb-global` / `trae-cn` / `trae-global` / `qoder-cn` / `qoder-global`).
+
+| Rule | Behaviour |
+| --- | --- |
+| Bare model name (no prefix) | **400** with the list of valid prefixes (no guessing a default and silently hitting the wrong pool) |
+| Namespace parsing | **Whole-segment exact match only** (`trae` / `traework` / `traecode` are prefixes of one another) |
+| One key, many platforms | A single `sk-uni-` key can authorize several platforms at once |
+| `/v1/responses` | Served for every namespace (Trae joined on 2026-10-22; Qoder translates to chat internally) |
+| Default state | **Off**; enable it in the Gateway page's "Unified gateway" type |
+
+> Architecture: [UNIFIED-GATEWAY-ARCH.md](docs/specs/UNIFIED-GATEWAY-ARCH.md) · Client snippets: [guides/GATEWAY-CLIENT-INTEGRATION.md](docs/guides/GATEWAY-CLIENT-INTEGRATION.md)
+
+## Automation
+
+Schedules support **minute-level** times (e.g. `09:37`), multiple times per task, and **random jitter** (±5/15/30 minutes) so runs scatter instead of firing on the hour.
+
+| Side | Tasks |
+| --- | --- |
+| WorkBuddy (6) | Check-in · cat travel · activity map · token keepalive · back-to-school · night owl |
+| Trae (2) | Check-in · automatic JWT renewal |
+| Qoder (2) | Check-in · token keepalive |
+
+Auto-rotation (WorkBuddy only) is a separate background loop, not a schedule entry — see below.
+
+<details>
+<summary><b>Auto-rotation policy (WorkBuddy, prevents credit expiry)</b></summary>
+
+A background loop sets the account used by **subsequent CodeBuddy CLI launches** to the most urgent one (earliest expiry with credits left). Decision order:
+
+1. Valid account (query ok, not expired, credits left)
+2. Urgency (if even the most urgent has more than `min_urgency_hours` left, default 72h → no switch)
+3. Already the target → no switch
+4. Cooldown (`cooldown_minutes`, default 120)
+5. Active guard (conversation within the last `active_guard_minutes`, default 30 → no switch)
+6. Value filter (remaining credits below `min_remaining_credits` → not worth it)
+7. Anti-jitter (gap smaller than `min_gap_hours`, default 24 → no switch)
+
+**Boundary**: only the default account for future sessions changes; the running session is not hot-swapped — reload via ACP or restart the CLI.
+
+</details>
+
+<details>
+<summary><b>App-level capabilities (shared by all six scopes)</b></summary>
+
+| Capability | Notes |
+| --- | --- |
+| App settings (⚙) | Theme (light / dark / pure black OLED / system), UI language (简体中文 / English), silent start to tray, close-to-tray, auto-update |
+| Global backup & restore | Covers every scope at once, selectable by accounts / config / gateway, **no credentials by default** |
+| Skill manager | Scans `skills/*/SKILL.md`, toggles each entry (line-level rewrite, other bytes preserved), moves entries across regions, imports from zip |
+| Client settings hosting | Reads and writes the upstream client's own `settings.json`: six-slot spec table, format fingerprint, minimal byte-level patch, backup / restore / diff |
+| Session overlay (desktop only) | A small always-on-top window with cross-source task states; read-only, click to focus the original session |
+| Client session watching (off by default) | Installs a hook into WorkBuddy's `settings.json` and streams task states into the overlay (receiver `127.0.0.1:57893`) |
+| Runtime log | This tool's **own** log (`~/.buddy-switch/logs/runtime-YYYY-MM-DD.log`), readable in Settings → logs with level / date / keyword filters, copy, open-folder and clear. Kept 7 days, capped at 4 MiB per part and 4 parts per day; credentials are redacted before writing. Set `BUDDY_SWITCH_LOG_LEVEL=debug` (then restart) for per-request detail |
+
+</details>
+
+## Data and privacy
+
+- Everything lives in `~/.buddy-switch/` on this machine; nothing is uploaded. UI preferences stay local too.
+- Account stores are per scope (e.g. `accounts.json` / `accounts.global.json`, `trae/checkin_accounts*.json`).
+- Exported backups contain **no tokens by default**; plaintext tokens require an explicit checkbox plus a second confirmation, with a warning that the file can be used to sign in directly.
+- Gateway keys store only a hash and a prefix; **local data is never committed**, and token patterns are scanned before release.
+- The runtime log stays on this machine and **redacts credentials before writing** (token parameters, `Bearer` values and JWTs). Local paths are kept as-is, since that is what makes a bug report actionable.
+
+## Development
+
+```mermaid
+flowchart TB
+    FE["src/ · React 19 + Vite<br/>6 destinations · api.ts dual channel"] --> H["Hosts: Tauri commands | HTTP (axum)"]
+    H --> CORE["crates/buddy-switch-core<br/>accounts · auth · check-in · sessions · scopes"]
+    H --> GW["crates/buddy-switch-gateway<br/>WB / Trae / Qoder / unified"]
+    CORE --> DATA[("~/.buddy-switch/")]
+    GW --> DATA
+```
+
+```bash
+npm install
+npm run tauri dev     # desktop development
+npm run build         # frontend build + contract / scope / platform gates
+npm run check:api     # API contract check only
+```
 
 ```
 crates/
-  buddy-switch-core/     # core logic: accounts, auth, OAuth, processes, switching, sessions, check-in, refresh, regions and the Trae module
-  buddy-switch-gateway/  # OpenAI / Anthropic compatible gateway (one implementation each for WorkBuddy and Trae)
-  buddy-switch-server/   # HTTP server + CLI (axum API + rust-embed embedded frontend)
-src-tauri/               # desktop host (thin Tauri command wrappers + tray)
-src/                     # frontend: components / pages / lib (api.ts dual channel: Tauri invoke or HTTP fetch)
-npm/                     # npm packages (**not published yet**): main package @kingkadienm/buddy-switch + 5 platform packages
+  buddy-switch-core/     # accounts, auth, OAuth, processes, switching, sessions, check-in, regions, Trae / Qoder modules
+  buddy-switch-gateway/  # OpenAI / Anthropic compatible gateways (four implementations)
+  buddy-switch-server/   # HTTP server + CLI (axum API + rust-embed frontend)
+src-tauri/               # desktop host (thin Tauri wrappers + tray + gateway hosts)
+src/                     # frontend: components / pages / lib / locales
+npm/                     # npm packages (not published yet)
 ```
+
+## Docs
+
+The full index lives in [docs/README.md](docs/README.md) — split by lifecycle: guides / living specs / read-only history / prototype. The ones you will open most:
+
+| Document | What it covers |
+| --- | --- |
+| [guides/DEVELOPMENT.md](docs/guides/DEVELOPMENT.md) | Requirements, local development, gate list, release process, layout conventions |
+| [guides/DOCKER.md](docs/guides/DOCKER.md) | Container deployment: prebuilt image / source build, ports and security, troubleshooting |
+| [guides/GATEWAY-CLIENT-INTEGRATION.md](docs/guides/GATEWAY-CLIENT-INTEGRATION.md) | Wiring Codex / Claude Code / other clients to the local gateway |
+| [specs/](docs/specs/) | Living architecture and decisions (read before changing code) |
+| [policies/](docs/policies/) | License and disclaimer |
 
 ## Contributing
 
-**Contributions of every kind are welcome — pull requests included.** Issues, documentation, bug fixes and features all count — see **[CONTRIBUTING.en.md](CONTRIBUTING.en.md)** ([简体中文](CONTRIBUTING.md)) for the full guide: what you can work on, the PR checklist and this repository's code conventions.
+**This project has grown through contributions**: the Qoder platform, the unified gateway, schedule jitter and the multilingual READMEs all came from issues and pull requests. You do not need to be an expert to help.
 
-## Support the project
+| | |
+| --- | --- |
+| 🐞 **Report a bug** | Include the version and a screenshot of the log: [open an issue](https://github.com/NextAgentX/qoder-trae-workbuddy-switch/issues/new) |
+| 🧩 **Add a platform** | Platform differences are declared once in `src/lib/platforms/registry.ts` and `product.rs`; page components stay untouched. |
+| 🌍 **Fix translations** | UI copy lives in `src/locales/domains/*.zh.ts` ↔ `*.en.ts`; corrections to the eight READMEs are welcome too. |
+| 📸 **Refresh screenshots** | One command re-shoots every light/dark image — see the header of `scripts/gen-readme-shots.mjs`. |
+| 🧪 **Add a test** | Most guard tests in this repo were added by contributors; start from the gate list in `docs/guides/DEVELOPMENT.md`. |
 
-If Buddy Switch has been useful to you, you can buy the author a drink ☕
-
-<table>
-  <thead>
-    <tr>
-      <th>WeChat Pay</th>
-      <th>Alipay</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td><img src="docs/images/donate-wechat.png" alt="WeChat Pay QR code" width="260" /></td>
-      <td><img src="docs/images/donate-alipay.jpg" alt="Alipay QR code" width="260" /></td>
-    </tr>
-  </tbody>
-</table>
-
+Full guide (what to work on, PR checklist, code conventions): **[CONTRIBUTING.en.md](CONTRIBUTING.en.md)** ([简体中文](CONTRIBUTING.md)).
 
 ## Acknowledgements
 
-This project drew on the following open-source projects during its development. Thanks to their authors:
+- [changexbc/workbuddy-switch](https://github.com/changexbc/workbuddy-switch) — for the WorkBuddy account data format and the multi-account switching approach.
+- [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) — for the idea of exposing model quota as an OpenAI-compatible service.
 
-- [changexbc/workbuddy-switch](https://github.com/changexbc/workbuddy-switch) — for the WorkBuddy account data format and the general approach to multi-account switching.
-- [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) — for the idea of exposing WorkBuddy model quota as an OpenAI-compatible API service.
+Each project follows its own license. This project is an independent implementation with no affiliation, partnership or endorsement relationship with them; all names and trademarks belong to their respective owners.
 
-Each of those projects is governed by its own license. This project is an independent implementation with no affiliation, partnership or endorsement relationship with any of them, and all names and trademarks belong to their respective owners. This project has its own codebase, release channel and data directory, and does not replace, overwrite or rewrite any other project's update source or data directory.
+## Related projects
+
+- **[NextAgentX/omni-game-studio-codex](https://github.com/NextAgentX/omni-game-studio-codex)** — a **game-development studio plugin for Codex**: 20 skills covering design, engine engineering (Cocos / Unity / Godot / Unreal), art and audio production, QA and release, plus a software-copyright filing pipeline; G1–G5 milestones and document gates push Codex towards a runnable build rather than a paper plan.
+
+These are independent projects in the same ecosystem. There is no affiliation, partnership or endorsement relationship, and each follows its own license.
+
+## Support this project
+
+Buddy Switch is free, open source, and licensed for noncommercial use only. If it saves you a few minutes a day, you can buy the author a drink:
+
+<table>
+  <tr>
+    <td align="center"><img src="docs/images/donate-wechat.png" alt="WeChat Pay QR code" width="220" /><br /><sub>WeChat Pay</sub></td>
+    <td align="center"><img src="docs/images/donate-alipay.jpg" alt="Alipay QR code" width="220" /><br /><sub>Alipay</sub></td>
+  </tr>
+</table>
+
+Or support via **[Afdian](https://ifdian.net/a/NextAgentX)**.
+
+No money needed either: **starring the repo** helps just as much — it is the main reason this project keeps getting maintained.
+
+> **Donations are unrelated to functionality**: every feature is the same for everyone, and donating **does not unlock, affect or change** any feature or licence. Donations are voluntary gifts: not a purchase, subscription, paid service, commercial licence or support commitment, and they create no consideration of any kind; donating buys no priority response, custom development or extra entitlement. Licensing and terms of use remain governed solely by [LICENSE](./LICENSE) — see [License](#license).
 
 ## Disclaimer
 
-By using this project you acknowledge that you have read, understood and agreed to all of the terms below. If you do not agree, stop using it and uninstall it immediately.
-
-The full text lives in **[docs/DISCLAIMER.en.md](docs/DISCLAIMER.en.md)** ([简体中文](docs/DISCLAIMER.md)) and covers six sections: unofficial third-party tool; terms of service and compliance; data writes and backups; risks of automated behaviour; API gateway exposure risks; provided "as is".
+Full text in **[docs/policies/DISCLAIMER.en.md](docs/policies/DISCLAIMER.en.md)** ([简体中文](docs/policies/DISCLAIMER.md)), seven sections: unofficial third-party tool; terms of service and compliance; data writes and backups; risks of automated behaviour; API gateway exposure; provided "as is"; restrictions on use (no commercial use, no resale or sharing of quota). Using the project means you have read and agree to them; if not, stop using it and uninstall.
 
 ## License
 
-This project is licensed under the **[PolyForm Noncommercial License 1.0.0](./LICENSE)**: **noncommercial use is permitted, commercial use is not licensed** (commercial use requires prior written authorization from the author).
+**[PolyForm Noncommercial License 1.0.0](./LICENSE)**: noncommercial use is permitted, **commercial use is not licensed**.
 
 - Full text: [LICENSE](./LICENSE)
-- Plain-language summary, what is permitted and what is not, FAQ, and the MIT note for versions before 2026-09-22: [docs/LICENSING.en.md](docs/LICENSING.en.md)
-- For commercial licensing, please contact the author via this repository's Issues.
+- Plain-language summary and FAQ: [docs/policies/LICENSING.en.md](docs/policies/LICENSING.en.md) ([简体中文](docs/policies/LICENSING.md))
+- For commercial licensing, contact the author via this repository's Issues.
+- **Donations are unrelated to licensing**: they are voluntary gifts, not a purchase, a commercial licence, or any promise of service.
+- This is a **personal project**: no commercial support, no SLA, no maintenance commitment. Issues and PRs get a best-effort response, without any guaranteed turnaround.
 
-## Star History
+## Star history
 
-<a href="https://www.star-history.com/?repos=kingkadienm%2Ftrae-workbuddy-switch&type=date&legend=top-left">
+<a href="https://www.star-history.com/?repos=NextAgentX%2Fqoder-trae-workbuddy-switch&type=date&legend=top-left">
+
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=kingkadienm/trae-workbuddy-switch&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=kingkadienm/trae-workbuddy-switch&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=kingkadienm/trae-workbuddy-switch&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=NextAgentX/qoder-trae-workbuddy-switch&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=NextAgentX/qoder-trae-workbuddy-switch&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=NextAgentX/qoder-trae-workbuddy-switch&type=date&legend=top-left" />
  </picture>
 </a>

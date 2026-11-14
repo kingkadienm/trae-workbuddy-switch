@@ -1,0 +1,358 @@
+/** 文案域：Qoder 产品线 · 页面（英文）。键与 `qoderPages.zh.ts` 一一对应。 */
+export const en = {
+  "qoder.page.accounts.title": "Accounts",
+  // The page-head subtitle uses the shared `pageHead.accounts` formula
+  // ("{scope} · {n} accounts · {m} need attention") — same as WB / Trae.
+
+  "qoder.page.accounts.sectionAria": "Qoder account list ({count} accounts)",
+  "qoder.page.accounts.loadFailed": "Failed to load the account list",
+  "qoder.page.accounts.recheck": "Check again",
+
+  "qoder.page.accounts.empty.title": "No Qoder account in this realm yet",
+  "qoder.page.accounts.empty.description":
+    "Import from a signed-in Qoder client on this machine, or paste a PAT.",
+  "qoder.page.accounts.empty.action": "Add account",
+  "qoder.page.accounts.empty.sources": "Sources on this machine",
+
+  "qoder.page.accounts.import.description":
+    "Read-only probe of the desktop app and CLI sessions. No client file is modified.",
+  "qoder.page.accounts.import.result": "{imported} added, {updated} updated",
+  "qoder.page.accounts.import.none": "Neither source has an importable account",
+
+  "qoder.page.accounts.source.missing": "Not found",
+  "qoder.page.accounts.source.unreadable": "Unreadable",
+  "qoder.page.accounts.source.empty": "No account inside",
+  "qoder.page.accounts.source.ready": "Importable",
+
+  "qoder.page.accounts.pat.title": "Paste a PAT",
+  "qoder.page.accounts.pat.description":
+    "Personal access token (starts with pt-). For machines without a client, or when the client session cannot be read.",
+  "qoder.page.accounts.pat.placeholder": "pt-…",
+  "qoder.page.accounts.pat.action": "Import",
+  "qoder.page.accounts.pat.invalid": "Wrong prefix: a PAT starts with pt-",
+  "qoder.page.accounts.pat.cancel": "Cancel",
+
+  // ---- Card / table / toolbar (slots of `accountCard` / `tableView` / `viewAccounts`) ----
+  "qoder.page.accounts.chip.ok": "Credential usable",
+  "qoder.page.accounts.chip.noCredential": "No usable credential",
+  "qoder.page.accounts.chip.unrecognized": "Credential unrecognized",
+  "qoder.page.accounts.chip.foreign": "Wrong realm",
+  "qoder.page.accounts.chip.foreignTip":
+    "This account's domain does not belong to the current realm (possibly imported by mistake)",
+
+  "qoder.page.accounts.card.manageAria": "More actions for {name}",
+  "qoder.page.accounts.card.moreActions": "More actions",
+  "qoder.page.accounts.card.viewDetail": "View details",
+  "qoder.page.accounts.card.checkin": "Manual check-in",
+  "qoder.page.accounts.card.checkinUnknownHint": "Today's check-in status is unknown — click to query and claim upstream (it will say \"already checked in\" if so)",
+  "qoder.page.accounts.card.editRemark": "Edit remark",
+  "qoder.page.accounts.card.deleteAccount": "Delete account",
+  "qoder.page.accounts.card.selectAria": "Select {name}",
+
+  "qoder.page.accounts.toolbar.sort.name": "Name",
+  "qoder.page.accounts.toolbar.sort.recent": "Recently updated",
+  "qoder.page.accounts.toolbar.group.none": "No grouping",
+  "qoder.page.accounts.toolbar.group.status": "By status",
+  "qoder.page.accounts.toolbar.statusBucket.normal": "Normal",
+  "qoder.page.accounts.toolbar.statusBucket.noCredential": "No usable credential",
+  "qoder.page.accounts.toolbar.statusBucket.unrecognized": "Credential unrecognized",
+
+  "qoder.page.accounts.table.account": "Account",
+  "qoder.page.accounts.table.status": "Status",
+  "qoder.page.accounts.table.source": "Source",
+  "qoder.page.accounts.table.remark": "Remark",
+
+  // ---- Detail drawer (`drawerAccount`: account info + remark edited **inside the drawer**) ----
+  "qoder.page.accounts.drawer.subtitle": "{name} · UID {uid}",
+  "qoder.page.accounts.drawer.info": "Account info",
+  "qoder.page.accounts.drawer.uid": "UID",
+  "qoder.page.accounts.drawer.domain": "Domain",
+  "qoder.page.accounts.drawer.source": "Source",
+  "qoder.page.accounts.drawer.addedAt": "Added at",
+  "qoder.page.accounts.drawer.updatedAt": "Last updated",
+  "qoder.page.accounts.drawer.credential": "Credential",
+  "qoder.page.accounts.drawer.accessToken": "Access token",
+
+  // ---- Deletion (Qoder deletes **permanently**, no recycle bin ⇒ never claim "restorable") ----
+  "qoder.page.accounts.removed": "Deleted {name}",
+  "qoder.page.accounts.domainMismatch": "Belongs to a different realm",
+  "qoder.page.accounts.delete.title": "Delete account",
+  "qoder.page.accounts.delete.desc": "Delete “{name}”? It moves to the recycle bin and can be restored.",
+  "qoder.page.accounts.delete.batchTitle": "Delete selected accounts",
+  "qoder.page.accounts.delete.batchDesc": "Delete the {n} selected accounts? They move to the recycle bin and can be restored.",
+  "qoder.page.accounts.delete.confirm": "Delete",
+  "qoder.page.accounts.delete.cancel": "Cancel",
+  "qoder.page.accounts.delete.done": "Deleted {n} accounts",
+  "qoder.page.accounts.delete.partial": "Deleted {ok}, {fail} failed",
+
+  "qoder.page.accounts.remark.saved": "Remark saved",
+  "qoder.page.accounts.remark.missing": "That account is no longer in the store — remark not saved",
+
+  // Source ids are backend data (`qoder::account::SOURCE_*`); unknown values render as-is.
+  "qoder.page.accounts.origin.pat": "Imported via PAT",
+  "qoder.page.accounts.origin.desktopApp": "Imported from desktop app",
+  "qoder.page.accounts.origin.cli": "Imported from CLI",
+  "qoder.page.accounts.origin.oauth": "Device-code sign-in",
+
+  // ── Program slots / switching / nickname / group (added 2026-10-15) ──
+  "qoder.page.accounts.program.desktop": "Qoder Desktop",
+  "qoder.page.accounts.program.cli": "Qoder CLI",
+  "qoder.page.accounts.program.current": "Signed in",
+  "qoder.page.accounts.program.switchTo": "Switch to this account",
+  "qoder.page.accounts.program.running": "Client is running",
+  "qoder.page.accounts.program.runningHint": "The client is running — it will be closed before switching (closing its window does not quit it; it usually stays in the system tray).",
+  "qoder.page.accounts.program.missing": "Not detected",
+  "qoder.page.accounts.program.unreadable": "Unreadable",
+  "qoder.page.accounts.program.empty": "Not signed in",
+  "qoder.page.accounts.switch.title": "Switch account",
+  "qoder.page.accounts.switch.desc":
+    "Write the credentials of “{name}” into {program}. The current sign-in state is backed up first; a failed verification restores it automatically.",
+  "qoder.page.accounts.switch.runningDesc":
+    "{program} is running (closing its window does not quit it — it usually stays in the system tray). Continuing closes it first and then writes the sign-in state; unsaved work there may be lost.",
+  "qoder.page.accounts.switch.confirm": "Switch",
+  "qoder.page.accounts.switch.closeAndSwitch": "Close {program} and continue",
+  "qoder.page.accounts.switch.cancel": "Cancel",
+  "qoder.page.accounts.switch.done": "Switched to {name}",
+  "qoder.page.accounts.switch.backup": "Previous sign-in state backed up to {path}",
+  "qoder.page.accounts.group.saved": "Group saved",
+  "qoder.page.accounts.group.missing": "This account is no longer in the library — group not saved",
+  "qoder.page.accounts.toolbar.group.group": "By group",
+  "qoder.page.accounts.toolbar.group.program": "By program slot",
+  "qoder.page.accounts.toolbar.programBucket.none": "Not signed in to any program slot",
+  "qoder.page.accounts.toolbar.groupBucket.ungrouped": "Ungrouped",
+  "qoder.page.accounts.card.setGroup": "Set group",
+
+  // ── Usage (unit is credits, not tokens) ──
+  "qoder.page.usage.unit.credits": "Credits",
+  "qoder.page.usage.sourceNote":
+    "Data comes from the local Qoder client session records. Qoder bills in credits and the client records a token count of 0 — so this view reports credits, not tokens.",
+  "qoder.page.usage.totals.credits": "Total credits",
+  "qoder.page.usage.totals.requests": "Requests",
+  "qoder.page.usage.totals.sessions": "Sessions",
+  "qoder.page.usage.totals.models": "Models",
+  "qoder.page.usage.totals.sessionsCustomHint": "Custom ranges cannot de-duplicate sessions",
+  "qoder.page.usage.totals.sessionsGatewayHint":
+    "The gateway ledger has no session ids — switch to the Sessions view for account / endpoint breakdown",
+  // ---- Ledger (issue #63 platform parity) ----
+  "qoder.page.usage.ledger.gatewayNote":
+    "You are reading the gateway book: only calls relayed through the local Qoder gateway are counted (recorded incrementally every 2 minutes, kept for 90 days). Chats made directly in the IDE without the gateway are not in this book.",
+  "qoder.page.usage.ledger.bothNote":
+    "\"All\" adds the two books day by day — a call that both appears in the client records and went through the gateway is counted twice; switch to a single book for exact figures.",
+  "qoder.page.usage.models.count": "Models",
+  "qoder.page.usage.models.top": "Top model",
+  "qoder.page.usage.models.topShare": "Top share",
+  "qoder.page.usage.models.stacked": "Daily model mix",
+  "qoder.page.usage.models.ranking": "Model ranking",
+  "qoder.page.usage.models.other": "Other",
+  "qoder.page.usage.models.empty": "No model-level usage in this window",
+  "qoder.page.usage.sessions.count": "Sessions",
+  "qoder.page.usage.sessions.top": "Top session",
+  "qoder.page.usage.sessions.avg": "Avg per session",
+  "qoder.page.usage.sessions.list": "Session ranking",
+  "qoder.page.usage.sessions.empty": "No sessions in this window",
+  "qoder.page.usage.sessions.untitled": "Session {id}",
+  "qoder.page.usage.sessions.requests": "{n} requests",
+  "qoder.page.usage.sessions.range": "{from} → {to}",
+  "qoder.page.usage.sessions.capped": "Sorted by credits, up to {n} sessions",
+  "qoder.page.usage.sessions.note": "Qoder has no session-copy capability: this is a read-only view of this machine's client sessions; other devices and gateway calls are not included.",
+  "qoder.page.usage.creditsView.remaining": "Remaining",
+  "qoder.page.usage.creditsView.total": "Quota total",
+  "qoder.page.usage.creditsView.okAccounts": "Accounts OK",
+  "qoder.page.usage.creditsView.failedAccounts": "Failed",
+  "qoder.page.usage.creditsView.perAccount": "Balance per account",
+  "qoder.page.usage.creditsView.value": "{remaining} / {total}",
+  "qoder.page.usage.creditsView.exceeded": "Exceeded",
+  "qoder.page.usage.creditsView.plan": "Plan {plan}",
+  "qoder.page.usage.creditsView.note": "This is a **live balance snapshot** (queried upstream), not daily usage; quota resets by upstream rules.",
+  "qoder.page.usage.creditsView.empty": "No accounts in this region yet — import one on the Accounts page to see balances.",
+  "qoder.page.usage.creditsView.loadFailed": "Couldn't read balances",
+  "qoder.page.usage.creditsView.rowFailed": "Failed: {error}",
+  "qoder.page.usage.creditsView.partial": "{n} accounts failed (others shown as usual)",
+  "qoder.page.usage.creditsView.reload": "Query again",
+  "qoder.page.usage.trend": "Daily credits",
+  "qoder.page.usage.empty.title": "No usage in this window",
+  "qoder.page.usage.empty.description": "No request in the local client session records falls inside this window.",
+  "qoder.page.usage.missing.title": "No client session records found",
+  "qoder.page.usage.missing.description":
+    "There is no Qoder client session directory on this machine ({path}) — install the client and have at least one conversation.",
+  "qoder.page.usage.loadFailed": "Failed to read usage",
+  "qoder.page.usage.recheck": "Reload",
+  "qoder.page.usage.creditsValue": "{value} credits",
+  "qoder.page.usage.caption": "{total} credits total · {peak} peak day",
+
+  // ── OAuth device authorization (added 2026-10-15: the capability was declared long ago) ──
+  "qoder.page.accounts.oauth.title": "Device-code sign-in",
+  "qoder.page.accounts.oauth.description":
+    "Authorize Qoder in your browser; the account is collected here automatically. The two realms use different authorization pages, chosen by the current scope.",
+  "qoder.page.accounts.oauth.start": "Start sign-in",
+  "qoder.page.accounts.oauth.starting": "Starting…",
+  "qoder.page.accounts.oauth.collected": "Account collected: {name}",
+  "qoder.page.accounts.oauth.failed": "Sign-in failed",
+  "qoder.page.accounts.oauth.close": "Close",
+
+  // ── Recycle bin (soft delete) ──
+  "qoder.page.accounts.trash.restored": "Restored {name}",
+  "qoder.page.accounts.trash.undo": "Undo",
+
+  // ── Check-in / quota (backend was ready; there was no UI entry) ──
+  "qoder.page.accounts.chip.checkedIn": "Checked in today",
+  "qoder.page.accounts.chip.notCheckedIn": "Not checked in today",
+  /* Credential expired — the new branch of the status slot (previously Qoder only checked
+     `hasCredential` / `unrecognized`, so a long-expired token still read "Credential usable"). */
+  "qoder.page.accounts.chip.expired": "Credentials expired",
+  "qoder.page.accounts.chip.checkinUnavailable": "Check-in unavailable",
+  "qoder.page.accounts.chip.priority": "Priority",
+  "qoder.page.accounts.chip.priorityTip": "Recommended priority",
+  "qoder.page.accounts.chip.toolsInUse": "{n} tools in use",
+  "qoder.page.accounts.metric.credits": "Credits",
+  // Expiry badge (issue #166): warning = expiring soon (7-day window, same as WB / Trae).
+  // Badge reports the **closest-expiring batch only**; per-batch absolute timestamps go in the tooltip.
+  "qoder.page.accounts.metric.expiringChip": "Closest expiry in {days} days · {amount} credits",
+  /* Within 48 hours the badge speaks in hours, so 25h and 47h stay distinguishable. */
+  "qoder.page.accounts.metric.expiringChipHours": "Closest expiry in {hours} hrs · {amount} credits",
+  "qoder.page.accounts.metric.expiringTipTitle": "Expiring batches ({n})",
+  "qoder.page.accounts.metric.expiringTipLine": "{time} · {amount} credits",
+
+  // ---- Web-session credit packs (issue #111) ----
+  "qoder.page.accounts.web.loginMenu": "Sign in to Qoder web (per-pack detail)",
+  "qoder.page.accounts.web.loginToast": "Sign-in window opened. Per-pack detail is read automatically once you sign in; you can also close the window and click \"Read per-pack detail\".",
+  "qoder.page.accounts.web.read": "Signed in — read per-pack detail",
+  "qoder.page.accounts.web.readDone": "Read {n} resource packs",
+  "qoder.page.accounts.web.readFailed": "No per-pack detail yet. Make sure the sign-in window finished signing in, then retry.",
+  "qoder.page.accounts.web.readMismatch": "The sign-in window was authenticated as a different account; that session was discarded.",
+  "qoder.page.accounts.web.packsNotice": "Per-pack detail needs a one-time web sign-in (the session stays on this machine). Showing aggregate credits for now.",
+  "qoder.page.accounts.web.packsNoticeReady": "{n} packs · web session stored on this machine",
+  "qoder.page.accounts.web.logout": "Sign out of web",
+  "qoder.page.accounts.web.logoutDone": "Web session cleared from this machine",
+  "qoder.page.accounts.web.sourcePlan": "Plan quota",
+  "qoder.page.accounts.web.sourceBonus": "Bonus pack",
+  "qoder.page.accounts.web.sourceDedicated": "Dedicated pack",
+  "qoder.page.accounts.web.sourceOther": "Resource pack",
+  "qoder.page.accounts.web.neverExpires": "No expiry",
+  "qoder.page.accounts.web.expired": "Expired",
+  "qoder.page.accounts.web.packName": "{source} · {n}",
+  "qoder.page.accounts.web.triggerUnsupported": "Desktop only",
+  "qoder.page.accounts.web.triggerLoading": "Loading…",
+  "qoder.page.accounts.web.triggerPacks": "{n} packs",
+  "qoder.page.accounts.web.triggerNeutral": "Packs",
+  "qoder.page.accounts.web.triggerNoSession": "Packs · not signed in",
+  "qoder.page.accounts.web.triggerHint": "View per-pack detail",
+  "qoder.page.accounts.web.title": "Per-pack detail",
+  "qoder.page.accounts.web.summary": "{n} packs · {remaining} left",
+  "qoder.page.accounts.web.loading": "Loading…",
+  "qoder.page.accounts.web.used": "{n} used",
+  "qoder.page.accounts.web.noUsablePacks": "No packs with remaining credits",
+  "qoder.page.accounts.web.expiresAt": "Expires {date}",
+  "qoder.page.accounts.web.state.noSession": "Not signed in to Qoder web",
+  "qoder.page.accounts.web.state.noSessionHint": "Per-pack detail lives behind the web endpoint. Sign in there once and it will be remembered.",
+  "qoder.page.accounts.web.state.expired": "Web session expired",
+  "qoder.page.accounts.web.state.expiredHint": "Sign in again — the account itself is fine.",
+  "qoder.page.accounts.web.state.mismatch": "Web session belongs to another account",
+  "qoder.page.accounts.web.state.mismatchHint": "The sign-in window was authenticated as a different account, so the session was discarded. Please sign in again.",
+  "qoder.page.accounts.web.state.upstream": "Upstream did not respond",
+  "qoder.page.accounts.web.state.upstreamHint": "This is not a sign-in problem. Retry later; the session is kept.",
+  "qoder.page.accounts.web.state.unknown": "No per-pack data yet",
+  "qoder.page.accounts.web.state.unknownHint": "Sign in to the web console to see how much each credit pack has left and when it expires.",
+  "qoder.page.accounts.web.state.unsupported": "Per-pack unavailable in this build",
+  "qoder.page.accounts.web.state.unsupportedHint": "Per-pack needs an embedded browser to capture the web session, so it is desktop-only. Aggregate credits work everywhere.",
+
+
+  "qoder.page.accounts.metric.plan": "Plan",
+  "qoder.page.accounts.checkin.done": "{name} checked in",
+  "qoder.page.accounts.checkin.batchPartial": "{ok} succeeded, {fail} failed",
+  "qoder.page.accounts.checkin.resultFail": "{n} failed",
+  "qoder.page.accounts.pro.title": "Pro upgrade pack",
+  "qoder.page.accounts.pro.desc": "One-time perk: claim +1800 credits",
+  "qoder.page.accounts.pro.claim": "Claim",
+  "qoder.page.accounts.pro.claiming": "Claiming…",
+  "qoder.page.accounts.pro.claimed": "Claimed",
+  "qoder.page.accounts.checkin.noticeUnreadable": "Couldn't read check-in status: {error}",
+  "qoder.page.accounts.checkin.noticeNoMachine": "The official client's machine identity was not found, so check-in campaigns may be hidden in this region (check-in only — model relay is unaffected).",
+  "qoder.page.accounts.checkin.noticeNoCampaign": "No claimable check-in campaign right now (resets daily at 10:00).",
+  "qoder.page.accounts.refresh.done": "Token refreshed for {name}",
+  "qoder.page.accounts.refresh.batchDone": "Refreshed tokens for {n} accounts",
+
+  "qoder.page.accounts.toolbar.sort.credits": "Credit balance",
+
+  "qoder.page.pending.title": "This page is not wired for Qoder yet",
+  "qoder.page.pending.description":
+    "Account management, overview and settings are available for Qoder; usage / gateway depend on gateway request logs and the usage ledger, which are not landed yet.",
+  "qoder.page.pending.action": "Go to accounts",
+
+  // ---- Overview ----
+  "qoder.page.overview.title": "Overview",
+  "qoder.page.overview.subtitle": "{scope} · accounts and local clients; usage and gateway not landed yet",
+  "qoder.page.overview.error": "Failed to load: {error}",
+  "qoder.page.overview.kpi.aria": "Qoder overview statistics",
+  "qoder.page.overview.kpi.accounts": "Accounts",
+  "qoder.page.overview.kpi.accountsHint": "All belong to this realm",
+  "qoder.page.overview.kpi.accountsForeign": "{n} of them belong to another realm",
+  "qoder.page.overview.kpi.accountsTitle": "Number of entries in this realm's account store",
+  "qoder.page.overview.kpi.clients": "Local clients",
+  "qoder.page.overview.kpi.clientsReady": "Has an importable session",
+  "qoder.page.overview.kpi.clientsNone": "Neither location detected",
+  "qoder.page.overview.kpi.clientsHint": "Probe result for desktop / CLI",
+  "qoder.page.overview.kpi.clientsTitle":
+    "How many of the two official credential stores hold a usable account",
+  "qoder.page.overview.kpi.domain": "Realm domain",
+  "qoder.page.overview.kpi.domainHint": "Account store and requests are split by it",
+  "qoder.page.overview.kpi.domainTitle":
+    "The official domain of this realm — the two realms are separate stores",
+  "qoder.page.overview.kpi.usage": "Credits recorded today",
+  "qoder.page.overview.kpi.usageHint": "From this machine's client session records (no other devices or third-party calls)",
+  "qoder.page.overview.kpi.usageTitle":
+    "Daily tokens and credits come from gateway request logs and a local credit cache, neither of which is landed; unknown shows “—” rather than 0",
+  "qoder.page.overview.clients.title": "Local credential sources",
+  "qoder.page.overview.clients.description": "Read-only probe; nothing is persisted and no client file is modified.",
+  "qoder.page.overview.clients.action": "Go to accounts",
+  "qoder.page.overview.accounts.title": "Accounts",
+  "qoder.page.overview.accounts.description": "One of the two realm-split account stores.",
+  "qoder.page.overview.accounts.action": "Go to accounts",
+  "qoder.page.overview.accounts.more": "{n} more",
+  "qoder.page.overview.accounts.empty":
+    "No account in this realm yet — open the accounts page to import from this machine or paste a PAT.",
+  "qoder.page.overview.pending.title": "Usage and gateway are not landed yet",
+  "qoder.page.overview.pending.description":
+    "Daily tokens, credits and request logs all come from the gateway; until it is wired this page shows no placeholder KPIs.",
+  "qoder.page.overview.pending.action": "Go to accounts",
+
+  // ---- Settings ----
+  "qoder.page.settings.title": "Settings",
+  // ---- Settings · Network (per-pack outbound proxy, issue #111) ----
+  "qoder.page.settings.proxy.group": "Per-pack outbound proxy",
+  "qoder.page.settings.proxy.cn": "China proxy",
+  "qoder.page.settings.proxy.cnHint": "China region works via direct connection; usually leave empty.",
+  "qoder.page.settings.proxy.global": "International proxy",
+  "qoder.page.settings.proxy.globalHint": "International endpoints judge region by IP; direct connections from CN networks get blocked, so a proxy is usually required.",
+  "qoder.page.settings.proxy.note": "Applies only to per-pack detail requests (http:// or socks5://). The sign-in window follows the system proxy and is not affected. Saves take effect immediately.",
+  "qoder.page.settings.proxy.save": "Save proxy",
+  "qoder.page.settings.proxy.saving": "Saving…",
+  "qoder.page.settings.proxy.saved": "Proxy settings saved",
+  "qoder.page.settings.proxy.saveFailed": "Failed to save proxy settings",
+  "qoder.page.settings.section.client": "Client detection",
+  "qoder.page.settings.client.description": "Probe result for the two official credential stores (read-only).",
+  "qoder.page.settings.client.error": "Probe failed: {error}",
+  // ★ Scheduled tasks (Qoder has two; the schedule config is a single global file)
+  "qoder.page.settings.schedule.checkinGroup": "Auto check-in",
+  "qoder.page.settings.schedule.checkinEnable": "Check in on schedule",
+  "qoder.page.settings.schedule.checkinDesc":
+    "Claims the campaign credit reward at the configured times (off by default — it acts on your behalf, so it must be opted in).",
+  "qoder.page.settings.schedule.checkinTimesLabel": "Check-in times",
+  "qoder.page.settings.schedule.checkinTimesDesc":
+    "One attempt at each time (local timezone); jitter is applied so it never lands on the same second as the official client.",
+  "qoder.page.settings.schedule.keepaliveGroup": "Token keep-alive",
+  "qoder.page.settings.schedule.keepaliveEnable": "Refresh the token automatically",
+  "qoder.page.settings.schedule.keepaliveDesc":
+    "Refreshes within 48 hours of expiry (on by default: a refresh token exists solely to be refreshed, and you handed it over at login). The window must be longer than the sweep interval (once a day by default); otherwise every sweep decides \"not yet\" and the account expires between sweeps.",
+  "qoder.page.settings.schedule.keepaliveTimesLabel": "Keep-alive times",
+  "qoder.page.settings.schedule.keepaliveTimesDesc": "Checks once at each of these times whether the token is close to expiry.",
+  "qoder.page.settings.schedule.saveFailed": "Failed to save scheduled tasks",
+  "qoder.page.settings.schedule.autoLogSummary":
+    "Last auto check-in: {at} · {ok}/{total} ok · earned {earned}",
+  "qoder.page.settings.schedule.autoLogPending":
+    "Retry scheduled at {at} — the upstream reward only resets at 10:00, so an earlier run can do nothing but re-claim yesterday's instance.",
+  "qoder.page.settings.schedule.autoLogNever":
+    "No runs recorded yet: this schedule has not fired (a catch-up run happens on startup, then at the times above).",
+  "qoder.page.settings.filtered":
+    "Only sections with real content are listed; check-in / gateway / permissions / log settings will appear once those features land (no empty shells are shown up front).",
+} as const;

@@ -1,5 +1,4 @@
-import { useState } from "react";
-import { Coffee, ExternalLink } from "lucide-react";
+import { ExternalLink, Heart, Star } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { useT } from "@/lib/i18n";
@@ -12,7 +11,6 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
-  DialogTrigger,
 } from "@/components/ui/dialog";
 import { GITHUB_REPOSITORY_URL, openReleaseUrl } from "@/lib/update";
 import donateAlipay from "@/assets/donate-alipay.jpeg";
@@ -28,42 +26,48 @@ const DONATE_CHANNELS: { key: string; nameKey: TranslationKey; image: string }[]
 ];
 
 /**
- * 侧栏底部的打赏入口：**位于版本号上方**，点击后弹出收款码。
+ * 爱发电主页（**账号级**，覆盖作者 GitHub 下的所有项目，不限于 Buddy Switch）。
+ *
+ * 只此一处使用，因此不做成 `lib/` 常量 —— 与 `GITHUB_*` 不同，它不参与更新检查、
+ * 不被任何其它模块读取。
+ */
+const IFDIAN_URL = "https://ifdian.net/a/NextAgentX";
+
+/**
+ * 打赏入口：点击后弹出收款码。
+ *
+ * **两个入口共用这一个弹层**：顶栏 ⚙ 菜单项（`app-menu.tsx`）与侧栏底部
+ * 「版本号上方」的整行按钮（`App.tsx` 的 `SidebarDonate`）。两个入口各自持有
+ * 自己的 `open`，因此收款码 UI 只有这一处实现（同款先例见「更新」弹层）。
  *
  * ## 为什么做成弹窗而不是直接铺开两张码
  *
- * 侧栏固定 220px，收款码是竖版海报（约 744×1080），铺开会把版本号与运行状态挤出视野；
- * 而打赏是**低频**操作，不值得长期占据侧栏的固定高度。
+ * 收款码是竖版海报（约 744×1080），铺开会把内容挤出视野；而打赏是**低频**操作，
+ * 不值得长期占据固定高度。
  *
- * ## 为什么入口不做成图标按钮
+ * ## 受控形态
  *
- * 侧栏底部已经有状态圆点与更新按钮两处图标入口，再加一枚无文字图标，
- * 用户只能靠猜。这里用「图标 + 文字」的整行按钮，语义自明。
+ * `open` / `onOpenChange` 由调用方驱动（顶栏 ⚙「应用设置」抽屉里的入口 / 侧栏底部入口）；
+ * 本组件**不自带触发按钮**（与 `SkillManagerDialog` / `ClientSettingsDialog` 同构）。
  */
-export function DonateButton() {
+export function DonateDialog({
+  open,
+  onOpenChange,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
   const t = useT();
-  const [open, setOpen] = useState(false);
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger asChild>
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          className="h-8 w-full justify-start gap-2 rounded-lg px-2 text-xs font-normal text-sidebar-foreground/70 hover:bg-foreground/[0.04] hover:text-sidebar-foreground"
-        >
-          <Coffee className="size-3.5" aria-hidden="true" />
-          {t("wbSettings.donate.trigger")}
-        </Button>
-      </DialogTrigger>
+    <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-xl">
         <DialogHeader>
           <DialogTitle>{t("wbSettings.donate.title")}</DialogTitle>
           <DialogDescription>{t("wbSettings.donate.desc")}</DialogDescription>
         </DialogHeader>
-        {/* 两张收款码的长宽比并不相同（1121×1527 / 1080×1620），若各自按宽度铺满，
-            高度会差出十几像素、下面的渠道名对不齐。这里给**统一高度的容器 + object-contain**：
+        {/* 两张收款码的像素尺寸不同（微信 425×422 / 支付宝 799×803），若各自按宽度铺满，
+            高度会有偏差、下面的渠道名对不齐。这里给**统一高度的容器 + object-contain**：
             图按自身比例缩放到容器内，多出来的部分留白，两张码的视觉高度与说明位置因此一致。
             **不要用 `object-cover`** —— 那会把二维码裁掉边缘，扫不出来。 */}
         <div className="grid grid-cols-2 gap-4">
@@ -80,6 +84,32 @@ export function DonateButton() {
             </figure>
           ))}
         </div>
+        {/* ★ 爱发电：唯一「不扫码」的通道，做成**条状**而不是第三张码 ——
+            它没有收款码图，硬塞进两列 grid 会破等高，且它的主页里本来就带支付入口。
+            位置紧跟收款码：这是「已经决定掏钱」的人的第二选择（境外用户往往只有这一条路）。 */}
+        <button
+          type="button"
+          onClick={() => void openReleaseUrl(IFDIAN_URL)}
+          className="flex flex-wrap items-center justify-center gap-x-2 gap-y-1 rounded-lg border border-border bg-muted/30 px-3 py-2 text-[12.5px] leading-relaxed text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground"
+        >
+          <Heart className="size-3.5 shrink-0 text-rose-500" aria-hidden="true" />
+          <span>{t("wbSettings.donate.ifdianLead")}</span>
+          <span className="shrink-0 font-medium text-primary">
+            {t("wbSettings.donate.ifdianCta")}
+          </span>
+        </button>
+        {/* ★ Star 引导：放在两条打赏入口下方、动作条上方 —— 打开这个弹层的人正处在「愿意支持」
+            的意愿峰值，而 Star 对他是**零成本**动作，转化率天然高于打赏。
+            链接指向仓库首页（Star 按钮在那里），不直连 `/stargazers`（那是名单，不是动作）。 */}
+        <button
+          type="button"
+          onClick={() => void openReleaseUrl(GITHUB_REPOSITORY_URL)}
+          className="flex flex-wrap items-center justify-center gap-x-2 gap-y-1 rounded-lg border border-border bg-muted/30 px-3 py-2 text-[12.5px] leading-relaxed text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground"
+        >
+          <Star className="size-3.5 shrink-0 text-amber-500" aria-hidden="true" />
+          <span>{t("wbSettings.donate.starLead")}</span>
+          <span className="shrink-0 font-medium text-primary">{t("wbSettings.donate.starCta")}</span>
+        </button>
         <DialogFooter className="sm:justify-between">
           <Button
             type="button"

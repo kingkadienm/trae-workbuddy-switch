@@ -28,6 +28,9 @@ const FEATURES: &[&str] = &[
 /// 身份句的匹配串**不带结尾标点**：CLI 版以句号收尾，桌面版以逗号接后继内容，
 /// 去掉标点后两种形态一并覆盖，原有标点由原文保留。
 const REWRITES: &[(&str, &str)] = &[
+    // 上游按**偏移 0 + 忽略大小写**匹配该身份句（实测全小写变体同样被拦），
+    // 而本表是大小写敏感的 `replace`，走表只能覆盖列出的那一种大小写。
+    // 故该句的预检与改写同源走 [`harness_identity_re`]，不进本表也不进 `FEATURES`。
     (
         "You are Claude Code, Anthropic's official CLI for Claude",
         "You are Claude Code, Anthropic's official CLI tool for Claude",
@@ -51,6 +54,29 @@ const REWRITES: &[(&str, &str)] = &[
 
 /// 裸键名兜底替换值（`header` → `hdr`，破坏逐字匹配但保留可读性）。
 const BARE_HEADER_REPLACEMENT: &str = "x-anthropic-billing-hdr";
+
+/// 身份句改写目标：插入冠词 `the` 即破坏逐字匹配，句子仍通顺、语义不变。
+///
+/// 与 `REWRITES` 里 `for Claude` → `for Claude tool` 的改法同构（只多一个词）。
+/// 统一回规范大小写：上游忽略大小写匹配，改写后必须是「不命中」的确定形态。
+const HARNESS_IDENTITY_REPLACEMENT: &str = "You are an AI agent powered by the DeepSeek Harness";
+
+/// `(?i)you are an ai agent powered by deepseek harness` —— 第三方客户端身份句。
+///
+/// 上游对 system / developer 消息**偏移 0** 处以该串做字面匹配，命中即整单返回
+/// HTTP 400 + `code: 11-128`（`Illegal API invocation from an unapproved channel`），
+/// 请求头怎么补都无效。判定特征：**忽略大小写**、后缀任意（句号/逗号皆可）、
+/// 加连字符（`DeepSeek-Harness`）即不命中。
+///
+/// 大小写不敏感是必须的：该句的全部小写形态同样被拦，因此不能走 [`REWRITES`] 表
+/// （`contains` / `replace` 大小写敏感）。预检 [`has_fingerprint`] 与净化
+/// [`sanitize_text`] 共用本正则，避免两处形态判断漂移。
+fn harness_identity_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)you are an ai agent powered by deepseek harness").expect("静态正则合法")
+    })
+}
 
 /// `(?i)x-anthropic-billing-header:[^;\n]*;?\s*` —— 键值形态整段删除。
 fn header_re() -> &'static Regex {
@@ -80,7 +106,9 @@ fn kv_re() -> &'static Regex {
 /// `contains` 大小写敏感、`header_re` 要求冒号，两者都会漏掉「混合大小写 + 裸键名」，
 /// 故必须用不要求冒号的 [`bare_header_re`] 兜底，否则整条净化被跳过。
 pub fn has_fingerprint(text: &str) -> bool {
-    FEATURES.iter().any(|feature| text.contains(feature)) || bare_header_re().is_match(text)
+    FEATURES.iter().any(|feature| text.contains(feature))
+        || bare_header_re().is_match(text)
+        || harness_identity_re().is_match(text)
 }
 
 /// 单段文本净化：预检不中直接返回原串。
@@ -94,6 +122,12 @@ pub fn sanitize_text(text: &str) -> String {
         if out.contains(from) {
             out = out.replace(from, to);
         }
+    }
+
+    if harness_identity_re().is_match(&out) {
+        out = harness_identity_re()
+            .replace_all(&out, HARNESS_IDENTITY_REPLACEMENT)
+            .into_owned();
     }
 
     if header_re().is_match(&out) {
@@ -217,6 +251,77 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// 回归（issue #67）：上游对 system / developer 消息**偏移 0** 处的该身份句做
+    /// 忽略大小写的字面匹配，命中即 400 / `11-128`，请求头怎么补都无效。
+    /// 漏改 = 该客户端的每次请求都失败。
+    ///
+    /// 可证伪：去掉 [`harness_identity_re`] 的 `(?i)`，全小写那条失败；
+    /// 删掉整条规则，三条全失败。
+    #[test]
+    fn harness_identity_line_is_rewritten_in_any_case() {
+        for source in [
+            "You are an AI agent powered by DeepSeek Harness.",
+            "you are an ai agent powered by deepseek harness.\n\nYou are a coding agent.",
+            "YOU ARE AN AI AGENT POWERED BY DEEPSEEK HARNESS",
+        ] {
+            let cleaned = sanitize_text(source);
+            assert!(
+                !cleaned
+                    .to_lowercase()
+                    .contains("powered by deepseek harness"),
+                "改写后不得残留可被逐字匹配的原文: {cleaned}"
+            );
+            assert!(
+                cleaned.contains("powered by the DeepSeek Harness"),
+                "必须插入冠词破坏逐字匹配: {cleaned}"
+            );
+        }
+    }
+
+    #[test]
+    fn harness_identity_rewrite_keeps_the_rest_verbatim() {
+        let text = "You are an AI agent powered by DeepSeek Harness.\n\nYou are a coding agent.";
+        let cleaned = sanitize_text(text);
+        assert!(
+            cleaned.starts_with("You are an AI agent powered by the DeepSeek Harness."),
+            "改写必须发生在偏移 0 且保留原有标点: {cleaned}"
+        );
+        assert!(
+            cleaned.ends_with("You are a coding agent."),
+            "其余内容必须逐字保留: {cleaned}"
+        );
+    }
+
+    /// 预检与改写同源：上游忽略大小写，预检也必须忽略大小写，否则全小写形态
+    /// 在 `has_fingerprint` 处就被判为「无指纹」直接返回原文。
+    #[test]
+    fn harness_identity_is_hit_by_precheck_in_any_case() {
+        assert!(has_fingerprint(
+            "You are an AI agent powered by DeepSeek Harness."
+        ));
+        assert!(has_fingerprint(
+            "you are an ai agent powered by deepseek harness"
+        ));
+        // 加连字符即不触发上游拦截，故刻意不改写（避免无谓改动用户内容）。
+        assert!(!has_fingerprint(
+            "You are an AI agent powered by DeepSeek-Harness."
+        ));
+    }
+
+    /// 护栏：`FEATURES` 预检与 `REWRITES` 规则必须成对。
+    ///
+    /// `sanitize_text` 在预检不中时直接返回原文，只加 `REWRITES` 而不加
+    /// `FEATURES` 会让规则**永远不执行** —— 这类「改了却不生效」的漏改必须拦住。
+    #[test]
+    fn every_rewrite_source_is_covered_by_feature_precheck() {
+        for (from, _) in REWRITES {
+            assert!(
+                has_fingerprint(from),
+                "REWRITES 的匹配串未被预检覆盖，该规则永不生效: {from}"
+            );
+        }
+    }
+
     #[test]
     fn ordinary_text_is_untouched() {
         let text = "正常的一句中英文 mixed content，包含 11101 与 11148 等无关数字。";
@@ -237,7 +342,9 @@ mod tests {
     fn bare_header_key_is_abbreviated_case_insensitively() {
         let cleaned = sanitize_text("see `X-Anthropic-Billing-Header` in docs");
         assert!(
-            !cleaned.to_lowercase().contains("x-anthropic-billing-header"),
+            !cleaned
+                .to_lowercase()
+                .contains("x-anthropic-billing-header"),
             "裸键名必须被改写: {cleaned}"
         );
         assert!(cleaned.contains(BARE_HEADER_REPLACEMENT));
@@ -247,16 +354,20 @@ mod tests {
     fn cc_key_values_are_removed_in_a_loop() {
         let text = "a cc_version=1.2.3; cc_entrypoint=cli; b";
         let cleaned = sanitize_text(text);
-        assert!(!cleaned.contains("cc_version"), "首个键值必须清除: {cleaned}");
-        assert!(!cleaned.contains("cc_entrypoint"), "相邻键值也必须清除: {cleaned}");
+        assert!(
+            !cleaned.contains("cc_version"),
+            "首个键值必须清除: {cleaned}"
+        );
+        assert!(
+            !cleaned.contains("cc_entrypoint"),
+            "相邻键值也必须清除: {cleaned}"
+        );
         assert!(cleaned.contains('a') && cleaned.contains('b'));
     }
 
     #[test]
     fn identity_sentence_is_rewritten_with_one_word() {
-        let cleaned = sanitize_text(
-            "You are Claude Code, Anthropic's official CLI for Claude.",
-        );
+        let cleaned = sanitize_text("You are Claude Code, Anthropic's official CLI for Claude.");
         assert!(cleaned.contains("official CLI tool for Claude"));
         assert!(!cleaned.contains("official CLI for Claude"));
         assert!(cleaned.ends_with('.'), "原有标点必须保留: {cleaned}");

@@ -14,7 +14,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::watch;
 
 use crate::modules::account;
-use crate::modules::catalog::CatalogModel;
+use crate::modules::catalog::{parse_credits_rate, CatalogModel, CatalogReasoning};
 use crate::modules::identity;
 use crate::modules::net;
 use crate::modules::region::{region_spec, CatalogUa, Region};
@@ -45,6 +45,16 @@ pub enum UpstreamErrorKind {
     NotFound,
     /// 服务端错误 → 502。
     Server,
+    /// **传输层超时**（连接 / 读超时，`reqwest::Error::is_timeout()`）。
+    ///
+    /// 与 [`Self::Server`] 分开是因为**处置方式相反**：
+    /// - `Server`（5xx）是上游故障，同一个号重试通常也没用，该换号；
+    /// - `Timeout` 往往是**这个模型 / 这条链路慢**，换号未必有用，而换一个更快的
+    ///   模型（降级链）是有效的。
+    ///
+    /// 混在 `Server` 里会让「请求超时」这一档降级条件永远选不到 ——
+    /// 用户勾了它却不生效，是典型的假开关。
+    Timeout,
     /// 其他客户端错误 → 400。
     Client,
 }
@@ -58,6 +68,7 @@ impl UpstreamErrorKind {
             UpstreamErrorKind::SessionDead => "session_dead",
             UpstreamErrorKind::NotFound => "not_found",
             UpstreamErrorKind::Server => "server",
+            UpstreamErrorKind::Timeout => "timeout",
             UpstreamErrorKind::Client => "client",
         }
     }
@@ -99,6 +110,17 @@ const HARD_CREDIT_MARKERS: &[&str] = &[
     "今日次数已用完",
     "触发限流",
 ];
+
+/// 会话失效标记。
+/// 会话被上游**作废**的标记（出现在响应体里）。
+///
+/// ★ 跨产品线**唯一来源**：WorkBuddy（`gateway::pool::classify_event`）与 Trae
+/// （`gateway::trae::pool::classify_http_with_body` / `classify_solo`）都必须读这一份。
+///
+/// issue #108 的教训：Trae 侧此前**完全不识别** `12153`，于是「真正的会话作废」
+/// 与「access token 过期」共用同一个判据（裸 401）⇒ 只能二选一，怎么选都错。
+/// 必须先能识别作废，才有资格把裸 401 降级为可自愈的浅冷却。
+pub const SESSION_DEAD_MARKERS: &[&str] = &["Offline user session not found", "12153"];
 
 /// 上游失败分类（严格按参考实现的判定顺序）。
 pub fn classify_upstream_error(status: u16, body: &str) -> UpstreamErrorKind {
@@ -219,7 +241,11 @@ fn normalize_tool_choice(obj: &mut Map<String, Value>) {
                         }
                     }
                     let name = name.trim().to_string();
-                    let value = if name.is_empty() { "auto".to_string() } else { name };
+                    let value = if name.is_empty() {
+                        "auto".to_string()
+                    } else {
+                        name
+                    };
                     obj.insert("tool_choice".to_string(), json!(value));
                 }
                 _ => {
@@ -353,6 +379,12 @@ impl UpstreamClient {
         Self { http }
     }
 
+    /// 所有账号复用网关共享出口；账号配置中的旧代理映射不会参与路由。
+    fn client_for_account(&self, acc: &Value) -> Result<reqwest::Client, String> {
+        let _ = acc;
+        Ok(self.http.clone())
+    }
+
     /// POST chat 端点；成功返回原始 SSE 响应。
     ///
     /// CN 直传已规范化的 body；Global 走 [`prepare_international_chat_body`]
@@ -368,45 +400,72 @@ impl UpstreamClient {
             .await
     }
 
-    /// 同 [`Self::chat_stream`]，但允许调用方注入额外出站头（会话头族 / 派生标识）。
+    /// **通用出站**：把一次 POST 送到上游并分类结果。
     ///
-    /// `extra_headers` 在基础头之后写入、在 `User-Agent` 之前写入——即
-    /// **UA 由本函数最终决定**，调用方无法用额外头覆盖它（fail-closed）。
-    /// 空值不写入（避免发出 `X-Foo:` 这类空头）。
-    pub async fn chat_stream_with(
+    /// ★ **2026-10-07 从 [`Self::chat_stream_with`] 抽出** —— 为了让「本地路由」的
+    /// **业务请求转发**（P12 T03）**复用同一条出站路径**，而不是另写一份。
+    ///
+    /// **参数全部由调用方决定**（URL / 头 / body）⇒ 本函数**不含任何协议假设**。
+    /// ⚠️ 唯一约定：**`User-Agent` 由本函数最后写入**（沿用既有 fail-closed 语义 ——
+    /// 调用方无法经 `headers` 覆盖 UA）。
+    pub async fn forward_with(
         &self,
-        region: Region,
-        acc: &Value,
-        body_json: &str,
+        url: &str,
+        headers: HashMap<String, String>,
+        body: String,
         signal: Option<watch::Receiver<bool>>,
-        extra_headers: Option<&HashMap<String, String>>,
+        user_agent: &str,
     ) -> UpstreamChatResult {
-        let user_agent = match self.resolve_chat_ua(region) {
-            Ok(ua) => ua,
-            Err(message) => {
-                return UpstreamChatResult::Err {
-                    status: 0,
-                    kind: UpstreamErrorKind::Server,
-                    message,
-                }
-            }
-        };
+        // 行为与抽取前**逐字一致**（一律 POST）—— LLM 两条路径都走这里，不给它们引入任何可变性。
+        self.forward_with_method(
+            url,
+            headers,
+            body,
+            signal,
+            user_agent,
+            reqwest::Method::POST,
+        )
+        .await
+    }
 
-        let url = format!("{}/v2/chat/completions", region_spec(region).chat_base);
-        let mut headers = account::build_chat_headers(region, acc);
-        if let Some(extra) = extra_headers {
-            for (key, value) in extra {
-                if !value.is_empty() {
-                    headers.insert(key.clone(), value.clone());
-                }
-            }
-        }
-        headers.insert("User-Agent".to_string(), user_agent);
-        let body = chat_body_for(region, body_json);
+    /// 同 [`Self::forward_with`]，但**出站方法可指定**。
+    ///
+    /// ## 为什么需要它（实测，不是推测）
+    ///
+    /// 业务白名单是**按前缀**收的，而同一个前缀下混着两种方法的端点：
+    /// `/activity/growth/streak`、`/activity/growth/heatmap` 只有 **GET**，
+    /// 而 `/activity/growth/redeem`、`/lottery/draw` 是 **POST**。
+    /// 网关原先一律 POST 出去 ⇒ GET-only 的路径被上游回 `404 page not found`（真实环境实测）。
+    ///
+    /// ⇒ **业务转发必须透传客户端的原方法**；LLM 路径继续走上面的 POST 包装。
+    pub async fn forward_with_method(
+        &self,
+        url: &str,
+        headers: HashMap<String, String>,
+        body: String,
+        signal: Option<watch::Receiver<bool>>,
+        user_agent: &str,
+        method: reqwest::Method,
+    ) -> UpstreamChatResult {
+        self.forward_with_method_on(&self.http, url, headers, body, signal, user_agent, method)
+            .await
+    }
 
-        let request = self
-            .http
-            .post(&url)
+    /// 在指定客户端上执行通用出站（账号独立出口复用同一套结果分类）。
+    async fn forward_with_method_on(
+        &self,
+        http: &reqwest::Client,
+        url: &str,
+        mut headers: HashMap<String, String>,
+        body: String,
+        signal: Option<watch::Receiver<bool>>,
+        user_agent: &str,
+        method: reqwest::Method,
+    ) -> UpstreamChatResult {
+        headers.insert("User-Agent".to_string(), user_agent.to_string());
+
+        let request = http
+            .request(method, url)
             .headers(header_map(&headers))
             .body(body);
         let send = request.send();
@@ -442,14 +501,128 @@ impl UpstreamClient {
                     }
                 }
             }
-            Err(error) => UpstreamChatResult::Err {
-                status: 0,
-                kind: UpstreamErrorKind::Server,
-                // 走统一出口：只有顶层一行「error sending request for url (…)」
-                // 是没法排障的，网关日志需要看到具体原因（超时/拒绝/TLS）。
-                message: format!("transport error: {}", net::describe_transport_error(&error)),
-            },
+            Err(error) => {
+                // ★ 超时单独成档（见 `UpstreamErrorKind::Timeout` 的文档）：
+                //   它在降级链里是可勾选的一档，归到 `Server` 就永远选不到。
+                let kind = if error.is_timeout() {
+                    UpstreamErrorKind::Timeout
+                } else {
+                    UpstreamErrorKind::Server
+                };
+                UpstreamChatResult::Err {
+                    status: 0,
+                    kind,
+                    // 走统一出口：只有顶层一行「error sending request for url (…)」
+                    // 是没法排障的，网关日志需要看到具体原因（超时/拒绝/TLS）。
+                    message: format!("transport error: {}", net::describe_transport_error(&error)),
+                }
+            }
         }
+    }
+
+    /// **业务请求出站**（P12 T03 · 本地路由）：URL = `billing_base + path`，头走 [`account::build_auth_headers`]。
+    ///
+    /// 与 [`Self::chat_stream_with`] 的差异**只有两处**（**路径基址 + 头构造**）——
+    /// 出站与结果分类**完全复用** [`Self::forward_with`]。
+    ///
+    /// ⚠️ **body 原样透传**：业务请求不是 LLM 协议，**不做任何改写**（不调 `chat_body_for`）。
+    pub async fn forward_biz_with(
+        &self,
+        region: Region,
+        acc: &Value,
+        path: &str,
+        body_json: &str,
+        signal: Option<watch::Receiver<bool>>,
+        method: reqwest::Method,
+    ) -> UpstreamChatResult {
+        let user_agent = match self.resolve_chat_ua(region) {
+            Ok(ua) => ua,
+            Err(message) => {
+                return UpstreamChatResult::Err {
+                    status: 0,
+                    kind: UpstreamErrorKind::Server,
+                    message,
+                }
+            }
+        };
+        let url = format!("{}{path}", region_spec(region).billing_base);
+        let headers = account::build_auth_headers(acc);
+        let http = match self.client_for_account(acc) {
+            Ok(client) => client,
+            Err(message) => {
+                return UpstreamChatResult::Err {
+                    status: 0,
+                    kind: UpstreamErrorKind::Server,
+                    message,
+                }
+            }
+        };
+        self.forward_with_method_on(
+            &http,
+            &url,
+            headers,
+            body_json.to_string(),
+            signal,
+            &user_agent,
+            method,
+        )
+        .await
+    }
+
+    /// 同 [`Self::chat_stream`]，但允许调用方注入额外出站头（会话头族 / 派生标识）。
+    ///
+    /// `extra_headers` 在基础头之后写入、在 `User-Agent` 之前写入——即
+    /// **UA 由本函数最终决定**，调用方无法用额外头覆盖它（fail-closed）。
+    /// 空值不写入（避免发出 `X-Foo:` 这类空头）。
+    pub async fn chat_stream_with(
+        &self,
+        region: Region,
+        acc: &Value,
+        body_json: &str,
+        signal: Option<watch::Receiver<bool>>,
+        extra_headers: Option<&HashMap<String, String>>,
+    ) -> UpstreamChatResult {
+        let user_agent = match self.resolve_chat_ua(region) {
+            Ok(ua) => ua,
+            Err(message) => {
+                return UpstreamChatResult::Err {
+                    status: 0,
+                    kind: UpstreamErrorKind::Server,
+                    message,
+                }
+            }
+        };
+
+        let url = format!("{}/v2/chat/completions", region_spec(region).chat_base);
+        let mut headers = account::build_chat_headers(region, acc);
+        if let Some(extra) = extra_headers {
+            for (key, value) in extra {
+                if !value.is_empty() {
+                    headers.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        // ★ 出站交给通用实现，但客户端必须按账号选择；缺独立出口时 fail-closed。
+        let http = match self.client_for_account(acc) {
+            Ok(client) => client,
+            Err(message) => {
+                return UpstreamChatResult::Err {
+                    status: 0,
+                    kind: UpstreamErrorKind::Server,
+                    message,
+                }
+            }
+        };
+        self.forward_with_method_on(
+            &http,
+            &url,
+            headers,
+            chat_body_for(region, body_json),
+            signal,
+            &user_agent,
+            reqwest::Method::POST,
+        )
+        .await
     }
 
     /// POST 刷新端点；`X-Refresh-Token` 仅在此出现。
@@ -493,8 +666,11 @@ impl UpstreamClient {
             headers.insert("X-Enterprise-Id".to_string(), eid);
         }
 
-        let response = self
-            .http
+        let http = match self.client_for_account(acc) {
+            Ok(client) => client,
+            Err(message) => return Err(message),
+        };
+        let response = http
             .post(&url)
             .headers(header_map(&headers))
             .json(&json!({}))
@@ -554,6 +730,18 @@ impl UpstreamClient {
         region: Region,
         acc: &Value,
     ) -> Result<Vec<CatalogModel>, UpstreamFailure> {
+        let uid = account::get_str(acc, "uid").unwrap_or_default();
+        let _risk_permit = crate::modules::risk_control::admit_platform_request(
+            "workbuddy",
+            region.as_str(),
+            &uid,
+        )
+        .await
+        .map_err(|error| UpstreamFailure {
+            status: 0,
+            kind: UpstreamErrorKind::Server,
+            message: format!("风控准入拦截：{error}"),
+        })?;
         let spec = region_spec(region);
         let international = matches!(spec.catalog_ua, CatalogUa::App);
         let url = format!("{}{}", spec.chat_base, spec.models_path);
@@ -581,8 +769,17 @@ impl UpstreamClient {
         }
         headers.insert("User-Agent".to_string(), user_agent);
 
-        let response = self
-            .http
+        let http = match self.client_for_account(acc) {
+            Ok(client) => client,
+            Err(message) => {
+                return Err(UpstreamFailure {
+                    status: 0,
+                    kind: UpstreamErrorKind::Server,
+                    message,
+                })
+            }
+        };
+        let response = http
             .get(&url)
             .headers(header_map(&headers))
             .send()
@@ -594,6 +791,13 @@ impl UpstreamClient {
             })?;
         let status = response.status().as_u16();
         let text = response.text().await.unwrap_or_default();
+        let _ = crate::modules::risk_control::record_platform_response(
+            "workbuddy",
+            region.as_str(),
+            &uid,
+            i64::from(status),
+            format!("模型目录 HTTP {status}"),
+        );
         let Some(document) = parse_envelope(&text) else {
             let message = text.chars().take(ERROR_BODY_LIMIT).collect::<String>();
             return Err(UpstreamFailure {
@@ -637,6 +841,18 @@ impl UpstreamClient {
         region: Region,
         acc: &Value,
     ) -> Result<Credits, UpstreamFailure> {
+        let uid = account::get_str(acc, "uid").unwrap_or_default();
+        let _risk_permit = crate::modules::risk_control::admit_platform_request(
+            "workbuddy",
+            region.as_str(),
+            &uid,
+        )
+        .await
+        .map_err(|error| UpstreamFailure {
+            status: 0,
+            kind: UpstreamErrorKind::Server,
+            message: format!("风控准入拦截：{error}"),
+        })?;
         let spec = region_spec(region);
         let url = format!("{}/v2/billing/meter/get-user-resource", spec.billing_base);
         let now = chrono::Local::now();
@@ -676,8 +892,17 @@ impl UpstreamClient {
             headers.insert("X-Domain".to_string(), domain);
         }
 
-        let response = self
-            .http
+        let http = match self.client_for_account(acc) {
+            Ok(client) => client,
+            Err(message) => {
+                return Err(UpstreamFailure {
+                    status: 0,
+                    kind: UpstreamErrorKind::Server,
+                    message,
+                })
+            }
+        };
+        let response = http
             .post(&url)
             .headers(header_map(&headers))
             .json(&body)
@@ -690,6 +915,13 @@ impl UpstreamClient {
             })?;
         let status = response.status().as_u16();
         let text = response.text().await.unwrap_or_default();
+        let _ = crate::modules::risk_control::record_platform_response(
+            "workbuddy",
+            region.as_str(),
+            &uid,
+            i64::from(status),
+            format!("积分查询 HTTP {status}"),
+        );
         let Some(document) = parse_envelope(&text) else {
             let message = text.chars().take(ERROR_BODY_LIMIT).collect::<String>();
             return Err(UpstreamFailure {
@@ -744,9 +976,7 @@ impl UpstreamClient {
             let cycle_remain = number("CycleCapacityRemain");
             let cycle_used = number("CycleCapacityUsed");
             let capacity_remain = number("CapacityRemain");
-            let mut remain = if size > 0.0 {
-                cycle_remain
-            } else if cycle_remain > 0.0 || cycle_used > 0.0 {
+            let mut remain = if size > 0.0 || cycle_remain > 0.0 || cycle_used > 0.0 {
                 cycle_remain
             } else {
                 capacity_remain
@@ -762,7 +992,11 @@ impl UpstreamClient {
                     .unwrap_or("(unnamed)")
                     .to_string(),
                 remain,
-                size: if size > 0.0 { size } else { number("CapacitySize") },
+                size: if size > 0.0 {
+                    size
+                } else {
+                    number("CapacitySize")
+                },
             });
         }
         Ok(Credits { total, accounts })
@@ -770,10 +1004,14 @@ impl UpstreamClient {
 
     fn resolve_chat_ua(&self, region: Region) -> Result<String, String> {
         let identity = identity::resolve_chat_identity(region);
-        identity::chat_user_agent(region, &identity.client_version, identity.cli_version.as_deref())
-            .or_else(|_| {
-                identity::chat_user_agent(region, region_spec(region).fallback_app_version, None)
-            })
+        identity::chat_user_agent(
+            region,
+            &identity.client_version,
+            identity.cli_version.as_deref(),
+        )
+        .or_else(|_| {
+            identity::chat_user_agent(region, region_spec(region).fallback_app_version, None)
+        })
     }
 }
 
@@ -843,7 +1081,7 @@ async fn wait_for_cancel(mut receiver: watch::Receiver<bool>) {
 /// 正数否则跳过。`international` 决定是否解析 `contextWindow.defaultLength`。
 pub fn parse_model_catalog(
     data: &Value,
-    international: bool,
+    _international: bool,
 ) -> Result<Vec<CatalogModel>, UpstreamFailure> {
     let raw_models = data
         .get("models")
@@ -907,17 +1145,21 @@ pub fn parse_model_catalog(
         if input == 0 || output == 0 {
             continue;
         }
-        let context_window = if international {
-            wrapped
-                .get("contextWindow")
-                .and_then(Value::as_object)
-                .and_then(|c| c.get("defaultLength"))
-                .and_then(Value::as_u64)
-                .filter(|value| *value > 0)
-                .unwrap_or(input)
-        } else {
-            input
-        };
+        // ★ 上游给两档：`maxInputTokens`/`maxAllowedSize` 是**上限**，
+        // `contextWindow.defaultLength` 是**默认**（如 300k 默认 / 1M 上限）。
+        // 过去国际版直接拿 defaultLength 当 window ⇒ 清单永远只显示下限，用户看到的 300k 其实不是上限。
+        let context_window = wrapped
+            .get("maxInputTokens")
+            .and_then(Value::as_u64)
+            .or_else(|| wrapped.get("maxAllowedSize").and_then(Value::as_u64))
+            .filter(|value| *value > 0)
+            .unwrap_or(input);
+        let default_window = wrapped
+            .get("contextWindow")
+            .and_then(Value::as_object)
+            .and_then(|c| c.get("defaultLength"))
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0 && *value < context_window);
         let name = wrapped
             .get("name")
             .and_then(Value::as_str)
@@ -933,9 +1175,13 @@ pub fn parse_model_catalog(
             .filter(|value| !value.is_empty())
             .map(str::to_string);
         let badges = parse_badges(wrapped.get("tags"));
+        let reasoning = parse_reasoning(wrapped.get("reasoning"));
+        // ★ 判零走 `parse_credits_rate`（唯一解析点）：旧实现只认 `x0.00`，遇到上游真给的
+        //   `x0.00 credits` 会算成「收费」（issue #65 顺带修）。
         let free = credits
             .as_deref()
-            .map(is_zero_credits)
+            .and_then(parse_credits_rate)
+            .map(|rate| rate == 0.0)
             .unwrap_or(false);
         by_id.insert(
             id.clone(),
@@ -943,11 +1189,13 @@ pub fn parse_model_catalog(
                 id,
                 name,
                 context_window,
+                context_window_default: default_window,
                 max_tokens: output,
                 supports_images,
                 credits,
                 badges,
                 free,
+                reasoning,
             },
         );
     }
@@ -996,17 +1244,47 @@ fn parse_badges(tags: Option<&Value>) -> Vec<String> {
 }
 
 /// 判断积分字符串是否为 `x0.00` 形态（免费）。
-fn is_zero_credits(credits: &str) -> bool {
-    let trimmed = credits.trim();
-    let body = trimmed.strip_prefix('x').unwrap_or(trimmed);
-    match body.split_once('.') {
-        Some((int_part, frac)) => {
-            int_part.bytes().all(|b| b == b'0')
-                && !frac.is_empty()
-                && frac.bytes().all(|b| b == b'0')
-        }
-        None => false,
+/// 解析上游 `reasoning` 块（issue #65）。
+///
+/// 实测三种形态（2026-10-21 `wb_raw.json`）：
+/// - `{"effort": "medium", "summary": "auto"}` —— 只给默认档，**没有** `supportedEfforts`
+///   ⇒ 这里返回「档位为空、默认档有值」，由网关侧回落静态表补全可选档位。
+/// - `{"defaultEffort": "high", "supportedEfforts": ["low","high","max"], "canDisableThinking": true}`
+/// - 整个键缺失 ⇒ `None`（与「声明了但没有档位」不同）。
+///
+/// 空数组 / 全脏值 ⇒ `None`：上游给了个空表等于没给，别把它当「不支持思考」的结论。
+fn parse_reasoning(raw: Option<&Value>) -> Option<CatalogReasoning> {
+    let object = raw?.as_object()?;
+    let efforts: Vec<String> = object
+        .get("supportedEfforts")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|effort| !effort.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let default_effort = object
+        .get("defaultEffort")
+        // 实测另一支只给 `{"effort": "medium", "summary": "auto"}`（没有 supportedEfforts）
+        // —— 那是「默认用哪一档」，语义等价于 `defaultEffort`，别丢。
+        .or_else(|| object.get("effort"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|effort| !effort.is_empty())
+        .map(str::to_string);
+    let can_disable_thinking = object.get("canDisableThinking").and_then(Value::as_bool);
+    if efforts.is_empty() && default_effort.is_none() && can_disable_thinking.is_none() {
+        return None;
     }
+    Some(CatalogReasoning {
+        efforts,
+        default_effort,
+        can_disable_thinking,
+    })
 }
 
 #[cfg(test)]
@@ -1031,7 +1309,10 @@ mod tests {
             classify_upstream_error(200, "error code 12153"),
             UpstreamErrorKind::SessionDead
         );
-        assert_eq!(classify_upstream_error(429, ""), UpstreamErrorKind::SoftRate);
+        assert_eq!(
+            classify_upstream_error(429, ""),
+            UpstreamErrorKind::SoftRate
+        );
         assert_eq!(
             classify_upstream_error(404, "model not found"),
             UpstreamErrorKind::NotFound
@@ -1115,10 +1396,9 @@ mod tests {
         let auto: Value =
             serde_json::from_str(&prepare_chat_body(r#"{"tool_choice":{"type":"auto"}}"#)).unwrap();
         assert_eq!(auto["tool_choice"], json!("auto"));
-        let required: Value = serde_json::from_str(&prepare_chat_body(
-            r#"{"tool_choice":{"type":"required"}}"#,
-        ))
-        .unwrap();
+        let required: Value =
+            serde_json::from_str(&prepare_chat_body(r#"{"tool_choice":{"type":"required"}}"#))
+                .unwrap();
         assert_eq!(required["tool_choice"], json!("required"));
     }
 
@@ -1172,8 +1452,9 @@ mod tests {
         assert!(!models[1].supports_images);
     }
 
+    /// ★ 国际版也要区分两档：`maxInputTokens` 是**上限**、`contextWindow.defaultLength` 是**默认**。
     #[test]
-    fn parse_model_catalog_reads_billing_and_international_window() {
+    fn parse_model_catalog_reads_billing_and_both_windows() {
         let data = json!({
             "agents": [{"name": "cli", "models": ["m"]}],
             "models": [{
@@ -1183,13 +1464,89 @@ mod tests {
                 "maxOutputTokens": 100,
                 "credits": "x0.00",
                 "tags": ["badge:限时免费:#FF0000", "other"],
-                "contextWindow": {"defaultLength": 2000, "supportedLengths": [1000, 2000]}
+                "contextWindow": {"defaultLength": 500, "supportedLengths": [500, 1000]}
             }]
         });
         let models = parse_model_catalog(&data, true).unwrap();
-        assert_eq!(models[0].context_window, 2000);
+        assert_eq!(models[0].context_window, 1000, "上限档取 maxInputTokens");
+        assert_eq!(
+            models[0].context_window_default,
+            Some(500),
+            "默认档取 defaultLength"
+        );
         assert!(models[0].free);
         assert_eq!(models[0].badges, vec!["限时免费".to_string()]);
+    }
+
+    /// ★ issue #65：`x0.00 credits` 也是免费（旧判据只认 `x0.00`，`free` 恒 false），
+    /// 且倍率要能解析成数字（同一份目录里三种写法并存）。
+    ///
+    /// 变异：把 `free` 改回 `is_zero_credits`（只比整数段）⇒ 第一条断言红。
+    #[test]
+    fn parse_model_catalog_treats_zero_credits_with_suffix_as_free() {
+        let data = json!({
+            "agents": [{"name": "cli", "models": ["free-a", "free-b", "paid"]}],
+            "models": [
+                {"id": "free-a", "maxInputTokens": 10, "maxOutputTokens": 10, "credits": "x0.00 credits"},
+                {"id": "free-b", "maxInputTokens": 10, "maxOutputTokens": 10, "credits": "0.00"},
+                {"id": "paid", "maxInputTokens": 10, "maxOutputTokens": 10, "credits": "x0.34 credits"}
+            ]
+        });
+        let models = parse_model_catalog(&data, false).unwrap();
+        assert!(models[0].free, "`x0.00 credits` 必须判免费");
+        assert_eq!(models[0].credits_rate(), Some(0.0));
+        assert!(models[1].free, "无前缀的 `0.00` 也要认");
+        assert!(!models[2].free);
+        assert_eq!(models[2].credits_rate(), Some(0.34), "后缀不影响取数");
+    }
+
+    /// ★ issue #65：上游 `reasoning` 块解析 —— 声明了档位 / 只给默认档 / 完全缺失。
+    #[test]
+    fn parse_model_catalog_reads_reasoning_efforts() {
+        let data = json!({
+            "agents": [{"name": "cli", "models": ["declared", "default-only", "none"]}],
+            "models": [
+                {"id": "declared", "maxInputTokens": 10, "maxOutputTokens": 10,
+                 "reasoning": {"defaultEffort": "high", "canDisableThinking": true,
+                               "supportedEfforts": ["low", "high", "max"], "summary": "auto"}},
+                {"id": "default-only", "maxInputTokens": 10, "maxOutputTokens": 10,
+                 "reasoning": {"effort": "medium", "summary": "auto"}},
+                {"id": "none", "maxInputTokens": 10, "maxOutputTokens": 10}
+            ]
+        });
+        let models = parse_model_catalog(&data, false).unwrap();
+        let declared = models[0].reasoning.as_ref().expect("声明了 reasoning");
+        assert_eq!(declared.efforts, vec!["low", "high", "max"]);
+        assert_eq!(declared.default_effort.as_deref(), Some("high"));
+        assert_eq!(declared.can_disable_thinking, Some(true));
+
+        let default_only = models[1].reasoning.as_ref().expect("有默认档也算声明");
+        assert!(default_only.efforts.is_empty(), "没给 supportedEfforts");
+        assert_eq!(
+            default_only.default_effort.as_deref(),
+            Some("medium"),
+            "`effort` 等价于 defaultEffort"
+        );
+
+        assert!(
+            models[2].reasoning.is_none(),
+            "整块缺失 ⇒ None（不是空档位）"
+        );
+    }
+
+    /// 默认档不小于上限（脏数据）⇒ 不认默认档，避免出现「默认 > 上限」。
+    #[test]
+    fn parse_model_catalog_ignores_inverted_default_window() {
+        let data = json!({
+            "agents": [{"name": "cli", "models": ["m"]}],
+            "models": [{
+                "id": "m", "maxInputTokens": 1000, "maxOutputTokens": 100,
+                "contextWindow": {"defaultLength": 2000}
+            }]
+        });
+        let models = parse_model_catalog(&data, true).unwrap();
+        assert_eq!(models[0].context_window, 1000);
+        assert_eq!(models[0].context_window_default, None);
     }
 
     #[test]
@@ -1219,5 +1576,24 @@ mod tests {
         let source = r#"{"messages":[{"role":"user","content":"hi"}]}"#;
         let once = chat_body_for(Region::Global, source);
         assert_eq!(chat_body_for(Region::Global, &once), once);
+    }
+
+    #[test]
+    fn account_egress_config_does_not_change_shared_client() {
+        let dir = std::env::temp_dir().join(format!(
+            "buddy-switch-upstream-egress-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let previous = std::env::var_os(crate::modules::config::BUDDY_SWITCH_HOME_ENV);
+        std::env::set_var(crate::modules::config::BUDDY_SWITCH_HOME_ENV, &dir);
+        let client = UpstreamClient::new(reqwest::Client::new());
+        let selected = client.client_for_account(&json!({"uid": "u1"})).unwrap();
+        assert!(selected.get("https://example.com").build().is_ok());
+        match previous {
+            Some(value) => std::env::set_var(crate::modules::config::BUDDY_SWITCH_HOME_ENV, value),
+            None => std::env::remove_var(crate::modules::config::BUDDY_SWITCH_HOME_ENV),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

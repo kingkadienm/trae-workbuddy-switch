@@ -1,6 +1,6 @@
 [package]
 name = "buddy-switch-rust"
-version = "2026.9.291555"
+version = "2026.11.131828"
 description = "BuddySwitch —— WorkBuddy 账号切换工具（Rust/Tauri 版）"
 authors = ["kingkadienm"]
 edition = "2021"
@@ -26,11 +26,14 @@ custom-protocol = ["tauri/custom-protocol"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
 tauri-plugin-opener = "2"
 tauri-plugin-updater = "2"
 buddy-switch-core = { path = "../crates/buddy-switch-core" }
 buddy-switch-gateway = { path = "../crates/buddy-switch-gateway" }
+# ⚠️ SQLCipher 通道。Cargo 的 feature 是**并集**：只要链上有它，整个 workspace 的
+# `rusqlite` 都会以 SQLCipher 编译（标准 SQLite 的行为不变，只是多带一份加解密）。
+buddy-switch-vault = { path = "../crates/buddy-switch-vault" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }

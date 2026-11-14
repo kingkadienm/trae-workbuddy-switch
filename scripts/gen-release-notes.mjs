@@ -34,7 +34,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -83,6 +83,21 @@ function gitOrEmpty(args) {
   } catch {
     return "";
   }
+}
+
+/**
+ * `ref` 是否真的存在（tag 或提交）。
+ *
+ * 用在 range 的**终点**上：非 tag 触发的构建（`workflow_dispatch` / 本地）里，
+ * 版本号是 `stamp-version` 按时钟生成的（`2026.11.60720`），仓库里**根本没有**
+ * 同名 tag。把它拼进 `git log <prev>..v<时钟版本>` 会 exit 128，被 main 的 catch
+ * 吞掉后连 `--json` 都不写 ⇒ 打包内置说明停在上一版 ⇒ `check:scope` 的
+ * 「内置说明必须与当前版本一致」必然红 —— build.yml 的 workflow_dispatch 路径
+ * 因此长期产不出任何安装包（2026-11-06 实测：mac job 拿到 runner 后 87 秒即挂在此处）。
+ */
+function revExists(ref) {
+  if (!ref) return false;
+  return gitOrEmpty(["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]) !== "";
 }
 
 function parseArgs(argv) {
@@ -189,11 +204,26 @@ function customNotes(tag) {
   for (const name of [tag, tag.replace(/^v/, "")]) {
     const path = resolve(CUSTOM_NOTES_DIR, `${name}.md`);
     if (existsSync(path)) {
-      const body = readFileSync(path, "utf8").trim();
+      /* ⚠️ 必须去掉**开头**的 HTML 注释块：那是写给维护者的编辑提示
+         （「本文件存在时整篇采用、续行会被丢弃」），不是给安装用户看的。
+         以前直接 `readFileSync().trim()` ⇒ 这段提示原样出现在 Release 页面上
+         （2026-11-05 的 v2026.11.51155 就发出去过一版，事后 `gh release edit` 才修掉）。
+         只剥开头：正文中间偶尔会有注释（如隐藏旧条目），那些保持原样。 */
+      const body = stripLeadingHtmlComments(readFileSync(path, "utf8")).trim();
       if (body) return { path, body };
     }
   }
   return null;
+}
+
+/** 去掉文本**开头**连续出现的 `<!-- ... -->` 块（含块之间的空行）。 */
+function stripLeadingHtmlComments(text) {
+  let out = text.replace(/^\uFEFF/, "");
+  for (;;) {
+    const match = out.match(/^\s*<!--[\s\S]*?-->\s*/);
+    if (!match) return out;
+    out = out.slice(match[0].length);
+  }
 }
 
 function render({ tag, prev, commits, repo }) {
@@ -244,8 +274,27 @@ function render({ tag, prev, commits, repo }) {
   } else if (repo) {
     footer.push("", "---", "", `**提交历史**：https://github.com/${repo}/commits/${tag}`);
   }
+  // 资产名与平台的对应关系只有 CI 知道，而 Releases 的资产列表是**按名字排序**的：
+  // `buddy-switch-cli-darwin-arm64` 这类裸二进制会排在 `BuddySwitch_…dmg` 前面，
+  // 用户在那里认不出该下哪个。所以把「装哪个文件」直接写进正文。
+  // 反例：v2026.11.101809 之前正文只有一句「macOS（DMG，Apple Silicon / Intel）」，
+  // 没有具体文件名，用户下到了 `buddy-switch-darwin-arm64`（裸 Mach-O），
+  // 反馈「下载的 mac 版根本不是 dmg，无法安装」。
+  const version = (tag || "").replace(/^v/, "") || "<版本>";
   footer.push(
-    "**安装包**：Windows（NSIS）· macOS（DMG，Apple Silicon / Intel）· Linux（deb / AppImage）；桌面端也可在应用内直接更新。",
+    "",
+    "**装哪个文件**：",
+    "",
+    "| 平台 | 安装包 |",
+    "|:--|:--|",
+    `| macOS Apple Silicon（arm64） | \`BuddySwitch_${version}_aarch64.dmg\` |`,
+    `| macOS Intel（x86_64） | \`BuddySwitch_${version}_x86_64.dmg\` |`,
+    `| Windows x64 | \`BuddySwitch_${version}_x64-setup.exe\` |`,
+    `| Linux x64 | \`BuddySwitch_${version}_amd64.deb\` / \`BuddySwitch_${version}_amd64.AppImage\` |`,
+    "",
+    "> `buddy-switch-cli-*` 是 webui 形态的**命令行程序**（裸二进制），**不是安装包**：没有 `.app` / `.dmg` 外壳，macOS 上双击打不开，需要 `chmod +x` 后在终端运行。只想用桌面 App 就下上表里对应的安装包。",
+    "",
+    "桌面端也可在应用内直接更新。",
     "**许可**：PolyForm Noncommercial 1.0.0 —— 源码公开（source-available）· 非商业使用。",
     "",
   );
@@ -270,16 +319,334 @@ function fallbackBody({ tag, prev, repo, reason }) {
   return `${lines.join("\n")}\n`;
 }
 
+/**
+ * 本次发布的 tag。
+ *
+ * 优先级：`--tag` > 形如 `v2026.10.171833` 的 `GITHUB_REF_NAME` > **`src-tauri/Cargo.toml`
+ * 的当前版本**。
+ *
+ * 为什么要读 Cargo：本地跑（`npm run notes:json`）时没有 tag，而 `GITHUB_REF_NAME`
+ * 在非 tag 触发的 CI 里是**分支名**（`main`）—— 直接采信会产出一个 `version: "main"`
+ * 的垃圾说明。版本载体只有 Cargo / package.json，它们已经被 `stamp-version` 统一过。
+ */
+function resolveTag(opts) {
+  if (opts.tag) return opts.tag;
+  const fromEnv = process.env.GITHUB_REF_NAME || "";
+  if (/^v?\d{4}\.\d{1,2}\.\d{2}\d{4}$/.test(fromEnv.trim())) return fromEnv.trim();
+  const cargo = resolve(REPO_ROOT, "src-tauri/Cargo.toml");
+  if (existsSync(cargo)) {
+    const match = readFileSync(cargo, "utf8").match(/^version\s*=\s*"([^"]+)"/m);
+    if (match) return `v${match[1]}`;
+  }
+  return "";
+}
+
 function usage() {
   return [
-    "usage: node scripts/gen-release-notes.mjs [--tag <tag>] [--from <ref>] [--out <file>] [--repo <owner/repo>]",
+    "usage: node scripts/gen-release-notes.mjs [--tag <tag>] [--from <ref>] [--out <file>] [--repo <owner/repo>] [--json <file>]",
     "",
-    "  --tag   本次发布的 tag（默认 GITHUB_REF_NAME）",
+    "  --tag   本次发布的 tag（默认 GITHUB_REF_NAME；不是版本形则回落 src-tauri/Cargo.toml 的版本）",
     "  --from  对比起点的 ref（默认自动找上一个 tag；找不到即为首次发布）",
-    "  --out   输出文件（默认 release-notes.md，相对仓库根目录）",
+    "  --out   输出文件（默认 release-notes.md；只传 --json 时**不写** Markdown）",
     "  --repo  GitHub 仓库坐标（默认 GITHUB_REPOSITORY，再回落 origin 远端）",
+    "  --json  额外产出**结构化版本说明**（应用内「升级前弹窗」的数据源，见 docs/specs/UPDATE-NOTES-ARCH.md）",
   ].join("\n");
 }
+
+/* ══════════════════════ 结构化版本说明（--json）══════════════════════
+ *
+ * 为什么同一份「这一版改了什么」要出两种形态：
+ *   - `.md`   → GitHub Release 正文（人读，允许 Markdown）；
+ *   - `.json` → 应用内**升级前说明弹窗**（机器读，只能是结构化纯文本）。
+ *
+ * 前端**不解析 markdown**：版本说明来自发布资产（可被替换的外部输入），
+ * 把 Markdown 转成 HTML 再渲染就是给自己开一个注入面。所以分组必须在这里做完。
+ *
+ * 三个来源，优先级从高到低：
+ *   ① `docs/releases/<tag>.json` —— 人工写的结构化说明（要精细控制就用它）；
+ *   ② `docs/releases/<tag>.md`   —— 人工措辞的正文，**按标题与列表解析**出分组；
+ *   ③ 提交本身（Conventional Commits 前缀分组）—— 与 `.md` 正文同一套分组口径。
+ *
+ * `history` 由 `docs/releases/*.md` 全量解析而来（新→旧）：应用里「更早的 N 个版本」
+ * 就是它，前端按「当前版本 < v ≤ 最新版本」切片（`lib/release-notes.ts` 的 `olderNotes`）。
+ */
+
+/** 嵌进 `.json` 前的清洗：去掉 Markdown 装饰，只留可读文本。 */
+function plainText(text) {
+  return String(text ?? "")
+    /* 行内链接 [文案](url) → 文案（URL 对用户没意义，保留会把一行撑成两行）。 */
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    /* 只去掉**成对**的强调符：单个 `*` / `_` 是文件名字符 ——
+       `api_gateway.json`、`pool_busy` 被吃成 `apigateway.json` 是实打实的数据损坏
+       （本轮初版就踩了），所以这里绝不碰单个下划线 / 星号。 */
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/__([^_]+)__/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** 分组标题去掉 emoji 前缀（`🔧 网关：…` → `网关：…`）：中文界面里 emoji 只是装饰。 */
+function stripEmoji(text) {
+  return String(text ?? "")
+    .replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}]/gu, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * 版本号 → 发布时间。
+ *
+ * 本仓的版本号**自带本地构建时间**（`2026.10.171833` = 2026-10-17 18:33，北京时间），
+ * 所以不查任何外部数据就能给出一个**准确**的发布时间。解析不出来就返回 `undefined`
+ * —— 宁可不显示，也不编一个时间。
+ */
+function publishedAtFromVersion(version) {
+  const m = String(version ?? "")
+    .trim()
+    .replace(/^v/, "")
+    .match(/^(\d{4})\.(\d{1,2})\.(\d{2})(\d{2})(\d{2})$/);
+  if (!m) return undefined;
+  const [, y, mo, d, hh, mm] = m;
+  const pad = (v) => String(v).padStart(2, "0");
+  return `${y}-${pad(mo)}-${pad(d)}T${hh}:${mm}:00+08:00`;
+}
+
+/**
+ * 解析人工撰写的发布说明（`docs/releases/<tag>.md`）。
+ *
+ * 只认两种行，其余（引用、代码块、分隔线之后的内容）一律跳过：
+ *   - `## 标题` → 一个分组；标题含「必读 / 破坏性」⇒ 该组进 `breaking`；
+ *   - `- 条目`  → 组内一条。
+ *
+ * 判据：人工稿是**人写给人**的，结构不会比这更复杂；猜多了反而会把正文吃进去。
+ *
+ * 两处的口径说明：
+ *   ① **必读组一条 = 一个变更**：标题（「升级前必读：网关端口统一到 5789x」）就是这一项
+ *      的名字，组内 bullet 是它的说明。硬拆成多条会把「一条变更的两个后果」说成两件事。
+ *      标题里除了标签没有信息（只剩「升级前必读」）时，才退回按 bullet 拆。
+ *   ② 章节标题里 `🔧` 这类 emoji 只做装饰，进 `.json` 前去掉（中文界面里它占宽度不传递信息）。
+ */
+function parseHumanNotes(markdown) {
+  const breakingGroups = [];
+  const sections = [];
+
+  /** 一组必读 bullet：整组收成一个条目（见口径 ①）。 */
+  const flushBreaking = (group) => {
+    const bullets = (group.items ?? []).map((item) => String(item ?? "").trim()).filter(Boolean);
+    if (!bullets.length) return;
+    if (group.title) {
+      /* 多条 bullet 合成一段说明：各自的 `。` 已经在句子里，直接相接即可
+         （用「；」连接会拼出「。；」这种标点双打）。 */
+      const desc = bullets.map(plainText).filter(Boolean).join("");
+      breakingGroups.push(desc ? { title: group.title, desc } : { title: group.title });
+      return;
+    }
+    for (const bullet of bullets) {
+      breakingGroups.push(splitLead(bullet));
+    }
+  };
+
+  let current = null;
+  for (const rawLine of String(markdown ?? "").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    /* 分隔线之后是「安装包 / 许可」这类发布元信息，不是变更内容。 */
+    if (/^-{3,}$/.test(line)) break;
+    if (!line || line.startsWith("<!--") || line.startsWith(">") || line.startsWith("```")) continue;
+
+    if (line.startsWith("## ")) {
+      if (current && current.kind === "breaking") flushBreaking(current);
+      current = null;
+      const title = stripEmoji(line.slice(3));
+      if (!title) continue;
+      if (/必读|破坏性/.test(title)) {
+        /* 去掉标签本身，只留「这一项叫什么」；标题里的行内代码也要洗掉（`5789x` → 5789x）。 */
+        const groupTitle = plainText(
+          title
+            .replace(/^(升级前必读|破坏性变更|破坏性改动)\s*[：:]?\s*/, "")
+            .replace(/[：:]\s*$/, ""),
+        );
+        current = { kind: "breaking", title: groupTitle, items: [] };
+        continue;
+      }
+      const section = { title: plainText(title).replace(/[：:]\s*$/, ""), items: [] };
+      sections.push(section);
+      current = { kind: "section", section };
+      continue;
+    }
+
+    if (!current) continue;
+    const bullet = line.match(/^[-*+]\s+(.*)$/);
+    if (!bullet) continue;
+
+    if (current.kind === "section") {
+      const text = plainText(bullet[1]);
+      if (text) current.section.items.push(text);
+    } else {
+      /* 保留原始标记：`splitLead` 要靠 `**加粗**` 判断哪一段是标题。 */
+      current.items.push(bullet[1]);
+    }
+  }
+  if (current && current.kind === "breaking") flushBreaking(current);
+
+  return {
+    breaking: breakingGroups.filter((item) => item.title),
+    /* 空分组不产出（只有标题没有条目的分组在弹窗里比不显示更困惑）。 */
+    sections: sections.filter((section) => section.items.length > 0),
+  };
+}
+
+/**
+ * 一条必读 bullet → `{ title, desc? }`。
+ *
+ * 三种写法都认：`**标题**：说明` / `标题：说明` / 整句（无冒号就别硬拆）。
+ */
+function splitLead(rawBullet) {
+  const text = plainText(rawBullet);
+  if (!text) return { title: "" };
+  const bold = String(rawBullet).match(/^\s*\*\*([^*]+)\*\*\s*[：:]?\s*(.*)$/);
+  if (bold) {
+    const title = plainText(bold[1]);
+    const desc = plainText(bold[2]);
+    return desc ? { title, desc } : { title };
+  }
+  const colon = text.match(/^([^：。]{2,30})[：。]\s*(.+)$/);
+  if (colon) return { title: colon[1], desc: colon[2] };
+  return { title: text };
+}
+
+/** 提交 → 结构化分组（`.md` 缺失时的口径；与自动正文同一套 GROUPS）。 */
+function notesFromCommits(commits) {
+  const groups = new Map();
+  const breaking = [];
+  for (const commit of commits) {
+    const entry = classify(commit);
+    if (entry.breaking) {
+      breaking.push({ title: entry.scope ? `${entry.scope}：${entry.text}` : entry.text });
+      continue;
+    }
+    const title = stripEmoji(entry.group);
+    if (!groups.has(title)) groups.set(title, []);
+    groups.get(title).push(entry.scope ? `${entry.scope}：${entry.text}` : entry.text);
+  }
+  return {
+    breaking,
+    sections: [...groups.entries()].map(([title, items]) => ({ title, items })),
+  };
+}
+
+/**
+ * 历史版本（新→旧）。来源是 `docs/releases/*.md` 人工稿 —— **只认人工稿**：
+ * 自动按提交分组的历史需要完整 git 历史与旧 tag，CI 里拿不到，硬凑只会产出错内容。
+ *
+ * 只收**比本次版本更早**的：仓库里可能存在已写好、但还没构建的「未来版本」说明
+ * （发版期间就是这个状态），把它当历史塞进去会变成「更早的版本」里列着一个更高版本。
+ */
+function historyFromDocs(currentTag) {
+  const dir = CUSTOM_NOTES_DIR;
+  if (!existsSync(dir)) return [];
+  const current = String(currentTag ?? "").replace(/^v/, "");
+  const entries = [];
+  for (const file of readdirSync(dir)) {
+    const match = file.match(/^v?(.+)\.(md|json)$/);
+    if (!match) continue;
+    const version = match[1];
+    if (!version || version === current) continue;
+    if (!/^\d{4}\.\d{1,2}\.\d{2}\d{4}$/.test(version)) continue;
+    if (match[2] === "json") continue;
+    if (compareVersionStrings(version, current) >= 0) continue;
+    const parsed = parseHumanNotes(readFileSync(resolve(dir, file), "utf8"));
+    const sections = parsed.sections.length
+      ? parsed.sections
+      : parsed.breaking.map((item) => ({ title: "升级前必读", items: [item.title] }));
+    if (!sections.length) continue;
+    entries.push({
+      version,
+      publishedAt: publishedAtFromVersion(version),
+      sections,
+    });
+  }
+  /* 版本号自带时间，同格式下按段数值比较即可 = 时间序。 */
+  return entries.sort((a, b) => compareVersionStrings(b.version, a.version));
+}
+
+/** 版本号逐段数值比较（与前端 `lib/release-notes.ts::compareVersions` 同一口径）。 */
+function compareVersionStrings(a, b) {
+  const parse = (value) =>
+    String(value ?? "")
+      .replace(/^v/, "")
+      .split(".")
+      .map((part) => Number.parseInt(part, 10) || 0);
+  const left = parse(a);
+  const right = parse(b);
+  for (let i = 0; i < Math.max(left.length, right.length); i += 1) {
+    const x = left[i] ?? 0;
+    const y = right[i] ?? 0;
+    if (x !== y) return x > y ? 1 : -1;
+  }
+  return 0;
+}
+
+function buildReleaseNotes({ tag, commits, customMarkdown }) {
+  const version = String(tag ?? "").replace(/^v/, "");
+  if (!version) throw new Error("缺少 --tag，无法产出结构化版本说明");
+
+  /* ① 人工结构化稿 > ② 人工正文解析 > ③ 提交分组。 */
+  const jsonPath = resolve(CUSTOM_NOTES_DIR, `${version}.json`);
+  let notes;
+  if (existsSync(jsonPath)) {
+    const raw = JSON.parse(readFileSync(jsonPath, "utf8"));
+    notes = { breaking: raw.breaking ?? [], sections: raw.sections ?? [] };
+  } else if (customMarkdown) {
+    notes = parseHumanNotes(customMarkdown);
+  } else {
+    notes = notesFromCommits(commits ?? []);
+  }
+
+  const publishedAt = publishedAtFromVersion(version);
+  return {
+    version,
+    ...(publishedAt ? { publishedAt } : {}),
+    ...(notes.breaking.length ? { breaking: notes.breaking } : {}),
+    ...(notes.sections.length ? { sections: notes.sections } : {}),
+    history: historyFromDocs(version),
+  };
+}
+
+/**
+ * 写 `<--json>` 产物。**失败不阻断发布**（与 `.md` 同一条判据：说明缺失是降级，
+ * 发布失败才是事故），但要留 `::warning::` 让人看得见。
+ */
+function writeNotesJson(opts, source) {
+  try {
+    const payload = buildReleaseNotes(source);
+    /* ⚠️ 这里必须 `?? []`：`buildReleaseNotes` 在空数组时**根本不产出** `sections` /
+       `breaking` 两个键（见它最后的展开写法），直接 `.length` 会抛「undefined 的 length」，
+       于是「写成功但内容为空」被报成「生成失败」—— 2026-11-07 用人稿（纯散文、
+       没有 `## ` 分组）发布时实测踩到。 */
+    const sectionCount = (payload.sections ?? []).length;
+    const breakingCount = (payload.breaking ?? []).length;
+    if (!sectionCount && !breakingCount) {
+      console.log("::warning title=结构化版本说明为空::本次没有可用的分组内容（人工稿与提交都没给出）");
+    }
+    const outPath = resolve(REPO_ROOT, opts.json);
+    mkdirSync(dirname(outPath), { recursive: true });
+    writeFileSync(outPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+    /* 计数必须带 `?? []`：`breaking` / `sections` 为空时**键根本不产出**
+       （空数组在产物里没有意义），直接 `.length` 会抛「undefined 的 length」——
+       本轮初版就因此把「写成功」报成了「生成失败」。 */
+    console.log(
+      `gen-release-notes: 已写入 ${outPath}（${(payload.sections ?? []).length} 组 / ` +
+        `${(payload.breaking ?? []).length} 条必读 / ${(payload.history ?? []).length} 个历史版本）`,
+    );
+    return 0;
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    console.log(`::warning title=结构化版本说明生成失败::${reason}`);
+    return 0;
+  }
+}
+
 
 function main(argv) {
   const opts = parseArgs(argv);
@@ -288,11 +655,14 @@ function main(argv) {
     return 0;
   }
 
-  const tag = opts.tag || process.env.GITHUB_REF_NAME || "";
-  const outPath = resolve(REPO_ROOT, opts.out || "release-notes.md");
+  const tag = resolveTag(opts);
   const repo = resolveRepo(opts);
+  /* 只传 `--json` 时不写 Markdown：本地生成「内置兜底说明」不该在仓库根目录留一份
+     `release-notes.md`（CI 里由 Release 正文那一步显式 `--out`，行为不变）。 */
+  const outPath = opts.out ? resolve(REPO_ROOT, opts.out) : opts.json ? null : resolve(REPO_ROOT, "release-notes.md");
 
   const write = (body) => {
+    if (!outPath) return;
     writeFileSync(outPath, body.endsWith("\n") ? body : `${body}\n`, "utf8");
     console.log(`gen-release-notes: 已写入 ${outPath}`);
   };
@@ -306,17 +676,28 @@ function main(argv) {
     if (custom) {
       write(custom.body);
       console.log(`gen-release-notes: 使用人工撰写的 ${custom.path}（未自动拼装）`);
+      if (opts.json) writeNotesJson(opts, { tag, commits: [], customMarkdown: custom.body });
       return 0;
     }
 
     prev = opts.from !== undefined ? opts.from : previousTag(tag);
-    const range = prev ? `${prev}..${tag || "HEAD"}` : tag || "HEAD";
+    /* 终点不能无条件写 `tag`：见 `revExists()` 的注释 —— 非 tag 构建的版本号在
+       git 里不存在，`git log` 会 128。退到 HEAD 后内容变成「上一个 tag 之后的提交」，
+       版本号仍是当前版本，门禁语义（内置说明 = 当前版本）不受影响。 */
+    const tagIsRev = revExists(tag);
+    /* 版本号不是 git 里的 rev 时，`previousTag(tag)` 必然也是空（它就是拿 `${tag}^`
+       去查的）⇒ 不补这一步，说明内容会退化成「全部历史」（576 条提交全塞进弹窗）。
+       改从 HEAD 往回找最近的 tag；浅克隆（`fetch-depth: 1`）找不到就仍是空，无害。 */
+    if (!prev && !tagIsRev) prev = previousTag("HEAD");
+    const end = tagIsRev ? tag : "HEAD";
+    const range = prev ? `${prev}..${end}` : end;
     const commits = readCommits(range);
     console.log(
       `gen-release-notes: 范围 ${range}，解析出 ${commits.length} 条提交` +
         (prev ? "" : "（无上一个 tag，按首次发布处理）"),
     );
     write(render({ tag, prev, commits, repo }));
+    if (opts.json) writeNotesJson(opts, { tag, commits });
     return 0;
   } catch (error) {
     // 见头部注释第 3 条：降级，不阻断发布。

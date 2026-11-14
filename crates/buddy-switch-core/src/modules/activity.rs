@@ -16,9 +16,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::modules::account::{account_display_name, load_accounts_for};
-use crate::modules::config::{
-    authed_json_request_for, load_checkin_config, now_ms,
-};
+use crate::modules::config::{authed_json_request_for, load_checkin_config, now_ms};
 use crate::modules::cst::{cst_date_str, cst_yesterday_str};
 use crate::modules::refresh::ensure_fresh_token_for;
 use crate::modules::region::{region_spec, Region};
@@ -85,9 +83,7 @@ impl DailyGate {
             .and_then(|entries| entries.as_object().cloned())
             .map(|map| {
                 map.into_iter()
-                    .filter_map(|(uid, date)| {
-                        date.as_str().map(|date| (uid, date.to_string()))
-                    })
+                    .filter_map(|(uid, date)| date.as_str().map(|date| (uid, date.to_string())))
                     .collect::<HashMap<String, String>>()
             })
             .unwrap_or_default();
@@ -159,7 +155,10 @@ fn growth_extra(region: Region) -> HashMap<String, String> {
     let mut headers = HashMap::new();
     headers.insert("x-client-platform".to_string(), "web".to_string());
     headers.insert("origin".to_string(), base.to_string());
-    headers.insert("referer".to_string(), format!("{base}/profile/growth-center"));
+    headers.insert(
+        "referer".to_string(),
+        format!("{base}/profile/growth-center"),
+    );
     headers
 }
 
@@ -175,7 +174,15 @@ async fn chat_get(region: Region, path: &str, account: &Value) -> (u16, Value) {
 
 async fn chat_post(region: Region, path: &str, body: Value, account: &Value) -> (u16, Value) {
     let url = format!("{}{path}", region_spec(region).chat_base);
-    authed_json_request_for(region, &url, "POST", Some(body), account, &growth_extra(region)).await
+    authed_json_request_for(
+        region,
+        &url,
+        "POST",
+        Some(body),
+        account,
+        &growth_extra(region),
+    )
+    .await
 }
 
 /// 构造一条 `chat_request_send`（craft）上报事件。
@@ -329,8 +336,13 @@ async fn makeup_yesterday(region: Region, account: &Value, yesterday: &str) -> b
     if streak_status != 200 || makeup_balance(&streak) <= 0 {
         return false;
     }
-    let (use_status, _) =
-        chat_post(region, MAKEUP_PATH, json!({"target_date": yesterday}), account).await;
+    let (use_status, _) = chat_post(
+        region,
+        MAKEUP_PATH,
+        json!({"target_date": yesterday}),
+        account,
+    )
+    .await;
     use_status == 200
 }
 
@@ -410,10 +422,17 @@ async fn claim_growth_lottery(region: Region, account: &Value) {
         return;
     }
     let token = format!("draw-{}", random_hex32());
-    let (draw_status, draw_resp) =
-        chat_post(region, LOTTERY_DRAW_PATH, json!({"client_token": token}), account).await;
+    let (draw_status, draw_resp) = chat_post(
+        region,
+        LOTTERY_DRAW_PATH,
+        json!({"client_token": token}),
+        account,
+    )
+    .await;
     debug_assert!(
-        draw_status == 200 || is_lottery_no_chance(draw_status, &draw_resp) || is_lottery_disabled(draw_status, &draw_resp),
+        draw_status == 200
+            || is_lottery_no_chance(draw_status, &draw_resp)
+            || is_lottery_disabled(draw_status, &draw_resp),
         "lottery draw 非正常态: status={draw_status} resp={draw_resp}"
     );
 }
@@ -524,12 +543,15 @@ mod tests {
             !reloaded.should_run("u1", "2026-09-16"),
             "重启后同日必须仍被拦住（否则会对上游重复领取）"
         );
+        assert!(reloaded.should_run("u1", "2026-09-17"), "跨日必须恢复执行");
         assert!(
-            reloaded.should_run("u1", "2026-09-17"),
-            "跨日必须恢复执行"
+            reloaded.should_run("u2", "2026-09-16"),
+            "未处理过的账号不受影响"
         );
-        assert!(reloaded.should_run("u2", "2026-09-16"), "未处理过的账号不受影响");
-        assert_eq!(reloaded.snapshot().get("u1").map(String::as_str), Some("2026-09-16"));
+        assert_eq!(
+            reloaded.snapshot().get("u1").map(String::as_str),
+            Some("2026-09-16")
+        );
 
         let _ = std::fs::remove_file(&file);
     }
@@ -553,12 +575,17 @@ mod tests {
     #[test]
     fn gate_loads_missing_or_malformed_file_as_empty() {
         let missing = temp_gate_file();
-        assert!(DailyGate::load_from(missing).snapshot().is_empty(), "缺失文件不得 panic");
+        assert!(
+            DailyGate::load_from(missing).snapshot().is_empty(),
+            "缺失文件不得 panic"
+        );
 
         let malformed = temp_gate_file();
         std::fs::write(&malformed, b"{ not json").expect("写入临时文件");
         assert!(
-            DailyGate::load_from(malformed.clone()).snapshot().is_empty(),
+            DailyGate::load_from(malformed.clone())
+                .snapshot()
+                .is_empty(),
             "损坏文件应视为空表"
         );
         let _ = std::fs::remove_file(&malformed);
@@ -566,7 +593,9 @@ mod tests {
         let wrong_shape = temp_gate_file();
         std::fs::write(&wrong_shape, br#"{"entries": "oops"}"#).expect("写入临时文件");
         assert!(
-            DailyGate::load_from(wrong_shape.clone()).snapshot().is_empty(),
+            DailyGate::load_from(wrong_shape.clone())
+                .snapshot()
+                .is_empty(),
             "entries 非对象应视为空表"
         );
         let _ = std::fs::remove_file(&wrong_shape);
@@ -606,8 +635,14 @@ mod tests {
             "tier_28d_status": "available",
         });
         assert_eq!(growth_eligible_tier(7, &redemption).as_deref(), Some("7d"));
-        assert_eq!(growth_eligible_tier(20, &redemption).as_deref(), Some("14d"));
-        assert_eq!(growth_eligible_tier(30, &redemption).as_deref(), Some("28d"));
+        assert_eq!(
+            growth_eligible_tier(20, &redemption).as_deref(),
+            Some("14d")
+        );
+        assert_eq!(
+            growth_eligible_tier(30, &redemption).as_deref(),
+            Some("28d")
+        );
         // 未达最低档 → 无可领。
         assert_eq!(growth_eligible_tier(3, &redemption), None);
 
@@ -652,13 +687,19 @@ mod tests {
             409,
             &json!({"msg": "该奖励已领取"})
         ));
-        assert!(!is_redeem_already_claimed(409, &json!({"message": "other"})));
+        assert!(!is_redeem_already_claimed(
+            409,
+            &json!({"message": "other"})
+        ));
         // redeem 403 天数不足
         assert!(is_redeem_not_enough_days(
             403,
             &json!({"message": "连续登录天数不足"})
         ));
-        assert!(!is_redeem_not_enough_days(403, &json!({"message": "forbidden"})));
+        assert!(!is_redeem_not_enough_days(
+            403,
+            &json!({"message": "forbidden"})
+        ));
         // lottery 400 无次数 / 未开启
         assert!(is_lottery_no_chance(
             400,

@@ -18,6 +18,7 @@ use crate::modules::session;
 pub type ProgressFn = Box<dyn Fn(&str) + Send + Sync>;
 
 /// 切换账号（CN）。copy_session_ids 非空时按路径 B 复制勾选会话（新 id，云端可同步）。
+
 pub fn switch_account(
     progress_fn: Option<&ProgressFn>,
     account_id: &str,
@@ -89,10 +90,12 @@ pub fn switch_account_cross(
         close_workbuddy_for(region, 20)?;
         // 只有重启场景才做会话操作（数据库在运行中不宜写入）
         if !copy_session_ids.is_empty() {
-            progress("正在复制会话到目标账号…");
+            // 逐会话进度直接透传：正文复制是 GB 级 I/O，切成 (i/N) 步进
+            // 才能让用户知道「还在动」，而不是盯着一行消息以为卡死。
             copy_report = session::copy_sessions_for_switch_cross(
                 source_region,
                 region,
+                progress_fn.map(|f| f.as_ref()),
                 &acc,
                 copy_session_ids,
             );
@@ -100,6 +103,10 @@ pub fn switch_account_cross(
     }
     progress("正在写入认证文件…");
     auth_file::write_account_to_auth_file_for(region, &acc)?;
+    // ★ 记录「最近使用」：切换即代表该账号被**实际使用**（时间戳口径与账号库既有
+    // `createdAt` / `refreshedAt` 一致）。写入失败**不阻断**切换 —— 认证文件已写好、
+    // 账号已被用上，一条本地记账失败不该把整个切换判为失败（故忽略错误，不 `?`）。
+    let _ = account::touch_last_used_for(region, account_id);
     if restart {
         progress("正在启动 WorkBuddy…");
         launch_workbuddy_for(region, Some(&progress))?;

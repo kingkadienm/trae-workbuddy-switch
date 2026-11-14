@@ -12,6 +12,7 @@
 //! 若把 `merge_memory_files` / `merge_connectors_for` 里的备份调用删掉：
 //! - `memory_merge_backs_up_original_target_before_overwrite` 会因 `backup` 为 `None` panic；
 //! - `connector_merge_backs_up_original_target_file` 同理，且备份文件不存在。
+//!
 //! 若把「只在 changed 时备份」改成「无条件备份」：
 //! - `memory_merge_second_run_creates_no_second_backup` 会因第二次仍产生备份而 panic。
 //!
@@ -49,7 +50,9 @@ struct IsolatedHome {
 
 impl IsolatedHome {
     fn new(label: &str) -> Self {
-        let lock = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let previous = std::env::var(BUDDY_SWITCH_HOME_ENV).ok();
         let dir = unique_temp_dir(label);
         fs::create_dir_all(&dir).expect("create isolated home");
@@ -196,8 +199,7 @@ fn connector_merge_backs_up_original_target_file() {
         &source_dir.join("mcp.json"),
         r#"{"mcpServers":{"shared":{"command":"src"},"onlyInSource":{"command":"new"}}}"#,
     );
-    let target_original =
-        r#"{"mcpServers":{"shared":{"command":"target"}}}"#;
+    let target_original = r#"{"mcpServers":{"shared":{"command":"target"}}}"#;
     write_at(&target_mcp, target_original);
 
     let result = connector::merge_connectors_for(Region::Cn, "uid-conn-source", "uid-conn-target")
@@ -280,7 +282,10 @@ fn migrate_report_exposes_backup_paths_and_is_idempotent() {
     let conn_backup = report["connectors"]["backup"]
         .as_str()
         .expect("connector 备份路径应出现在报告中");
-    assert!(Path::new(conn_backup).is_dir(), "connector 备份目录应真实存在");
+    assert!(
+        Path::new(conn_backup).is_dir(),
+        "connector 备份目录应真实存在"
+    );
 
     // 二次迁移：全部命中指纹 → 无新增、无改写、无新备份。
     let second = migrate::migrate_account_data_for(

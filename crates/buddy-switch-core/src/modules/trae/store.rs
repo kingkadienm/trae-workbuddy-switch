@@ -26,8 +26,7 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
     }
-    let text =
-        serde_json::to_string_pretty(value).map_err(|e| format!("序列化失败: {e}"))?;
+    let text = serde_json::to_string_pretty(value).map_err(|e| format!("序列化失败: {e}"))?;
     atomic_write_text(path, &text)
 }
 
@@ -54,8 +53,7 @@ pub fn atomic_write_text(path: &Path, text: &str) -> Result<(), String> {
     }
     let tmp = tmp_path(path);
     let write_result = (|| -> Result<(), String> {
-        let mut file =
-            std::fs::File::create(&tmp).map_err(|e| format!("创建临时文件失败: {e}"))?;
+        let mut file = std::fs::File::create(&tmp).map_err(|e| format!("创建临时文件失败: {e}"))?;
         file.write_all(text.as_bytes())
             .map_err(|e| format!("写入失败: {e}"))?;
         file.flush().map_err(|e| format!("刷新失败: {e}"))?;
@@ -78,7 +76,10 @@ pub fn atomic_write_text(path: &Path, text: &str) -> Result<(), String> {
 /// 不用 `with_extension`（会把 `checkin_accounts.json` 变成 `checkin_accounts.tmp`，
 /// 丢扩展名后不易排查）；uuid 后缀保证并发写各自独立（见 `atomic_write_text` 第 1 条）。
 fn tmp_path(path: &Path) -> std::path::PathBuf {
-    let mut name = path.file_name().map(|s| s.to_os_string()).unwrap_or_default();
+    let mut name = path
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_default();
     name.push(format!(".tmp-{}", uuid::Uuid::new_v4().simple()));
     path.with_file_name(name)
 }
@@ -212,8 +213,21 @@ mod tests {
         let path = dir.join("data.json");
         // 先写一份旧内容，再覆盖，确认 rename 路径不会留下半截文件。
         std::fs::write(&path, "{\"a\":1}").unwrap();
-        write_json(&path, &Sample { a: 7, b: "x".into() }).unwrap();
-        assert_eq!(read_json::<Sample>(&path), Sample { a: 7, b: "x".into() });
+        write_json(
+            &path,
+            &Sample {
+                a: 7,
+                b: "x".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            read_json::<Sample>(&path),
+            Sample {
+                a: 7,
+                b: "x".into()
+            }
+        );
         // 临时文件必须已被 rename 掉，不能残留。
         //
         // 断言**整目录**而不是 `!tmp_path(&path).exists()`：临时名现在带 uuid，

@@ -162,7 +162,8 @@ impl SchoolIo for RealSchoolIo {
     ) -> Pin<Box<dyn Future<Output = SchoolResponse> + Send + 'a>> {
         Box::pin(async move {
             let url = format!("{}{path}", region_spec(region).billing_base);
-            authed_json_request_for(region, &url, method, body, account, &school_extra(region)).await
+            authed_json_request_for(region, &url, method, body, account, &school_extra(region))
+                .await
         })
     }
 }
@@ -237,7 +238,8 @@ fn expert_event(uid: &str, cid: &str, at_ms: i64) -> Value {
 
 /// 桌面端成功对话 6 连事件链（点亮 desktop_chat_1_time），每事件注入 activityId。
 fn desktop_seq_events(uid: &str, cid: &str, at_ms: i64) -> Vec<Value> {
-    let base = |code: &str| json!({"eventCode": code, "userId": uid, "activityId": SCHOOL_ACTIVITY_ID});
+    let base =
+        |code: &str| json!({"eventCode": code, "userId": uid, "activityId": SCHOOL_ACTIVITY_ID});
     let mut events = Vec::new();
 
     let mut created = base("agent_task_created");
@@ -312,7 +314,12 @@ fn desktop_seq_events(uid: &str, cid: &str, at_ms: i64) -> Vec<Value> {
 // ---------------------------------------------------------------------------
 
 /// 激活任务（pending → viewed）。
-async fn post_viewed(io: &dyn SchoolIo, region: Region, account: &Value, code: &str) -> SchoolResponse {
+async fn post_viewed(
+    io: &dyn SchoolIo,
+    region: Region,
+    account: &Value,
+    code: &str,
+) -> SchoolResponse {
     school_post(
         io,
         region,
@@ -324,7 +331,12 @@ async fn post_viewed(io: &dyn SchoolIo, region: Region, account: &Value, code: &
 }
 
 /// 领奖（`/tasks/{code}/claim`，无 body）。
-async fn post_claim(io: &dyn SchoolIo, region: Region, account: &Value, code: &str) -> SchoolResponse {
+async fn post_claim(
+    io: &dyn SchoolIo,
+    region: Region,
+    account: &Value,
+    code: &str,
+) -> SchoolResponse {
     school_post(
         io,
         region,
@@ -345,7 +357,14 @@ async fn trigger_judgement(
 ) -> SchoolResponse {
     match action {
         SchoolAction::Share => {
-            school_post(io, region, SHARE_PATH, json!({"channel": "wechat"}), account).await
+            school_post(
+                io,
+                region,
+                SHARE_PATH,
+                json!({"channel": "wechat"}),
+                account,
+            )
+            .await
         }
         SchoolAction::MiniChat => {
             let cid = format!("wbmp-{}", now_ms());
@@ -463,8 +482,14 @@ async fn run_school_lottery(io: &dyn SchoolIo, region: Region, account: &Value) 
     let mut drawn = 0i64;
     while balance > 0 {
         let draw_uuid = uuid::Uuid::new_v4().to_string();
-        let (draw_status, draw_resp) =
-            school_post(io, region, WHEEL_PATH, json!({"draw_uuid": draw_uuid}), account).await;
+        let (draw_status, draw_resp) = school_post(
+            io,
+            region,
+            WHEEL_PATH,
+            json!({"draw_uuid": draw_uuid}),
+            account,
+        )
+        .await;
         // 余额为 0 时上游返回 HTTP 409 + code=40900 "no chance"：边界，正常结束。
         if draw_status == 409 {
             break;
@@ -580,7 +605,12 @@ mod tests {
         let codes: Vec<&str> = plan.iter().map(|(c, _)| c.as_str()).collect();
         assert_eq!(
             codes,
-            vec!["chat_3_times", "expert_use", "share_invite", "desktop_chat_1_time"]
+            vec![
+                "chat_3_times",
+                "expert_use",
+                "share_invite",
+                "desktop_chat_1_time"
+            ]
         );
         assert!(
             !codes.contains(&"task_student_verify"),
@@ -606,9 +636,15 @@ mod tests {
 
     #[test]
     fn school_action_table_maps_known_codes_only() {
-        assert_eq!(school_task_action("chat_3_times"), Some(SchoolAction::MiniChat));
+        assert_eq!(
+            school_task_action("chat_3_times"),
+            Some(SchoolAction::MiniChat)
+        );
         assert_eq!(school_task_action("expert_use"), Some(SchoolAction::Expert));
-        assert_eq!(school_task_action("share_invite"), Some(SchoolAction::Share));
+        assert_eq!(
+            school_task_action("share_invite"),
+            Some(SchoolAction::Share)
+        );
         assert_eq!(
             school_task_action("desktop_chat_1_time"),
             Some(SchoolAction::DesktopSeq)
@@ -627,9 +663,7 @@ mod tests {
         assert_eq!(expert["eventCode"], "expert_actual_use");
         let seq = desktop_seq_events("uid-1", "wbdesk-1", 1);
         assert_eq!(seq.len(), 6);
-        assert!(seq
-            .iter()
-            .all(|e| e["activityId"] == SCHOOL_ACTIVITY_ID));
+        assert!(seq.iter().all(|e| e["activityId"] == SCHOOL_ACTIVITY_ID));
         assert_eq!(seq[0]["eventCode"], "agent_task_created");
         assert_eq!(seq[5]["eventCode"], "chat_request_response");
     }
@@ -651,7 +685,10 @@ mod tests {
             _account: &'a Value,
         ) -> Pin<Box<dyn Future<Output = SchoolResponse> + Send + 'a>> {
             Box::pin(async move {
-                (200, json!({"code": 0, "data": {"in_period": false, "tasks": []}}))
+                (
+                    200,
+                    json!({"code": 0, "data": {"in_period": false, "tasks": []}}),
+                )
             })
         }
     }
@@ -764,7 +801,10 @@ mod tests {
         let out = run_school_cycle_for_with(Region::Cn, one_account("u-409"), &io).await;
         assert_eq!(out["status"], "ok", "{out}");
         let lottery = &out["accounts"][0]["lottery"];
-        assert_ne!(lottery["result"], "error", "409 no chance 不得记为失败: {out}");
+        assert_ne!(
+            lottery["result"], "error",
+            "409 no chance 不得记为失败: {out}"
+        );
         assert_eq!(lottery["result"], "ok", "{out}");
         assert_eq!(lottery["drawn"], 0, "无次数不得抽出任何奖: {out}");
     }
@@ -789,7 +829,10 @@ mod tests {
             };
             let out = run_school_cycle_for_with(Region::Cn, one_account("u-mal"), &io).await;
             assert_eq!(out["status"], "ok", "cfg={config}");
-            assert_eq!(out["accounts"][0]["lottery"]["result"], "ok", "cfg={config}");
+            assert_eq!(
+                out["accounts"][0]["lottery"]["result"], "ok",
+                "cfg={config}"
+            );
         }
     }
 }

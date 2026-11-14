@@ -1,3 +1,4 @@
+import { accountDisplayName } from "@/components/account-card";
 import { useCallback, useEffect, useState } from "react";
 import { Download, Loader2, Play, Trash2 } from "lucide-react";
 import { toast } from "sonner";
@@ -191,7 +192,7 @@ function AccountList({
               onChange={() => onToggle(account.id)}
             />
             <span className="min-w-0 flex-1 truncate text-sm">
-              {account.nickname || account.email || account.id}
+              {accountDisplayName(account)}
             </span>
             {account.region && <span className="text-xs text-muted-foreground">{account.region}</span>}
           </label>

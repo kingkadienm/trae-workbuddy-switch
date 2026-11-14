@@ -118,7 +118,7 @@ pub fn merge_legacy_cn_into_region() -> Result<MergeReport, String> {
     let target_groups_path = paths::groups_file_for_region(TraeRegion::Cn);
 
     // 用「能否读到内容」判断存在性，而不是 `Path::exists()` ——
-    // 本工作区的元数据探测偶发假报（见 `.workbuddy/memory/MEMORY-2-tooling.md`）。
+    // 本工作区的元数据探测偶发假报（见 `.workbuddy-ai/memory/archive/legacy-workbuddy/MEMORY-2-tooling.md`）。
     let legacy_raw = std::fs::read_to_string(&legacy_accounts_path).ok();
     if legacy_raw.is_none() {
         return Ok(MergeReport::default());
@@ -126,8 +126,13 @@ pub fn merge_legacy_cn_into_region() -> Result<MergeReport, String> {
 
     // 旧库解析失败时**不猜**：宁可报错让调用方决定，也不要把半份数据并进去
     // （一旦并入就无法反向区分"本来就这些"和"解析漏了"）。
-    let legacy: AccountsFile = serde_json::from_str(legacy_raw.as_deref().unwrap_or(""))
-        .map_err(|e| format!("旧账号库解析失败（{}）：{e}", legacy_accounts_path.display()))?;
+    let legacy: AccountsFile =
+        serde_json::from_str(legacy_raw.as_deref().unwrap_or("")).map_err(|e| {
+            format!(
+                "旧账号库解析失败（{}）：{e}",
+                legacy_accounts_path.display()
+            )
+        })?;
 
     // 目标库原本是否存在 —— 决定"要不要备份"的一半条件。
     let target_existed = std::fs::read_to_string(&target_accounts_path).is_ok();
@@ -162,7 +167,9 @@ pub fn merge_legacy_cn_into_region() -> Result<MergeReport, String> {
         if target.device_bindings.contains_key(uid) {
             continue;
         }
-        target.device_bindings.insert(uid.clone(), device_id.clone());
+        target
+            .device_bindings
+            .insert(uid.clone(), device_id.clone());
         report.bindings_added += 1;
     }
 
@@ -214,9 +221,7 @@ pub fn merge_legacy_cn_into_region() -> Result<MergeReport, String> {
             // 成员指向一个旧库里不存在的分组 → 不并（悬空成员比没有更坏）。
             continue;
         };
-        target_groups
-            .membership
-            .insert(uid.clone(), mapped.clone());
+        target_groups.membership.insert(uid.clone(), mapped.clone());
         report.membership_added += 1;
     }
 
@@ -244,9 +249,15 @@ pub fn merge_legacy_cn_into_region() -> Result<MergeReport, String> {
 }
 
 /// 备份目标库文件到 `trae/backups/region-merge/<utc>/`，返回目录路径。
-fn write_backup(accounts_path: &std::path::Path, groups_path: &std::path::Path) -> Result<String, String> {
+fn write_backup(
+    accounts_path: &std::path::Path,
+    groups_path: &std::path::Path,
+) -> Result<String, String> {
     let stamp = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%SZ").to_string();
-    let dir = paths::trae_dir().join("backups").join("region-merge").join(&stamp);
+    let dir = paths::trae_dir()
+        .join("backups")
+        .join("region-merge")
+        .join(&stamp);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     for source in [accounts_path, groups_path] {
         if !source.is_file() {
@@ -312,6 +323,7 @@ mod tests {
             refresh_token: Some(format!("rt-{uid}")),
             added_at: Some("2026-09-01T00:00:00Z".into()),
             updated_at: None,
+            remark: None,
         }
     }
 
@@ -321,8 +333,14 @@ mod tests {
             device_bindings: HashMap::from([("u-legacy".to_string(), "dev-legacy".to_string())]),
             web_devices: std::collections::HashSet::new(),
         };
-        store_write(&legacy_path_for(&paths::accounts_file_for_region(TraeRegion::Cn)), &file);
-        store_write(&legacy_path_for(&paths::groups_file_for_region(TraeRegion::Cn)), &groups);
+        store_write(
+            &legacy_path_for(&paths::accounts_file_for_region(TraeRegion::Cn)),
+            &file,
+        );
+        store_write(
+            &legacy_path_for(&paths::groups_file_for_region(TraeRegion::Cn)),
+            &groups,
+        );
     }
 
     fn store_write<T: serde::Serialize>(path: &std::path::Path, value: &T) {
@@ -346,11 +364,16 @@ mod tests {
         };
         store_write(&paths::accounts_file_for_region(TraeRegion::Cn), &cn_seed);
         write_legacy(
-            vec![legacy_account("u-legacy", "小号 A"), legacy_account("u-2", "小号 B")],
+            vec![
+                legacy_account("u-legacy", "小号 A"),
+                legacy_account("u-2", "小号 B"),
+            ],
             GroupsFile::default(),
         );
-        let legacy_before =
-            std::fs::read_to_string(legacy_path_for(&paths::accounts_file_for_region(TraeRegion::Cn))).unwrap();
+        let legacy_before = std::fs::read_to_string(legacy_path_for(
+            &paths::accounts_file_for_region(TraeRegion::Cn),
+        ))
+        .unwrap();
 
         let report = merge_legacy_cn_into_region().expect("迁移应成功");
 
@@ -358,18 +381,25 @@ mod tests {
         assert_eq!(report.accounts_added, 2);
         assert_eq!(report.accounts_kept, 0);
         assert_eq!(report.bindings_added, 1);
-        assert!(report.backup.is_some(), "目标原本存在且发生了改写 → 必须有备份");
+        assert!(
+            report.backup.is_some(),
+            "目标原本存在且发生了改写 → 必须有备份"
+        );
 
         let target = load_target();
         let mut uids: Vec<String> = target
             .accounts
             .iter()
-            .map(|record| account::resolve_user_id(record))
+            .map(account::resolve_user_id)
             .collect();
         uids.sort();
         assert_eq!(
             uids,
-            vec!["u-2".to_string(), "u-cn".to_string(), "u-legacy".to_string()],
+            vec![
+                "u-2".to_string(),
+                "u-cn".to_string(),
+                "u-legacy".to_string()
+            ],
             "原有的 CN 账号必须留着，旧库两条并进来"
         );
         assert_eq!(
@@ -378,7 +408,10 @@ mod tests {
         );
         // ★ 旧文件必须逐字未动。
         assert_eq!(
-            std::fs::read_to_string(legacy_path_for(&paths::accounts_file_for_region(TraeRegion::Cn))).unwrap(),
+            std::fs::read_to_string(legacy_path_for(&paths::accounts_file_for_region(
+                TraeRegion::Cn
+            )))
+            .unwrap(),
             legacy_before,
             "迁移不得改写旧库文件"
         );
@@ -400,11 +433,15 @@ mod tests {
                 refresh_token: Some("rt-new".into()),
                 added_at: Some("2026-09-20T00:00:00Z".into()),
                 updated_at: None,
+                remark: None,
             }],
             device_bindings: HashMap::new(),
             web_devices: std::collections::HashSet::new(),
         };
-        store_write(&paths::accounts_file_for_region(TraeRegion::Cn), &target_seed);
+        store_write(
+            &paths::accounts_file_for_region(TraeRegion::Cn),
+            &target_seed,
+        );
         write_legacy(vec![legacy_account("u-1", "旧主号")], GroupsFile::default());
 
         let report = merge_legacy_cn_into_region().expect("迁移应成功");
@@ -414,7 +451,10 @@ mod tests {
         let target = load_target();
         assert_eq!(target.accounts.len(), 1);
         assert_eq!(account::resolve_user_id(&target.accounts[0]), "u-1");
-        assert_eq!(target.accounts[0].jwt, "Cloud-IDE-JWT NEW", "不得被旧值覆盖");
+        assert_eq!(
+            target.accounts[0].jwt, "Cloud-IDE-JWT NEW",
+            "不得被旧值覆盖"
+        );
         assert_eq!(target.accounts[0].name, "主号");
         // 账号一条没加，但旧库那条**目标库里没有**的设备绑定确实并了进来 ——
         // 绑定/分组的变化同样是改写，所以这里应当有备份。
@@ -479,8 +519,11 @@ mod tests {
         // 用裸 `std::fs::write` 写"坏文件"：`store::write_json` 只收可序列化的值，
         // 写不出语法非法的 JSON。裸写前必须自己把父目录建出来。
         let _ = std::fs::create_dir_all(paths::trae_dir());
-        std::fs::write(legacy_path_for(&paths::accounts_file_for_region(TraeRegion::Cn)), "{不是数组")
-            .expect("写坏文件应成功");
+        std::fs::write(
+            legacy_path_for(&paths::accounts_file_for_region(TraeRegion::Cn)),
+            "{不是数组",
+        )
+        .expect("写坏文件应成功");
 
         let err = merge_legacy_cn_into_region().expect_err("损坏的旧库必须报错");
         assert!(err.contains("解析失败"), "错误信息应指明原因：{err}");
@@ -502,7 +545,10 @@ mod tests {
             }],
             membership: HashMap::from([("u-cn".to_string(), "g-main".to_string())]),
         };
-        store_write(&paths::groups_file_for(TraeVariant::TraeWork), &target_groups);
+        store_write(
+            &paths::groups_file_for(TraeVariant::TraeWork),
+            &target_groups,
+        );
         write_legacy(
             vec![legacy_account("u-a", "A"), legacy_account("u-b", "B")],
             GroupsFile {
@@ -542,7 +588,10 @@ mod tests {
             Some("g-main"),
             "同名分组必须重映射到目标的 id"
         );
-        assert_eq!(merged.membership.get("u-b").map(String::as_str), Some("g-new"));
+        assert_eq!(
+            merged.membership.get("u-b").map(String::as_str),
+            Some("g-new")
+        );
         assert!(!merged.membership.contains_key("u-c"), "悬空成员不得并入");
 
         drop(guard);

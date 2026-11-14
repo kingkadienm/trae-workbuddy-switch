@@ -57,7 +57,7 @@ pub const SOURCE_MISSING: &str = "missing";
 ///
 /// 序列化成 camelCase —— 与 Trae 分区既有的前端类型（`TraeEnvStatus` 等）同风格，
 /// 前端不需要为这一处单独做字段名转换。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientModel {
     /// 模型标识（上游 `name`，如 `deepseek-v4.1-flash`）。空名条目会被丢弃。
@@ -72,17 +72,66 @@ pub struct ClientModel {
     pub is_preset: bool,
     pub is_new: bool,
     pub is_beta: bool,
+    /// 是否**第三方 / 自定义路由**条目（上游 `provider` 非空，或 `custom_model_id` 有值）。
+    ///
+    /// 网关发给上游的是 `config_name` / `model_name` 这套字段，对这类条目**无效**：
+    /// 本机实测 `openrouter//stealth/ox-alpha`（`provider = "openrouter"`，
+    /// `custom_model_id = "2445846658"`）在 `solo_work_lite` 下被上游
+    /// `4001 param is invalid` 拒（见 `buddy-switch-gateway` 的 `probe_work_list_names`）。
+    ///
+    /// ⇒ 网关侧 [`buddy_switch_gateway::trae::payload`] 的对外清单会**过滤掉**它们；
+    /// 界面按「在不在对外清单里」逐个打「网关不提供」标记，两处口径一致。
+    pub is_bypass: bool,
     /// 默认上下文窗口（`context_window_size.default`），取不到为 `None`。
     pub context_window: Option<i64>,
+    /// 上限上下文窗口（`context_window_size.max`），取不到为 `None`。
+    ///
+    /// 上游给 Max Mode 声明的上限（如 `1000000`）；实测客户端缓存里**常为 `null`**，
+    /// 因此消费方（Trae 网关的 `/v1/models`）必须有兜底，不能只依赖本字段。
+    pub context_window_max: Option<i64>,
     /// 单次回复上限（`prompt_max_tokens`），取不到为 `None`。
     pub prompt_max_tokens: Option<i64>,
+    /// 积分倍率（`features.consumption_rate.data.rate`，如 `0.2` = 基准价的 0.2 倍）。
+    ///
+    /// ★ issue #65：上游一直下发这个字段，此前解析时被丢弃 ⇒ 界面查「这个模型多少积分」
+    /// 只能回客户端看。`None` = 该条目没下发（实测 `assistant` 分组整组都没有）。
+    pub credits_rate: Option<f64>,
+    /// 支持的思考档位（`reasoning_effort_config.options`，保序照抄上游词表）。
+    ///
+    /// ★ 空数组有**两种成因**，界面文案必须区分（见 `efforts_supported`）：
+    /// - `support_thinking == false`：该模型确实不支持选档；
+    /// - 整个 `reasoning_effort_config` 缺失：这条程序位**没下发**档位信息。
+    ///
+    /// 混为一谈会让 TraeWork 侧（实测 `solo_work_lite` 22 条里只有 1 条带档位）看着像
+    /// 「全都不支持思考」，而真相是「这个程序位的清单里没这项能力」。
+    pub efforts: Vec<String>,
+    /// 默认档位（`reasoning_effort_config.default_level`）；取不到为 `None`。
+    pub default_effort: Option<String>,
+    /// 上游对「思考档位」的声明状态（见 [`ThinkingSupport`]）。
+    ///
+    /// ★ 必须与 `efforts` 分开放：`efforts` 为空有**两种**成因（明确不支持 / 根本没下发），
+    /// 混为一谈会让 TraeWork 侧（实测 `solo_work_lite` 22 条只有 1 条带档位）看着像
+    /// 「全都不支持思考」，而真相是「这条程序位的清单里没这项能力」。
+    pub thinking: ThinkingSupport,
+}
+
+/// 思考档位的声明状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingSupport {
+    /// 上游声明支持，可选档位见 `efforts`（实测全非空）。
+    Supported,
+    /// 上游明确不支持（`support_thinking: false` 且没有 options）。
+    Unsupported,
+    /// 客户端清单里**没有**这项字段 —— 不是「不支持」，是「不知道」，界面必须显示未下发。
+    Unknown,
 }
 
 /// 一个 function 分组（`solo_work_lite` / `solo_coder` / `builder` …）。
 ///
 /// 分组名**按产品线不同**（Trae Work 与 TraeCode 的取值集合完全不同），
 /// 故本模块原样透出、不做映射 —— 由调用方决定展示哪几组。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientModelGroup {
     pub function: String,
@@ -124,6 +173,32 @@ impl ClientModelList {
             note: Some(note.into()),
         }
     }
+
+    /// 直连上游的来源出口（issue #173）：`source = upstream`。
+    ///
+    /// **分组名固定 `chat_v3`**：直连路径只请求了这一个 function（实测它已含界面需要的
+    /// 全部可见模型），而上游响应里没有「本地客户端那套程序位分组」。编一个看起来像
+    /// `solo_work_lite` 的分组名就是造假 —— 界面按原样显示这个上游 function 名。
+    fn from_upstream(
+        variant: TraeVariant,
+        models: Vec<ClientModel>,
+        read_at: i64,
+        note: String,
+    ) -> Self {
+        Self {
+            variant: variant.as_str().to_string(),
+            variant_label: variant.display_name().to_string(),
+            source: super::model_list_upstream::SOURCE_UPSTREAM.to_string(),
+            read_at,
+            data_dir: None,
+            uid: None,
+            groups: vec![ClientModelGroup {
+                function: "chat_v3".to_string(),
+                models,
+            }],
+            note: Some(note),
+        }
+    }
 }
 
 /// 该变体「客户端此刻在用的」userData 目录候选（去重，**只读、不建目录**）。
@@ -152,9 +227,31 @@ fn state_db_candidates(root: &Path) -> [PathBuf; 2] {
 }
 
 /// 读取该变体的客户端模型清单（**永不失败**，读不到时 `source = missing`）。
+///
+/// ## 三档来源（优先级即顺序）
+///
+/// 1. **直连上游缓存**（issue #173，`source = upstream`）：新鲜期内优先 —— 它是用户
+///    **显式点过刷新**才有的，比客户端缓存更新；
+/// 2. **客户端 `state.vscdb`**（`source = client-cache`）：随客户端启动/刷新更新；
+/// 3. **过期的直连缓存**：前两者都没有时的兜底（headless 部署的常见形态），
+///    文案里必须写明「抓取于何时」，否则用户会以为是当天的。
 pub fn read_client_model_list(variant: TraeVariant) -> ClientModelList {
+    let now = now_ms();
+    if let Some(models) = super::model_list_upstream::fresh_models(variant, now) {
+        return ClientModelList::from_upstream(
+            variant,
+            models,
+            now,
+            "清单来自直连上游（不是客户端缓存）".to_string(),
+        );
+    }
+
     let dirs = candidate_dirs(variant);
     if dirs.is_empty() {
+        // headless 部署的典型形态：没有客户端目录，但用户点过一次「从上游拉取」。
+        if let Some(list) = stale_upstream_models(variant, now) {
+            return list;
+        }
         return ClientModelList::missing(
             variant,
             None,
@@ -172,7 +269,10 @@ pub fn read_client_model_list(variant: TraeVariant) -> ClientModelList {
     // 单个目录读失败（库损坏 / 权限 / 锁）**不该立刻放弃** —— 别的候选目录可能有能用的库。
     let mut last_error: Option<(PathBuf, String)> = None;
     for dir in &dirs {
-        if !state_db_candidates(dir).into_iter().any(|path| path.is_file()) {
+        if !state_db_candidates(dir)
+            .into_iter()
+            .any(|path| path.is_file())
+        {
             continue;
         }
         last_dir = Some(dir.clone());
@@ -188,6 +288,11 @@ pub fn read_client_model_list(variant: TraeVariant) -> ClientModelList {
     }
 
     // 全试完了：有「真的读失败」就报它，否则报「还没缓存」—— 后者是可操作的那条。
+    // ★ issue #173：两条出口都先看一眼**过期的**直连缓存 —— 比「什么都没有」有用，
+    //   但文案必须写明抓取时间（把陈旧数据说成当天的是谎报）。
+    if let Some(list) = stale_upstream_models(variant, now) {
+        return list;
+    }
     if let Some((dir, error)) = last_error {
         return ClientModelList::missing(
             variant,
@@ -205,6 +310,23 @@ pub fn read_client_model_list(variant: TraeVariant) -> ClientModelList {
     )
 }
 
+/// 过期的直连缓存 → 清单（带「抓取于 N 小时前」的说明）；没有缓存 ⇒ `None`。
+fn stale_upstream_models(variant: TraeVariant, now: i64) -> Option<ClientModelList> {
+    let (fetched_at, models) = super::model_list_upstream::stale_models(variant)?;
+    let hours = now.saturating_sub(fetched_at) / 3_600_000;
+    let age = if hours <= 0 {
+        "不到 1 小时前".to_string()
+    } else {
+        format!("约 {hours} 小时前")
+    };
+    Some(ClientModelList::from_upstream(
+        variant,
+        models,
+        now,
+        format!("客户端缓存不可用，展示的是 {age}从上游直连抓取的清单"),
+    ))
+}
+
 /// 从**指定** userData 目录读清单。
 ///
 /// `Ok(None)` 表示「这个目录里没有可用清单」（没库 / 没键 / 键解析不出分组）——
@@ -217,7 +339,10 @@ fn read_dir_model_list(
     variant: TraeVariant,
     prefer_uid: Option<&str>,
 ) -> Result<Option<ClientModelList>, String> {
-    let Some(db) = state_db_candidates(dir).into_iter().find(|path| path.is_file()) else {
+    let Some(db) = state_db_candidates(dir)
+        .into_iter()
+        .find(|path| path.is_file())
+    else {
         return Ok(None);
     };
     let Some(hit) = read_key_from_db(&db, prefer_uid)? else {
@@ -390,6 +515,8 @@ fn parse_model(value: &Value) -> Option<ClientModel> {
         .map(str::to_string)
         .unwrap_or_else(|| name.clone());
 
+    let (efforts, default_effort, thinking) = parse_thinking(value.get("reasoning_effort_config"));
+
     Some(ClientModel {
         name,
         display_name,
@@ -399,12 +526,74 @@ fn parse_model(value: &Value) -> Option<ClientModel> {
         is_preset: bool_field(value, "is_preset"),
         is_new: bool_field(value, "is_new"),
         is_beta: bool_field(value, "is_beta"),
+        is_bypass: !string_field(value, "provider").is_empty()
+            || value
+                .get("custom_model_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.trim().is_empty()),
         context_window: value
             .get("context_window_size")
             .and_then(|size| size.get("default"))
             .and_then(as_i64),
+        context_window_max: value
+            .get("context_window_size")
+            .and_then(|size| size.get("max"))
+            .and_then(as_i64),
         prompt_max_tokens: value.get("prompt_max_tokens").and_then(as_i64),
+        // ★ issue #65：这两项一直随清单下发，此前被丢弃 ⇒ 界面只能显示名字与窗口。
+        //   实测（2026-10-21 Trae CN `state.vscdb`）：
+        //   `features.consumption_rate.data.rate` = 0.06～1.83；`assistant` 分组整组没有。
+        credits_rate: value
+            .get("features")
+            .and_then(|features| features.get("consumption_rate"))
+            .and_then(|rate| rate.get("data"))
+            .and_then(|data| data.get("rate"))
+            .and_then(as_f64),
+        efforts,
+        default_effort,
+        thinking,
     })
+}
+
+/// 解析 `reasoning_effort_config` → `(可选档位, 默认档, 声明状态)`。
+///
+/// 三种实测形态（2026-10-21）：
+/// - `{"support_thinking": true, "options": ["light","high"], "default_level": "high"}`
+/// - `{"support_thinking": false}` —— 明确不支持
+/// - 整个字段缺失 —— **未下发**（不等于不支持，见 [`ThinkingSupport`]）
+fn parse_thinking(raw: Option<&Value>) -> (Vec<String>, Option<String>, ThinkingSupport) {
+    let Some(object) = raw.and_then(Value::as_object) else {
+        return (Vec::new(), None, ThinkingSupport::Unknown);
+    };
+    let efforts: Vec<String> = object
+        .get("options")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|effort| !effort.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    // 默认档必须在可选集里（上游若给出集外值，展示它就是误导）。
+    let default_effort = object
+        .get("default_level")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|effort| !effort.is_empty())
+        .map(str::to_string)
+        .filter(|effort| efforts.iter().any(|item| item == effort));
+    let thinking = if !efforts.is_empty() {
+        ThinkingSupport::Supported
+    } else if object.get("support_thinking").and_then(Value::as_bool) == Some(false) {
+        ThinkingSupport::Unsupported
+    } else {
+        // 声明了「支持」却没给选项 ⇒ 等于没下发，别编档位。
+        ThinkingSupport::Unknown
+    };
+    (efforts, default_effort, thinking)
 }
 
 /// 取字符串字段；类型不对或缺失一律回落空串（**绝不让脏值传到展示层**）。
@@ -431,6 +620,22 @@ fn as_i64(value: &Value) -> Option<i64> {
     }
 }
 
+/// 取浮点字段；接受数字与「数字字符串」（上游个别地方把数字塞进字符串），其余为 `None`。
+///
+/// ★ 用 `as_f64` 而不是 `as_i64`：`consumption_rate` 是 `0.06` / `1.83` 这类小数，
+/// 走整数解析会**静默变 None**（`as_i64` 只认整数），于是整列全是「—」。
+fn as_f64(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(number) => number.as_f64().filter(|rate| rate.is_finite()),
+        Value::String(text) => text
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|rate| rate.is_finite()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,8 +652,11 @@ mod tests {
         let db = root.join("User").join("globalStorage").join("state.vscdb");
         std::fs::create_dir_all(db.parent().unwrap()).expect("建 globalStorage");
         let conn = rusqlite::Connection::open(&db).expect("建库");
-        conn.execute("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)", [])
-            .expect("建表");
+        conn.execute(
+            "CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .expect("建表");
         for (key, value) in entries {
             conn.execute(
                 "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)",
@@ -490,7 +698,10 @@ mod tests {
         let key = "1234:AI.agent.model.model_list_map";
         assert!(key_belongs_to_uid(key, "1234"));
         assert!(!key_belongs_to_uid(key, "123"), "前缀相同但不是同一个 uid");
-        assert!(!key_belongs_to_uid(key, "1234:AI"), "uid 之后必须紧跟分隔符");
+        assert!(
+            !key_belongs_to_uid(key, "1234:AI"),
+            "uid 之后必须紧跟分隔符"
+        );
     }
 
     /// 端到端：两种键名形状都能从真库读出来。
@@ -568,7 +779,10 @@ mod tests {
             .expect("应当读到清单");
         assert_eq!(list.groups[0].models[0].name, "model-b");
         assert_eq!(list.uid.as_deref(), Some("7000000000000002"));
-        assert!(list.note.is_some(), "多份缓存必须给出提示，不能装作只有一份");
+        assert!(
+            list.note.is_some(),
+            "多份缓存必须给出提示，不能装作只有一份"
+        );
 
         cleanup(&root);
     }
@@ -611,6 +825,32 @@ mod tests {
         }
     }
 
+    /// ★★ 护栏：**第三方 / 自定义路由**条目必须被标出来（`provider` 非空或 `custom_model_id` 有值）。
+    ///
+    /// 网关发给上游的是 `config_name` / `model_name` 这套字段，对这类条目**无效** ——
+    /// 实测 `openrouter//stealth/ox-alpha`（`provider = "openrouter"`）在 `solo_work_lite`
+    /// 下被上游 `4001` 拒。漏标 ⇒ 它会进对外清单，成为又一个「看得见、调不动」。
+    #[test]
+    fn parse_model_marks_third_party_routes_as_bypass() {
+        let raw = r#"{
+            "g": [
+                {"name":"openrouter//stealth/ox-alpha","provider":"openrouter","custom_model_id":"2445846658"},
+                {"name":"custom-with-id","provider":"","custom_model_id":" 42 "},
+                {"name":"blank-provider","provider":"   ","custom_model_id":null},
+                {"name":"normal","provider":"","custom_model_id":null}
+            ]
+        }"#;
+        let groups = parse_groups(raw);
+        let models = &groups[0].models;
+        assert!(models[0].is_bypass, "provider 非空 ⇒ bypass");
+        assert!(
+            models[1].is_bypass,
+            "custom_model_id 非空（含空白）⇒ bypass"
+        );
+        assert!(!models[2].is_bypass, "provider 全空白 ⇒ 不是 bypass");
+        assert!(!models[3].is_bypass, "两者都空 ⇒ 正常条目");
+    }
+
     /// ★ 护栏：脏值一律归一，**绝不让非字符串传到展示层**（本仓踩过 React 白屏）。
     #[test]
     fn parse_groups_normalizes_dirty_entries() {
@@ -629,7 +869,10 @@ mod tests {
 
         let model = &groups[0].models[0];
         assert_eq!(model.name, "good");
-        assert_eq!(model.display_name, "good", "非字符串 display_name 必须回落 name");
+        assert_eq!(
+            model.display_name, "good",
+            "非字符串 display_name 必须回落 name"
+        );
         assert!(!model.is_default, "非布尔 is_default 必须回落 false");
         assert!(!model.is_beta);
         assert_eq!(model.model_type, "", "缺失的字符串字段回落空串");
@@ -640,4 +883,61 @@ mod tests {
         assert!(parse_groups("[1,2,3]").is_empty(), "顶层不是对象 ⇒ 空结果");
     }
 
+    /// ★ issue #65：思考档位 + 积分倍率必须从客户端清单里读出来。
+    ///
+    /// 三种「档位」形态要能区分（`supported` / `unsupported` / `unknown`）——
+    /// 把 `unknown` 混成 `unsupported` 会让 TraeWork 侧（实测 22 条只有 1 条带档位）
+    /// 看着像「全都不支持思考」，而真相是这条程序位没下发。
+    ///
+    /// 变异：`parse_thinking` 的缺失分支返回 `Unsupported` ⇒ 第一条断言红；
+    /// 用 `as_i64` 读 `rate` ⇒ `0.2` 变 `None` ⇒ 第二条红。
+    #[test]
+    fn parse_model_reads_thinking_and_consumption_rate() {
+        let raw = r#"{
+            "solo_agent": [
+                {"name":"with-thinking","reasoning_effort_config":
+                    {"support_thinking":true,"options":["light","high"],"default_level":"high"},
+                 "features":{"consumption_rate":{"enable":true,"data":{"rate":0.2}}}},
+                {"name":"no-thinking","reasoning_effort_config":{"support_thinking":false},
+                 "features":{"consumption_rate":{"enable":true,"data":{"rate":0.06}}}},
+                {"name":"no-config","features":{"consumption_rate":{"enable":true,"data":{"rate":"0.83"}}}},
+                {"name":"no-features"}
+            ]
+        }"#;
+        let groups = parse_groups(raw);
+        let models = &groups[0].models;
+
+        assert_eq!(models[0].efforts, vec!["light", "high"]);
+        assert_eq!(models[0].default_effort.as_deref(), Some("high"));
+        assert_eq!(models[0].thinking, ThinkingSupport::Supported);
+        assert_eq!(models[0].credits_rate, Some(0.2));
+
+        assert!(models[1].efforts.is_empty());
+        assert!(models[1].default_effort.is_none());
+        assert_eq!(
+            models[1].thinking,
+            ThinkingSupport::Unsupported,
+            "support_thinking:false ⇒ 明确不支持"
+        );
+        assert_eq!(models[1].credits_rate, Some(0.06));
+
+        assert_eq!(
+            models[2].thinking,
+            ThinkingSupport::Unknown,
+            "整块缺失 ⇒ 未下发（不是「不支持」）"
+        );
+        assert_eq!(models[2].credits_rate, Some(0.83), "数字字符串倍率也要认");
+
+        assert_eq!(models[3].thinking, ThinkingSupport::Unknown);
+        assert_eq!(models[3].credits_rate, None, "没下发就是 None，不编");
+    }
+
+    /// 默认档不在可选集里 ⇒ 丢弃（否则界面会显示一个传了就被降级的档位）。
+    #[test]
+    fn parse_model_drops_default_level_outside_options() {
+        let raw = r#"{"g":[{"name":"m","reasoning_effort_config":
+            {"support_thinking":true,"options":["low"],"default_level":"max"}}]}"#;
+        let groups = parse_groups(raw);
+        assert!(groups[0].models[0].default_effort.is_none());
+    }
 }

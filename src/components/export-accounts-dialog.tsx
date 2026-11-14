@@ -13,21 +13,30 @@ import {
 } from "@/components/ui/dialog";
 import * as api from "@/lib/api";
 import { useT, type Translate } from "@/lib/i18n";
-import type { AccountMeta, Region } from "@/lib/types";
+import type { Scope } from "@/lib/scope";
+
+/**
+ * 可导出账号的**最小结构**。
+ *
+ * ⚠️ 刻意**不**收 `AccountMeta`：三个平台的账号视图字段不同（Qoder 没有 `id`，只有
+ * `uid`）。收窄成「一个回传键 + 一个展示名」后，调用方各自映射 —— 组件内不必长平台分支，
+ * 也不必为了类型吻合去伪造 `AccountMeta`。
+ */
+export interface ExportableAccount {
+  /** 导出 / 回传键（WB 是 `id`，Qoder 是 `uid`）。 */
+  id: string;
+  /** 已归一为字符串的展示名。 */
+  label: string;
+}
 
 interface Props {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  accounts: AccountMeta[];
+  accounts: ExportableAccount[];
   /** 导出完成后回调（参数为导出的账号数）。 */
   onExported?: (count: number) => void;
-  /** 目标版本；缺省为国内版。 */
-  region?: Region;
-}
-
-/** 账号展示名（与账号卡片一致）。 */
-function accountLabel(a: AccountMeta): string {
-  return a.nickname || a.email || a.uid || a.id;
+  /** 目标作用域（`wb-cn` / `qoder-global` …）；缺省 `wb-cn`。理由同 `ImportAccountsDialog`。 */
+  scope?: Scope;
 }
 
 /** 导出文件名：buddy-switch-accounts-YYYY-MM-DD.json */
@@ -65,7 +74,7 @@ function revealLabel(t: Translate): string {
 }
 
 /** 导出账号弹框：多选账号 → 后端导出完整记录（含 token）→ 下载 JSON。 */
-export function ExportAccountsDialog({ open, onOpenChange, accounts, onExported, region }: Props) {
+export function ExportAccountsDialog({ open, onOpenChange, accounts, onExported, scope }: Props) {
   const t = useT();
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
@@ -105,7 +114,7 @@ export function ExportAccountsDialog({ open, onOpenChange, accounts, onExported,
       const ids = [...selected];
       if (api.isWebui()) {
         // webui：浏览器 Blob 下载
-        const res = await api.exportAccounts(ids, region);
+        const res = await api.exportAccounts(ids, scope);
         downloadJson(exportFileName(), res.accounts);
         onExported?.(res.accounts.length);
         onOpenChange(false);
@@ -118,7 +127,7 @@ export function ExportAccountsDialog({ open, onOpenChange, accounts, onExported,
           filters: [{ name: "JSON", extensions: ["json"] }],
         });
         if (!path) return; // 用户取消保存对话框
-        const res = await api.exportAccountsToPath(ids, path, region);
+        const res = await api.exportAccountsToPath(ids, path, scope);
         setSavedPath(res.path);
         onExported?.(ids.length);
       }
@@ -168,7 +177,7 @@ export function ExportAccountsDialog({ open, onOpenChange, accounts, onExported,
                     checked={selected.has(a.id)}
                     onChange={() => toggle(a.id)}
                   />
-                  <span className="min-w-0 flex-1 truncate text-sm">{accountLabel(a)}</span>
+                  <span className="min-w-0 flex-1 truncate text-sm">{a.label}</span>
                 </label>
               ))}
             </div>

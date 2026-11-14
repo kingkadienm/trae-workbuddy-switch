@@ -85,7 +85,10 @@ fn unique_temp_dir(label: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!("buddy-switch-{label}-{}-{nanos}", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "buddy-switch-{label}-{}-{nanos}",
+        std::process::id()
+    ))
 }
 
 /// 隔离 home 守卫：设置 `BUDDY_SWITCH_HOME`、持有 [`ENV_LOCK`]，Drop 时恢复环境变量
@@ -99,7 +102,9 @@ struct IsolatedHome {
 
 impl IsolatedHome {
     fn new(label: &str) -> Self {
-        let lock = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let previous = std::env::var(BUDDY_SWITCH_HOME_ENV).ok();
         let dir = unique_temp_dir(label);
         fs::create_dir_all(&dir).expect("create isolated home");
@@ -248,10 +253,16 @@ fn credit_stats_split_view_filters_by_account_ownership() {
     );
 
     // cn 视图：accounts[].accountId 必须全部属于 cn 账号库。
-    let cn = futures_block_on(credit_usage::get_statistics_for_filter(RegionFilter::Cn, false));
+    let cn = futures_block_on(credit_usage::get_statistics_for_filter(
+        RegionFilter::Cn,
+        false,
+    ));
     assert_eq!(cn["region"], "cn");
     for account in cn["accounts"].as_array().expect("accounts") {
-        assert_eq!(account["accountId"], "cn-only", "cn 视图不得串入 global 账号");
+        assert_eq!(
+            account["accountId"], "cn-only",
+            "cn 视图不得串入 global 账号"
+        );
         assert_eq!(account["region"], "cn");
     }
 }
@@ -263,7 +274,10 @@ fn credit_stats_merged_view_returns_union_with_region_badges() {
     assert_eq!(config::home_dir(), home.path().to_path_buf());
     write_credit_fixtures(home.path());
 
-    let merged = futures_block_on(credit_usage::get_statistics_for_filter(RegionFilter::All, false));
+    let merged = futures_block_on(credit_usage::get_statistics_for_filter(
+        RegionFilter::All,
+        false,
+    ));
     assert_eq!(merged["region"], "all");
     let accounts = merged["accounts"].as_array().expect("accounts");
     let ids: Vec<&str> = accounts
@@ -292,10 +306,8 @@ fn token_stats_merged_view_contains_all_sources_and_region_all() {
     assert_eq!(config::home_dir(), home.path().to_path_buf());
 
     // 合并视图顶层 region=all，且 sources 含 global 专属的 workbuddy-ai 源。
-    let value = buddy_switch_core::modules::token_stats::get_statistics_for_filter(
-        RegionFilter::All,
-        None,
-    );
+    let value =
+        buddy_switch_core::modules::token_stats::get_statistics_for_filter(RegionFilter::All, None);
     assert_eq!(value["region"], "all");
     let names: Vec<&str> = value["sources"]
         .as_array()
@@ -370,12 +382,18 @@ fn credit_stats_merged_view_excludes_orphan_snapshots_and_equals_split_sum() {
     assert_eq!(config::home_dir(), home.path().to_path_buf());
     write_credit_fixtures_with_orphan(home.path());
 
-    let cn = futures_block_on(credit_usage::get_statistics_for_filter(RegionFilter::Cn, false));
+    let cn = futures_block_on(credit_usage::get_statistics_for_filter(
+        RegionFilter::Cn,
+        false,
+    ));
     let global = futures_block_on(credit_usage::get_statistics_for_filter(
         RegionFilter::Global,
         false,
     ));
-    let all = futures_block_on(credit_usage::get_statistics_for_filter(RegionFilter::All, false));
+    let all = futures_block_on(credit_usage::get_statistics_for_filter(
+        RegionFilter::All,
+        false,
+    ));
 
     // 分开视图：各自只含本版账号的消耗。
     let used_cn = cn["summary"]["usage7Days"].as_f64().unwrap_or(-1.0);
@@ -581,7 +599,9 @@ fn home_dir_honours_override_and_store_dir_derives_from_it() {
     // region 化账号库同样落在覆盖根目录下（CN 与 Global 文件名不同）。
     assert_eq!(
         region::accounts_file_for(Region::Global),
-        home.path().join(".buddy-switch").join("accounts.global.json")
+        home.path()
+            .join(".buddy-switch")
+            .join("accounts.global.json")
     );
     assert_ne!(
         region::accounts_file_for(Region::Cn),
@@ -596,7 +616,9 @@ fn home_dir_honours_override_and_store_dir_derives_from_it() {
 
 #[test]
 fn home_dir_falls_back_to_real_home_when_unset() {
-    let lock = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let previous = std::env::var(BUDDY_SWITCH_HOME_ENV).ok();
     std::env::remove_var(BUDDY_SWITCH_HOME_ENV);
 
@@ -616,7 +638,9 @@ fn home_dir_falls_back_to_real_home_when_unset() {
 
 #[test]
 fn blank_override_is_ignored_and_falls_back_to_real_home() {
-    let lock = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let previous = std::env::var(BUDDY_SWITCH_HOME_ENV).ok();
     std::env::set_var(BUDDY_SWITCH_HOME_ENV, "   ");
 
@@ -643,7 +667,9 @@ fn blank_override_is_ignored_and_falls_back_to_real_home() {
 /// 在持有 [`ENV_LOCK`] 的前提下，把 `BUDDY_SWITCH_HOME` 临时设为 `value` 运行 `f`，
 /// 结束后恢复原值。只用于**不改动**环境变量以外状态的断言。
 fn with_override<T>(value: &str, f: impl FnOnce() -> T) -> T {
-    let lock = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let previous = std::env::var(BUDDY_SWITCH_HOME_ENV).ok();
     std::env::set_var(BUDDY_SWITCH_HOME_ENV, value);
     let result = f();

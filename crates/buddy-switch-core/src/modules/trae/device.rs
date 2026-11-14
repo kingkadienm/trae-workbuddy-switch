@@ -299,7 +299,10 @@ mod tests {
         let full = seeded_stream("1234567890123456", "devid", 16).unwrap();
         let short = seeded_stream("1234567890123456", "devid", 15).unwrap();
         assert_eq!(short, full[..15].to_vec(), "取前缀性质被破坏，派生会漂移");
-        assert_eq!(seeded_stream("1234567890123456", "devid", 16).unwrap(), full);
+        assert_eq!(
+            seeded_stream("1234567890123456", "devid", 16).unwrap(),
+            full
+        );
     }
 
     #[test]
@@ -332,7 +335,9 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.len(), 64);
         assert!(
-            first.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            first
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "{first}"
         );
         // 奇数长度也必须精确截断
@@ -343,7 +348,10 @@ mod tests {
     fn rand_hex_delegates_to_salted_variant_and_salts_stay_distinct() {
         // `rand_hex` 必须是 `rand_hex_salted(n, "sess", …)` 的别名，
         // 否则 `vscode-sessionid` 会与既有落盘数据不一致。
-        assert_eq!(rand_hex(64, Some("u")), rand_hex_salted(64, "sess", Some("u")));
+        assert_eq!(
+            rand_hex(64, Some("u")),
+            rand_hex_salted(64, "sess", Some("u"))
+        );
         // 不同 salt 必须给出不同结果，否则 `x-machine-id` 会与 session-id 撞车。
         assert_ne!(
             rand_hex_salted(64, "mach", Some("u")),
@@ -445,11 +453,18 @@ mod tests {
             assert_ne!(cn.machine_id, work_first.machine_id);
 
             // 两个文件都要真的落盘，且路径不同。
-            let work_path = crate::modules::trae::paths::oauth_device_file_for(TraeVariant::TraeWork);
+            let work_path =
+                crate::modules::trae::paths::oauth_device_file_for(TraeVariant::TraeWork);
             let cn_path = crate::modules::trae::paths::oauth_device_file_for(TraeVariant::Global);
             assert_ne!(work_path, cn_path);
-            assert!(work_path.is_file(), "Trae Work 的 machine_id 未落盘: {work_path:?}");
-            assert!(cn_path.is_file(), "Trae CN 的 machine_id 未落盘: {cn_path:?}");
+            assert!(
+                work_path.is_file(),
+                "Trae Work 的 machine_id 未落盘: {work_path:?}"
+            );
+            assert!(
+                cn_path.is_file(),
+                "Trae CN 的 machine_id 未落盘: {cn_path:?}"
+            );
 
             // 落盘内容可被读回（形状与结构体一致）。
             let reloaded: OAuthLoginMachine = store::read_json(&work_path);
@@ -552,7 +567,11 @@ mod tests {
             // ② 更早期的形态：只有 `seed` / `device_id`，没有 `machine_id`。
             std::fs::write(&path, r#"{"seed":"abc","device_id":"123456789012345"}"#).unwrap();
             let healed = oauth_login_machine_for(TraeVariant::TraeWork);
-            assert_eq!(healed.machine_id.len(), 32, "缺 machine_id 时必须自愈，不能留空");
+            assert_eq!(
+                healed.machine_id.len(),
+                32,
+                "缺 machine_id 时必须自愈，不能留空"
+            );
             assert!(
                 healed.machine_id.chars().all(|c| c.is_ascii_hexdigit()),
                 "自愈值必须是 hex，实际为 {}",

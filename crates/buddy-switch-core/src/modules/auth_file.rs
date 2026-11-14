@@ -99,10 +99,10 @@ pub fn workbuddy_app_path_for(region: Region) -> PathBuf {
             Region::Cn => ("WorkBuddy", "WorkBuddy.exe"),
             Region::Global => ("WorkBuddyAI", "WorkBuddyAI.exe"),
         };
-        return std::path::Path::new(&local)
+        std::path::Path::new(&local)
             .join("Programs")
             .join(folder)
-            .join(exe);
+            .join(exe)
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -309,43 +309,16 @@ pub fn write_account_to_auth_file_for(region: Region, acc: &Value) -> Result<(),
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
 
-    let existing = read_auth_file_for(region).unwrap_or_else(|| json!({}));
-    eprintln!(
-        "[auth] write_account: existing is_object={} allAccounts_len={}",
-        existing.is_object(),
-        existing
-            .get("allAccounts")
-            .and_then(|v| v.as_array())
-            .map(|a| a.len())
-            .unwrap_or(0)
-    );
-    let all_accounts = existing
-        .get("allAccounts")
-        .cloned()
-        .or_else(|| existing.get("accounts").cloned())
-        .filter(|v| v.is_array())
-        .unwrap_or_else(|| json!([]));
+    // ★ 风控隔离：官方客户端文件是**当前账号的单账号快照**，不是账号库镜像。
+    //
+    // 旧实现把历史 `allAccounts` 合并后写回，导致官方客户端同时看到多个账号，
+    // 形成直接的账号关联面。全部账号仍由 `~/.buddy-switch/accounts*.json` 保管；
+    // 这里只把目标账号交给客户端。读取 `existing` 仍保留，用于后续兼容性校验/诊断，
+    // 但绝不把其中其它账号透传。
+    let _existing = read_auth_file_for(region).unwrap_or_else(|| json!({}));
     let account_obj = build_account_obj(acc);
     let auth_obj = build_auth_obj(acc);
-
-    // 把目标账号并入 allAccounts（去重：按 uid 或 id）
-    let target_uid = get_str(acc, "uid").unwrap_or_default();
-    let mut all: Vec<Value> = all_accounts.as_array().cloned().unwrap_or_default();
-    all.retain(|a| {
-        let primary = a
-            .get("uid")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                a.get("id")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-            })
-            .unwrap_or("");
-        primary != target_uid
-    });
-    all.push(account_obj.clone());
-    eprintln!("[auth] write_account: merged allAccounts len={}", all.len());
+    let all: Vec<Value> = vec![account_obj.clone()];
 
     let session = json!({
         "account": &account_obj,
@@ -426,6 +399,40 @@ pub fn import_from_auth_file_for(region: Region) -> Option<Value> {
     }
 }
 
+/// 从**文本**导入账号（粘贴凭据，issue #62）。
+///
+/// 与 [`import_from_auth_file_for`] 共用**同一条解析与解锁链**，差别只在数据源：
+/// 那边读本机认证文件，这边吃用户粘进来的 JSON。服务器 / 容器里没有客户端目录，
+/// 让用户把 `auth/workbuddy-desktop-ai.info` 的内容贴过来是最省事的入库方式。
+///
+/// 解锁口径与文件导入**逐字一致**：解不开就保留信封（账号仍可用于切换 / 网关），
+/// 绝不因为「本机拿不到密钥」把整个导入判失败。
+pub fn import_account_from_text_for(region: Region, text: &str) -> Result<Value, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("凭据内容为空".to_string());
+    }
+    let root: Value = serde_json::from_str(trimmed)
+        .map_err(|error| format!("不是合法的认证文件 JSON：{error}"))?;
+    let account = imported_account_from_root(root)
+        .ok_or("没有找到可用的凭据（accessToken / refreshToken）")?;
+    if !crate::modules::at_rest::is_unlockable(&account) {
+        return Ok(account);
+    }
+    match crate::modules::at_rest::unlock_account_for(region, &account) {
+        Ok(Some(unlocked)) => Ok(unlocked),
+        // `None` = 读取与解锁之间字段变了（并发切换），用原值即可。
+        Ok(None) => Ok(account),
+        Err(error) => {
+            eprintln!(
+                "[at-rest] 粘贴的凭据未解锁（{}）：{error}；保留信封，账号仍可用于切换",
+                error.code()
+            );
+            Ok(account)
+        }
+    }
+}
+
 /// 字段取值：**明文优先**（`get_str`：trim + 空串视为缺失，保持历史回落链），
 /// 明文取不到时接受 WorkBuddy 5.6 的**加密信封**并原样返回。
 ///
@@ -495,9 +502,7 @@ fn imported_account_from_root(root: Value) -> Option<Value> {
             .or_else(|| auth_obj.get("refreshExpiresAt")),
     );
 
-    if access_token.is_none() {
-        return None;
-    }
+    access_token.as_ref()?;
 
     Some(json!({
         "id": uuid::Uuid::new_v4().to_string(),
@@ -538,6 +543,60 @@ fn parse_ts(v: Option<&Value>) -> Option<i64> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 粘贴凭据（issue #62）：空内容 / 非 JSON 必须给**可读原因**，
+    /// 不能返回一个「没有凭据」的模糊错误（用户会以为是自己的凭据坏了）。
+    #[test]
+    fn paste_credential_rejects_empty_and_invalid_json() {
+        let empty = import_account_from_text_for(Region::Cn, "   ").unwrap_err();
+        assert!(empty.contains("为空"), "空内容的提示应点明是空的: {empty}");
+
+        let invalid = import_account_from_text_for(Region::Cn, "{not-json").unwrap_err();
+        assert!(
+            invalid.contains("JSON"),
+            "非 JSON 必须说清是格式问题: {invalid}"
+        );
+    }
+
+    /// 粘贴凭据：结构对但没有凭据字段 ⇒ 明确说「没有可用凭据」。
+    #[test]
+    fn paste_credential_reports_missing_tokens() {
+        let error = import_account_from_text_for(Region::Cn, r#"{"uid":"u1"}"#).unwrap_err();
+        assert!(
+            error.contains("accessToken") || error.contains("refreshToken"),
+            "应指出缺哪个字段: {error}"
+        );
+    }
+
+    /// 粘贴凭据与文件导入共用解析链：最小可用的 auth 结构应能解析出账号。
+    ///
+    /// 断言的是**同一条链**（`imported_account_from_root`）：字段名与嵌套形态与
+    /// 客户端 auth 文件一致（`auth.accessToken` + `account.uid`）。
+    #[test]
+    fn paste_credential_parses_minimal_auth_payload() {
+        let text = r#"{
+            "uid": "u-paste-1",
+            "auth": { "accessToken": "at-123", "refreshToken": "rt-456" }
+        }"#;
+        let account = import_account_from_text_for(Region::Cn, text).expect("应能解析出账号");
+        // ⚠️ `id` 是**本仓生成的 UUID**（与客户端 uid 不是一回事），
+        // 断言要落在真正搬运的字段上：uid 与两个 token。
+        assert_eq!(
+            account.get("uid").and_then(Value::as_str),
+            Some("u-paste-1"),
+            "uid 应原样保留: {account}"
+        );
+        assert_eq!(
+            account.get("access_token").and_then(Value::as_str),
+            Some("at-123"),
+            "access_token 应取自 auth.accessToken: {account}"
+        );
+        assert_eq!(
+            account.get("refresh_token").and_then(Value::as_str),
+            Some("rt-456"),
+            "refresh_token 应取自 auth.refreshToken: {account}"
+        );
+    }
 
     #[test]
     fn auth_file_path_is_expected_location() {
@@ -590,8 +649,8 @@ mod tests {
     #[test]
     fn ensure_region_matches_rejects_cross_region_credential() {
         let global_root = json!({"auth": {"domain": "www.workbuddy.ai"}});
-        let err = ensure_region_matches(Region::Cn, &global_root)
-            .expect_err("国际版凭据不得用于 CN");
+        let err =
+            ensure_region_matches(Region::Cn, &global_root).expect_err("国际版凭据不得用于 CN");
         assert_eq!(err.actual_domain, "www.workbuddy.ai");
         assert_eq!(err.actual_region, Region::Global);
         assert_eq!(err.expected_region, Region::Cn);
@@ -741,6 +800,70 @@ mod tests {
         drop(guard);
         let _ = std::fs::remove_dir_all(&dir);
     }
+    /// ★ 风控隔离：切换账号时，官方认证文件里**只能出现当前账号**。
+    ///
+    /// 旧实现会把 `allAccounts` / `accounts` 原样保留并追加目标账号，于是官方客户端
+    /// 同时看到多个账号 —— 这是最直接的账号关联面。账号库仍由本应用保管全部账号，
+    /// 但交给官方客户端的那份文件必须是「单账号快照」。
+    ///
+    /// 可证伪：把写入侧改回合并旧 `allAccounts`，本用例第一条断言立即变红。
+    #[test]
+    fn write_back_exposes_only_the_current_account() {
+        let dir = std::env::temp_dir().join(format!(
+            "buddy-switch-auth-isolation-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let guard = crate::modules::config::HomeOverrideGuard::set(&dir);
+
+        let old = json!({
+            "uid": "u-old",
+            "nickname": "旧账号",
+            "domain": "www.codebuddy.cn",
+        });
+        let seed = json!({
+            "account": old.clone(),
+            "auth": {
+                "accessToken": "old-at",
+                "refreshToken": "old-rt",
+                "domain": "www.codebuddy.cn",
+            },
+            "accounts": [old.clone()],
+            "allAccounts": [old],
+        });
+        let path = auth_file_path_for(Region::Cn);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create auth dir");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&seed).expect("serialize seed"),
+        )
+        .expect("seed auth file");
+
+        let target = json!({
+            "id": "a-target",
+            "uid": "u-target",
+            "nickname": "目标账号",
+            "domain": "www.codebuddy.cn",
+            "access_token": "target-at",
+            "refresh_token": "target-rt",
+        });
+        write_account_to_auth_file_for(Region::Cn, &target).expect("写入目标账号");
+
+        let written = read_auth_file_for(Region::Cn).expect("写回后必须能读回");
+        for key in ["accounts", "allAccounts"] {
+            let list = written[key].as_array().expect("账号列表必须是数组");
+            assert_eq!(list.len(), 1, "{key} 必须只含当前账号");
+            assert_eq!(list[0]["uid"], "u-target", "{key} 必须指向目标账号");
+            assert!(
+                list.iter().all(|account| account["uid"] != "u-old"),
+                "{key} 不得泄漏旧账号"
+            );
+        }
+        assert_eq!(written["account"]["uid"], "u-target");
+
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// ★ 真机用例（**默认忽略**，需本机装有客户端且当前登录态是信封）：
     /// 「从本机导入」必须**直接产出明文凭据**，而不是把信封原样存进账号库。
@@ -793,9 +916,15 @@ mod tests {
         let token = saved["access_token"]
             .as_str()
             .expect("导入后 access_token 应是明文字符串，而不是信封对象");
-        assert!(token.starts_with("eyJ"), "应是 JWT：{}", &token[..token.len().min(16)]);
         assert!(
-            saved["refresh_token"].as_str().is_some_and(|v| v.starts_with("eyJ")),
+            token.starts_with("eyJ"),
+            "应是 JWT：{}",
+            &token[..token.len().min(16)]
+        );
+        assert!(
+            saved["refresh_token"]
+                .as_str()
+                .is_some_and(|v| v.starts_with("eyJ")),
             "refresh_token 也应解锁：{}",
             saved["refresh_token"]
         );

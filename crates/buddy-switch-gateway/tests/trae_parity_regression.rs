@@ -1,3 +1,7 @@
+// 测试串行锁（`guard()` / `ENV_LOCK`）会被**故意**持有到用例结束：它防的是多个用例
+// 同时改同一个进程级状态（环境变量 / 全局配置）。`#[tokio::test]` 默认 current-thread，
+// 不存在「持锁跨线程唤醒」的风险；clippy::await_holding_lock 在这里是误报。
+#![allow(clippy::await_holding_lock)]
 //! 独立回归护栏：**证伪**「Trae 对齐 WorkBuddy」本轮改造中的高风险点。
 //!
 //! 本文件由 QA 新增（不改任何产品源码），与 `trae_gateway_e2e.rs` 平行、互不依赖，
@@ -54,23 +58,34 @@ fn isolated_home(tag: &str) -> std::path::PathBuf {
 
 /// 往隔离 home 写入**指定变体**的账号库（默认变体沿用无后缀旧文件名）。
 fn write_accounts_for(home: &std::path::Path, variant: TraeVariant, accounts: &[(&str, &str)]) {
-    let name = if variant == TraeVariant::default() {
-        "checkin_accounts.json".to_string()
-    } else {
-        format!("checkin_accounts.{}.json", variant.as_str())
-    };
-    let file = home.join(".buddy-switch").join("trae").join(name);
+    // ★ 文件名**必须走生产同源的取值点** `paths::accounts_file_for` —— 它按**区域**
+    //   命名（Cn = `checkin_accounts.json`、Global = `checkin_accounts.global.json`）。
+    //   原实现在这里手搓「默认变体无后缀、其余加 `.<variant>` 后缀」，那是**合并前**
+    //   的产品线命名（`.trae_cn`），生产早已不再写入 ⇒ 默认变体一改就会写错文件名、
+    //   用例读到空账号库（症状是 503 `no_healthy_account`，与真实缺陷难以区分）。
+    let file = home.join(".buddy-switch").join("trae").join(
+        buddy_switch_core::modules::trae::paths::accounts_file_for(variant)
+            .file_name()
+            .expect("账号库文件名应可取")
+            .to_string_lossy()
+            .to_string(),
+    );
     let list: Vec<serde_json::Value> = accounts
         .iter()
         .map(|(uid, jwt)| serde_json::json!({ "name": format!("账号 {uid}"), "UserID": uid, "jwt": jwt }))
         .collect();
-    std::fs::write(file, serde_json::to_string_pretty(&serde_json::json!({ "accounts": list })).unwrap())
-        .expect("写入账号库");
+    std::fs::write(
+        file,
+        serde_json::to_string_pretty(&serde_json::json!({ "accounts": list })).unwrap(),
+    )
+    .expect("写入账号库");
 }
 
 /// 键库文件路径。
 fn keys_file(home: &std::path::Path) -> std::path::PathBuf {
-    home.join(".buddy-switch").join("trae").join("api_gateway_keys.json")
+    home.join(".buddy-switch")
+        .join("trae")
+        .join("api_gateway_keys.json")
 }
 
 /// 在隔离 home 里创建一把归属指定变体的 Key，返回一次性明文。
@@ -81,8 +96,12 @@ fn create_key(home: &std::path::Path, variant: TraeVariant) -> String {
 }
 
 fn write_legacy_settings(home: &std::path::Path, key: &str) {
-    let file = home.join(".buddy-switch").join("trae").join("settings.json");
-    std::fs::write(file, serde_json::json!({ "apiKey": key }).to_string()).expect("写入 settings.json");
+    let file = home
+        .join(".buddy-switch")
+        .join("trae")
+        .join("settings.json");
+    std::fs::write(file, serde_json::json!({ "apiKey": key }).to_string())
+        .expect("写入 settings.json");
 }
 
 /// mock 上游行为。
@@ -108,7 +127,9 @@ async fn mock_upstream(State(behavior): State<Behavior>, headers: HeaderMap) -> 
             .expect("构造 mock 响应")
     };
     match behavior {
-        Behavior::FailForJwt(target) if jwt == target => plain(StatusCode::UNAUTHORIZED, "session dead"),
+        Behavior::FailForJwt(target) if jwt == target => {
+            plain(StatusCode::UNAUTHORIZED, "session dead")
+        }
         _ => {
             let body = format!(
                 "id:1\nevent:output\ndata:{{\"response\":\"{jwt}\"}}\n\n\
@@ -163,7 +184,8 @@ async fn body_text(response: Response) -> String {
     String::from_utf8_lossy(&bytes).to_string()
 }
 
-const NONSTREAM: &str = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":false}"#;
+const NONSTREAM: &str =
+    r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":false}"#;
 
 /// R1 时序护栏：**先新建 CN Key（触发 legacy 物化）之后**，旧 `settings.apiKey`
 /// 仍必须能鉴权、且路由到 **Work** 池（拿 jwt-a），而不是被物化到别的产品线。
@@ -180,8 +202,12 @@ async fn legacy_key_still_routes_to_work_pool_after_materialization() {
     // 物化前：文件不存在，verify 走 settings 回落。
     assert!(!keys_file(&home).exists(), "键库文件此时不应存在");
     assert_eq!(
-        state.key_store.verify(legacy).expect("物化前旧 Key 应可用").variant,
-        TraeVariant::TraeWork
+        state
+            .key_store
+            .verify(legacy)
+            .expect("物化前旧 Key 应可用")
+            .variant,
+        TraeVariant::default()
     );
 
     // 新建一把 CN Key → legacy 被一并物化落盘（本轮惰性物化语义）。
@@ -190,7 +216,10 @@ async fn legacy_key_still_routes_to_work_pool_after_materialization() {
 
     // 磁盘上的 legacy 记录归属必须仍是 trae_work（物化不得改写归属）。
     let on_disk = std::fs::read_to_string(keys_file(&home)).expect("读键库文件");
-    assert!(on_disk.contains("\"id\": \"legacy\""), "legacy 记录必须被物化: {on_disk}");
+    assert!(
+        on_disk.contains("\"id\": \"legacy\""),
+        "legacy 记录必须被物化: {on_disk}"
+    );
     let parsed: serde_json::Value = serde_json::from_str(&on_disk).expect("键库是 JSON 数组");
     let legacy_entry = parsed
         .as_array()
@@ -198,25 +227,38 @@ async fn legacy_key_still_routes_to_work_pool_after_materialization() {
         .iter()
         .find(|entry| entry["id"] == "legacy")
         .expect("物化后的 legacy 记录");
+    // ★ issue #28：默认变体已改为**合并版** —— 老默认 `trae_work` 指向已被官方
+    //   合并卸载的客户端，物化时若还写它，老用户升级后 Key 会绑到一个死客户端上。
     assert_eq!(
-        legacy_entry["variant"], "trae_work",
-        "物化后 legacy 的 variant 必须仍是 trae_work（写错归属 → 老用户升级后全量失败）: {on_disk}"
+        legacy_entry["variant"], "trae_merged",
+        "物化后 legacy 的 variant 必须仍是默认变体（写错归属 → 老用户升级后全量失败）: {on_disk}"
     );
 
     // 物化后：旧 Key 仍能 verify。
     assert_eq!(
-        state.key_store.verify(legacy).expect("物化后旧 Key 仍必须可用").variant,
-        TraeVariant::TraeWork
+        state
+            .key_store
+            .verify(legacy)
+            .expect("物化后旧 Key 仍必须可用")
+            .variant,
+        TraeVariant::default()
     );
     // 新 CN Key 立即可用。
-    assert!(state.key_store.verify(&cn_plaintext).is_some(), "新 Key 必须立即可用");
+    assert!(
+        state.key_store.verify(&cn_plaintext).is_some(),
+        "新 Key 必须立即可用"
+    );
 
     // 关键：用旧 Key 发请求，必须由 **Work** 账号（jwt-a）完成。
     let response = buddy_switch_gateway::trae::router(state.clone())
         .oneshot(chat_request(legacy, NONSTREAM))
         .await
         .expect("路由调用");
-    assert_eq!(response.status(), StatusCode::OK, "旧 Key 必须照常选中 Work 账号");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "旧 Key 必须照常选中 Work 账号"
+    );
     let text = body_text(response).await;
     let parsed: serde_json::Value = serde_json::from_str(&text).expect("聚合 JSON");
     assert_eq!(
@@ -243,10 +285,15 @@ async fn region_keys_never_cross_into_the_other_region_pool() {
     let _g = guard();
     let home = isolated_home("two-pools");
     // 国内库 1 个账号（`TraeWork` 的区域即国内）、国际库 1 个账号。
-    write_accounts_for(&home, TraeVariant::TraeWork, &[("uid-a", "jwt-a")]);
-    write_accounts_for(&home, TraeVariant::Global, &[("uid-global", "jwt-global")]);
-    let cn_key = create_key(&home, TraeVariant::Trae);
-    let global_key = create_key(&home, TraeVariant::Global);
+    // ★ issue #28：区域才是隔离维度，程序位已收敛为「每区域一个」。
+    write_accounts_for(&home, TraeVariant::TraeMerged, &[("uid-a", "jwt-a")]);
+    write_accounts_for(
+        &home,
+        TraeVariant::GlobalTraeMerged,
+        &[("uid-global", "jwt-global")],
+    );
+    let cn_key = create_key(&home, TraeVariant::TraeMerged);
+    let global_key = create_key(&home, TraeVariant::GlobalTraeMerged);
     let state = state_with_mock(Behavior::Normal).await;
 
     let cn_text = body_text(
@@ -291,11 +338,15 @@ async fn cooling_one_region_does_not_touch_the_other() {
     let _g = guard();
     let home = isolated_home("pool-isolation");
     // 两套账号体系各一个账号。
-    write_accounts_for(&home, TraeVariant::TraeWork, &[("uid-cn", "jwt-cn")]);
-    write_accounts_for(&home, TraeVariant::Global, &[("uid-global", "jwt-global")]);
+    write_accounts_for(&home, TraeVariant::TraeMerged, &[("uid-cn", "jwt-cn")]);
+    write_accounts_for(
+        &home,
+        TraeVariant::GlobalTraeMerged,
+        &[("uid-global", "jwt-global")],
+    );
     // 只让**国内**账号在上游 401。
     let state = state_with_mock(Behavior::FailForJwt("jwt-cn".into())).await;
-    let cn_key = create_key(&home, TraeVariant::TraeWork);
+    let cn_key = create_key(&home, TraeVariant::TraeMerged);
 
     let response = buddy_switch_gateway::trae::router(state.clone())
         .oneshot(chat_request(&cn_key, NONSTREAM))
@@ -316,8 +367,12 @@ async fn cooling_one_region_does_not_touch_the_other() {
     let global_cooldowns = read_cooldowns("account_cooldowns.global.json");
 
     // (1) 方向不变：国内账号必须被冷却，且落在 **国内** 冷却文件里。
+    //
+    // ★ issue #108：类型从 `SessionDead` 改为 `AuthRejected` —— 本用例的 mock 返回
+    // 的是**裸 401（无 12153）**，按新契约它只是 60 秒浅冷却。本用例要证的是
+    // 「冷却落在正确区域的文件里」，与冷却时长/类型无关，故只跟着改口径。
     assert_eq!(
-        cn_cooldowns["cooldowns"]["uid-cn"]["type"], "SessionDead",
+        cn_cooldowns["cooldowns"]["uid-cn"]["type"], "AuthRejected",
         "国内账号必须被冷却并写进国内冷却文件\n{cn_cooldowns}"
     );
     // (2) 国内文件里不得冒出国际版账号。
@@ -341,7 +396,17 @@ async fn cooling_one_region_does_not_touch_the_other() {
         "国际版池不得被国内的冷却影响: {global}"
     );
     let cn = status_view(&state, false, None, "test", TraeVariant::TraeWork).await;
-    assert_eq!(cn["pool"]["disabled"], 1, "国内池该账号应为会话失效: {cn}");
+    // ★ issue #108：mock 返回的是裸 401（无 `12153`）⇒ 按新契约只落**浅冷却**，
+    // 不再把账号打成禁用终态。断言跟着改：`cooling == 1` 且 `disabled == 0`。
+    // 本用例真正要证的是「区域之间不互相污染」，`disabled` 的取值只是顺带的口径。
+    assert_eq!(
+        cn["pool"]["cooling"], 1,
+        "国内池该账号应处于冷却中（裸 401 = 浅冷却）: {cn}"
+    );
+    assert_eq!(
+        cn["pool"]["disabled"], 0,
+        "裸 401 不得把账号打成禁用终态（否则重登也救不回来）: {cn}"
+    );
 
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -363,18 +428,27 @@ fn legacy_remaining_file_without_packages_deserializes_empty() {
         "expire_times": { "uid-a": 1_234_567_890i64 },
         "updated_at": "2026-01-01T00:00:00+08:00"
     });
-    let file = home.join(".buddy-switch").join("trae").join("remaining_credits.json");
+    let file = home
+        .join(".buddy-switch")
+        .join("trae")
+        .join("remaining_credits.json");
     std::fs::write(&file, legacy.to_string()).expect("写旧 remaining 文件");
 
     // 走真实读盘路径：缺失字段回落空 map，而不是 panic / 整份丢弃。
     let parsed = load_remaining_for(TraeVariant::TraeWork);
-    assert!(parsed.packages.is_empty(), "旧文件缺 packages 必须回落空 map: {parsed:?}");
+    assert!(
+        parsed.packages.is_empty(),
+        "旧文件缺 packages 必须回落空 map: {parsed:?}"
+    );
     assert_eq!(
         parsed.credits.get("uid-a").copied(),
         Some(42.5),
         "既有 credits 不得被 legacy 兼容吞掉"
     );
-    assert_eq!(parsed.expire_times.get("uid-a").copied(), Some(1_234_567_890));
+    assert_eq!(
+        parsed.expire_times.get("uid-a").copied(),
+        Some(1_234_567_890)
+    );
 
     // 直接反序列化也必须成功（等价于「不得设 deny_unknown_fields」）。
     let direct: RemainingCreditsFile =
@@ -391,18 +465,25 @@ fn legacy_remaining_file_without_packages_deserializes_empty() {
 async fn variant_ids_are_underscore_form_on_disk_and_in_api_response() {
     let _g = guard();
     let home = isolated_home("variant-ids");
-    let work_key = create_key(&home, TraeVariant::TraeWork);
-    let cn_key = create_key(&home, TraeVariant::Trae);
+    // ★ issue #28：可选变体只剩两个合并版（`trae_merged` / `global_trae_merged`）。
+    let cn_key = create_key(&home, TraeVariant::TraeMerged);
+    let work_key = create_key(&home, TraeVariant::GlobalTraeMerged);
 
     let on_disk = std::fs::read_to_string(keys_file(&home)).expect("读键库文件");
-    assert!(on_disk.contains("\"trae_work\""), "落盘必须是 trae_work: {on_disk}");
-    assert!(on_disk.contains("\"trae_cn\""), "落盘必须是 trae_cn: {on_disk}");
+    assert!(
+        on_disk.contains("\"trae_merged\""),
+        "落盘必须是 trae_merged: {on_disk}"
+    );
+    assert!(
+        on_disk.contains("\"global_trae_merged\""),
+        "落盘必须是 global_trae_merged: {on_disk}"
+    );
     assert!(
         !on_disk.contains("\"traework\"") && !on_disk.contains("\"traecn\""),
         "不得出现派生 serde 的小写形态: {on_disk}"
     );
 
-    // 上线形态：list_response 的每条记录都带下划线形态的 variant，且不含明文/hash。
+    // 上线形态：list_response 的每条记录都带下划线形态的 variant，含明文（新建 Key）、不含 hash。
     let store = TraeApiKeyStore::new(keys_file(&home));
     let response = list_response(&store);
     let keys = response["keys"].as_array().expect("keys 是数组");
@@ -411,12 +492,35 @@ async fn variant_ids_are_underscore_form_on_disk_and_in_api_response() {
         .iter()
         .map(|entry| entry["variant"].as_str().expect("variant 必须是字符串"))
         .collect();
-    let expected: std::collections::BTreeSet<&str> = ["trae_work", "trae_cn"].into_iter().collect();
+    let expected: std::collections::BTreeSet<&str> =
+        ["trae_merged", "global_trae_merged"].into_iter().collect();
     assert_eq!(variants, expected, "上线 variant 集合漂移: {response}");
-    // 脱敏红线：响应里不得出现明文 / hash。
+    // ★ 2026-11-04：创建时**不落盘**明文 ⇒ 列表默认不含明文；用户选「保存到本软件」后才随列表下发。
     let serialized = response.to_string();
-    assert!(!serialized.contains(&work_key) && !serialized.contains(&cn_key), "不得泄漏明文");
-    assert!(keys.iter().all(|entry| entry.get("hash").is_none()), "不得下发 hash");
+    assert!(
+        !serialized.contains(&work_key) && !serialized.contains(&cn_key),
+        "未保存前列表不得下发明文"
+    );
+    assert!(
+        keys.iter().all(|entry| entry.get("hash").is_none()),
+        "不得下发 hash"
+    );
+
+    for (variant, secret) in [("global_trae_merged", &work_key), ("trae_merged", &cn_key)] {
+        let id = keys
+            .iter()
+            .find(|entry| entry["variant"] == variant)
+            .and_then(|entry| entry["id"].as_str())
+            .expect("variant 必须命中一条记录")
+            .to_string();
+        store.save_plaintext(&id, secret).unwrap();
+    }
+    let after = list_response(&store);
+    let after_text = after.to_string();
+    assert!(
+        after_text.contains(&work_key) && after_text.contains(&cn_key),
+        "保存后明文应随列表下发（眼睛查看）"
+    );
 
     let _ = std::fs::remove_dir_all(&home);
 }

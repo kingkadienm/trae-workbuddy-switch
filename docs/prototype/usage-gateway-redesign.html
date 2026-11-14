@@ -1,0 +1,859 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>用量页 · 网关账本重设计（设计稿）</title>
+<style>
+:root{
+  --bg: oklch(0.208 0.042 265.755);
+  --card: oklch(0.279 0.041 260.031);
+  --card2: oklch(0.245 0.041 262);
+  --fg: oklch(0.929 0.013 255.508);
+  --muted: oklch(0.704 0.04 256.788);
+  --faint: oklch(0.58 0.03 258);
+  --border: oklch(1 0 0 / 10%);
+  --border-strong: oklch(1 0 0 / 18%);
+  --primary: oklch(0.696 0.17 162.48);
+  --warning: oklch(0.79 0.14 78);
+  --danger: oklch(0.704 0.191 22.216);
+  --c1: oklch(0.82 0.12 163);
+  --c2: oklch(0.71 0.13 163);
+  --c3: oklch(0.60 0.12 163);
+  --c4: oklch(0.50 0.10 163);
+  --g1: oklch(0.74 0.12 278);
+  --g2: oklch(0.62 0.14 278);
+  --g3: oklch(0.52 0.13 278);
+  --g4: oklch(0.44 0.12 278);
+  --r: 12px;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--fg);
+  font-family:ui-sans-serif,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  font-size:14px;line-height:1.55;-webkit-font-smoothing:antialiased}
+.app{max-width:1160px;margin:0 auto;padding:26px 28px 40px}
+
+.page-head{display:flex;align-items:flex-start;gap:16px;margin-bottom:18px}
+.page-head h1{margin:0;font-size:22px;font-weight:600;letter-spacing:-.01em}
+.page-head p{margin:4px 0 0;color:var(--muted);font-size:12.5px}
+.grow{flex:1}
+.btn{display:inline-flex;align-items:center;gap:6px;height:32px;padding:0 12px;border-radius:8px;
+  border:1px solid var(--border);background:var(--card2);color:var(--fg);font-size:12.5px;cursor:pointer}
+.btn:hover{border-color:var(--border-strong)}
+.btn svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:1.8}
+
+.param-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 12px;margin-bottom:12px;
+  background:var(--card2);border:1px solid var(--border);border-radius:var(--r)}
+.param-label{font-size:11.5px;color:var(--faint);letter-spacing:.04em}
+.seg{display:inline-flex;padding:2px;background:oklch(1 0 0 / 5%);border-radius:8px;gap:2px}
+.seg button{border:0;background:transparent;color:var(--muted);font-size:12.5px;padding:5px 11px;
+  border-radius:6px;cursor:pointer;font-family:inherit;white-space:nowrap}
+.seg button:hover{color:var(--fg)}
+.seg button.on{background:var(--card);color:var(--fg);box-shadow:0 1px 2px oklch(0 0 0/.25)}
+.seg.book button.on{background:oklch(0.696 0.17 162.48 / .16);color:oklch(0.88 0.10 163);box-shadow:none}
+.vsep{width:1px;height:20px;background:var(--border)}
+
+.coverage{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:9px 14px;margin-bottom:16px;
+  background:oklch(0.279 0.041 260.031 / .5);border:1px solid var(--border);border-radius:10px;font-size:12.5px}
+.cov{display:inline-flex;align-items:center;gap:7px;color:var(--muted)}
+.cov b{color:var(--fg);font-weight:500;font-variant-numeric:tabular-nums}
+.dot{width:8px;height:8px;border-radius:3px;display:inline-block}
+.dot.c{background:var(--c2)}
+.dot.g{background:var(--g2)}
+.chip{display:inline-flex;align-items:center;height:19px;padding:0 7px;border-radius:5px;
+  font-size:11px;background:oklch(1 0 0/6%);color:var(--muted);border:1px solid var(--border)}
+.chip.warn{background:oklch(0.79 0.14 78/.14);color:var(--warning);border-color:oklch(0.79 0.14 78/.3)}
+.chip.only{background:oklch(0.68 0.14 278/.18);color:var(--g1);border-color:oklch(0.68 0.14 278/.35)}
+
+.tabs{display:inline-flex;gap:2px;padding:3px;background:oklch(1 0 0/4%);border-radius:10px;margin-bottom:18px}
+.tabs button{border:0;background:transparent;color:var(--muted);font-size:13px;padding:7px 16px;
+  border-radius:8px;cursor:pointer;font-family:inherit}
+.tabs button.on{background:var(--card);color:var(--fg)}
+
+.tiles{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}
+.stat{background:var(--card);border:1px solid var(--border);border-radius:var(--r);padding:13px 14px 12px}
+.stat-label{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--muted)}
+.stat-label svg{width:13px;height:13px;stroke:currentColor;fill:none;stroke-width:1.7;opacity:.8}
+.stat-value{font-size:24px;font-weight:500;letter-spacing:-.02em;margin-top:6px;
+  font-variant-numeric:tabular-nums;display:flex;align-items:baseline;gap:5px}
+.stat-hint{font-size:11.5px;color:var(--faint);margin-top:3px}
+.approx{font-size:16px;color:var(--warning);border-bottom:1px dotted var(--warning);cursor:help;font-weight:400}
+.stat-label .grow{flex:1}
+.link{color:var(--g1);cursor:pointer;border-bottom:1px dotted var(--g1);font-size:11.5px;white-space:nowrap}
+.link:hover{color:var(--g2)}
+.badge{display:inline-flex;align-items:center;height:17px;padding:0 6px;border-radius:5px;font-size:10.5px;
+  background:oklch(0.696 0.17 162.48/.14);color:oklch(0.86 0.12 163);border:1px solid oklch(0.696 0.17 162.48/.32)}
+.badge.warn{background:oklch(0.79 0.14 78/.14);color:var(--warning);border-color:oklch(0.79 0.14 78/.32)}
+
+.drawer-mask{position:fixed;inset:0;background:oklch(0 0 0/.5);display:none;z-index:40}
+.drawer-mask.on{display:block}
+.drawer{position:absolute;top:0;right:0;bottom:0;width:452px;background:var(--card2);
+  border-left:1px solid var(--border);padding:18px 20px 28px;overflow-y:auto}
+.drawer h2{margin:0 0 2px;font-size:15px;font-weight:600}
+.drawer .dsub{font-size:12px;color:var(--faint);margin-bottom:16px}
+.drawer .x{position:absolute;top:14px;right:16px;width:26px;height:26px;border-radius:7px;border:1px solid var(--border);
+  background:transparent;color:var(--muted);cursor:pointer;font-size:15px;line-height:1}
+.dsec{margin-bottom:16px}
+.dsec h4{margin:0 0 7px;font-size:11px;color:var(--faint);font-weight:500;letter-spacing:.05em}
+.dformula{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:13px 14px;font-size:12.5px}
+.dformula .big{font-size:26px;font-weight:500;letter-spacing:-.02em;font-variant-numeric:tabular-nums;margin-bottom:4px}
+.dformula .eq{color:var(--muted);font-variant-numeric:tabular-nums}
+.dformula .eq b{color:var(--fg);font-weight:500}
+.drow{display:flex;align-items:center;gap:8px;padding:6px 0;font-size:12.5px;border-bottom:1px solid oklch(1 0 0/5%)}
+.drow:last-child{border-bottom:0}
+.drow .k{flex:1;color:var(--muted)}
+.drow .v{font-variant-numeric:tabular-nums}
+.dnote{font-size:11.5px;color:var(--faint);line-height:1.6}
+.verdict{border-radius:10px;padding:12px 14px;margin-bottom:16px;font-size:12.5px;line-height:1.6;
+  background:oklch(0.696 0.17 162.48/.10);border:1px solid oklch(0.696 0.17 162.48/.26)}
+.verdict h3{margin:0 0 4px;font-size:12.5px;font-weight:600;color:oklch(0.88 0.10 163)}
+.verdict p{margin:0;color:var(--muted)}
+.verdict b{color:var(--fg);font-weight:500}
+.verdict.mixed{background:oklch(0.79 0.14 78/.10);border-color:oklch(0.79 0.14 78/.28)}
+.verdict.mixed h3{color:var(--warning)}
+
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--r);margin-bottom:16px}
+.card-head{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--border)}
+.card-head h3{margin:0;font-size:13.5px;font-weight:600}
+.card-head .sub{font-size:11.5px;color:var(--faint)}
+.card-pad{padding:16px}
+.caption{padding:0 16px 14px;font-size:11.5px;color:var(--faint);line-height:1.55}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:stretch}
+
+.chart{position:relative;height:196px;display:flex;align-items:flex-end;padding:0 4px}
+.gl{position:absolute;left:0;right:0;border-top:1px dashed oklch(1 0 0/6%)}
+.col{flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;height:100%;padding:0 9px}
+.stack{width:100%;max-width:46px;display:flex;flex-direction:column-reverse;gap:2px}
+.s-client{background:var(--c2);border-radius:2px}
+.s-gw{background:var(--g2);border-radius:2px 2px 0 0}
+.col-label{font-size:11px;color:var(--faint);margin-top:7px}
+.col-tip{font-size:10.5px;color:var(--faint);font-variant-numeric:tabular-nums;white-space:nowrap;margin-bottom:5px}
+.legend{display:flex;gap:16px;flex-wrap:wrap;padding:12px 16px 0;font-size:11.5px;color:var(--muted)}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.sw{width:10px;height:10px;border-radius:3px;display:inline-block;flex:none}
+
+.donut-wrap{display:flex;align-items:center;gap:20px}
+.donut{position:relative;width:180px;height:180px;flex:none}
+.ring{position:absolute;border-radius:50%}
+.ring.outer{inset:0;
+  -webkit-mask:radial-gradient(circle at 50% 50%,transparent 0 64%,#000 64.6% 100%);
+  mask:radial-gradient(circle at 50% 50%,transparent 0 64%,#000 64.6% 100%)}
+.ring.inner{inset:32px;
+  -webkit-mask:radial-gradient(circle at 50% 50%,transparent 0 58%,#000 58.8% 100%);
+  mask:radial-gradient(circle at 50% 50%,transparent 0 58%,#000 58.8% 100%)}
+.donut-mid{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:1px;font-size:10.5px;color:var(--faint);text-align:center}
+.donut-mid b{font-size:14px;font-weight:500;color:var(--fg);font-variant-numeric:tabular-nums}
+.dlegend{flex:1;min-width:0;font-size:12.5px}
+.dlegend.two{display:grid;grid-template-columns:1fr 1fr;gap:0 28px;align-items:start}
+.dlegend .row{display:flex;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid oklch(1 0 0/4%)}
+.dlegend .row:last-child{border-bottom:0}
+.dlegend .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dlegend .vv{color:var(--muted);font-variant-numeric:tabular-nums;font-size:11.5px}
+.dgroup{font-size:11px;color:var(--faint);margin:8px 0 2px;display:flex;align-items:center;gap:6px}
+
+.tbl{width:100%;border-collapse:collapse;font-size:12.5px}
+.tbl th{text-align:left;font-weight:500;font-size:11px;color:var(--faint);padding:8px 12px;
+  border-bottom:1px solid var(--border);white-space:nowrap}
+.tbl th.num,.tbl td.num{text-align:right;font-variant-numeric:tabular-nums}
+.tbl td{padding:9px 12px;border-bottom:1px solid oklch(1 0 0/4%)}
+.tbl tr:last-child td{border-bottom:0}
+.tbl tbody tr:hover td{background:oklch(1 0 0/2.5%)}
+.mname{display:flex;align-items:center;gap:8px}
+.bar-cell{width:34%;min-width:150px}
+.bar{display:flex;gap:2px;height:8px;border-radius:4px;overflow:hidden;background:oklch(1 0 0/4%)}
+.bar i{display:block;height:100%}
+.bar i.c{background:var(--c2)}
+.bar i.g{background:var(--g2)}
+.num-muted{color:var(--muted);font-variant-numeric:tabular-nums}
+.fail{color:var(--warning);font-variant-numeric:tabular-nums}
+.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11.5px;color:var(--muted)}
+
+.notice{display:flex;align-items:center;gap:10px;padding:10px 14px;margin-bottom:14px;font-size:12.5px;
+  background:oklch(0.68 0.14 278/.10);border:1px solid oklch(0.68 0.14 278/.24);border-radius:10px;color:var(--muted)}
+.notice b{color:var(--fg);font-weight:500}
+.notice a{color:var(--g1);text-decoration:none;border-bottom:1px dotted var(--g1);cursor:pointer}
+.notice svg{width:14px;height:14px;stroke:var(--g1);fill:none;stroke-width:1.8;flex:none}
+
+.heat{display:grid;grid-template-columns:30px repeat(24,1fr);gap:2px;align-items:center}
+.heat .hl{font-size:10px;color:var(--faint);text-align:right;padding-right:3px}
+.heat .cell{aspect-ratio:1;border-radius:2px;background:var(--c3)}
+
+.empty{display:flex;flex-direction:column;align-items:center;gap:7px;padding:34px 20px;text-align:center}
+.empty svg{width:22px;height:22px;stroke:var(--faint);fill:none;stroke-width:1.6}
+.empty h4{margin:0;font-size:13.5px;font-weight:500}
+.empty p{margin:0;font-size:12.5px;color:var(--faint);max-width:420px}
+
+.foot{margin-top:22px;padding-top:12px;border-top:1px solid var(--border);font-size:11.5px;color:var(--faint)}
+</style>
+</head>
+<body>
+<div class="app">
+
+  <div class="page-head">
+    <div>
+      <h1>用量</h1>
+      <p>WorkBuddy · 国际版 · Token 与积分统计</p>
+    </div>
+    <div class="grow"></div>
+    <button class="btn"><svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/></svg>刷新</button>
+  </div>
+
+  <div class="param-bar">
+    <span class="param-label">范围</span>
+    <div class="seg" id="segRange">
+      <button data-range="today">今天</button>
+      <button data-range="7" class="on">近 7 天</button>
+      <button data-range="14">近 14 天</button>
+      <button data-range="30">近 30 天</button>
+      <button data-range="custom">自定义时间</button>
+    </div>
+    <div class="vsep"></div>
+    <span class="param-label">账本</span>
+    <div class="seg book" id="segBook">
+      <button data-book="all" class="on">全部</button>
+      <button data-book="client">客户端</button>
+      <button data-book="gateway">网关</button>
+    </div>
+    <div class="grow"></div>
+    <div class="seg"><button class="on">仅本作用域</button><button>合并全部作用域</button></div>
+  </div>
+
+  <div class="coverage" id="coverage"></div>
+
+  <nav class="tabs" id="tabs">
+    <button data-tab="trend" class="on">趋势</button>
+    <button data-tab="models">模型</button>
+    <button data-tab="sessions">会话</button>
+    <button data-tab="credits">积分</button>
+  </nav>
+
+  <main id="view"></main>
+
+  <div class="foot">设计稿 · 近 7 天样本，其中今天取 issue #63 实测值（客户端 47 请求 / 2.9M，网关 77 请求 / 18.5M，含 5 次 429）；其余日按同比例铺开。非真实运行界面。
+    <div style="margin-top:8px">演示拓扑（不属于 UI，仅用于评审三种对账结论）：
+      <a class="link" data-case="independent">两本账独立</a> ·
+      <a class="link" data-case="subset">客户端走的正是网关</a> ·
+      <a class="link" data-case="mixed">部分重叠</a>
+    </div>
+  </div>
+</div>
+
+<div class="drawer-mask" id="drawerMask">
+  <aside class="drawer" id="drawer"></aside>
+</div>
+
+<script>
+const DAYS = ["10/15","10/16","10/17","10/18","10/19","10/20","10/21"];
+const D = [
+  {c:0.62, g:1.9,  cr:12, gr:9,  gf:0},
+  {c:0.48, g:2.4,  cr:9,  gr:12, gf:1},
+  {c:0.91, g:1.2,  cr:18, gr:6,  gf:0},
+  {c:0.33, g:0.8,  cr:6,  gr:4,  gf:0},
+  {c:0.74, g:2.1,  cr:14, gr:10, gf:2},
+  {c:0.55, g:1.6,  cr:11, gr:8,  gf:1},
+  {c:2.876,g:18.5, cr:47, gr:77, gf:5}
+];
+const M = 1e6;
+const sum = (f) => D.reduce((a,d)=>a+f(d),0);
+const CLIENT = {
+  tokens: sum(d=>d.c)*M, requests: sum(d=>d.cr),
+  models: [
+    {name:"step-5-preview", tokens:4294000, req:68},
+    {name:"hy3", tokens:1171000, req:19},
+    {name:"deepseek-v4.1-flash", tokens:1041000, req:30}
+  ],
+  sessions: [
+    {title:"重构网关鉴权中间件", account:"haocheng236", recs:412, tokens:1842100},
+    {title:"排查 429 限流与号池冷却", account:"haocheng236", recs:288, tokens:1611400},
+    {title:"用量页图表口径对齐", account:"haocheng23", recs:196, tokens:1302300},
+    {title:"迁移脚本 dry-run", account:"haocheng23", recs:104, tokens:986600},
+    {title:"README 八语种同步", account:"haocheng236", recs:63, tokens:820400}
+  ]
+};
+const GATEWAY = {
+  tokens: sum(d=>d.g)*M, requests: sum(d=>d.gr), failed: sum(d=>d.gf),
+  coverage: "7/7 天",
+  models: [
+    {name:"deepseek-v4.1-flash", tokens:28420000, req:123},
+    {name:"auto", tokens:80000, req:3}
+  ],
+  accounts: [
+    {name:"haocheng236", tokens:18686150, req:62},
+    {name:"haocheng23", tokens:9725417, req:61},
+    {name:"haocheng24", tokens:78433, req:3}
+  ],
+  endpoints: [
+    {name:"/v1/chat/completions", req:122},
+    {name:"/v1/messages", req:2},
+    {name:"/v1/responses", req:2}
+  ]
+};
+
+const state = {range:"7", book:"all", tab:"trend"};
+
+/* ── 对账（客户端 ↔ 网关）──
+   规则：同模型 + 时间差 ≤ 120s + prompt/completion 相差 ≤1%，一对一贪心。
+   窗口内网关日志只有最近 200 条 ⇒ 只能对账「日志仍覆盖」的时段（今日）。
+   三种拓扑由匹配率决定，设计稿用 ?case=independent|subset|mixed 演示。 */
+const q = new URLSearchParams(location.search);
+const CASES = {
+  independent: { matched: 9,   matchedTokens: 350000  },
+  subset:      { matched: 108, matchedTokens: 6160000 },
+  mixed:       { matched: 55,  matchedTokens: 3100000 }
+};
+const caseKey = ["independent","subset","mixed"].includes(q.get("case")) ? q.get("case") : "independent";
+const RECON = {
+  clientRows: 117, gatewayRows: 126,
+  logWindow: "今日 17:01–18:10",
+  logCovered: 126, logTotal: 126,
+  uncoveredDays: 6,
+  ...CASES[caseKey]
+};
+RECON.unmatched = RECON.clientRows - RECON.matched;
+RECON.unmatchedTokens = CLIENT.tokens - RECON.matchedTokens;
+RECON.estimate = CLIENT.tokens + GATEWAY.tokens - RECON.matchedTokens;
+RECON.lower = Math.max(CLIENT.tokens, GATEWAY.tokens);
+RECON.upper = CLIENT.tokens + GATEWAY.tokens;
+RECON.ratio = RECON.matched / RECON.clientRows;
+
+if(["trend","models","sessions","credits"].includes(q.get("tab"))) state.tab = q.get("tab");
+if(["all","client","gateway"].includes(q.get("book"))) state.book = q.get("book");
+
+function fmtTok(n){
+  if(n>=100*M) return Math.round(n/M)+"M";
+  if(n>=10*M)  return (n/M).toFixed(1)+"M";
+  if(n>=M)     return (n/M).toFixed(2).replace(/0$/,"").replace(/\.$/,"")+"M";
+  return Math.round(n/1e3)+"K";
+}
+function pct(a,b){
+  const r = a/b;
+  if(r>0 && r<0.005) return "<1%";
+  return Math.round(r*100)+"%";
+}
+
+/* 合计的算式随拓扑换形态：子集关系下「相加再扣」会写出一个减掉自己大半的怪式子。 */
+function reconFormula(){
+  if(RECON.ratio > 0.9) return {
+    eq:`网关 <b>${fmtTok(GATEWAY.tokens)}</b> + 直连客户端 <b>${fmtTok(RECON.unmatchedTokens)}</b>`,
+    hint:`网关 ${fmtTok(GATEWAY.tokens)} + 直连客户端 ${fmtTok(RECON.unmatchedTokens)}`
+  };
+  return {
+    eq:`客户端 <b>${fmtTok(CLIENT.tokens)}</b> + 网关 <b>${fmtTok(GATEWAY.tokens)}</b> − 重叠 <b>${fmtTok(RECON.matchedTokens)}</b>`,
+    hint:`客户端 ${fmtTok(CLIENT.tokens)} + 网关 ${fmtTok(GATEWAY.tokens)} − 重叠 ${fmtTok(RECON.matchedTokens)}`
+  };
+}
+
+function renderCoverage(){
+  document.getElementById("coverage").innerHTML = `
+    <span class="cov"><span class="dot c"></span>客户端 <b>${fmtTok(CLIENT.tokens)}</b> · ${CLIENT.requests} 请求</span>
+    <span class="cov"><span class="dot g"></span>网关 <b>${fmtTok(GATEWAY.tokens)}</b> · ${GATEWAY.requests} 请求
+      <span class="chip warn">429 × ${GATEWAY.failed}</span></span>
+    <span class="cov">网关记录覆盖 <b>${GATEWAY.coverage}</b> · 未记录日不算 0</span>
+    <span class="cov">两本账重叠 <b>${RECON.matched} 条</b> · ${fmtTok(RECON.matchedTokens)}
+      <span class="link" data-recon="1">看对账</span></span>
+  `;
+}
+
+const ICONS = {
+  msg:'<path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 9.6 9.6 0 0 1-3.2-.5L3 21l1.6-4.4A8.4 8.4 0 0 1 12 3.1a8.4 8.4 0 0 1 9 8.4z"/>',
+  trend:'<path d="M3 17l6-6 4 4 8-8"/><path d="M15 7h6v6"/>',
+  gauge:'<path d="M12 14l4-4"/><circle cx="12" cy="14" r="8"/>',
+  req:'<path d="M4 6h16M4 12h16M4 18h10"/>',
+  srv:'<rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/>'
+};
+function tilesHtml(tiles){
+  return `<div class="tiles">` + tiles.map(t=>`
+    <div class="stat">
+      <div class="stat-label"><svg viewBox="0 0 24 24">${ICONS[t.i]}</svg>${t.l}${t.action?'<span class="grow"></span>'+t.action:''}</div>
+      <div class="stat-value">${t.approx?'<span class="approx" title="两本账存在重叠：同一请求可能被两处各记一次。点「对账」看扣减明细">≈</span>':''}${t.v}</div>
+      <div class="stat-hint">${t.h}</div>
+    </div>`).join("") + `</div>`;
+}
+
+function trendTiles(){
+  const n = DAYS.length;
+  const cT = CLIENT.tokens, gT = GATEWAY.tokens;
+  if(state.book==="client") return [
+    {i:"msg", l:"客户端 Token", v:fmtTok(cT), h:"近 7 天 · 客户端自记"},
+    {i:"trend", l:"日均", v:fmtTok(cT/n), h:"按自然日平均"},
+    {i:"gauge", l:"峰值", v:fmtTok(2.876*M), h:"10/21"},
+    {i:"req", l:"请求数", v:String(CLIENT.requests), h:"会话日志条目"}
+  ];
+  if(state.book==="gateway") return [
+    {i:"srv", l:"网关 Token", v:fmtTok(gT), h:"近 7 天 · 网关记账"},
+    {i:"trend", l:"日均", v:fmtTok(gT/n), h:"按自然日平均"},
+    {i:"gauge", l:"峰值", v:fmtTok(18.5*M), h:"10/21"},
+    {i:"req", l:"请求数", v:String(GATEWAY.requests), h:`含 ${GATEWAY.failed} 次失败`}
+  ];
+  return [
+    {i:"msg", l:"合计 Token", approx:true, v:fmtTok(RECON.estimate),
+      action:`<span class="link" data-recon="1">对账</span>`,
+      h:reconFormula().hint},
+    {i:"trend", l:"日均", v:fmtTok(RECON.estimate/n), h:"按自然日平均"},
+    {i:"gauge", l:"峰值", v:fmtTok((2.876+18.5)*M), h:"10/21"},
+    {i:"req", l:"请求数", v:String(CLIENT.requests+GATEWAY.requests-RECON.matched), h:`重叠已扣 ${RECON.matched} 条`}
+  ];
+}
+
+function stackedChart(){
+  const showC = state.book!=="gateway", showG = state.book!=="client";
+  const max = Math.max(...D.map(d=> (showC?d.c:0) + (showG?d.g:0) ));
+  const cols = D.map((d,i)=>{
+    const c = showC?d.c:0, g = showG?d.g:0, tot = c+g;
+    return `<div class="col">
+      <div class="col-tip">${fmtTok(tot*M)}</div>
+      <div class="stack" style="height:${Math.max(2,tot/max*100)}%">
+        ${showC?`<div class="s-client" style="height:${c/tot*100}%"></div>`:''}
+        ${showG?`<div class="s-gw" style="height:${g/tot*100}%;border-radius:${showC?'0':'2px 2px 0 0'}"></div>`:''}
+      </div>
+      <div class="col-label">${DAYS[i]}</div>
+    </div>`;
+  }).join("");
+  const legend = `<div class="legend">
+    ${showC?`<span><i class="sw" style="background:var(--c2)"></i>客户端</span>`:''}
+    ${showG?`<span><i class="sw" style="background:var(--g2)"></i>网关</span>`:''}
+  </div>`;
+  return `<div class="chart">${[0,25,50,75,100].map(p=>`<div class="gl" style="bottom:${p}%;"></div>`).join("")}${cols}</div>${legend}`;
+}
+
+function trendCaption(){
+  if(state.book==="client") return "每日 Token · 仅客户端自记（扫本机会话日志）";
+  if(state.book==="gateway") return `每日 Token · 仅网关记账 · 覆盖 ${GATEWAY.coverage}，未记录日不画柱（不是 0）`;
+  return "每日 Token · 客户端 + 网关分色堆叠。柱高是两本账各自的值，不做扣减 —— 重叠只在「合计」里扣（见对账）";
+}
+
+function conic(items, key, colors){
+  const total = items.reduce((a,b)=>a+b[key],0);
+  const gap = items.length>1 ? 1.4 : 0;
+  let acc=0, stops=[];
+  items.forEach((it,i)=>{
+    const from = acc/total*360; acc+=it[key];
+    const to = acc/total*360;
+    stops.push(`${colors[i]} ${from.toFixed(2)}deg ${(to-gap).toFixed(2)}deg`);
+    if(gap) stops.push(`transparent ${(to-gap).toFixed(2)}deg ${to.toFixed(2)}deg`);
+  });
+  return `conic-gradient(${stops.join(",")})`;
+}
+function drow(name, color, tokens, total){
+  return `<div class="row"><i class="sw" style="background:${color}"></i>
+    <span class="nm">${name}</span><span class="vv">${fmtTok(tokens)} · ${pct(tokens,total)}</span></div>`;
+}
+function donutHtml(wide){
+  if(state.book==="all"){
+    const inner = conic(CLIENT.models,"tokens",["var(--c1)","var(--c2)","var(--c3)"]);
+    const outer = conic(GATEWAY.models,"tokens",["var(--g1)","var(--g2)"]);
+    return `<div class="donut-wrap">
+      <div class="donut">
+        <div class="ring outer" style="background:${outer}"></div>
+        <div class="ring inner" style="background:${inner}"></div>
+        <div class="donut-mid"><b>${fmtTok(RECON.estimate)}</b><span>≈ 合计</span></div>
+      </div>
+      <div class="dlegend ${wide?"two":""}">
+        <div>
+          <div class="dgroup"><i class="sw" style="background:var(--c2)"></i>客户端 ${fmtTok(CLIENT.tokens)}</div>
+          ${CLIENT.models.map((m,i)=>drow(m.name,`var(--c${i+1})`,m.tokens,CLIENT.tokens)).join("")}
+        </div>
+        <div>
+          <div class="dgroup"><i class="sw" style="background:var(--g2)"></i>网关 ${fmtTok(GATEWAY.tokens)}</div>
+          ${GATEWAY.models.map((m,i)=>drow(m.name,`var(--g${i+1})`,m.tokens,GATEWAY.tokens)).join("")}
+        </div>
+      </div>
+    </div>`;
+  }
+  const client = state.book==="client";
+  const set = client?CLIENT.models:GATEWAY.models;
+  const total = client?CLIENT.tokens:GATEWAY.tokens;
+  const colors = client?["var(--c1)","var(--c2)","var(--c3)"]:["var(--g1)","var(--g2)"];
+  return `<div class="donut-wrap">
+    <div class="donut">
+      <div class="ring outer" style="background:${conic(set,"tokens",colors)}"></div>
+      <div class="donut-mid"><b>${fmtTok(total)}</b><span>${set.length} 个模型</span></div>
+    </div>
+    <div class="dlegend">
+      ${set.map((m,i)=>drow(m.name,colors[i],m.tokens,total)).join("")}
+    </div>
+  </div>`;
+}
+
+function heatHtml(){
+  if(state.book==="gateway") return `<div class="empty">
+    <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8v4l3 2"/></svg>
+    <h4>网关日志没有本地小时维度</h4>
+    <p>它只记时间戳与耗时：能算逐日，不能算「一周七天 × 24 小时」。要按小时看，请切到客户端账本。</p>
+  </div>`;
+  const rows = ["周一","周二","周三","周四","周五","周六","周日"];
+  let cells = "";
+  for(let r=0;r<7;r++){
+    cells += `<div class="hl">${rows[r]}</div>`;
+    for(let c=0;c<24;c++){
+      const work = (c>=9 && c<=19) ? 1 : .16;
+      const wknd = r>=5 ? .28 : 1;
+      const v = Math.max(0.02, work*wknd*(0.12+((r*7+c*13)%12)/19));
+      cells += `<div class="cell" style="opacity:${v.toFixed(2)}"></div>`;
+    }
+  }
+  return `<div class="heat">${cells}</div>`;
+}
+
+function renderTrend(){
+  return tilesHtml(trendTiles()) + `
+    <div class="card">
+      <div class="card-head"><h3>每日 Token</h3><div class="grow"></div>
+        <span class="sub">近 7 天 · 悬停看当日合计</span></div>
+      <div class="card-pad">${stackedChart()}</div>
+      <div class="caption">${trendCaption()}</div>
+    </div>
+    <div class="grid2">
+      <div class="card">
+        <div class="card-head"><h3>模型占比</h3><div class="grow"></div>
+          <span class="sub">${state.book==="all"?"内环 客户端 · 外环 网关":state.book==="client"?"客户端账本":"网关账本"}</span></div>
+        <div class="card-pad">${donutHtml()}</div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>使用时段分布</h3><div class="grow"></div>
+          ${state.book==="gateway"?'<span class="chip only">网关不记录</span>':'<span class="chip">仅客户端</span>'}</div>
+        <div class="card-pad">${heatHtml()}</div>
+      </div>
+    </div>`;
+}
+
+function modelTable(book){
+  const client = book==="client";
+  const set = client?CLIENT.models:GATEWAY.models;
+  const total = client?CLIENT.tokens:GATEWAY.tokens;
+  const max = Math.max(...set.map(m=>m.tokens));
+  const rows = set.map(m=>`<tr>
+      <td><div class="mname"><span class="sw" style="background:var(--${client?"c":"g"}2)"></span>${m.name}</div></td>
+      <td class="bar-cell"><div class="bar"><i class="${client?"c":"g"}" style="width:${m.tokens/max*100}%"></i></div></td>
+      <td class="num">${fmtTok(m.tokens)}</td>
+      <td class="num num-muted">${pct(m.tokens,total)}</td>
+      <td class="num num-muted">${m.req}</td>
+      ${client?"":`<td class="num fail">${m.name==="deepseek-v4.1-flash"?GATEWAY.failed:0}</td>`}
+    </tr>`).join("");
+  return `<div class="card">
+      <div class="card-head"><h3>${client?"客户端账本":"网关账本"}</h3><div class="grow"></div>
+        <span class="sub">${client?"扫本机会话日志 · 不含网关转发":"网关记账 · 覆盖 "+GATEWAY.coverage}</span></div>
+      <table class="tbl">
+        <thead><tr><th>模型</th><th>分布</th><th class="num">合计</th><th class="num">占比</th><th class="num">请求</th>
+          ${client?"":'<th class="num">失败</th>'}</tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <div class="caption">${client
+        ? "客户端账本不记请求失败 —— 会话日志只留成功落盘的条目；占比按客户端合计算"
+        : `${GATEWAY.failed} 次 429 已计入请求数；占比按网关合计算`}</div>
+    </div>`;
+}
+
+function renderModels(){
+  const notice = state.book==="all"
+    ? `<div class="notice">
+         <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 8h.01"/></svg>
+         <span><b>两个账本各一张表，不相加。</b>同一请求可能客户端与网关各记一次 —— 所以这里没有「合并占比」，想对账请切到单一账本。</span>
+       </div>` : "";
+  const donut = `<div class="card">
+      <div class="card-head"><h3>模型构成</h3><div class="grow"></div>
+        <span class="sub">${state.book==="all"?"内环 客户端 · 外环 网关":state.book==="client"?"客户端账本":"网关账本"}</span></div>
+      <div class="card-pad">${donutHtml(true)}</div>
+    </div>`;
+  return notice + donut
+    + (state.book==="gateway" ? "" : modelTable("client"))
+    + (state.book==="client" ? "" : modelTable("gateway"));
+}
+
+function renderSessions(){
+  if(state.book==="gateway"){
+    return `
+      <div class="notice">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 8h.01"/></svg>
+        <span>网关是<b>逐请求转发</b>，日志里没有会话 ID —— 所以这个视图在网关账本下换成<b>按账号 / 按端点</b>。</span>
+      </div>
+      <div class="grid2">
+        <div class="card" style="margin-bottom:0">
+          <div class="card-head"><h3>按账号</h3><div class="grow"></div><span class="sub">近 7 天</span></div>
+          <table class="tbl">
+            <thead><tr><th>账号</th><th>分布</th><th class="num">Token</th><th class="num">请求</th><th class="num">占比</th></tr></thead>
+            <tbody>${GATEWAY.accounts.map((a,i)=>`<tr>
+              <td><div class="mname"><span class="sw" style="background:var(--g${Math.min(i+1,3)})"></span>${a.name}</div></td>
+              <td class="bar-cell"><div class="bar"><i class="g" style="width:${a.tokens/GATEWAY.accounts[0].tokens*100}%"></i></div></td>
+              <td class="num">${fmtTok(a.tokens)}</td><td class="num num-muted">${a.req}</td>
+              <td class="num num-muted">${pct(a.tokens,GATEWAY.tokens)}</td></tr>`).join("")}</tbody>
+          </table>
+          <div class="caption">账号按日志里的精确 uid 归属，展示名仅作显示</div>
+        </div>
+        <div class="card" style="margin-bottom:0">
+          <div class="card-head"><h3>按端点</h3><div class="grow"></div><span class="sub">近 7 天</span></div>
+          <table class="tbl">
+            <thead><tr><th>端点</th><th class="num">请求</th><th class="num">占比</th></tr></thead>
+            <tbody>${GATEWAY.endpoints.map(e=>`<tr>
+              <td class="mono">${e.name}</td>
+              <td class="num">${e.req}</td><td class="num num-muted">${pct(e.req,GATEWAY.requests)}</td></tr>`).join("")}</tbody>
+          </table>
+          <div class="caption">同一份数据在「网关 → 请求日志」里逐条可查</div>
+        </div>
+      </div>`;
+  }
+  const total = CLIENT.sessions.reduce((a,s)=>a+s.tokens,0);
+  const notice = state.book==="all" ? `<div class="notice">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 8h.01"/></svg>
+      <span>网关调用<b>没有会话 ID</b>，未计入本视图 · <a data-jump="gateway">按账号查看网关用量</a></span>
+    </div>` : "";
+  return notice + `
+    <div class="card" style="margin-bottom:0">
+      <div class="card-head"><h3>会话排行</h3><div class="grow"></div>
+        <span class="sub">近 7 天 · 仅客户端</span></div>
+      <table class="tbl">
+        <thead><tr><th>会话</th><th>账号</th><th class="num">记录数</th><th>分布</th><th class="num">Token</th><th class="num">占比</th></tr></thead>
+        <tbody>${CLIENT.sessions.map(s=>`<tr>
+          <td><b style="font-weight:500">${s.title}</b></td>
+          <td class="num-muted">${s.account}</td>
+          <td class="num num-muted">${s.recs}</td>
+          <td class="bar-cell"><div class="bar"><i class="c" style="width:${s.tokens/CLIENT.sessions[0].tokens*100}%"></i></div></td>
+          <td class="num">${fmtTok(s.tokens)}</td>
+          <td class="num num-muted">${pct(s.tokens,total)}</td></tr>`).join("")}</tbody>
+      </table>
+    </div>`;
+}
+
+/* ── 积分：两个口径 ──
+   ① 余额口径（权威）：账号积分余额快照的差值，**天然不重复**，但拆不到来源；
+   ② 请求口径（可拆）：每条请求自带的 credit（客户端 jsonl / 网关 usage.credit）累加，能拆来源，**会重复**。
+   两者不相等，差额 = 未归因消耗（其他设备 / 没落日志的请求）。页面必须同时给，并说明关系。 */
+const CREDITS = {
+  balance: 4280.5, earned: 120, consumed: 1006.3, expiring: 260,
+  client: 182.4, gateway: 815.6, overlap: 12.8,
+  clientModels: [
+    {name:"step-5-preview", v:96.2, req:68},
+    {name:"hy3", v:48.7, req:19},
+    {name:"deepseek-v4.1-flash", v:37.5, req:30}
+  ],
+  gatewayModels: [
+    {name:"deepseek-v4.1-flash", v:806.2, req:123},
+    {name:"auto", v:9.4, req:3}
+  ],
+  dailyClient:  [14.2, 11.6, 21.4, 7.8, 17.2, 12.9, 97.3],
+  dailyGateway: [54.3, 68.6, 34.3, 22.9, 60.1, 45.8, 529.6]
+};
+CREDITS.byRequest = CREDITS.client + CREDITS.gateway - CREDITS.overlap;
+CREDITS.gap = CREDITS.consumed - CREDITS.byRequest;
+
+function fmtCr(n){ return n.toLocaleString("zh-CN",{minimumFractionDigits:1,maximumFractionDigits:1}); }
+
+function creditBars(){
+  const showC = state.book!=="gateway", showG = state.book!=="client";
+  const max = Math.max(...DAYS.map((_,i)=> (showC?CREDITS.dailyClient[i]:0) + (showG?CREDITS.dailyGateway[i]:0)));
+  const cols = DAYS.map((d,i)=>{
+    const c = showC?CREDITS.dailyClient[i]:0, g = showG?CREDITS.dailyGateway[i]:0, tot = c+g;
+    return `<div class="col">
+      <div class="col-tip">${fmtCr(tot)}</div>
+      <div class="stack" style="height:${Math.max(2,tot/max*100)}%">
+        ${showC?`<div class="s-client" style="height:${c/tot*100}%"></div>`:''}
+        ${showG?`<div class="s-gw" style="height:${g/tot*100}%;border-radius:${showC?'0':'2px 2px 0 0'}"></div>`:''}
+      </div>
+      <div class="col-label">${d}</div>
+    </div>`;
+  }).join("");
+  return `<div class="chart">${[0,25,50,75,100].map(p=>`<div class="gl" style="bottom:${p}%;"></div>`).join("")}${cols}</div>
+    <div class="legend">
+      ${showC?`<span><i class="sw" style="background:var(--c2)"></i>客户端</span>`:''}
+      ${showG?`<span><i class="sw" style="background:var(--g2)"></i>网关</span>`:''}
+    </div>`;
+}
+
+function creditModelTable(book){
+  const client = book==="client";
+  const set = client?CREDITS.clientModels:CREDITS.gatewayModels;
+  const total = client?CREDITS.client:CREDITS.gateway;
+  const max = Math.max(...set.map(m=>m.v));
+  return `<table class="tbl">
+    <thead><tr><th>模型</th><th>分布</th><th class="num">积分</th><th class="num">占比</th><th class="num">请求</th></tr></thead>
+    <tbody>${set.map(m=>`<tr>
+      <td><div class="mname"><span class="sw" style="background:var(--${client?"c":"g"}2)"></span>${m.name}</div></td>
+      <td class="bar-cell"><div class="bar"><i class="${client?"c":"g"}" style="width:${m.v/max*100}%"></i></div></td>
+      <td class="num">${fmtCr(m.v)}</td>
+      <td class="num num-muted">${pct(m.v,total)}</td>
+      <td class="num num-muted">${m.req}</td></tr>`).join("")}</tbody>
+  </table>`;
+}
+
+function renderCredits(){
+  const balanceTiles = `<div class="tiles">
+    <div class="stat"><div class="stat-label"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M12 8v8M9 10h6"/></svg>可用积分合计</div>
+      <div class="stat-value">${fmtCr(CREDITS.balance)}</div><div class="stat-hint">12 个账号 · 余额快照</div></div>
+    <div class="stat"><div class="stat-label"><svg viewBox="0 0 24 24"><path d="M3 17l6-6 4 4 8-8"/></svg>区间消耗</div>
+      <div class="stat-value">${fmtCr(CREDITS.consumed)}</div><div class="stat-hint">余额差值 · 权威口径</div></div>
+    <div class="stat"><div class="stat-label"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>区间入账</div>
+      <div class="stat-value">+${fmtCr(CREDITS.earned)}</div><div class="stat-hint">签到奖励</div></div>
+    <div class="stat"><div class="stat-label"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/></svg>即将过期</div>
+      <div class="stat-value">${fmtCr(CREDITS.expiring)}</div><div class="stat-hint">5 天内</div></div>
+  </div>`;
+
+  const balanceNote = `<div class="notice">
+    <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 8h.01"/></svg>
+    <span>上面四张是<b>余额口径</b>：账号余额快照的差值，<b>天然不重复</b>，但拆不到来源。下面按请求累加，能拆来源，<b>会重复</b>。</span>
+  </div>`;
+
+  const gapBox = `<div class="dformula" style="margin-top:16px">
+    <div class="eq" style="line-height:1.9">
+      余额口径 <b>${fmtCr(CREDITS.consumed)}</b>　−　请求口径 <b>${fmtCr(CREDITS.byRequest)}</b>
+      <span style="color:var(--faint)">（客户端 ${fmtCr(CREDITS.client)} + 网关 ${fmtCr(CREDITS.gateway)} − 重叠 ${fmtCr(CREDITS.overlap)}）</span>
+      ＝　差额 <b style="color:var(--warning)">${fmtCr(CREDITS.gap)}</b>
+    </div>
+    <div class="dnote" style="margin-top:6px">差额 = 未归因消耗：别的设备 / 没落本地日志的请求。它<b>不会</b>被摊到任何来源上 —— 摊了就是编数据。</div>
+  </div>`;
+
+  const book = state.book;
+  const modelCards = book==="all"
+    ? `<div class="grid2">
+        <div class="card" style="margin-bottom:0"><div class="card-head"><h3>客户端账本</h3><div class="grow"></div>
+          <span class="sub">按请求累加 · ${fmtCr(CREDITS.client)}</span></div>${creditModelTable("client")}</div>
+        <div class="card" style="margin-bottom:0"><div class="card-head"><h3>网关账本</h3><div class="grow"></div>
+          <span class="sub">按请求累加 · ${fmtCr(CREDITS.gateway)}</span></div>${creditModelTable("gateway")}</div>
+      </div>`
+    : `<div class="card" style="margin-bottom:0">
+        <div class="card-head"><h3>${book==="client"?"客户端账本":"网关账本"}</h3><div class="grow"></div>
+          <span class="sub">按请求累加 · ${fmtCr(book==="client"?CREDITS.client:CREDITS.gateway)}</span></div>
+        ${creditModelTable(book)}
+      </div>`;
+
+  return balanceTiles + balanceNote + `
+    <div class="card">
+      <div class="card-head"><h3>每日积分消耗</h3><div class="grow"></div>
+        <span class="sub">请求口径 · 近 7 天</span></div>
+      <div class="card-pad">${creditBars()}</div>
+      <div class="caption">每条请求自带的 credit 累加（客户端 jsonl / 网关 usage.credit）。两本账分色，柱高不做扣减。</div>
+    </div>
+    ${modelCards}
+    ${book==="all" ? gapBox : ""}
+  `;
+}
+
+const SAMPLE = [
+  {ts:"18:04:12", model:"step-5-preview", tok:42100, why:"模型不在网关账本"},
+  {ts:"18:07:31", model:"hy3", tok:28600, why:"最近网关记录相差 214s"},
+  {ts:"18:09:02", model:"deepseek-v4.1-flash", tok:15400, why:"token 数不符"}
+];
+
+function reconVerdict(){
+  const ratio = RECON.matched / RECON.clientRows;
+  if(ratio < 0.1) return { cls:"", title:"两本账基本独立",
+    body:`${RECON.clientRows} 条客户端记录里只有 <b>${RECON.matched}</b> 条能在网关账本里找到对应（${Math.round(ratio*100)}%）——
+      说明大部分客户端请求是<b>直连上游</b>的。合计 = 相加，再扣掉这 ${RECON.matched} 条重叠。` };
+  if(ratio > 0.9) return { cls:"", title:"客户端走的正是网关",
+    body:`${RECON.clientRows} 条客户端记录里有 <b>${RECON.matched}</b> 条能在网关账本里对上（${Math.round(ratio*100)}%）——
+      客户端用量<b>已包含在网关账本内</b>。合计 ≈ 网关，只补没对上的那几条。` };
+  return { cls:"mixed", title:"两本账部分重叠",
+    body:`只有 <b>${RECON.matched}/${RECON.clientRows}</b> 条客户端记录能对上（${Math.round(ratio*100)}%）——
+      可能今天中途才开网关，也可能只有部分客户端走网关。合计给区间，明细见下。` };
+}
+
+function renderRecon(){
+  const v = reconVerdict();
+  return `<button class="x" data-close="1">×</button>
+  <h2>对账 · 客户端 ↔ 网关</h2>
+  <div class="dsub">把两本账里「同一个请求」找出来，从合计里扣掉</div>
+
+  <div class="verdict ${v.cls}">
+    <h3>${v.title}</h3>
+    <p>${v.body}</p>
+  </div>
+
+  <div class="dsec">
+    <div class="dformula">
+      <div class="big">≈ ${fmtTok(RECON.estimate)}</div>
+      <div class="eq">${reconFormula().eq}</div>
+    </div>
+  </div>
+
+  <div class="dsec">
+    <h4>匹配结果</h4>
+    <div class="drow"><span class="k">客户端记录</span><span class="v">${RECON.clientRows} 条</span></div>
+    <div class="drow"><span class="k">网关记录</span><span class="v">${RECON.gatewayRows} 条</span></div>
+    <div class="drow"><span class="k">一对一匹配（重叠）</span><span class="v">${RECON.matched} 条 · ${fmtTok(RECON.matchedTokens)}</span></div>
+    <div class="drow"><span class="k">客户端未匹配</span><span class="v">${RECON.unmatched} 条 · ${fmtTok(RECON.unmatchedTokens)}</span></div>
+  </div>
+
+  <div class="dsec">
+    <h4>匹配规则</h4>
+    <p class="dnote">同模型 · 时间差 ≤ 120 秒 · prompt 与 completion 相差 ≤ 1% · 一对一（一条网关记录最多抵一条客户端记录）。三条同时满足才算重叠 —— 宁可少扣，也不多扣。</p>
+    <p class="dnote" style="margin-top:6px"><b>账号不参与匹配</b>：网关按请求选号（无缝切号），同一条请求在客户端账本里记的是登录账号、在网关账本里记的是被选中的账号 —— 拿账号当匹配键会把该对上的全漏掉。</p>
+  </div>
+
+  <div class="dsec">
+    <h4>这次覆盖了哪里</h4>
+    <div class="drow"><span class="k">${RECON.logWindow}</span><span class="v">${RECON.logCovered}/${RECON.logTotal} 条可对账</span></div>
+    <div class="drow"><span class="k">更早 ${RECON.uncoveredDays} 天</span><span class="v">只有日合计</span></div>
+    <p class="dnote">网关日志只留最近 200 条请求，更早的已滚出窗口，无法逐条对账。所以合计给的是区间
+      <b>${fmtTok(RECON.lower)} – ${fmtTok(RECON.upper)}</b>：下限 = 两本账取大（全部重叠），上限 = 直接相加（完全无重叠）。
+      ${fmtTok(RECON.estimate)} 取「未匹配的客户端请求都是直连」这一侧。</p>
+  </div>
+
+  <div class="dsec">
+    <h4>未匹配样本（前 3 条）</h4>
+    <table class="tbl">
+      <thead><tr><th>时间</th><th>模型</th><th class="num">Token</th><th>为什么没对上</th></tr></thead>
+      <tbody>${SAMPLE.map(s=>`<tr>
+        <td class="mono">${s.ts}</td>
+        <td>${s.model}</td>
+        <td class="num">${fmtTok(s.tok)}</td>
+        <td class="dnote" style="font-size:11px">${s.why}</td></tr>`).join("")}</tbody>
+    </table>
+    <p class="dnote" style="margin-top:8px">这三条按「直连上游」计入合计。如果它们其实走了网关、只是滑出了日志窗口，那合计会更低 —— 那就是区间下限 ${fmtTok(RECON.lower)}。</p>
+  </div>`;
+}
+
+function openDrawer(){
+  document.getElementById("drawer").innerHTML = renderRecon();
+  document.getElementById("drawerMask").classList.add("on");
+}
+function closeDrawer(){ document.getElementById("drawerMask").classList.remove("on"); }
+
+document.addEventListener("click", e=>{
+  if(e.target.closest("[data-recon]")){ openDrawer(); return; }
+  if(e.target.closest("[data-close]")){ closeDrawer(); return; }
+  const cs = e.target.closest("[data-case]");
+  if(cs){
+    const next = new URLSearchParams(location.search);
+    next.set("case", cs.dataset.case);
+    next.set("tab", state.tab); next.set("book", state.book);
+    location.search = next.toString();
+    return;
+  }
+  if(e.target.id==="drawerMask") closeDrawer();
+});
+
+function render(){
+  renderCoverage();
+  document.getElementById("view").innerHTML =
+    state.tab==="trend" ? renderTrend() :
+    state.tab==="models" ? renderModels() :
+    state.tab==="sessions" ? renderSessions() : renderCredits();
+  document.querySelectorAll("[data-jump]").forEach(el=>el.onclick=()=>{
+    state.book = el.dataset.jump; syncSeg(); render();
+  });
+}
+function syncSeg(){
+  document.querySelectorAll("#segBook button").forEach(b=>b.classList.toggle("on", b.dataset.book===state.book));
+}
+document.getElementById("segBook").onclick = e => {
+  const b = e.target.closest("button"); if(!b) return;
+  state.book = b.dataset.book; syncSeg(); render();
+};
+document.getElementById("tabs").onclick = e => {
+  const b = e.target.closest("button"); if(!b) return;
+  state.tab = b.dataset.tab;
+  document.querySelectorAll("#tabs button").forEach(x=>x.classList.toggle("on", x===b));
+  render();
+};
+document.getElementById("segRange").onclick = e => {
+  const b = e.target.closest("button"); if(!b) return;
+  document.querySelectorAll("#segRange button").forEach(x=>x.classList.toggle("on", x===b));
+  state.range = b.dataset.range; render();
+};
+render();
+syncSeg();
+document.querySelectorAll("#tabs button").forEach(x=>x.classList.toggle("on", x.dataset.tab===state.tab));
+if(q.get("drawer")==="1") openDrawer();
+</script>
+</body>
+</html>

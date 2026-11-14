@@ -1,256 +1,441 @@
-import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
+/**
+ * 「用量」· **Token 视图**（Trae 分区）：趋势 / 模型 —— 与 WorkBuddy **同一套骨架与图表**。
+ *
+ * ## 严格按原型实现（用户 2026-10-12 要求）
+ *
+ * 原型 `viewUsage`（`docs/prototype/demo-app.js:794-997`）是**平台无关**的
+ * （同一段代码 + 不同数据），两个 Token 视图的块序逐条对齐：
+ *
+ * - **趋势**：4 统计卡 → `每日 Token · 按模型拆分`（堆叠柱 + 图例）
+ *   → `累计消耗曲线` | `模型占比`（g2）→ `使用时段分布`（7×24 热力图）；
+ * - **模型**：4 统计卡 → `模型 Token 占比`（环形）→ `模型用量排行`（横向条 + 迷你趋势线）。
+ *
+ * 改造前本页是 Trae 自建的一套（整年活动网格 / 每日折线 / 按模型柱 / 按模型明细 /
+ * 按账号表 / 状态码卡）—— **原型里一个都没有**。现已全部替换：
+ * 「按账号」与「状态码」两个维度在原型里是**积分页的两个环形**（见 `TraeCreditsPage`），
+ * 不是趋势页的卡片。
+ *
+ * ## 与 WorkBuddy 的差异**只在数据**
+ *
+ * | 维度 | WorkBuddy | Trae（本页） |
+ * |:--|:--|:--|
+ * | 数据源 | 客户端会话文件（4 来源） | 网关账本 + **用户导出的客户端明文库**（两本账） |
+ * | 「活跃账号」统计卡 | **无账号维度** ⇒ 用「模型数」替代（门禁已登记） | 有 `accounts` ⇒ 原型原样「活跃账号」 |
+ * | 数据源提示条 | 无 | 「数据来源」Alert（**必须保留**，否则用户把「数字小」当 bug） |
+ *
+ * ## 客户端账本为什么要「导入」（第二轮改造）
+ *
+ * Trae 的对话库是 **SQLCipher 加密**的，本工具不内置解密 ⇒ 客户端那一本账只能由用户
+ * 自己导出明文副本、再把路径交给本工具（面板见 `components/usage/trae-client-import`）。
+ * 因此这本账有**三种「没有数」**，绝不能混成同一个 0：
+ *
+ * - **未配置**（`configured === false`）—— 用户还没指路；
+ * - **读失败**（`error.code` 五种）—— 指了路但读不出来（不是明文 / 认不出 / 没用量字段 / 文件没了 / IO）；
+ * - **真的是 0** —— 读到了，这段窗口里确实没用量。
+ *
+ * 覆盖条据此区分「客户端 0」与「客户端不可得」（`clientUnavailable`），
+ * 这就是本次改造的核心：**测不到**不能写成**没用**。
+ *
+ * ## `all` 档为什么不把两本账相加
+ *
+ * 同一个请求可能既落在客户端库里、又走了网关 ⇒ 逐键相加就是**双计**；而 Trae 没有
+ * 「对账」接口可以算出重叠量（`get_usage_reconcile` 仅 WorkBuddy 有）。
+ * 所以 `all` 档**只**把逐日柱画成「客户端 / 网关」两段并排（`ledgerDailySeries`），
+ * 统计卡与其余图表仍按**网关一本**算，并在页面上逐字写明口径（`totalGatewayTitle`）。
+ * 宁可少说，也不给一个看起来对的合计。
+ *
+ * 图表**一律走共用原语**（`StackedDailyBar` / `CumulativeArea` / `ModelDonut` /
+ * `ModelRanking` / `UsageHeatmap`），数据由 `lib/trae-usage-charts.ts` 映射成共用形状
+ * ⇒ 契约（分段和=当日总量 / 7×24 / 扇区数=模型数）只有一份实现。
+ *
+ * ## 视图参数是**受控**的
+ *
+ * `range` / `combineAll` 由 `UsagePage` 传入（原型 `state.range` / `state.merge` 是页面级的）。
+ * 本页**不持有**参数状态，也**不放**任何页内区域选择器 —— 区域归侧栏。
+ */
+
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   AlertTriangle,
-  ArrowDownToLine,
-  ArrowUpFromLine,
-  CircleAlert,
-  Coins,
   Gauge,
   Info,
   Loader2,
+  MessagesSquare,
   RefreshCw,
   Server,
-  Timer,
+  Sparkles,
+  TrendingUp,
   Users,
 } from "lucide-react";
-import { Bar, CartesianGrid, ComposedChart, Line, LineChart, XAxis, YAxis } from "recharts";
 
-import { DemoAction } from "@/components/demo-action";
-import { TraeVariantSwitch } from "@/components/trae-variant-switch";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
-import {
-  ChartContainer,
-  ChartTooltip,
-  ChartTooltipContent,
-  type ChartConfig,
-} from "@/components/ui/chart";
+import { CardHead } from "@/components/ui/card-head";
+import { EmptyState } from "@/components/ui/empty-state";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { SlowLoadHint } from "@/components/slow-load-hint";
+import { scopeLabel } from "@/components/scope-chip";
+import { ChartFrame } from "@/components/usage/chart-frame";
+import { CumulativeArea } from "@/components/usage/cumulative-area";
+import { compactTokens, exactTokens } from "@/components/usage/format";
+import {
+  CoverageStrip,
+  LedgerModelTable,
+} from "@/components/usage/ledger-parts";
+import { TraeClientImport } from "@/components/usage/trae-client-import";
+import { ModelDonut } from "@/components/usage/model-donut";
+import { ModelRanking } from "@/components/usage/model-ranking";
+import { KeysView } from "@/components/usage/key-ranking";
+import { StackedDailyBar } from "@/components/usage/stacked-daily-bar";
+import { StatTiles, type StatTile } from "@/components/usage/stat-tiles";
+import { UsageHeatmap } from "@/components/usage/usage-heatmap";
+import { useUsageWindowLabel, type UsageViewProps } from "@/components/usage/view-param-bar";
 import * as api from "@/lib/api";
+import { cumulativeCaption } from "@/lib/chart-caption";
 import { useT } from "@/lib/i18n";
-import type { TranslationKey } from "@/locales/zh";
+import { scopeOf } from "@/lib/scope";
+import { toTokenStatsSource } from "@/lib/trae-usage-charts";
+import type { GatewayUsageDim } from "@/lib/types";
 import type {
-  TraeModelDailyPoint,
+  TraeApiKeyRecord,
   TraeTokenScope,
   TraeTokenStatistics,
   TraeUnsupported,
 } from "@/lib/trae-types";
-import { cn } from "@/lib/utils";
 import { useCachedResource } from "@/lib/use-cached-resource";
+import { useRefreshAction } from "@/lib/use-refresh-action";
+import { useScope } from "@/lib/use-scope";
+import {
+  dailyModelSeries,
+  heatmapMatrix,
+  modelSlices,
+} from "@/lib/usage-charts";
+import {
+  clientDailyInWindow,
+  clientModelTotals,
+  dimCoverage,
+  dimTotals,
+  ledgerDailySeries,
+  ledgerToTokenStatsSource,
+  modelKey,
+  showsClient,
+  showsGateway,
+  type UsageLedger,
+} from "@/lib/usage-ledger";
+import {
+  usageWindowDays,
+  usageWindowKeys,
+  usageWindowSpanDays,
+  type UsageWindow,
+} from "@/lib/usage-window";
 
-/** 统计窗口选项。`0` 表示全部历史（后端把 `<= 0` 视为不限）。 */
-const RANGES = [
-  { value: "7", labelKey: "trae.stats.token.range.7d" },
-  { value: "30", labelKey: "trae.stats.token.range.30d" },
-  { value: "90", labelKey: "trae.stats.token.range.90d" },
-  { value: "0", labelKey: "trae.stats.token.range.all" },
-] as const;
+/** 本页承载的视图（积分视图在 `TraeCreditsPage`）。与原型 `tabs` 的前两项同名。 */
+export type TraeUsageView = "trend" | "models" | "keys";
 
 /**
- * 变体范围条四档（**筛选维度**，独立于时间窗口）。
+ * 客户端账本的返回体（判别式）：`{configured:false}` / `{error}` / 正常统计。
  *
- * `unlabeled` 是升级前的旧日志（没有 `variant` 键），不是第三种产品线；
- * 切勿把它并进 `TraeVariantId`。
- *
- * 文案只存**键**：表在模块加载时定型，存中文会让语言切换整条失效。
+ * 用 `Awaited<ReturnType<...>>` 而不是再抄一遍字段：返回形状一变，
+ * 这里跟着变，**不会**出现「类型说有三本账、实现只有两本」的漂移。
  */
-const SCOPE_OPTIONS: { value: TraeTokenScope; labelKey: TranslationKey; hintKey: TranslationKey }[] = [
-  {
-    value: "unlabeled",
-    labelKey: "trae.stats.token.scope.unlabeled",
-    hintKey: "trae.stats.token.scope.unlabeledHint",
-  },
-  { value: "cn", labelKey: "trae.stats.token.scope.cn", hintKey: "trae.stats.token.scope.cnHint" },
-  {
-    value: "global",
-    labelKey: "trae.stats.token.scope.global",
-    hintKey: "trae.stats.token.scope.globalHint",
-  },
-  { value: "all", labelKey: "trae.stats.token.scope.all", hintKey: "trae.stats.token.scope.allHint" },
-];
+type TraeClientStats = Awaited<ReturnType<typeof api.getTraeClientTokenStats>>;
 
-const TREND_SERIES = [
-  { key: "total", labelKey: "trae.stats.token.series.total", color: "var(--data-series-indigo)" },
-  { key: "input", labelKey: "trae.stats.token.series.input", color: "var(--data-series-sky)" },
-  { key: "output", labelKey: "trae.stats.token.series.output", color: "var(--data-series-emerald)" },
-] as const;
-
-/** 模型分布柱的单系列（文案在渲染处 `t()`，故只存键）。 */
-const MODEL_SERIES = [
-  { key: "total", labelKey: "trae.stats.token.series.total", color: "var(--data-series-violet)" },
-] as const;
-
-/** 堆叠柱各模型配色的固定循环（用既有 CSS 变量，不新增裸色值）。 */
-const MODEL_COLORS = [
-  "var(--data-series-indigo)",
-  "var(--data-series-sky)",
-  "var(--data-series-emerald)",
-  "var(--data-series-violet)",
-  "var(--data-series-amber)",
-] as const;
-
-/** 堆叠柱最多展示几个模型（其余并入「其他」颜色不做，避免图例过长）。 */
-const TOP_MODELS = 6;
-
-/** 热力网格五档底纹。 */
-const HEATMAP_LEVEL_CLASS = [
-  "bg-muted/70",
-  "bg-primary/20",
-  "bg-primary/40",
-  "bg-primary/65",
-  "bg-primary",
-] as const;
-
-function formatTokens(value: number | null | undefined): string {
-  if (value === null || value === undefined || !Number.isFinite(value)) return "—";
-  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`;
-  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}K`;
-  return String(value);
-}
-
-function formatExact(value: number | null | undefined): string {
-  if (value === null || value === undefined || !Number.isFinite(value)) return "—";
-  return new Intl.NumberFormat("zh-CN").format(value);
-}
-
-/** `YYYY-MM-DD` 本地日期键（与后端 `daily.key` 口径一致）。 */
-function dateKey(date: Date): string {
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
-}
-
-function formatHeatmapDate(date: Date): string {
-  return date.toLocaleDateString("zh-CN", { month: "long", day: "numeric" });
-}
-
-function StatMetric({
-  icon: Icon,
-  label,
-  value,
-  hint,
-  divided = false,
-}: {
-  icon: typeof Coins;
-  label: string;
-  value: string;
-  hint?: string;
-  divided?: boolean;
-}) {
-  return (
-    <div
-      className={cn(
-        "flex min-w-0 flex-col items-center justify-center px-4 py-5 text-center sm:py-3",
-        divided && "sm:border-l sm:border-border/60",
-      )}
-    >
-      <div className="flex max-w-full items-center justify-center gap-2 text-[13px] font-medium leading-5 text-muted-foreground">
-        <Icon className="size-4 shrink-0 stroke-[1.75]" aria-hidden="true" />
-        <span className="truncate">{label}</span>
-      </div>
-      <div
-        className="mt-3 max-w-full truncate text-[26px] font-semibold leading-8 tracking-[-0.025em] tabular-nums"
-        style={{ fontFamily: '"Bricolage Grotesque Variable", "SF Pro Display", ui-sans-serif, sans-serif' }}
-      >
-        {value}
-      </div>
-      {hint && <div className="mt-1.5 max-w-full truncate text-xs text-muted-foreground">{hint}</div>}
-    </div>
-  );
+/**
+ * 「按密钥」视图**只取展示名**：用量来自网关账本（本页已取的 `dim`），
+ * 不再读请求日志 —— 那是环形缓冲，窗口对齐不了（见 `src/lib/key-usage.ts`）。
+ * 模块级函数 ⇒ 引用稳定（`KeysView` 的 `useEffect` 依赖它）。
+ */
+async function loadTraeKeyNames() {
+  const keys = await api.listTraeApiKeys().catch(() => ({ keys: [] as TraeApiKeyRecord[] }));
+  return new Map((keys.keys ?? []).map((key) => [key.id, key.name] as const));
 }
 
 /**
- * 「Token 统计」页（Trae 分区）。
+ * 「用量 · Token」视图（Trae 分区）。
  *
- * 与 WorkBuddy 的 Token 统计**数据源不同**：那边扫客户端落的会话文件，
- * 这边只有本机网关的请求日志。页面上必须把这个边界讲清楚，
- * 否则用户会以为「数字小 = 统计坏了」。
- *
- * 本轮新增：变体范围条（`TraeTokenScope`，非第三种产品线）、整年热力网格（源 `daily`）、
- * 按模型 × 按天的堆叠柱 + 调用次数折线（源 `modelDaily`）、`unsupported` 置灰卡。
+ * `range` / `combineAll` 受控；`view` 决定画趋势还是模型。
  */
-export default function TraeTokenStatsPage() {
+export default function TraeTokenStatsPage({
+  view = "trend",
+  viewWindow,
+  combineAll,
+  ledger = "gateway",
+}: { view?: TraeUsageView } & UsageViewProps & { ledger?: UsageLedger }) {
   const t = useT();
-  const [days, setDays] = useState<string>("30");
-  const [scope, setScope] = useState<TraeTokenScope>("all");
-
+  const [region] = useScope("trae");
+  const scope = scopeOf("trae", region);
   /**
-   * 键里**必须**带上 `days` 与 `scope`：两者都会改变结果，漏在键外就会出现
-   * 「换了天数、图还是旧的」。键相同即结果相同，这是缓存层的唯一契约。
+   * 范围筛选（`TraeTokenScope`）= **区域**档：`cn` / `global` / `unlabeled` / `all`。
+   *
+   * 「仅本作用域」= 当前区域；「合并全部作用域」= `all`（国内 ∪ 国际 ∪ 未标注旧日志）。
+   * 与 WorkBuddy 的 `RegionFilter` 是**同一根轴的两个取值形态** ⇒ 共用同一枚控件。
    */
+  const tokenScope: TraeTokenScope = combineAll ? "all" : region;
+  /* ★ Trae 的统计接口按「最近 N 天」拉日志（`days <= 0` = 不限）⇒ 必须拉**覆盖整个窗口**
+     的跨度，而不是窗口自己的天数：窗口可能是**锚在过去**的一段（如 9/1–9/5），
+     拉 5 天只会拉到最后 5 天，那段历史**根本不在返回里**，图表会**静默全 0**。
+     拉回来之后再按窗口的日历日切片 —— 多拉的日在这两步之间被丢掉。 */
+  const spanDays = usageWindowSpanDays(viewWindow);
+
   const load = useCallback(
-    () => api.getTraeTokenStatistics(Number.parseInt(days, 10), scope),
-    [days, scope],
+    () => api.getTraeTokenStatistics(spanDays, tokenScope),
+    [spanDays, tokenScope],
   );
 
-  /**
-   * 统计结果走快照缓存：切到 WorkBuddy 再切回来时不再闪骨架、不再重跑一次统计。
-   * 页面上的「刷新」按钮走 `refresh()`（强制重取），所以手动刷新依然立刻生效。
-   */
   const {
     data: stats,
     loading,
+    slow,
     error,
     refresh,
-  } = useCachedResource<TraeTokenStatistics>(`trae:token-stats:${days}:${scope}`, load);
+  } = useCachedResource<TraeTokenStatistics>(`trae:token-stats:${spanDays}:${tokenScope}`, load);
 
-  const summary = stats?.summary;
-  const daily = useMemo(
-    () => (stats?.daily ?? []).filter((point) => (point.records ?? 0) > 0),
-    [stats],
+  /** 重试按钮的进行中态（`loading` 只在无值时 true，点重试那一刻它恒为 false）。 */
+  const { busy, run } = useRefreshAction();
+
+  /**
+   * ★ **客户端账本**（第二轮：读用户自己导出的明文库）。
+   *
+   * 与 `stats` / `dim` 都不同源：它读的是用户在设置里指定的那份 SQLCipher 明文副本
+   * （本工具不内置解密）。返回体是**判别式**的 —— `{configured:false}` 表示还没指路、
+   * `{error:{code}}` 表示指了路但读不出来，这两种**都不是「这段窗口没用量」**。
+   *
+   * 取数在**所有账本档位**下都发生：覆盖条要能回答「客户端这本账现在读得到吗」，
+   * 而不是只在用户切到客户端时才去探测。
+   */
+  const loadClient = useCallback(
+    () => api.getTraeClientTokenStats(spanDays, tokenScope),
+    [spanDays, tokenScope],
   );
-  const models = stats?.models ?? [];
-  const accounts = stats?.accounts ?? [];
-  const topModels = models.slice(0, 8);
-  const modelDaily = stats?.modelDaily ?? [];
-  const unsupported = stats?.unsupported ?? [];
-  const counts = stats?.variantCounts;
+  const {
+    data: clientStats,
+    error: clientLoadError,
+    refresh: refreshClient,
+  } = useCachedResource<TraeClientStats>(`trae:client-stats:${spanDays}:${tokenScope}`, loadClient);
 
-  /** 图表系列文案在渲染处取：模块级常量只存键，否则语言切换后图例仍是旧语言。 */
-  const trendConfig = useMemo(
+  /**
+   * 客户端**读不到**的原因：后端给了判别式的 `error.code`；命令本身失败（旧版本 / 演示站）
+   * 只有一条字符串，按 `io` 归类 —— 那也是一次真实的读取失败，不能当成「没配置」。
+   */
+  const clientError: api.TraeClientImportError | null =
+    clientStats?.error ?? (clientLoadError !== null ? { code: "io", message: clientLoadError } : null);
+  /** 「这本账现在可用吗」：未配置 / 读失败 / 还没取到 —— 三者都是**不可得**，不是 0。 */
+  const clientReady =
+    clientStats !== undefined && clientStats.configured !== false && clientError === null;
+  const clientSource = useMemo(
     () =>
-      Object.fromEntries(
-        TREND_SERIES.map((series) => [series.key, { label: t(series.labelKey), color: series.color }]),
-      ) as ChartConfig,
-    [t],
-  );
-  const modelConfig = useMemo(
-    () =>
-      Object.fromEntries(
-        MODEL_SERIES.map((series) => [series.key, { label: t(series.labelKey), color: series.color }]),
-      ) as ChartConfig,
-    [t],
+      /*
+       * ★ 第二个参数**必须**传 `"trae-client"`：两本账形状一致、只有来源不同，
+       * 而来源在账本视图里**是颜色语义**（客户端青绿 / 网关靛蓝）——
+       * 缺省值 `"trae-gateway"` 会把客户端这本账染成网关色，图例与柱子当场撒谎。
+       */
+      clientReady && clientStats ? toTokenStatsSource(clientStats, "trae-client") : null,
+    [clientReady, clientStats],
   );
 
+  /**
+   * ★ 账本（issue #63 平台补齐）：网关**逐日落库**的逐日 × 逐模型用量。
+   *
+   * 与 `stats`（网关日志的实时窗口）是**同一本账的两个观测点**：
+   * - 日志窗口：`log_keep` 条（缺省 200），只覆盖最近一段，滚过去就没了；
+   * - 账本：后台每 2 分钟增量累加、保留 90 天 ⇒ **窗口一长只有它画得出来**。
+   *
+   * 口径优先级：账本有数据就用账本；**还没有任何落库日**（刚升级 / 网关从未启用）时
+   * 回落到日志窗口，并在说明条里逐字写清「当前显示的是日志窗口」——
+   * 回落本身不是问题，**不说明**才是。
+   */
+  const [dim, setDim] = useState<GatewayUsageDim | null>(null);
+  useEffect(() => {
+    let disposed = false;
+    api
+      .getTraeGatewayUsageDim(tokenScope)
+      .then((result) => {
+        if (!disposed) setDim(result);
+      })
+      .catch(() => {
+        // 账本取不到只让这一层缺席，不阻塞日志窗口那一半（与 CreditsPage 同一取舍）。
+        if (!disposed) setDim(null);
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [tokenScope]);
+
+  /** 映射成共用形状后，下面全部走与 WorkBuddy 同一批适配函数（见 `lib/trae-usage-charts.ts`）。 */
+  const source = useMemo(() => (stats ? toTokenStatsSource(stats) : null), [stats]);
+  const ledgerSource = useMemo(() => ledgerToTokenStatsSource(dim), [dim]);
+  /** 只客户端一本（`ledger === "client"`）：此时不再看网关，也不读日志窗口。 */
+  const clientBook = showsClient(ledger) && !showsGateway(ledger);
+  /** 账本还没落库时回落日志窗口（网关口径，见上一条注释）。 */
+  const fromLedger = showsGateway(ledger) && (dim?.days.length ?? 0) > 0;
+  /**
+   * 当前「这一屏的账本」用的是哪份数据。
+   *
+   * ⚠️ `all` 档取的是**网关**这份：两本账相加会双计（同一请求可能两处各记一次，
+   * 而 Trae 没有对账接口能扣掉重叠）⇒ 统计卡与模型类图表一律单本口径，
+   * 「两本并排」只出现在逐日柱上（见 `ledgerColumns`）。
+   */
+  const bookSource = clientBook ? clientSource : fromLedger ? ledgerSource : source;
+
+  /** 客户端账的逐日列（窗口内）。 */
+  const clientColumns = useMemo(
+    () => (clientSource ? dailyModelSeries(clientSource, viewWindow) : []),
+    [clientSource, viewWindow],
+  );
+  /** 网关账的逐日列 —— 覆盖条**恒**读它（覆盖条描述数据现状，不随账本切换）。 */
+  const gatewayColumns = useMemo(() => {
+    const gateway = fromLedger ? ledgerSource : source;
+    return gateway ? dailyModelSeries(gateway, viewWindow) : [];
+  }, [fromLedger, ledgerSource, source, viewWindow]);
+  /** 这一屏的逐日 × 逐模型列（统计卡 / 累计曲线 / 峰值都按它算）。 */
+  const bookColumns = clientBook ? clientColumns : gatewayColumns;
+  const slices = useMemo(
+    () => (bookSource ? modelSlices(bookSource, viewWindow) : []),
+    [bookSource, viewWindow],
+  );
+  /* 热力图只认「周 × 小时」槽位，网关账本按日聚合 ⇒ 账本口径下**矩阵为空**（不画，不编）。
+     客户端明文库若有 `hours` 则照常画。 */
+  const matrix = useMemo(
+    () => (!fromLedger && bookSource ? heatmapMatrix(bookSource.hours) : null),
+    [fromLedger, bookSource],
+  );
+
+  /** 窗口内的账本覆盖（未记录日 ≠ 0，必须披露）。 */
+  const coverage = useMemo(
+    () => dimCoverage(dim, viewWindow),
+    [dim, viewWindow],
+  );
+
+  /** 窗口内网关 token 合计（账本口径与日志窗口口径**各算各的**，不混）。 */
+  const windowGatewayTokens = useMemo(
+    () => gatewayColumns.reduce((sum, column) => sum + column.total, 0),
+    [gatewayColumns],
+  );
+
+  /**
+   * 窗口内客户端账合计（token / 记录条数）。
+   *
+   * 只在 `clientReady` 时才有意义；**不可得时调用点传「不可得」而不是 0**（见覆盖条）。
+   */
+  const clientWindow = useMemo(() => {
+    if (!clientSource) return { tokens: 0, records: 0 };
+    const days = clientDailyInWindow(clientSource, viewWindow);
+    return {
+      tokens: days.reduce((sum, day) => sum + day.total, 0),
+      records: days.reduce((sum, day) => sum + day.records, 0),
+    };
+  }, [clientSource, viewWindow]);
+
+  /**
+   * `all` 档的逐日柱：**客户端 / 网关两段并排**，柱高不做任何扣减。
+   *
+   * 为什么不做统计卡相加：两本账的重叠量在 Trae 上算不出来（没有对账接口）⇒
+   * 相加得到的「合计」必然偏高，且无法解释高多少。这里只把两条事实**并排**摆出来，
+   * 由用户自己读（与 `ledgerDailySeries` 的契约一致：一个数字只属于一本账）。
+   */
+  const ledgerColumns = useMemo(() => {
+    if (ledger !== "all") return null;
+    const clientTotals = new Map(
+      (clientSource ? clientDailyInWindow(clientSource, viewWindow) : []).map(
+        (day) => [day.key, day.total] as const,
+      ),
+    );
+    const gatewayTotals = new Map(gatewayColumns.map((column) => [column.day, column.total] as const));
+    return ledgerDailySeries({
+      days: usageWindowKeys(viewWindow).map((key) => ({ key, total: 0 })),
+      clientTotals,
+      gatewayTotals,
+      ledger,
+      labelOf: (key) => key.slice(5).replace("-", "/"),
+    });
+  }, [ledger, clientSource, gatewayColumns, viewWindow]);
+
+  /** 窗口内的活跃账号（账本按 `accounts` 维度去重；回落时用日志窗口的账号数）。 */
+  const activeAccounts = useMemo(() => {
+    /* 客户端账本**没有账号维度**（读的是本机对话库，不是网关的选号记录）⇒ `null`，
+       第 4 枚卡改用「模型数」（与 WB 同一枚卡），而不是拿网关的账号数冒充。 */
+    if (clientBook) return null;
+    if (!fromLedger || !dim) return stats?.accounts.length ?? 0;
+    const inWindow = new Set(usageWindowKeys(viewWindow));
+    const uids = new Set<string>();
+    for (const day of dim.days) {
+      if (!inWindow.has(day.key)) continue;
+      for (const row of day.accounts) {
+        const uid = row.account?.trim();
+        if (row.total > 0 && uid) uids.add(uid);
+      }
+    }
+    return uids.size;
+  }, [clientBook, fromLedger, dim, viewWindow, stats]);
+
+  /** 窗口内的请求数与失败数（`accounts` 维度合计 —— 与 token 总量同源同水位线）。 */
+  const windowGatewayRequests = useMemo(() => {
+    if (!dim) return 0;
+    const inWindow = new Set(usageWindowKeys(viewWindow));
+    return dim.days
+      .filter((day) => inWindow.has(day.key))
+      .reduce(
+        (sum, day) => sum + day.accounts.reduce((inner, row) => inner + row.requests, 0),
+        0,
+      );
+  }, [dim, viewWindow]);
+  const windowGatewayFailed = useMemo(() => {
+    if (!dim) return 0;
+    const inWindow = new Set(usageWindowKeys(viewWindow));
+    return dim.days
+      .filter((day) => inWindow.has(day.key))
+      .reduce(
+        (sum, day) => sum + day.accounts.reduce((inner, row) => inner + row.failed, 0),
+        0,
+      );
+  }, [dim, viewWindow]);
+
+  /** 网关账本的模型表行（窗口内，token 口径；与 `slices` 同一份数据，另一个切法）。 */
+  const ledgerModels = useMemo(
+    () =>
+      dim
+        ? dimTotals(dim, viewWindow, modelKey)
+            .filter((row) => row.tokens > 0)
+            .map((row) => ({
+              name: row.key || t("wbStats.usage.models.unknown"),
+              tokens: row.tokens,
+              requests: row.requests,
+              failed: row.failed,
+            }))
+        : [],
+    [dim, viewWindow, t],
+  );
+
+  /** 客户端账本的模型表行（窗口内；与 `clientWindow.tokens` 同一分母）。 */
+  const clientModels = useMemo(
+    () => (clientSource ? clientModelTotals(clientSource, viewWindow) : []),
+    [clientSource, viewWindow],
+  );
+
+  /* ⚠️ 加载 / 失败态不带页头与页容器：页头由上层 `UsagePage` 统一渲染。 */
   if (loading && !stats) {
     return (
-      <div className="mx-auto w-full max-w-[1180px] px-6 py-8 sm:px-8 sm:py-9">
-        <Skeleton className="h-9 w-48" />
-        <Skeleton className="mt-4 h-32 w-full" />
-        <Skeleton className="mt-6 h-64 w-full" />
+      <div className="min-w-0 space-y-6" aria-busy="true">
+        {slow ? <SlowLoadHint onRetry={() => void run(() => refresh())} retrying={busy} /> : null}
+        <Skeleton className="h-[74px] w-full" />
+        <Skeleton className="h-64 w-full" />
+        <Skeleton className="h-40 w-full" />
       </div>
     );
   }
 
   if (error && !stats) {
     return (
-      <div className="mx-auto w-full max-w-[1180px] px-6 py-8 sm:px-8 sm:py-9">
-        <header className="mb-6">
-          <h1 className="text-[28px] font-semibold tracking-tight">{t("trae.stats.token.title")}</h1>
-          <p className="mt-2 text-sm leading-6 text-muted-foreground">
-            {t("trae.stats.token.subtitle")}
-          </p>
-        </header>
+      <div className="min-w-0">
         <Alert variant="destructive">
           <AlertTriangle />
           <AlertTitle>{t("trae.stats.token.loadFailed")}</AlertTitle>
           <AlertDescription className="flex flex-col gap-3">
             <span>{error}</span>
             <div>
-              <Button variant="outline" size="sm" onClick={() => void refresh()}>
-                <RefreshCw />
+              <Button variant="outline" size="sm" disabled={busy} onClick={() => void run(() => refresh())}>
+                {busy ? <Loader2 className="animate-spin" /> : <RefreshCw />}
                 {t("trae.stats.token.retry")}
               </Button>
             </div>
@@ -260,327 +445,189 @@ export default function TraeTokenStatsPage() {
     );
   }
 
-  const empty = (summary?.records ?? 0) === 0;
+  const summary = stats?.summary;
+  const unsupported = stats?.unsupported ?? [];
+  /* 空窗口判据随账本走：客户端看窗口内有没有量；网关看落库量（无落库时看日志记录数）；
+     `all` 两本都空才算空 —— 否则「客户端有量、网关没量」会被一句「没有记录」盖掉。 */
+  const gatewayEmpty = fromLedger ? windowGatewayTokens === 0 : (summary?.records ?? 0) === 0;
+  const empty = clientBook
+    ? clientWindow.tokens === 0
+    : ledger === "all"
+      ? gatewayEmpty && clientWindow.tokens === 0
+      : gatewayEmpty;
+  /** 客户端这本账现在需要用户「指路」（未配置 / 读失败）⇒ 面板就是这一屏的正文。 */
+  const needsImport = clientError !== null || !clientReady;
 
   return (
-    <div className="mx-auto w-full max-w-[1180px] px-6 py-8 sm:px-8 sm:py-9">
-      <header className="mb-6 flex min-w-0 flex-wrap items-end justify-between gap-3">
-        <div className="min-w-0">
-          <h1 className="text-[28px] font-semibold tracking-tight">{t("trae.stats.token.title")}</h1>
-          <p className="mt-2 text-sm leading-6 text-muted-foreground">
-            {t("trae.stats.token.subtitle")}
-          </p>
-        </div>
-        <div className="flex max-w-full flex-wrap items-center justify-end gap-2">
-          {/* 产品线切换器：Trae 分区的每个页面都可切，位置固定在页头右侧动作区。 */}
-          <TraeVariantSwitch />
-          <DemoAction>
-            <Button variant="outline" size="sm" disabled={loading} onClick={() => void refresh()}>
-              {loading ? <Loader2 className="animate-spin" /> : <RefreshCw />}
-              {t("trae.stats.token.refresh")}
-            </Button>
-          </DemoAction>
-        </div>
-      </header>
-
-      {/* 数据源边界：不写清楚，用户会把「数字小」当成 bug。**必须保留。** */}
-      <Alert className="mb-6">
-        <Info />
-        <AlertTitle>{t("trae.stats.token.sourceTitle")}</AlertTitle>
-        <AlertDescription>
-          <span className="break-all">
-            {stats?.note ?? t("trae.stats.token.sourceFallback")}
-          </span>
-          {stats?.logFile && (
-            <span className="mt-1 block break-all font-mono text-xs text-muted-foreground">
-              {stats.logFile}
+    <div className="min-w-0 space-y-6">
+      {/* 数据源边界：不写清楚，用户会把「数字小」当成 bug。**必须保留**（提示条，非内容块）。
+          ⚠️ 例外：客户端账需要「指路」时，下面的导入面板本身就是这一屏的正文（自带标题与
+          说明）⇒ 这里不再重复一条一模一样的提示（2026-10-28 实测截图里两段文案叠在一起）。 */}
+      {!(clientBook && needsImport) && (
+        <Alert>
+          <Info />
+          <AlertTitle>
+            {ledger === "all"
+              ? t("wbStats.usage.ledger")
+              : clientBook
+                ? t("trae.stats.token.client.title")
+                : fromLedger
+                  ? t("trae.stats.token.ledgerTitle")
+                  : t("trae.stats.token.sourceTitle")}
+          </AlertTitle>
+          <AlertDescription>
+            <span className="break-all">
+              {ledger === "all" ? (
+                <>
+                  {/* 「全部」档：两本账**部分重叠**（客户端副本含全部对话；网关只含经本机转发的，
+                      其中还可能有第三方直调网关、不在客户端库里）。重叠量在 Trae 上算不出来
+                      ⇒ 既不合并也不扣减。**完整解释放在这条提示条**（图注 `ledgerStackedCaption`
+                      里的「见上方说明」指的就是这里），图注只讲「怎么读」。
+                      ⚠️ 分两行而不是用「：」拼接：全角冒号在英文界面里是错的，中英都要读顺。 */}
+                  <b className="block font-medium text-foreground">
+                    {t("trae.stats.token.noMerge")}
+                  </b>
+                  <span className="mt-0.5 block">{t("trae.stats.token.noMergeBody")}</span>
+                </>
+              ) : clientBook ? (
+                (clientStats?.note || t("trae.stats.token.client.body"))
+              ) : fromLedger ? (
+                t("trae.stats.token.ledgerBody")
+              ) : (
+                (stats?.note ?? t("trae.stats.token.sourceFallback"))
+              )}
             </span>
-          )}
-        </AlertDescription>
-      </Alert>
-
-      {/* ---- 版本范围条：四档筛选（国内版 / 国际版 / 未标注 / 全部），
-              计数来自 variantCounts（只受时间窗口影响） ---- */}
-      <Card className="mb-6 gap-0 py-0">
-        <div className="flex min-w-0 flex-wrap items-center justify-between gap-3 border-b border-border/60 px-5 py-3">
-          <span className="text-[13px] font-medium">{t("trae.stats.token.scopeTitle")}</span>
-          <span className="text-xs text-muted-foreground">{t("trae.stats.token.scopeNote")}</span>
-        </div>
-        <div className="px-5 py-3">
-          <Tabs
-            className="min-w-0"
-            value={scope}
-            onValueChange={(value) => setScope(value as TraeTokenScope)}
-          >
-            <TabsList
-              className="grid h-auto w-full grid-cols-2 sm:inline-flex sm:w-fit sm:flex-wrap"
-              aria-label={t("trae.stats.token.scopeTitle")}
-            >
-              {SCOPE_OPTIONS.map((option) => (
-                <TabsTrigger key={option.value} value={option.value} className="gap-1.5 px-3">
-                  {t(option.labelKey)}
-                  <span className="rounded-full bg-muted px-1.5 text-[11px] tabular-nums text-muted-foreground">
-                    {counts ? counts[option.value] : "—"}
-                  </span>
-                </TabsTrigger>
-              ))}
-            </TabsList>
-          </Tabs>
-        </div>
-      </Card>
-
-      {empty ? (
-        <div className="rounded-xl border border-dashed px-4 py-16 text-center text-sm text-muted-foreground">
-          <div className="font-medium text-foreground">{t("trae.stats.token.emptyTitle")}</div>
-          <p className="mt-2 text-xs">{t("trae.stats.token.emptyBody")}</p>
-        </div>
-      ) : (
-        <>
-          {/* ---- 汇总 ---- */}
-          <Card
-            className="mb-6 min-w-0 gap-0 overflow-hidden rounded-2xl bg-card/70 py-0 shadow-none"
-            aria-label={t("trae.stats.token.summaryTitle")}
-          >
-            <div className="flex min-w-0 flex-wrap items-center justify-between gap-3 border-b border-border/60 px-5 py-3">
-              <span className="text-[13px] font-medium">{t("trae.stats.token.summaryTitle")}</span>
-              <Tabs
-                className="min-w-0 shrink-0 gap-0"
-                value={days}
-                onValueChange={(value) => setDays(value as (typeof RANGES)[number]["value"])}
-              >
-                <TabsList
-                  className="grid h-auto w-full grid-cols-2 sm:inline-flex sm:w-fit sm:flex-wrap"
-                  aria-label={t("trae.stats.token.rangeAria")}
-                >
-                  {RANGES.map((range) => (
-                    <TabsTrigger key={range.value} value={range.value} className="px-2">
-                      {t(range.labelKey)}
-                    </TabsTrigger>
-                  ))}
-                </TabsList>
-              </Tabs>
-            </div>
-            <div className="grid min-w-0 grid-cols-1 divide-y divide-border/60 p-0 sm:grid-cols-4 sm:divide-y-0 sm:py-5">
-              <StatMetric
-                icon={Coins}
-                label={t("trae.stats.token.series.total")}
-                value={formatTokens(summary?.total)}
-                hint={t("trae.stats.token.summary.inputOutputHint", {
-                  input: formatTokens(summary?.input),
-                  output: formatTokens(summary?.output),
-                })}
-              />
-              <StatMetric
-                icon={ArrowDownToLine}
-                label={t("trae.stats.token.series.input")}
-                value={formatTokens(summary?.input)}
-                divided
-              />
-              <StatMetric
-                icon={ArrowUpFromLine}
-                label={t("trae.stats.token.series.output")}
-                value={formatTokens(summary?.output)}
-                divided
-              />
-              <StatMetric
-                icon={Server}
-                label={t("trae.stats.token.summary.records")}
-                value={formatExact(summary?.records)}
-                hint={t("trae.stats.token.summary.errorsHint", {
-                  count: formatExact(summary?.errors),
-                })}
-                divided
-              />
-            </div>
-            <div className="grid min-w-0 grid-cols-1 divide-y divide-border/60 border-t border-border/60 p-0 sm:grid-cols-4 sm:divide-y-0 sm:py-5">
-              <StatMetric
-                icon={Timer}
-                label={t("trae.stats.token.summary.avgLatency")}
-                value={`${formatExact(summary?.avgLatencyMs)}ms`}
-              />
-              <StatMetric
-                icon={Gauge}
-                label={t("trae.stats.token.summary.p95Latency")}
-                value={`${formatExact(summary?.p95LatencyMs)}ms`}
-                divided
-              />
-              <StatMetric
-                icon={ArrowUpFromLine}
-                label={t("trae.stats.token.summary.streamRequests")}
-                value={formatExact(summary?.streamRequests)}
-                divided
-              />
-              <StatMetric
-                icon={Users}
-                label={t("trae.stats.token.summary.activeAccounts")}
-                value={formatExact(accounts.length)}
-                divided
-              />
-            </div>
-          </Card>
-
-          {/* ---- 整年热力网格（源 `daily`，空日由前端补齐） ---- */}
-          <TokenHeatGrid daily={daily} />
-
-          {/* ---- 每日趋势 ---- */}
-          {daily.length > 1 && (
-            <Card className="mb-6 gap-0 py-0">
-              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border/60 px-5 py-3">
-                <span className="text-[13px] font-medium">{t("trae.stats.token.trendTitle")}</span>
-              </div>
-              <div className="px-3 py-4">
-                <ChartContainer config={trendConfig} className="h-[240px] w-full">
-                  <LineChart data={daily} margin={{ top: 8, right: 16, bottom: 8, left: 8 }}>
-                    <CartesianGrid vertical={false} strokeDasharray="3 3" />
-                    <XAxis
-                      dataKey="key"
-                      tickLine={false}
-                      axisLine={false}
-                      tickMargin={8}
-                      tickFormatter={(value: string) => value.slice(5)}
-                    />
-                    <YAxis tickLine={false} axisLine={false} width={48} tickFormatter={formatTokens} />
-                    <ChartTooltip content={<ChartTooltipContent indicator="line" />} />
-                    {TREND_SERIES.map((series) => (
-                      <Line
-                        key={series.key}
-                        type="monotone"
-                        dataKey={series.key}
-                        stroke={`var(--color-${series.key})`}
-                        strokeWidth={2}
-                        dot={false}
-                      />
-                    ))}
-                  </LineChart>
-                </ChartContainer>
-              </div>
-            </Card>
-          )}
-
-          {/* ---- 按模型 × 按天：堆叠柱（Token）+ 折线（调用次数） ---- */}
-          <ModelDailyChart points={modelDaily} />
-
-          {/* ---- 模型分布 ---- */}
-          <Card className="mb-6 gap-0 py-0">
-            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border/60 px-5 py-3">
-              <span className="text-[13px] font-medium">{t("trae.stats.token.byModel")}</span>
-            </div>
-            {topModels.length === 0 ? (
-              <p className="px-5 py-6 text-center text-sm text-muted-foreground">
-                {t("trae.stats.token.byModelEmpty")}
-              </p>
-            ) : (
-              <>
-                <div className="px-3 py-4">
-                  <ChartContainer config={modelConfig} className="h-[200px] w-full">
-                    <ComposedChart data={topModels} margin={{ top: 8, right: 16, bottom: 8, left: 8 }}>
-                      <CartesianGrid vertical={false} strokeDasharray="3 3" />
-                      <XAxis
-                        dataKey="key"
-                        tickLine={false}
-                        axisLine={false}
-                        tickMargin={8}
-                        interval={0}
-                        angle={-18}
-                        textAnchor="end"
-                        height={56}
-                      />
-                      <YAxis tickLine={false} axisLine={false} width={48} tickFormatter={formatTokens} />
-                      <ChartTooltip content={<ChartTooltipContent indicator="dot" />} />
-                      <Bar dataKey="total" fill="var(--color-total)" radius={[4, 4, 0, 0]} />
-                    </ComposedChart>
-                  </ChartContainer>
-                </div>
-                <div className="divide-y divide-border/60 border-t border-border/60">
-                  {models.map((model) => (
-                    <div key={model.key} className="flex flex-wrap items-center gap-3 px-5 py-2.5">
-                      <code className="min-w-0 flex-1 truncate font-mono text-xs">{model.key}</code>
-                      <span className="text-xs text-muted-foreground tabular-nums">
-                        {t("trae.stats.token.times", { count: formatExact(model.records) })}
-                      </span>
-                      {model.errors > 0 && (
-                        <Badge variant="destructive" className="shrink-0">
-                          {t("trae.stats.token.failed", { count: model.errors })}
-                        </Badge>
-                      )}
-                      <span className="w-20 text-right text-xs font-medium tabular-nums">
-                        {formatTokens(model.total)}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              </>
+            {!fromLedger && !clientBook && stats?.logFile && (
+              <span className="mt-1 block break-all font-mono text-xs text-muted-foreground">
+                {stats.logFile}
+              </span>
             )}
-          </Card>
-
-          {/* ---- 按账号 ---- */}
-          <Card className="mb-6 gap-0 py-0">
-            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border/60 px-5 py-3">
-              <span className="text-[13px] font-medium">{t("trae.stats.token.byAccount")}</span>
-            </div>
-            {accounts.length === 0 ? (
-              <p className="px-5 py-6 text-center text-sm text-muted-foreground">
-                {t("trae.stats.token.byAccountEmpty")}
-              </p>
-            ) : (
-              <div className="divide-y divide-border/60">
-                {accounts.map((account) => (
-                  <div key={account.key} className="flex flex-wrap items-center gap-3 px-5 py-3">
-                    <span className="min-w-0 flex-1 truncate text-sm font-medium">{account.name}</span>
-                    <span className="font-mono text-xs text-muted-foreground">{account.shortId}</span>
-                    <span className="text-xs text-muted-foreground tabular-nums">
-                      {t("trae.stats.token.times", { count: formatExact(account.records) })}
-                    </span>
-                    {account.errors > 0 && (
-                      <Badge variant="destructive" className="shrink-0">
-                        {t("trae.stats.token.failed", { count: account.errors })}
-                      </Badge>
-                    )}
-                    <span className="w-20 text-right text-xs font-medium tabular-nums">
-                      {formatTokens(account.total)}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            )}
-          </Card>
-
-          {/* ---- 状态码分布 ---- */}
-          {(stats?.statuses.length ?? 0) > 0 && (
-            <Card className="mb-6 gap-0 py-0">
-              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border/60 px-5 py-3">
-                <span className="text-[13px] font-medium">{t("trae.stats.token.statusTitle")}</span>
-              </div>
-              <div className="flex flex-wrap gap-2 px-5 py-4">
-                {stats?.statuses.map((item) => {
-                  const code = Number.parseInt(item.key, 10);
-                  const ok = code >= 200 && code < 300;
-                  return (
-                    <span
-                      key={item.key}
-                      className={cn(
-                        "rounded-md border px-2 py-1 font-mono text-xs tabular-nums",
-                        ok
-                          ? "border-border text-muted-foreground"
-                          : "border-destructive/40 text-destructive",
-                      )}
-                    >
-                      {item.key} × {item.records}
-                    </span>
-                  );
-                })}
-              </div>
-            </Card>
-          )}
-        </>
+          </AlertDescription>
+        </Alert>
       )}
 
-      {/* ---- 平台做不到的维度（置灰卡；形状来自 handlers::unsupported_note） ---- */}
+      {/* ★ 账本覆盖条：两本账各有多少、网关覆盖了窗口里的几天。
+          客户端那一项**按实况**给：读到了就给真数（含 0），未配置 / 读失败才写「不可得」——
+          这是「测不到」与「没用」的唯一区分点，不能写成常量。 */}
+      <CoverageStrip
+        clientTokens={needsImport ? 0 : clientWindow.tokens}
+        clientRequests={needsImport ? 0 : clientWindow.records}
+        gatewayTokens={windowGatewayTokens}
+        gatewayRequests={windowGatewayRequests}
+        gatewayFailed={windowGatewayFailed}
+        recorded={coverage.recorded}
+        windowDays={coverage.total}
+        overlapRows={0}
+        overlapTokens={0}
+        /* ★ 条件而不是常量：Trae 没有逐条对账（`get_usage_reconcile` 仅 WB 有），
+           所以重叠量恒不显示；而客户端「有没有读到」是能回答的，必须回答。 */
+        clientUnavailable={needsImport}
+        showOverlap={false}
+        className="-mt-2"
+      />
+
+      {clientBook && (needsImport || empty) ? (
+        /* 只客户端一本时，导入面板就是这一屏的正文：没指路 / 读不出来，用户的下一步都在卡里。
+           已读到但这段窗口**没量**是另一件事 —— 先给空态（含出口），再让面板承担「换一份库」。 */
+        <div className="space-y-6">
+          {!needsImport && empty ? (
+            <EmptyState
+              icon={Server}
+              title={t("trae.stats.token.ledgerEmptyTitle")}
+              description={t("trae.stats.token.client.noUsageHint")}
+              action={
+                <Button size="sm" variant="outline" onClick={() => void refreshClient()}>
+                  {t("trae.stats.token.refresh")}
+                </Button>
+              }
+            />
+          ) : null}
+          <TraeClientImport
+            window={viewWindow}
+            error={clientError}
+            onImported={() => void refreshClient()}
+            onRetry={() => void refreshClient()}
+          />
+        </div>
+      ) : empty ? (
+        /* 空窗口：原型每个视图都有自己的空态块（四要素含出口）。 */
+        <EmptyState
+          icon={Server}
+          title={fromLedger ? t("trae.stats.token.ledgerEmptyTitle") : t("trae.stats.token.emptyTitle")}
+          description={
+            fromLedger ? t("trae.stats.token.ledgerEmptyBody") : t("trae.stats.token.emptyBody")
+          }
+          action={
+            <Button size="sm" variant="outline" onClick={() => void refresh()}>
+              {t("trae.stats.token.refresh")}
+            </Button>
+          }
+        />
+      ) : view === "models" ? (
+        <>
+          <ModelsView slices={slices} onRefresh={() => void refresh()} />
+          {/* 两本账**各一张表**（分母各用各的）—— `all` 档下不加成一张混合表。 */}
+          {showsClient(ledger) && !needsImport && clientModels.length > 0 ? (
+            <LedgerModelTable
+              book="client"
+              rows={clientModels}
+              total={clientWindow.tokens}
+              caption={`${t("trae.stats.token.client.title")} · ${compactTokens(clientWindow.tokens)}`}
+            />
+          ) : null}
+          {showsGateway(ledger) && fromLedger && ledgerModels.length > 0 ? (
+            <LedgerModelTable
+              book="gateway"
+              rows={ledgerModels}
+              total={windowGatewayTokens}
+              caption={t("wbStats.usage.models.gatewayCaption")}
+              failed={windowGatewayFailed}
+            />
+          ) : null}
+        </>
+      ) : view === "keys" ? (
+        /* 「按密钥」只对网关这本账有意义（Key 是网关发出去的）⇒ 恒读网关账本维度。 */
+        <KeysView
+          dim={dim}
+          window={viewWindow}
+          selfScope="trae"
+          loadNames={loadTraeKeyNames}
+        />
+      ) : (
+        <TrendView
+          columns={ledgerColumns ?? bookColumns}
+          bookColumns={bookColumns}
+          slices={slices}
+          matrix={matrix}
+          accounts={activeAccounts}
+          viewWindow={viewWindow}
+          scopeName={combineAll ? t("shared.region.combine.all") : scopeLabel(t, scope)}
+          fromLedger={fromLedger}
+          stackedByLedger={ledgerColumns !== null}
+        />
+      )}
+
+      {/* `all` 档下客户端读不到时，横幅不能代替「怎么修」：面板放在页末（不挡住网关那本）。 */}
+      {ledger === "all" && needsImport ? (
+        <TraeClientImport
+          window={viewWindow}
+          error={clientError}
+          onImported={() => void refreshClient()}
+          onRetry={() => void refreshClient()}
+        />
+      ) : null}
+
+      {/* ---- 平台做不到的维度（置灰卡；形状来自 handlers::unsupported_note）----
+          不是原型的内容块，而是**诚实性要求**：Trae 没有「按项目 / 会话」维度，
+          不说清楚用户会以为「统计漏了」。 */}
       {unsupported.length > 0 && <UnsupportedSection items={unsupported} />}
 
-      {stats && stats.parseErrors > 0 && (
-        <p className="flex items-center gap-1.5 px-1 text-xs text-amber-600">
-          <CircleAlert className="size-3.5" aria-hidden="true" />
+      {/* 日志解析失败：**诚实性提示** —— 数字不完整时必须说（不是原型的内容块，
+          但与 `unsupported` 同类：不说明会让用户把「少算」当成 bug）。
+          ⚠️ 这是**网关日志**的解析结果 ⇒ 只看客户端那本账时不出现。 */}
+      {showsGateway(ledger) && stats && stats.parseErrors > 0 && (
+        <p className="flex items-center gap-1.5 px-1 text-xs text-warning">
+          <AlertTriangle className="size-3.5" aria-hidden="true" />
           {t("trae.stats.token.parseErrors", { count: stats.parseErrors })}
         </p>
       )}
@@ -588,274 +635,244 @@ export default function TraeTokenStatsPage() {
   );
 }
 
-/**
- * 整年热力网格（53 周 × 7 天）。
- *
- * 骨架参 `TokenStatsPage.tsx:813-879`；数据源＝本页的 `daily`（**同源**），
- * 空日由前端补 0，因此「整年」是画布语义，只有窗口内的日期有值。
- */
-function TokenHeatGrid({ daily }: { daily: TraeTokenStatistics["daily"] }) {
+/* ────────────────────────────── 趋势（原型四块） ────────────────────────────── */
+
+function TrendView({
+  columns,
+  bookColumns,
+  slices,
+  matrix,
+  accounts,
+  viewWindow,
+  scopeName,
+  fromLedger,
+  stackedByLedger,
+}: {
+  /** 逐日柱的列。`all` 档是「客户端 / 网关」两段并排，其余档是按模型拆分。 */
+  columns: ReturnType<typeof dailyModelSeries>;
+  /** **单本账**的逐日 × 逐模型列：统计卡 / 累计曲线 / 峰值都按它算（`all` 档是网关那本）。 */
+  bookColumns: ReturnType<typeof dailyModelSeries>;
+  slices: ReturnType<typeof modelSlices>;
+  matrix: ReturnType<typeof heatmapMatrix> | null;
+  /** 窗口内的活跃账号；`null` = 这本账没有账号维度（客户端账本）⇒ 第 4 枚卡改用模型数。 */
+  accounts: number | null;
+  viewWindow: UsageWindow;
+  scopeName: string;
+  /** 当前画的是账本（逐日落库）还是日志窗口 —— 只影响热力图那一块的说明。 */
+  fromLedger: boolean;
+  /** 逐日柱是否按**账本**堆叠（`all` 档）。颜色与图注随之切换。 */
+  stackedByLedger: boolean;
+}) {
   const t = useT();
-  const scrollerRef = useRef<HTMLDivElement>(null);
-  const valueByDate = useMemo(() => new Map(daily.map((point) => [point.key ?? "", point.total])), [daily]);
-  const recordByDate = useMemo(
-    () => new Map(daily.map((point) => [point.key ?? "", point.records])),
-    [daily],
+  const windowLabel = useUsageWindowLabel();
+
+  const total = bookColumns.reduce((sum, column) => sum + column.total, 0);
+  /* 日均的分母是**窗口天数**（不是「有数据的天数」）—— 与 WB 的 A1-3 同一口径。 */
+  const average = Math.round(total / usageWindowDays(viewWindow));
+  const peak = bookColumns.reduce(
+    (best, column) => (column.total > best.total ? column : best),
+    bookColumns[0] ?? { day: "", label: "", total: 0, segments: [] },
   );
-
-  const today = new Date();
-  today.setHours(12, 0, 0, 0);
-  const todayKey = dateKey(today);
-  const start = new Date(today);
-  start.setDate(start.getDate() - start.getDay() - 52 * 7);
-
-  const weeks = Array.from({ length: 53 }, (_, weekIndex) =>
-    Array.from({ length: 7 }, (_, dayIndex) => {
-      const date = new Date(start);
-      date.setDate(start.getDate() + weekIndex * 7 + dayIndex);
-      const key = dateKey(date);
-      return {
-        date,
-        key,
-        value: valueByDate.get(key) ?? 0,
-        records: recordByDate.get(key) ?? 0,
-        future: key > todayKey,
-      };
-    }),
-  );
-  const max = Math.max(1, ...weeks.flatMap((week) => week.filter((day) => !day.future).map((day) => day.value)));
-  const monthLabels = weeks.map((week, weekIndex) => {
-    const firstOfMonth = week.find((day) => day.date.getDate() === 1);
-    let labelDate: Date | null = null;
-    if (firstOfMonth && firstOfMonth.key <= todayKey) {
-      labelDate = firstOfMonth.date;
-    } else if (weekIndex === 0) {
-      labelDate = week[0].date;
-    }
-    if (!labelDate || dateKey(labelDate) > todayKey) return null;
-    return labelDate.toLocaleDateString("zh-CN", { month: "short" });
-  });
-  const activeDays = weeks.flat().filter((day) => !day.future && day.value > 0).length;
-
-  useLayoutEffect(() => {
-    const scroller = scrollerRef.current;
-    if (!scroller) return;
-    scroller.scrollLeft = scroller.scrollWidth - scroller.clientWidth;
-  }, [daily]);
-
-  return (
-    <Card className="mb-6 min-w-0 gap-0 rounded-xl py-0 shadow-none">
-      <div className="flex items-center justify-between gap-3 border-b border-border/60 px-5 py-3">
-        <span className="text-[13px] font-medium">{t("trae.stats.heatmap.title")}</span>
-        <span className="shrink-0 text-xs text-muted-foreground">
-          {t("trae.stats.heatmap.activeDays", { count: activeDays })}
-        </span>
-      </div>
-      <div className="min-w-0 px-4 pt-4 pb-5 sm:px-5">
-        <div ref={scrollerRef} className="overflow-x-auto pb-1">
-          <div
-            className="min-w-[760px]"
-            role="img"
-            aria-label={t("trae.stats.heatmap.aria", { count: activeDays })}
-          >
-            <div
-              className="grid gap-1"
-              style={{ gridTemplateColumns: "repeat(53, minmax(10px, 1fr))" }}
-              aria-hidden="true"
-            >
-              {weeks.flatMap((week, weekIndex) =>
-                week.map((day, dayIndex) => {
-                  const level = day.value ? Math.max(1, Math.ceil(Math.sqrt(day.value / max) * 4)) : 0;
-                  const cell = (
-                    <span
-                      key={day.key}
-                      className={`aspect-square min-w-0 rounded-[3px] ${
-                        day.future ? "opacity-0" : HEATMAP_LEVEL_CLASS[level]
-                      }`}
-                      style={{ gridColumn: weekIndex + 1, gridRow: dayIndex + 1 }}
-                      aria-label={t("trae.stats.heatmap.cellAria", {
-                        date: formatHeatmapDate(day.date),
-                        tokens: formatExact(day.value),
-                      })}
-                    />
-                  );
-
-                  if (day.future) return cell;
-
-                  return (
-                    <Tooltip key={day.key} disableHoverableContent>
-                      <TooltipTrigger asChild>{cell}</TooltipTrigger>
-                      <TooltipContent
-                        side="top"
-                        sideOffset={7}
-                        className="pointer-events-none rounded-lg bg-foreground px-2.5 py-1.5 text-xs leading-4 text-background shadow-md"
-                      >
-                        {t("trae.stats.heatmap.tooltip", {
-                          date: formatHeatmapDate(day.date),
-                          tokens: formatTokens(day.value),
-                        })}
-                        {day.records > 0
-                          ? t("trae.stats.heatmap.tooltipCalls", { count: formatExact(day.records) })
-                          : ""}
-                      </TooltipContent>
-                    </Tooltip>
-                  );
-                }),
-              )}
-            </div>
-            <div
-              className="mt-3 grid gap-1 text-[11px] text-muted-foreground"
-              style={{ gridTemplateColumns: "repeat(53, minmax(10px, 1fr))" }}
-              aria-hidden="true"
-            >
-              {monthLabels.map((label, index) => (
-                <span key={`${index}-${label ?? "empty"}`} className="whitespace-nowrap">
-                  {label}
-                </span>
-              ))}
-            </div>
-          </div>
-        </div>
-      </div>
-    </Card>
-  );
-}
-
-/** 按天 × 按模型的堆叠柱（Token）+ 调用次数折线（同一图，双 Y 轴）。 */
-function ModelDailyChart({ points }: { points: TraeModelDailyPoint[] }) {
-  const t = useT();
-  const { rows, series } = useMemo(() => {
-    const totals = new Map<string, number>();
-    for (const point of points) {
-      totals.set(point.model, (totals.get(point.model) ?? 0) + point.total);
-    }
-    const top = [...totals.entries()]
-      .sort((left, right) => right[1] - left[1])
-      .slice(0, TOP_MODELS)
-      .map(([model]) => model);
-    const topSet = new Set(top);
-
-    const byDate = new Map<string, { tokens: Map<string, number>; calls: number }>();
-    for (const point of points) {
-      if (!topSet.has(point.model)) continue;
-      const entry = byDate.get(point.date) ?? { tokens: new Map<string, number>(), calls: 0 };
-      entry.tokens.set(point.model, (entry.tokens.get(point.model) ?? 0) + point.total);
-      entry.calls += point.records;
-      byDate.set(point.date, entry);
-    }
-
-    const series = top.map((model, index) => ({
-      key: `s${index}`,
-      model,
-      color: MODEL_COLORS[index % MODEL_COLORS.length],
-    }));
-
-    const rows = [...byDate.entries()]
-      .sort((left, right) => (left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0))
-      .map(([date, entry]) => {
-        const row: Record<string, number | string> = { date, calls: entry.calls };
-        series.forEach((item) => {
-          row[item.key] = entry.tokens.get(item.model) ?? 0;
-        });
-        return row;
-      });
-
-    return { rows, series };
-  }, [points]);
-
-  const config: ChartConfig = useMemo(() => {
-    const base: ChartConfig = {
-      calls: { label: t("trae.stats.token.modelDaily.calls"), color: "var(--data-series-amber)" },
-    };
-    series.forEach((item) => {
-      base[item.key] = { label: item.model, color: item.color };
+  /* 累计曲线按**单本账**算：`all` 档的逐日柱是两本账并排，把它当累计分母就是双计。 */
+  const cumulative = useMemo(() => {
+    let running = 0;
+    return bookColumns.map((column) => {
+      running += column.total;
+      return { label: column.label, value: running };
     });
-    return base;
-  }, [series, t]);
+  }, [bookColumns]);
+  const peakDelta = bookColumns.reduce((max, column) => Math.max(max, column.total), 0);
+  const heatmapHasData = matrix?.cells.some((row) => row.some((value) => value > 0)) ?? false;
+
+  /* 四枚统计卡 = 原型 `statTile` 的区间总 Token / 日均 / 峰值 / **活跃账号**。
+     ⚠️ 原型第 4 枚是「活跃账号」—— WB 侧**没有账号维度**，用「模型数」替代（已登记）；
+     Trae 的**网关账本**有 `accounts` ⇒ 按原型原样用「活跃账号」；客户端账本没有这个维度
+     ⇒ 换成「模型数」（与 WB 同一枚卡），而不是拿网关的账号数冒充。 */
+  const tiles: StatTile[] = [
+    {
+      icon: MessagesSquare,
+      label: t("wbStats.usage.trend.total"),
+      value: compactTokens(total),
+      hint: windowLabel(viewWindow),
+    },
+    {
+      icon: TrendingUp,
+      label: t("wbStats.usage.trend.avg"),
+      value: compactTokens(average),
+      hint: t("wbStats.usage.trend.avgHint"),
+    },
+    {
+      icon: Gauge,
+      label: t("wbStats.usage.trend.peak"),
+      value: compactTokens(peak.total),
+      hint: peak.label || undefined,
+    },
+    accounts === null
+      ? {
+          icon: Server,
+          label: t("wbStats.usage.models.count"),
+          value: exactTokens(slices.length),
+          hint: scopeName,
+        }
+      : {
+          icon: Users,
+          label: t("trae.stats.token.summary.activeAccounts"),
+          value: exactTokens(accounts),
+          hint: scopeName,
+        },
+  ];
 
   return (
-    <Card className="mb-6 gap-0 py-0">
-      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border/60 px-5 py-3">
-        <span className="text-[13px] font-medium">{t("trae.stats.token.modelDaily.title")}</span>
-        <span className="text-xs text-muted-foreground">{t("trae.stats.token.modelDaily.note")}</span>
-      </div>
-      {rows.length === 0 ? (
-        <p className="px-5 py-6 text-center text-sm text-muted-foreground">
-          {t("trae.stats.token.modelDaily.empty")}
+    <>
+      <StatTiles tiles={tiles} ariaLabel={t("trae.stats.token.summaryAria")} />
+
+      {/* `all` 档的四枚卡只算**网关**一本（两本相加会双计，重叠量在 Trae 上算不出来）——
+          这句话必须留在卡下面，否则用户会把「客户端没被算进来」当成 bug。 */}
+      {stackedByLedger ? (
+        <p className="-mt-3 px-1 text-[11.5px] leading-5 text-muted-foreground">
+          {t("wbStats.usage.trend.totalGatewayTitle")}
         </p>
-      ) : (
-        <>
-          <div className="px-3 py-4">
-            <ChartContainer config={config} className="h-[260px] w-full">
-              <ComposedChart data={rows} margin={{ top: 8, right: 16, bottom: 8, left: 8 }}>
-                <CartesianGrid vertical={false} strokeDasharray="3 3" />
-                <XAxis
-                  dataKey="date"
-                  tickLine={false}
-                  axisLine={false}
-                  tickMargin={8}
-                  tickFormatter={(value: string) => String(value).slice(5)}
-                />
-                <YAxis yAxisId="left" tickLine={false} axisLine={false} width={48} tickFormatter={formatTokens} />
-                <YAxis
-                  yAxisId="right"
-                  orientation="right"
-                  tickLine={false}
-                  axisLine={false}
-                  width={40}
-                  tickFormatter={formatExact}
-                />
-                <ChartTooltip content={<ChartTooltipContent indicator="dot" />} />
-                {series.map((item, index) => (
-                  <Bar
-                    key={item.key}
-                    yAxisId="left"
-                    dataKey={item.key}
-                    stackId="tokens"
-                    fill={`var(--color-${item.key})`}
-                    radius={index === series.length - 1 ? [4, 4, 0, 0] : 0}
-                  />
-                ))}
-                <Line
-                  yAxisId="right"
-                  type="monotone"
-                  dataKey="calls"
-                  stroke="var(--data-series-amber)"
-                  strokeWidth={2}
-                  dot={false}
-                />
-              </ComposedChart>
-            </ChartContainer>
-          </div>
-          <div className="flex flex-wrap gap-x-4 gap-y-1.5 border-t border-border/60 px-5 py-3">
-            {series.map((item) => (
-              <span key={item.key} className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
-                <span className="size-2 shrink-0 rounded-full" style={{ backgroundColor: item.color }} aria-hidden="true" />
-                {item.model}
-              </span>
-            ))}
-            <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
-              <span className="size-2 shrink-0 rounded-full" style={{ backgroundColor: "var(--data-series-amber)" }} aria-hidden="true" />
-              {t("trae.stats.token.modelDaily.callsAxis")}
-            </span>
-          </div>
-        </>
-      )}
-    </Card>
+      ) : null}
+
+      {columns.length > 0 ? (
+        <ChartFrame
+          title={
+            stackedByLedger
+              ? t("trae.stats.token.ledgerStackedTitle")
+              : t("wbStats.usage.trend.stackedTitle")
+          }
+          caption={
+            stackedByLedger
+              ? t("trae.stats.token.ledgerStackedCaption")
+              : t("wbStats.usage.trend.stackedDesc")
+          }
+          ariaLabel={
+            stackedByLedger
+              ? t("trae.stats.token.ledgerStackedAria")
+              : t("wbStats.usage.trend.stackedAria")
+          }
+        >
+          {/* 颜色本身是语义：客户端青绿、网关靛蓝（与覆盖条、账本表同一套）。
+              账本段由 `StackedDailyBar` **按段名**固定取色（不按出现顺序）——
+              这里不再传 `palette`，否则会出现两套并存的取色逻辑。 */}
+          <StackedDailyBar columns={columns} />
+        </ChartFrame>
+      ) : null}
+
+      <div className="grid min-w-0 gap-6 lg:grid-cols-2">
+        {cumulative.length > 0 ? (
+          <ChartFrame
+            title={t("wbStats.usage.trend.cumulativeTitle")}
+            caption={cumulativeCaption(t, cumulative[cumulative.length - 1].value, peakDelta)}
+            ariaLabel={t("wbStats.usage.trend.cumulativeTitle")}
+          >
+            <CumulativeArea points={cumulative} />
+          </ChartFrame>
+        ) : null}
+        {slices.length > 0 ? (
+          <ChartFrame
+            title={t("wbStats.usage.trend.donutTitle")}
+            caption={`${exactTokens(slices.length)} · ${compactTokens(total)}`}
+            ariaLabel={t("wbStats.usage.trend.donutTitle")}
+          >
+            <ModelDonut slices={slices} size={150} />
+          </ChartFrame>
+        ) : null}
+      </div>
+
+      {heatmapHasData && matrix ? (
+        <ChartFrame
+          title={t("wbStats.usage.trend.heatmapTitle")}
+          caption={t("wbStats.usage.trend.heatmapDesc")}
+          ariaLabel={t("wbStats.usage.trend.heatmapAria")}
+          exportable={false}
+        >
+          <UsageHeatmap matrix={matrix} />
+        </ChartFrame>
+      ) : fromLedger ? (
+        /* 账本按**日**聚合，没有「周 × 小时」槽位 ⇒ 这张图在账本口径下画不出来。
+           不画空图，也不静默消失：一行字说明它为什么不在这里。 */
+        <p className="px-1 text-xs text-muted-foreground">
+          {t("trae.stats.token.heatmapLedgerUnavailable")}
+        </p>
+      ) : null}
+    </>
   );
 }
 
-/** 平台做不到的维度：置灰卡，逐条带 `supportedOn` / `reason`。 */
+/* ────────────────────────────── 模型（原型三块） ────────────────────────────── */
+
+function ModelsView({
+  slices,
+  onRefresh,
+}: {
+  slices: ReturnType<typeof modelSlices>;
+  onRefresh: () => void;
+}) {
+  const t = useT();
+  const total = slices.reduce((sum, slice) => sum + slice.value, 0);
+  const top = slices[0];
+
+  if (slices.length === 0) {
+    /* 原型 `emptyBlock(ICON.usage, "暂无模型用量", …)` —— 出口由 §3.6 补上。 */
+    return (
+      <EmptyState
+        icon={Server}
+        title={t("wbStats.usage.empty.models")}
+        description={t("wbStats.usage.empty.modelsHint")}
+        action={
+          <Button size="sm" variant="outline" onClick={onRefresh}>
+            {t("wbStats.usage.empty.refresh")}
+          </Button>
+        }
+      />
+    );
+  }
+
+  const tiles: StatTile[] = [
+    { icon: Server, label: t("wbStats.usage.models.count"), value: exactTokens(slices.length) },
+    {
+      icon: Sparkles,
+      label: t("wbStats.usage.models.top"),
+      value: top?.name ?? "—",
+      hint: top ? `${((top.value / total) * 100).toFixed(0)}%` : undefined,
+    },
+    { icon: MessagesSquare, label: t("wbStats.usage.models.total"), value: compactTokens(total) },
+    { icon: Gauge, label: t("wbStats.usage.models.avg"), value: compactTokens(Math.round(total / slices.length)) },
+  ];
+
+  return (
+    <>
+      <StatTiles tiles={tiles} ariaLabel={t("wbStats.usage.view.models")} />
+      <ChartFrame
+        title={t("wbStats.usage.models.donutTitle")}
+        caption={`${exactTokens(slices.length)} · ${compactTokens(total)}`}
+        ariaLabel={t("wbStats.usage.models.donutTitle")}
+      >
+        <ModelDonut slices={slices} />
+      </ChartFrame>
+      <ChartFrame
+        title={t("wbStats.usage.models.rankTitle")}
+        caption={t("wbStats.usage.models.rankDesc")}
+        ariaLabel={t("wbStats.usage.models.rankTitle")}
+        exportable={false}
+      >
+        <ModelRanking slices={slices} />
+      </ChartFrame>
+    </>
+  );
+}
+
+/* ────────────────────────────── 平台做不到的维度 ────────────────────────────── */
+
 function UnsupportedSection({ items }: { items: TraeUnsupported[] }) {
   const t = useT();
   return (
-    <Card className="mb-6 gap-0 border-dashed py-0">
-      <div className="border-b border-border/60 px-5 py-3">
-        <span className="text-[13px] font-medium">{t("trae.stats.token.unsupportedTitle")}</span>
-      </div>
+    <Card className="min-w-0 gap-0 overflow-hidden rounded-lg border-dashed py-0 shadow-none">
+      <CardHead title={t("trae.stats.token.unsupportedTitle")} />
       <div className="divide-y divide-border/60">
         {items.map((item) => (
-          <div key={item.capability} className="flex flex-wrap items-baseline gap-x-3 gap-y-1 px-5 py-3 opacity-70">
+          <div key={item.capability} className="flex flex-wrap items-baseline gap-x-3 gap-y-1 px-4 py-3 opacity-70">
             <span className="text-sm font-medium text-muted-foreground">{item.label}</span>
             <span className="text-xs text-muted-foreground">
               {t("trae.stats.token.unsupportedOnly", { on: item.supportedOn })}

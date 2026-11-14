@@ -1,3 +1,4 @@
+import { accountDisplayName } from "@/components/account-card";
 import { useDeferredValue, useMemo, useState, useEffect } from "react";
 import { Loader2, RefreshCw, Search } from "lucide-react";
 
@@ -83,7 +84,7 @@ export default function AccountPoolPage() {
     const q = deferredSearch.trim().toLowerCase();
     if (q) {
       list = list.filter((a) => {
-        const name = (a.nickname || a.email || a.uid || a.id || "").toLowerCase();
+        const name = (accountDisplayName(a) || "").toLowerCase();
         return name.includes(q) || a.id.toLowerCase().includes(q);
       });
     }
@@ -163,7 +164,7 @@ export default function AccountPoolPage() {
               {filtered.map((account) => {
                 const status = poolStatus(account);
                 const statusMeta = STATUS_META[status];
-                const label = account.nickname || account.email || account.uid || account.id;
+                const label = accountDisplayName(account);
                 const credit = creditMap[account.id];
                 const expiry = account.expiresAt ?? account.refreshExpiresAt ?? null;
 

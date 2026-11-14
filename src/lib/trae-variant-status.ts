@@ -30,6 +30,10 @@ function programStub(
     path: null,
     dataDir: null,
     dataDirExists: false,
+    // 登录态文件是否存在（见 `TraeProgramStatus.storageJsonExists`）：
+    // 后端不可用时一律按「不存在」——**不要**跟着 `dataDirExists` 置 true，
+    // 那会把「什么都没探测到」说成「登录态在这儿」。
+    storageJsonExists: false,
     // 写侧目录（见 `TraeProgramStatus.writeDataDir`）：后端不可用时与 `dataDir` 同样置空。
     writeDataDir: null,
     writeDataDirExists: false,
@@ -42,14 +46,13 @@ function programStub(
  * ⚠️ **只此一份**：账号页的区域切换条与账号卡片都要遍历「有哪些区域/程序位」，
  * 各自维护一份占位表迟早漂移（曾经由 `TraeVariantBar` 私有持有）。
  *
- * 程序位的 `variant` 是**切换时要回传给后端的标识**：
- * 国内两个程序位有各自的历史标识（`trae_work` / `trae_cn`），
- * 国际版两个是 `global`（TraeWork）与 `global_trae_code`（TraeCode）。
+ * 程序位的 `variant` 是**切换时要回传给后端的标识**。
  *
- * ⚠️ 2026-09-28（issue #3）之前，国际版 TraeCode 未建模 ⇒ 这里填 `null`、
- * 按钮禁用。现在四个程序位都已建模，**四个占位都必须带标识** ——
- * 留 `null` 会让「后端不可用」时的占位形态与正常形态不一致，
- * 而 `variant` 的类型已收成非空（`TraeProgramStatus.variant`）。
+ * ★★ issue #28 收敛：每个区域**只有一个程序位** —— 官方已把 TraeWork 与 TraeCode
+ * 合并成单一客户端（CN `Trae CN` / 国际 `Trae`），两条老程序位的客户端已被卸载。
+ * 继续渲染它们，用户点下去只会得到「未检测到 TraeWork CN」这类死路
+ * （issue #28 报障原文）。后端 `region::programs_of()` 是同一事实的**唯一来源**，
+ * 本表必须与它逐条一致（跨语言门禁 `check-scope-registry.cjs` 钉住）。
  *
  * `consoleBase` 是本表里**唯一**「只在后端不可用时才用到」的域值 —— 正常路径一律由后端
  * `region_endpoints(region).console_base` 提供（`platform.rs` 有单测钉住按区域分家）。
@@ -60,8 +63,10 @@ export const TRAE_VARIANT_FALLBACK: TraeVariantStatus[] = [
   {
     variant: "cn",
     // 表在模块加载时就定型 ⇒ 只存文案键，展示名在**读取时**现取，语言切换才不会失效。
+    // ⚠️ 区域名走 `trae.region.*`（客户端产品名），**不是** `shared.region.version.*`
+    // —— 后端 `TraeRegion::display_name` 给的就是前者，用后者会让演示站与真机文案不同。
     get variantLabel() {
-      return t("shared.region.version.cn");
+      return t("trae.region.cn");
     },
     consoleBase: "https://www.trae.cn",
     installed: false,
@@ -70,18 +75,22 @@ export const TRAE_VARIANT_FALLBACK: TraeVariantStatus[] = [
     path: null,
     dataDir: null,
     dataDirExists: false,
+    // 登录态文件是否存在（见 `TraeVariantStatus.storageJsonExists`）：后端不可用时按「不存在」。
+    storageJsonExists: false,
     // 写侧目录（见 `TraeProgramStatus.writeDataDir`）：后端不可用时与 `dataDir` 同样置空。
     writeDataDir: null,
     writeDataDirExists: false,
     programs: [
-      programStub("trae_work", "TraeWork", "trae.program.traeWork", "trae_work"),
-      programStub("trae_code", "TraeCode", "trae.program.traeCode", "trae_cn"),
+      // 展示名规则：**国内版带 ` CN` 后缀、国际版不带后缀**（用户 2026-10-13 更正）。
+      // `variant` 是它自己的标识 `trae_merged` —— 变体是快照目录 / Key 归属 /
+      // 日志分档的派生来源，退役的 `trae_cn` / `trae_work` 不再是可选目标。
+      programStub("trae", "Trae CN", "trae.program.traeCn", "trae_merged"),
     ],
   },
   {
     variant: "global",
     get variantLabel() {
-      return t("shared.region.version.global");
+      return t("trae.region.global");
     },
     consoleBase: "https://www.trae.ai",
     installed: false,
@@ -90,12 +99,14 @@ export const TRAE_VARIANT_FALLBACK: TraeVariantStatus[] = [
     path: null,
     dataDir: null,
     dataDirExists: false,
+    // 登录态文件是否存在（见 `TraeVariantStatus.storageJsonExists`）：后端不可用时按「不存在」。
+    storageJsonExists: false,
     // 写侧目录（见 `TraeProgramStatus.writeDataDir`）：后端不可用时与 `dataDir` 同样置空。
     writeDataDir: null,
     writeDataDirExists: false,
     programs: [
-      programStub("trae_work", "TraeWork AI", "trae.program.traeWorkGlobal", "global"),
-      programStub("trae_code", "Trae AI", "trae.program.traeCodeGlobal", "global_trae_code"),
+      // 国际版不带后缀 ⇒ `Trae`；变体是 `global_trae_merged`。
+      programStub("trae", "Trae", "trae.program.traeGlobal", "global_trae_merged"),
     ],
   },
 ];
@@ -174,8 +185,8 @@ export async function loadTraeVariantStatuses(): Promise<TraeVariantStatus[]> {
 export async function loadTraeVariantLogins(
   statuses: TraeVariantStatus[],
 ): Promise<TraeVariantLogins> {
-  // 每个程序位都带标识（2026-09-28 起 `TraeProgramStatus.variant` 非空），
-  // 因此这里不再有「跳过未建模程序位」的过滤 —— 四个程序位各取一次登录态。
+  // 每个程序位都带标识（`TraeProgramStatus.variant` 非空）⇒ 这里没有过滤，
+  // 遍历到的每个程序位各取一次登录态（收敛后 = 两个区域各一个）。
   const targets: TraeVariantId[] = statuses.flatMap((item) =>
     item.programs.map((program) => program.variant),
   );
@@ -202,4 +213,65 @@ export function findRegionStatus(
   region: TraeRegionId,
 ): TraeVariantStatus | undefined {
   return statuses.find((item) => item.variant === region);
+}
+
+/**
+ * 本区域下的**程序位**（收敛后恰好一个），供「按程序位取数据」的卡片使用。
+ *
+ * ## 为什么取的是 {@link TRAE_VARIANT_FALLBACK} 而不是再探测一次
+ *
+ * 本函数要回答的是「这个区域**有哪些**程序位」，而这是一个**结构性事实**
+ * （每个区域一个：合并后的单一客户端，见 `TraeProgramId` 的说明），
+ * 与「装了没 / 在不在跑」无关。
+ * `TRAE_VARIANT_FALLBACK` 正是这份结构表（区域切换器在后端不可用时也用它），
+ * 复用它就**不会**多出第二份会漂移的程序位清单。
+ *
+ * ## ⚠️ 别拿它的 `installed` 当判断依据
+ *
+ * 兜底表里每个程序位都是 `installed: false`（它是「状态未知」的占位）。
+ * 调用方需要真实安装状态时应改传探测结果（`get_trae_variants`），
+ * **不要**用本函数的结果去禁用控件 —— 那会把所有程序位都禁掉。
+ * 本函数只提供 `variant`（回传标识）与 `label`（展示名）。
+ *
+ * 清单读不到（客户端没启动过 / 没登录）时不需要预先禁用：后端会回
+ * `source = "missing"` 与可读原因，界面按空态呈现即可。
+ */
+export function regionPrograms(region: TraeRegionId): { variant: TraeVariantId; label: string }[] {
+  const entry = findRegionStatus(TRAE_VARIANT_FALLBACK, region);
+  return (entry?.programs ?? []).map((program) => ({
+    variant: program.variant,
+    label: program.label,
+  }));
+}
+
+/**
+ * **全部**程序位（区域 × 程序），顺序与 {@link TRAE_VARIANT_FALLBACK} 一致，
+ * **按 `variant` 去重**。
+ *
+ * 与 {@link regionPrograms} 的分工：后者只回答「这个区域有哪几条」，
+ * 本函数回答「一共有哪几个**变体**」—— 用于**不按区域分区**、而按程序位归属的控件
+ * （目前是 API Key 的「归属程序位」下拉：一把 Key 绑定一个 `variant`，由它决定
+ * `/v1/models` 列哪份清单、请求体带哪个 `function`）。
+ *
+ * ## ⚠️ 去重是**安全网**（issue #28 收敛后 2 个变体互不相同 ⇒ 不再触发）
+ *
+ * 收敛前合并版与遗留 TraeCode 曾共用变体，不去重会出现两个 value 完全相同的选项
+ * （`Select` 选中态指向第一个、点第二个像"没反应"）。现在两个变体互不相同。
+ * **仍然保留它**：同一个变体被两个程序位引用这件事一旦再次发生，
+ * 症状极难定位，而这段守卫的成本只是几行循环。
+ *
+ * ⚠️ 与 {@link regionPrograms} 同样：`installed` 在兜底表里恒为 `false`，
+ * 不能拿它禁用控件；本函数只提供 `variant`（回传标识）与 `label`（展示名）。
+ */
+export function allPrograms(): { variant: TraeVariantId; label: string }[] {
+  const seen = new Set<TraeVariantId>();
+  const out: { variant: TraeVariantId; label: string }[] = [];
+  for (const region of TRAE_VARIANT_FALLBACK) {
+    for (const program of region.programs) {
+      if (seen.has(program.variant)) continue;
+      seen.add(program.variant);
+      out.push({ variant: program.variant, label: program.label });
+    }
+  }
+  return out;
 }

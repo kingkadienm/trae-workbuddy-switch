@@ -1,0 +1,236 @@
+name: docker
+
+# 发布**预构建镜像**到 GHCR（issue #54）。
+#
+# ## 为什么单独一个工作流，而不是塞进 build.yml
+#
+# `build.yml` 的四个 job 是**桌面安装包 / CLI 裸二进制**，硬依赖 updater 签名密钥；
+# 镜像与它们没有任何共享产物。塞进去只会让「镜像推送失败」连带把 Release 拖红，
+# 而三者的失败原因、修复动作完全不同（密钥 vs registry 权限 vs 构建）。
+#
+# ## 镜像坐标
+#
+#   ghcr.io/nextagentx/buddy-switch
+#
+# ⚠️ 必须**全小写**：镜像名大写会被 docker 直接判 `invalid reference format`。
+# 因此这里**不写** `${{ github.repository_owner }}`（那是 `NextAgentX` 大写），
+# 而是硬编码小写。`scripts/check-docker.cjs` 会校验这串名字与 `docker-compose.yml`、
+# `README.md`、`README.en.md`、`docs/guides/DOCKER.md` 完全一致 —— 四处漂移的症状是
+# 「compose 拉不到 → 静默回落成本地构建」，用户只会觉得慢，不会觉得错。
+#
+# ## 标签
+#
+#   tag 推送 v2026.10.191740   →  2026.10.191740 · 2026.10 · latest
+#   手动触发 workflow_dispatch →  edge
+#
+# ## 版本戳：**只在 tag 触发时**盖
+#
+# `stamp-version.sh` 会把版本写进 Cargo / package.json 等 14 个载体。盖完必须重生成
+# `src/data/release-notes.json`（`check:scope` 会比对两者版本），而
+# `gen-release-notes.mjs` 是**按 tag 取提交区间**的：手动触发时版本号是按打包时刻生成的
+# `2026.10.190950`，git 里**没有**这个 ref，脚本于是走「降级」分支（只打 warning、
+# 退出码 0、**不写文件**）—— 文件仍是上一个已提交的版本，`npm run build` 的门禁在
+# docker build 里红，而错误信息只说「内置说明是 vA 而应用版本是 vB」。2026-10-19 实测踩过。
+#
+# 所以：tag 触发盖戳（tag 存在，脚本能拿到区间）；手动触发**不盖**，直接用仓库里
+# 已提交且彼此一致的那一对版本 —— `edge` 镜像报的是「最后一次提交时的版本」，不是编造的时间戳。
+#
+# ## 架构
+#
+# `linux/amd64` + `linux/arm64`（NAS / 树莓派 / Apple Silicon 上跑容器）。
+# **不用 QEMU**：每个架构各跑一台**原生** runner（`ubuntu-24.04-arm` 对公开仓库免费）。
+# Rust release 编译在 QEMU 下要慢一个数量级（本项目含 rusqlite bundled，等于用模拟器
+# 编一份 SQLite 的 C 源码），而原生 arm 与 amd64 的 wall time 基本一致。
+#
+# 代价是「两个 job 各推一个 digest，再由 merge job 拼成 manifest list」：
+# 同一个 tag（尤其 `latest`）不能由两个 job 分别推，否则后到的会覆盖先到的。
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # 推送 `ghcr.io/<owner>/...` 需要的唯一权限。GITHUB_TOKEN 的作用域就是本仓库，
+  # 因此这个包会自动挂在本仓库下（配合 build 阶段打的 `org.opencontainers.image.source`
+  # 标签），不需要额外的 PAT。
+  packages: write
+
+# 同一 tag 的重复推送（打错 tag、删了重打）取消旧 run；但**不**取消进行中的
+# tag 发布 —— 半途取消会留下「某个 arch 已经推了 digest、manifest 却没拼」的悬空层，
+# 虽不致命，但会让 registry 里多一份无主的 blob。tag 构建本来就慢，重复触发罕见。
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/nextagentx/buddy-switch
+
+jobs:
+  # ===========================================================================
+  # 每个架构一台**原生** runner，各推一个 digest
+  # ===========================================================================
+  build:
+    name: build linux/${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `runner` 必须是**原生**同架构的机器：见文件头「架构」一节。
+          - arch: amd64
+            runner: ubuntu-latest
+          # ⚠️ `ubuntu-24.04-arm` 只对**公开仓库**免费可用。若本仓将来转私有，
+          # 这里要么换成自托管 arm runner，要么退回复用 `ubuntu-latest` +
+          # `docker/setup-qemu-action` + `platforms: linux/arm64`（慢但能跑）。
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      # `fetch-depth: 0` + `fetch-tags: true`：`gen-release-notes.mjs` 要
+      # `git log <上一个 tag>..<本次 tag>`，浅克隆会缺对象（与 build.yml 的 release
+      # job 同因）。缺了不报错，只会退化成「没有变更清单」的说明。
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # 版本号写进 Cargo / package.json 等载体，**必须在 docker build 之前** ——
+      # 二进制里的版本是编译期确定的，镜像跑起来再改已经晚了。
+      # 只在 tag 触发时盖：见文件头「版本戳」一节。
+      - name: Stamp version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: sh scripts/stamp-version.sh --tag "$GITHUB_REF_NAME"
+
+      # `src/data/release-notes.json` 会被判进前端产物，且 `check:scope` 会比对
+      # 「内置说明的版本 == Cargo.toml 的版本」。改了 Cargo 版本就必须同步它，
+      # 否则 `npm run build`（Dockerfile 阶段 1 跑的就是它）会在门禁处失败。
+      - name: Regenerate bundled release notes
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: node scripts/gen-release-notes.mjs --tag "$GITHUB_REF_NAME" --json src/data/release-notes.json
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 标签与 OCI 元数据**只在 build 阶段**计算：labels 是烙进镜像 config 的，
+      # merge 阶段再算一次只会得到另一份标签，改不了已经推上去的那两个 digest。
+      # （merge 阶段也算一次，是为了拿 `tags` 输出拼 manifest list。）
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          # `latest` 只在 semver tag 上打（`auto`），手动触发的 `edge` 不会污染它。
+          flavor: latest=auto
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=edge,enable=${{ github.event_name == 'workflow_dispatch' }}
+          # 不覆盖会被仓库描述顶掉（那份描述讲的是**桌面 App**，与这个 headless 镜像不符），
+          # 许可证也会落成 NOASSERTION。包页面上第一眼看到的就是这两项。
+          labels: |
+            org.opencontainers.image.title=Buddy Switch Server
+            org.opencontainers.image.description=Buddy Switch 服务端镜像（headless）：webui 管理面板 + WorkBuddy / Trae / Qoder API 网关。不含桌面切换器（切换登录态、托盘、悬浮窗依赖同机图形客户端）。
+            org.opencontainers.image.licenses=PolyForm-Noncommercial-1.0.0
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # ★ 刻意**不**用普通 `push: true`：那会按 metadata 的 tag 直接推送，
+          # 而两个架构共用同一批 tag ⇒ 后来的覆盖先到的，`latest` 最终只剩一个架构。
+          # `push-by-digest` 只推一个无名 digest 层，等 merge job 拼成 manifest list
+          # 之后 tag 才出现 —— 用户永远拉不到「半个架构」的镜像。
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          # 两个架构用不同的 cache scope，否则会互相覆盖对方的层缓存。
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      - name: Export digest
+        shell: bash
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          test -n "$digest"
+          # 文件名就是去掉 `sha256:` 前缀的十六进制，merge job 靠它 glob 出全部 digest。
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ===========================================================================
+  # 把两个 digest 拼成一个多架构 manifest list，并打上正式 tag
+  # ===========================================================================
+  merge:
+    name: Publish multi-arch manifest
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 与 build 阶段**逐字相同**的 tags 配置。两处必须同步改 ——
+      # 否则 manifest list 会挂到一个没人知道的 tag 上（构建全绿、用户拉不到）。
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: latest=auto
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=edge,enable=${{ github.event_name == 'workflow_dispatch' }}
+
+      - name: Create manifest list
+        working-directory: ${{ runner.temp }}/digests
+        shell: bash
+        run: |
+          ls -l
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.IMAGE }}@sha256:%s ' *)
+
+      # 断言「打出来的 tag 真的指向两个架构」。不加这一步的话，push-by-digest
+      # 出错时（例如某个 arch 少推了一层）`imagetools create` 仍可能成功。
+      - name: Verify manifest
+        shell: bash
+        run: |
+          IMAGE="${{ env.IMAGE }}:${{ steps.meta.outputs.version }}"
+          docker buildx imagetools inspect "$IMAGE"
+          ARCHS=$(docker buildx imagetools inspect "$IMAGE" \
+            --format '{{range .Manifest.Manifests}}{{.Platform.OS}}/{{.Platform.Architecture}} {{end}}')
+          echo "manifest 架构：$ARCHS"
+          for want in linux/amd64 linux/arm64; do
+            case "$ARCHS" in
+              *"$want"*) ;;
+              *) echo "::error::manifest 里缺少 $want（实际：$ARCHS）"; exit 1 ;;
+            esac
+          done
+          echo "已发布 $IMAGE"

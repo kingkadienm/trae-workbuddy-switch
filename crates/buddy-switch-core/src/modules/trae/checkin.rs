@@ -293,10 +293,12 @@ pub fn plan(
     remaining: &credits::RemainingCreditsFile,
     options: &CheckinOptions,
 ) -> Vec<(String, account::RawAccount)> {
-    let wanted = account::resolve_user_ids_for(options.variant, &options.scope, options.user_ids.clone());
+    let wanted =
+        account::resolve_user_ids_for(options.variant, &options.scope, options.user_ids.clone());
     // uid -> 今日是否已签到 / JWT 状态
     let mut checked_today: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut jwt_status: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut jwt_status: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for view in views {
         let Some(uid) = view.get("userId").and_then(|v| v.as_str()) else {
             continue;
@@ -331,10 +333,10 @@ pub fn plan(
             }
             // 视图缺失（理论上已被 `entries()` 过滤掉）或状态为 expired/unknown 一律跳过：
             // 这两类账号 claim 必然 401，放进队列只会白造一次会话失效冷却。
-            match jwt_status.get(uid).map(String::as_str) {
-                Some("ok") | Some("warn") => true,
-                _ => false,
-            }
+            matches!(
+                jwt_status.get(uid).map(String::as_str),
+                Some("ok") | Some("warn")
+            )
         })
         .filter(|(uid, _)| {
             // 冷却中（且未到期）的账号跳过。SessionDead 的 until 恒大于 now，即永久跳过。
@@ -373,9 +375,7 @@ pub fn plan(
                         .partial_cmp(&credits_a)
                         .unwrap_or(std::cmp::Ordering::Equal)
                     {
-                        std::cmp::Ordering::Equal => {
-                            daily_rank(uid_a).cmp(&daily_rank(uid_b))
-                        }
+                        std::cmp::Ordering::Equal => daily_rank(uid_a).cmp(&daily_rank(uid_b)),
                         other => other,
                     }
                 } else {
@@ -417,7 +417,10 @@ where
         ));
         store::append_log(
             &paths::checkin_log_file_for(variant),
-            &format!("{} 无签到体系，批量签到入口已短路（0 账号处理）", variant.display_name()),
+            &format!(
+                "{} 无签到体系，批量签到入口已短路（0 账号处理）",
+                variant.display_name()
+            ),
         );
         on_event(&json!({ "type": "start", "total": 0 }));
         on_event(&json!({ "type": "done", "ok": 0, "already": 0, "failed": 0, "total": 0 }));
@@ -586,9 +589,20 @@ where
             }
             report.total_ok += 1;
         } else {
-            let (error_type, cooldown_seconds) = credits::classify_error(result.http_status, result.code);
+            // ★ issue #108：分类必须带 body（作废标记优先于状态码），
+            //   并记下「这次判定所依据的 JWT `exp`」，让凭据更新后该记录自动失效。
+            let (error_type, cooldown_seconds) =
+                credits::classify_error(result.http_status, result.code, &result.message);
             if error_type != "Unknown" {
-                credits::save_cooldown_for(variant, uid, error_type, cooldown_seconds, &result.message);
+                let credential_exp = crate::modules::trae::jwt::parse(&raw.jwt).exp_timestamp;
+                credits::save_cooldown_with_credential_for(
+                    variant,
+                    uid,
+                    error_type,
+                    cooldown_seconds,
+                    &result.message,
+                    credential_exp,
+                );
                 let entry: Option<CooldownEntry> = credits::load_cooldowns_for(variant)
                     .cooldowns
                     .get(uid)
@@ -672,6 +686,153 @@ pub fn report_json(report: &CheckinReport) -> Value {
     })
 }
 
+// ---------------------------------------------------------------------------
+// 逐账号「今日签到状态」（issue #47）
+// ---------------------------------------------------------------------------
+
+/// 批量上限：一次最多问这么多个账号（与 WorkBuddy 的 `get_checkin_status_map` 同值）。
+///
+/// 超出部分**忽略**而不是报错：调用方（前端）只会传「当前页选中的账号」或单个账号，
+/// 传超说明上游有 bug；静默截断比让整次刷新失败更可接受，且不会把上游打爆。
+pub const STATUS_MAP_MAX_ACCOUNTS: usize = 50;
+
+/// 同时打开的上游请求数。
+///
+/// 状态端点是**逐账号**的 GET，串行问 50 个账号要十几秒（用户会以为卡死）；
+/// 全部并发又会在一瞬间把 50 个请求打到 Trae 上游（风控暴露面）。
+const STATUS_MAP_MAX_INFLIGHT: usize = 4;
+
+/// 把一个预检结果投影成 `CheckinStatusEntry`（**纯函数**，便于单测）。
+///
+/// 三档语义必须分开，否则前端无法区分「没签」与「读不到」：
+/// - `ok = false` ⇒ `todayCheckedIn` 一律 `false` + `error`（**不得**当成「未签到」事实）；
+/// - `ok = true` 且上游给了 `checked_in` ⇒ 那就是事实（`source = upstream`）；
+/// - `ok = true` 但上游没给 `checked_in` ⇒ 回落本地台账，并标 `source = ledger`。
+fn status_entry(
+    ok: bool,
+    checked_in: Option<bool>,
+    credits: Option<i64>,
+    ledger_says_checked: bool,
+    message: &str,
+) -> Value {
+    if !ok {
+        return json!({
+            "ok": false,
+            "todayCheckedIn": false,
+            "error": if message.is_empty() {
+                "状态预检失败".to_string()
+            } else {
+                message.to_string()
+            },
+        });
+    }
+    let (today_checked_in, source) = match checked_in {
+        Some(value) => (value, "upstream"),
+        None => (ledger_says_checked, "ledger"),
+    };
+    json!({
+        "ok": true,
+        "todayCheckedIn": today_checked_in,
+        "dailyCredit": credits,
+        "source": source,
+    })
+}
+
+/// 单账号预检 → 条目（IO 部分；投影逻辑见 [`status_entry`]）。
+async fn status_entry_for(
+    variant: TraeVariant,
+    uid: &str,
+    raw: &account::RawAccount,
+    ledger_says_checked: bool,
+) -> Value {
+    let device_entry = match device::ensure_for_variant(variant, uid) {
+        Ok(entry) => entry,
+        Err(error) => {
+            return status_entry(
+                false,
+                None,
+                None,
+                ledger_says_checked,
+                &format!("设备标识生成失败: {error}"),
+            )
+        }
+    };
+    let probe = probe_status(&raw.jwt, &device_entry).await;
+    status_entry(
+        probe.ok,
+        probe.checked_in,
+        probe.credits,
+        ledger_says_checked,
+        &probe.message,
+    )
+}
+
+/// 逐账号「今日签到状态」（`get_trae_checkin_status_map`；**只读**，issue #47）。
+///
+/// 返回 `Record<uid, { ok, todayCheckedIn, dailyCredit?, source?, error? }>`，与 WorkBuddy
+/// 的 `get_checkin_status_map` **同构** ⇒ 前端三平台共用同一套渲染。
+///
+/// ## 为什么不能只读本地台账
+///
+/// 台账（`credits::checked_in_today_for`）只记「**本工具**签过谁」。用户在 Trae IDE 里
+/// 手动签到时台账里没有 ⇒ 拿台账当答案会把「已签」报成「未签」。所以这里真去问上游
+/// 状态端点（只读 GET）——**绝不**在这里顺带 claim（Qoder/Trae 的签到都是写操作，
+/// 各有独立命令）。
+///
+/// ## 边界（前端照此渲染）
+///
+/// 1. 请求的 uid **不在账号库**（已删除 / 传错）⇒ **不进 map** ⇒ 前端显示「—」，
+///    而不是「未签到」（用 `false` 表示「不知道」是本仓明令禁止的）；
+/// 2. 上游读失败 / 设备标识生成失败 ⇒ `{ok:false, todayCheckedIn:false, error}`；
+/// 3. 上游回 `ok` 却没给 `checked_in` ⇒ 回落台账，`source` 标明来源（见 [`status_entry`]）；
+/// 4. 空数组 ⇒ `{}`（一次上游请求都不发）。
+pub async fn status_map_for(variant: TraeVariant, user_ids: Vec<String>) -> Value {
+    let ledger = credits::checked_in_today_for(variant);
+    let accounts: std::collections::HashMap<String, account::RawAccount> =
+        account::entries_for(variant).into_iter().collect();
+
+    let wanted: Vec<String> = user_ids
+        .into_iter()
+        .map(|uid| uid.trim().to_string())
+        .filter(|uid| !uid.is_empty() && accounts.contains_key(uid))
+        .take(STATUS_MAP_MAX_ACCOUNTS)
+        .collect();
+    if wanted.is_empty() {
+        return json!({});
+    }
+
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(STATUS_MAP_MAX_INFLIGHT));
+    let mut tasks = Vec::with_capacity(wanted.len());
+    for uid in wanted {
+        let raw = accounts
+            .get(&uid)
+            .cloned()
+            .expect("wanted 已按账号库存在性过滤");
+        let permit = semaphore.clone();
+        let from_ledger = ledger.contains(&uid);
+        tasks.push(tokio::spawn(async move {
+            // 拿到许可才发请求（`acquire_owned` 失败 = 信号量已关闭，直接放弃该账号）。
+            let Ok(_permit) = permit.acquire_owned().await else {
+                return (
+                    uid,
+                    status_entry(false, None, None, from_ledger, "并发闸门已关闭"),
+                );
+            };
+            let entry = status_entry_for(variant, &uid, &raw, from_ledger).await;
+            (uid, entry)
+        }));
+    }
+
+    let mut map = serde_json::Map::with_capacity(tasks.len());
+    for task in tasks {
+        // 任务 panic 时**不写条目**（前端显示「—」）——绝不编一个 `false` 顶上。
+        if let Ok((uid, entry)) = task.await {
+            map.insert(uid, entry);
+        }
+    }
+    Value::Object(map)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -709,6 +870,7 @@ mod tests {
             refresh_token: None,
             added_at: None,
             updated_at: None,
+            remark: None,
         }
     }
 
@@ -725,12 +887,76 @@ mod tests {
             None,
             checked_today,
             None,
-            None, None, None, None, None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
     }
 
     fn empty_context() -> (credits::CooldownsFile, credits::RemainingCreditsFile) {
-        (credits::CooldownsFile::default(), credits::RemainingCreditsFile::default())
+        (
+            credits::CooldownsFile::default(),
+            credits::RemainingCreditsFile::default(),
+        )
+    }
+
+    #[test]
+    fn status_entry_never_reports_read_failure_as_not_checked_in() {
+        // 上游读失败：`ok:false` + 错误文案，`todayCheckedIn` 不得被当成事实。
+        let failed = status_entry(false, None, None, true, "HTTP 500");
+        assert_eq!(failed["ok"], false);
+        assert_eq!(failed["todayCheckedIn"], false);
+        assert_eq!(failed["error"], "HTTP 500");
+        assert!(
+            failed.get("source").is_none(),
+            "读失败没有来源可标，不得伪造"
+        );
+
+        // 上游明确回答「没签」⇒ 事实，`ok:true`。
+        let not_checked = status_entry(true, Some(false), Some(150), false, "");
+        assert_eq!(not_checked["ok"], true);
+        assert_eq!(not_checked["todayCheckedIn"], false);
+        assert_eq!(not_checked["dailyCredit"], 150);
+        assert_eq!(not_checked["source"], "upstream");
+
+        // 上游明确回答「已签」⇒ 事实。
+        let checked = status_entry(true, Some(true), None, false, "");
+        assert_eq!(checked["todayCheckedIn"], true);
+        assert_eq!(checked["source"], "upstream");
+
+        // 上游 ok 但没给 checked_in ⇒ 回落台账，并标明来源（不伪装成上游事实）。
+        let fallback = status_entry(true, None, None, true, "");
+        assert_eq!(fallback["ok"], true);
+        assert_eq!(fallback["todayCheckedIn"], true);
+        assert_eq!(fallback["source"], "ledger");
+    }
+
+    /// 空数组 / 全是不存在的 uid ⇒ 一条上游请求都不发，直接回 `{}`（前端显示「—」）。
+    #[tokio::test]
+    async fn status_map_returns_empty_without_upstream_calls() {
+        // 账号库读的是 `$HOME` 下的文件 ⇒ 必须隔离（本仓单测纪律）。
+        let home = std::env::temp_dir().join(format!("trae-status-map-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("创建隔离目录");
+        let _guard = crate::modules::config::HomeOverrideGuard::set(&home);
+
+        let empty = status_map_for(TraeVariant::TraeWork, Vec::new()).await;
+        assert_eq!(empty, json!({}));
+
+        let unknown = status_map_for(
+            TraeVariant::TraeWork,
+            vec!["不存在的账号".to_string(), "   ".to_string()],
+        )
+        .await;
+        assert_eq!(
+            unknown,
+            json!({}),
+            "未知账号不进 map —— 用 false 表示「不知道」是本仓明令禁止的"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -764,7 +990,10 @@ mod tests {
             ("a".to_string(), raw("a", &valid_jwt("a"))),
             ("b".to_string(), raw("b", &valid_jwt("b"))),
         ];
-        let views = vec![view_for("a", &valid_jwt("a"), false), view_for("b", &valid_jwt("b"), false)];
+        let views = vec![
+            view_for("a", &valid_jwt("a"), false),
+            view_for("b", &valid_jwt("b"), false),
+        ];
         let (cooldowns, remaining) = empty_context();
         let options = CheckinOptions {
             scope: Scope::Selected(vec!["b".to_string()]),
@@ -797,7 +1026,10 @@ mod tests {
             skip_checked_in: false,
             ..Default::default()
         };
-        assert_eq!(plan(accounts, &views, &cooldowns, &remaining, &options).len(), 1);
+        assert_eq!(
+            plan(accounts, &views, &cooldowns, &remaining, &options).len(),
+            1
+        );
     }
 
     #[test]
@@ -822,7 +1054,10 @@ mod tests {
             skip_expired: false,
             ..Default::default()
         };
-        assert_eq!(plan(accounts, &views, &cooldowns, &remaining, &options).len(), 1);
+        assert_eq!(
+            plan(accounts, &views, &cooldowns, &remaining, &options).len(),
+            1
+        );
     }
 
     #[test]
@@ -842,6 +1077,8 @@ mod tests {
                 until: chrono::Local::now().timestamp() + 3600,
                 reason: "5xx".into(),
                 error_count: 0,
+                credential_exp: None,
+                judged_at: None,
             },
         );
         let planned = plan(
@@ -861,6 +1098,8 @@ mod tests {
                 until: chrono::Local::now().timestamp() - 10,
                 reason: "旧".into(),
                 error_count: 0,
+                credential_exp: None,
+                judged_at: None,
             },
         );
         let planned = plan(
@@ -888,7 +1127,9 @@ mod tests {
         let mut remaining = credits::RemainingCreditsFile::default();
         remaining.expire_times.insert("late".into(), 2_000);
         remaining.expire_times.insert("early".into(), 1_000);
-        remaining.expire_times.insert("same-time-richer".into(), 1_000);
+        remaining
+            .expire_times
+            .insert("same-time-richer".into(), 1_000);
         remaining.credits.insert("same-time-richer".into(), 900.0);
         remaining.credits.insert("early".into(), 1.0);
 
@@ -947,8 +1188,14 @@ mod tests {
             &CheckinOptions::default(),
         );
         assert_eq!(
-            forward.iter().map(|(uid, _)| uid.as_str()).collect::<Vec<_>>(),
-            reversed.iter().map(|(uid, _)| uid.as_str()).collect::<Vec<_>>(),
+            forward
+                .iter()
+                .map(|(uid, _)| uid.as_str())
+                .collect::<Vec<_>>(),
+            reversed
+                .iter()
+                .map(|(uid, _)| uid.as_str())
+                .collect::<Vec<_>>(),
             "并列组次序必须与输入顺序无关"
         );
         let order: Vec<&str> = forward.iter().map(|(uid, _)| uid.as_str()).collect();
@@ -984,10 +1231,12 @@ mod tests {
 
     #[test]
     fn report_json_exposes_camel_case_shape() {
-        let mut report = CheckinReport::default();
-        report.total = 2;
-        report.total_ok = 1;
-        report.already = 1;
+        let mut report = CheckinReport {
+            total: 2,
+            total_ok: 1,
+            already: 1,
+            ..Default::default()
+        };
         report.results.push(AccountOutcome {
             user_id: "u1".into(),
             name: "n1".into(),
@@ -1001,7 +1250,9 @@ mod tests {
             cooldown_until: None,
         });
         let value = report_json(&report);
-        for key in ["total", "totalOk", "already", "failed", "warnings", "results"] {
+        for key in [
+            "total", "totalOk", "already", "failed", "warnings", "results",
+        ] {
             assert!(value.get(key).is_some(), "缺少线上字段 {key}");
         }
         // snake_case 绝不能出现在线上形态
@@ -1026,7 +1277,10 @@ mod tests {
             error_type: None,
             cooldown_until: None,
         };
-        assert_eq!(outcome_json(&outcome).get("delta").unwrap().as_i64(), Some(0));
+        assert_eq!(
+            outcome_json(&outcome).get("delta").unwrap().as_i64(),
+            Some(0)
+        );
     }
 
     #[test]
@@ -1047,8 +1301,10 @@ mod tests {
             TraeVariant::default(),
             "签到选项的默认变体必须跟随 TraeVariant::default()，否则老用户数据白失效"
         );
-        // 变体默认值必须等于「沿用旧文件名」的那一个。
-        assert_eq!(TraeVariant::default(), TraeVariant::TraeWork);
+        // ★ issue #28：默认变体是**合并版**（CN），它才是「有客户端在跑」的那一个。
+        //   老默认 `TraeWork` 指向已被官方合并卸载的 `TRAE SOLO CN`，
+        //   继续拿它当默认会让所有未显式传变体的调用读到死客户端。
+        assert_eq!(TraeVariant::default(), TraeVariant::TraeMerged);
     }
 
     /// ★ 护栏：签到链路里的**每一个**落盘/读取点都必须使用 `options.variant`。
@@ -1076,11 +1332,15 @@ mod tests {
         credits::save_cooldown_for(work, "u-work", "SessionDead", 3600, "测试");
 
         assert!(
-            credits::load_cooldowns_for(work).cooldowns.contains_key("u-work"),
+            credits::load_cooldowns_for(work)
+                .cooldowns
+                .contains_key("u-work"),
             "Trae Work 应能看到自己写的冷却"
         );
         assert!(
-            !credits::load_cooldowns_for(cn).cooldowns.contains_key("u-work"),
+            !credits::load_cooldowns_for(cn)
+                .cooldowns
+                .contains_key("u-work"),
             "Trae CN 绝不能看到 Trae Work 的冷却 —— 这就是串味"
         );
 
@@ -1180,7 +1440,10 @@ mod tests {
     // （`run_scheduled_checkin` 逐区域各签一轮）与 HTTP `run_checkin_report` 共同的收口点。
     #[tokio::test]
     async fn global_variant_checkin_short_circuits_with_zero_accounts() {
-        let dir = std::env::temp_dir().join(format!("trae-checkin-global-{}", uuid::Uuid::new_v4().simple()));
+        let dir = std::env::temp_dir().join(format!(
+            "trae-checkin-global-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
         std::fs::create_dir_all(&dir).expect("临时 home 应能创建");
         let _guard = crate::modules::config::HomeOverrideGuard::set(&dir);
 
@@ -1197,11 +1460,18 @@ mod tests {
         assert_eq!(report.total, 0, "国际版没有可签到的账号");
         assert!(report.results.is_empty());
         assert!(
-            report.warnings.iter().any(|warning| warning.contains("无签到体系")),
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("无签到体系")),
             "国际版短路必须留一条可追溯的告警: {report:#?}"
         );
         // 事件契约不变：start(total=0) + done 各一条，前端进度流不会因为短路而断流。
-        assert_eq!(events.len(), 2, "短路也要成对发 start/done 事件: {events:#?}");
+        assert_eq!(
+            events.len(),
+            2,
+            "短路也要成对发 start/done 事件: {events:#?}"
+        );
         drop(_guard);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -2,8 +2,8 @@
 
 **WorkBuddy / TraeWork 多账号管理工具**（webui 形态）：启动本地服务后用浏览器操作，能力与桌面 App 一致。
 
-> 桌面 App（Tauri）请从 [GitHub Releases](https://github.com/kingkadienm/trae-workbuddy-switch/releases/latest) 下载安装包。
-> 在线只读演示：<https://kingkadienm.github.io/trae-workbuddy-switch/>
+> 桌面 App（Tauri）请从 [GitHub Releases](https://github.com/NextAgentX/qoder-trae-workbuddy-switch/releases/latest) 下载安装包。
+> 在线只读演示：<https://nextagentx.github.io/qoder-trae-workbuddy-switch/>
 
 > **本包（`@kingkadienm/buddy-switch`）暂未发布到 npm**（npmjs 账号侧受限，通道已就绪但未开启）。
 > 在开启之前，请用下面的「从 GitHub Releases 直接下载」方式获取 webui 形态；通道开启后以 npm 命令为准。
@@ -12,16 +12,16 @@
 
 ### 当前可用：从 GitHub Releases 下载裸二进制
 
-在 [Releases](https://github.com/kingkadienm/trae-workbuddy-switch/releases/latest) 资产里取对应平台的
-`buddy-switch-<platform>-<arch>`（Windows 带 `.exe`），直接运行即可：
+在 [Releases](https://github.com/NextAgentX/qoder-trae-workbuddy-switch/releases/latest) 资产里取对应平台的
+`buddy-switch-cli-<platform>-<arch>`（Windows 带 `.exe`），直接运行即可：
 
 ```bash
 # macOS / Linux
-chmod +x ./buddy-switch-darwin-arm64
-./buddy-switch-darwin-arm64          # 启动本地服务 + 自动打开浏览器
-./buddy-switch-darwin-arm64 serve    # 只起服务，不开浏览器（--port 指定端口）
-./buddy-switch-darwin-arm64 status   # 终端查看当前账号
-./buddy-switch-darwin-arm64 version  # 版本号
+chmod +x ./buddy-switch-cli-darwin-arm64
+./buddy-switch-cli-darwin-arm64          # 启动本地服务 + 自动打开浏览器
+./buddy-switch-cli-darwin-arm64 serve    # 只起服务，不开浏览器（--port 指定端口）
+./buddy-switch-cli-darwin-arm64 status   # 终端查看当前账号
+./buddy-switch-cli-darwin-arm64 version  # 版本号
 ```
 
 > macOS 未签名会触发 Gatekeeper：先执行 `xattr -d com.apple.quarantine <二进制路径>`。
@@ -77,21 +77,8 @@ buddy-switch version      # 版本号
 
 ## 参与贡献
 
-**欢迎 PR 与 Issue** —— 报 Bug、补文档、适配新版客户端、改进界面都可以。提交前的检查项与几条硬性要求（不要提交本地数据与来源不明的代码、贡献按同一许可分发）见[贡献指南](https://github.com/kingkadienm/trae-workbuddy-switch/blob/main/CONTRIBUTING.md)。
-
-## 支持这个项目
-
-如果 Buddy Switch 帮到了你，可以请作者喝杯饮料 ☕
-
-<table>
-  <tbody>
-    <tr>
-      <td align="center"><img src="https://raw.githubusercontent.com/kingkadienm/trae-workbuddy-switch/main/docs/images/donate-wechat.png" alt="微信支付收款码" width="240" /><br />微信支付</td>
-      <td align="center"><img src="https://raw.githubusercontent.com/kingkadienm/trae-workbuddy-switch/main/docs/images/donate-alipay.jpg" alt="支付宝收款码" width="240" /><br />支付宝</td>
-    </tr>
-  </tbody>
-</table>
+**欢迎 PR 与 Issue** —— 报 Bug、补文档、适配新版客户端、改进界面都可以。提交前的检查项与几条硬性要求（不要提交本地数据与来源不明的代码、贡献按同一许可分发）见[贡献指南](https://github.com/NextAgentX/qoder-trae-workbuddy-switch/blob/main/CONTRIBUTING.md)。
 
 ## 许可
 
-[PolyForm Noncommercial License 1.0.0](https://github.com/kingkadienm/trae-workbuddy-switch/blob/main/LICENSE) —— **个人非商业使用许可，商业使用不被授权**；白话说明与常见问题见[许可说明](https://github.com/kingkadienm/trae-workbuddy-switch/blob/main/docs/LICENSING.md)；如需商业授权，请通过主仓库 Issues 联系作者。
+[PolyForm Noncommercial License 1.0.0](https://github.com/NextAgentX/qoder-trae-workbuddy-switch/blob/main/LICENSE) —— **个人非商业使用许可，商业使用不被授权**；白话说明与常见问题见[许可说明](https://github.com/NextAgentX/qoder-trae-workbuddy-switch/blob/main/docs/policies/LICENSING.md)；如需商业授权，请通过主仓库 Issues 联系作者。

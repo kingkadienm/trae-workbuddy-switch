@@ -11,6 +11,7 @@
 //! 2. **`stream: false` 也要走这里**：上游只支持流式，非流式请求由 [`aggregate`]
 //!    在本地把事件流拼成单个 `chat.completion`。
 
+use std::collections::HashMap;
 use std::io;
 
 use axum::body::{Body, Bytes};
@@ -25,6 +26,11 @@ pub struct TokenUsage {
     pub completion: u64,
     pub total: u64,
     pub reasoning: u64,
+    /// 命中上游前缀缓存的输入 token（`prompt` 的**子集**；0 = 上游没报）。
+    ///
+    /// ★ issue #154：进请求日志的 `cachedTokens`，账本再按账号 / 模型 / 密钥分桶
+    /// ⇒ 「命中率掉了」与「换号了」终于能在同一本账里 join。
+    pub cached: u64,
 }
 
 impl TokenUsage {
@@ -42,22 +48,65 @@ impl TokenUsage {
             completion,
             total,
             reasoning: read("reasoning_tokens"),
+            cached: cached_tokens_of(value),
         }
     }
 
     /// 转成 OpenAI `usage` 对象。
+    ///
+    /// ★ issue #154：`prompt_tokens_details.cached_tokens` **只在真有命中量时才写**。
+    ///
+    /// 为什么不是「恒发射、没命中写 0」：这是**对外 wire 形状**，多一个键会让
+    /// 严格校验的客户端（把 `usage` 当封闭结构的那种）拒绝整帧。而命中量恰恰是
+    /// 「上游报了才有」的信息 —— 没有就整个键不出现，与 `cached` 的
+    /// 「0 = 没观测到」在本函数里收敛成同一种表现（缺键）。
+    ///
+    /// 有命中量时**必须**写：否则 Trae 这条线的客户端（dsh 等）看到的
+    /// `prompt_tokens` 含命中、却没有任何命中量可读 ⇒ 表现为「缓存从不命中」，
+    /// 与 WB 线（`/v1/messages` 已给 `cache_read_input_tokens`）口径不一致。
     pub fn to_openai(self) -> Value {
-        json!({
+        let mut usage = json!({
             "prompt_tokens": self.prompt,
             "completion_tokens": self.completion,
             "total_tokens": self.total,
-        })
+        });
+        if self.cached > 0 {
+            usage["prompt_tokens_details"] = json!({ "cached_tokens": self.cached });
+        }
+        usage
     }
 
     /// 是否拿到了有效数据（全 0 视为没拿到）。
     pub fn is_meaningful(self) -> bool {
         self.total > 0 || self.prompt > 0 || self.completion > 0
     }
+}
+
+/// 从上游 `usage` 里取缓存命中 token（宽口径：四种写法）。
+///
+/// | 上游 | 字段 |
+/// |:--|:--|
+/// | DeepSeek | `prompt_cache_hit_tokens` |
+/// | OpenAI | `prompt_tokens_details.cached_tokens` |
+/// | Anthropic | `cache_read_input_tokens` |
+/// | 裸字段 | `cached_tokens` |
+///
+/// **上限钳到 `prompt_tokens`**：命中量在语义上是输入的子集，脏数据（上游报大）
+/// 会让下游的命中率 > 100%。与 `usage_tap::extract_usage` 同一处置。
+fn cached_tokens_of(usage: &Value) -> u64 {
+    let read = |key: &str| usage.get(key).and_then(Value::as_u64);
+    let hit = read("prompt_cache_hit_tokens")
+        .or_else(|| {
+            usage
+                .get("prompt_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(Value::as_u64)
+        })
+        .or_else(|| read("cache_read_input_tokens"))
+        .or_else(|| read("cached_tokens"))
+        .unwrap_or(0);
+    let prompt = read("prompt_tokens").unwrap_or(0);
+    hit.min(prompt)
 }
 
 /// 一个解析完成的 SOLO 事件。
@@ -206,35 +255,249 @@ fn parse_event(event: &str, data: &str) -> SoloEvent {
     parsed
 }
 
-/// SOLO 的 `tool_calls` 转 OpenAI 形态：`function_call` → `function`，并去掉上游私有字段。
-fn convert_tool_calls(value: &Value) -> Vec<Value> {
-    let Some(calls) = value.as_array() else {
-        return Vec::new();
-    };
-    calls
-        .iter()
-        .map(|call| {
-            let mut call = call.clone();
-            let Some(object) = call.as_object_mut() else {
-                return call;
+/// 上游 `tool_calls` 的**增量累加器**（issue #172）。
+///
+/// SOLO 的 `tool_calls` 是**逐帧增量**：第一帧给 `id` + `function.name`，后续帧只给
+/// `function.arguments`（`id` / `name` 缺省或为空串）。改造前每一帧各自转换后
+/// **直接输出 / 追加**，同一个调用就落成两条残缺记录 —— 「有名无参」+「无名有参」。
+/// 客户端会把两条都判成非法调用（`arguments: ""` 解析失败、`name: ""` 找不到函数），
+/// 于是 Trae 线只能当纯对话用，agent 的工具链完全跑不动。
+///
+/// 槽位号是**对客户端稳定**的 `index`（按首次出现顺序分配），与上游 `index` 解耦：
+/// 上游可以不给 `index`，但 OpenAI / Anthropic 的流式分片必须靠 `index` 才能拼回一条。
+#[derive(Debug, Default)]
+struct ToolCallAccumulator {
+    slots: Vec<ToolCallSlot>,
+    /// 上游 `index` → 槽位号。
+    by_upstream: HashMap<i64, usize>,
+    /// 上游 `id` → 槽位号（重放同一帧时不能新开一条调用）。
+    by_id: HashMap<String, usize>,
+    /// 最近落位的槽位：上游既不给 `index` 也不给 `id` 的帧视为**续写**它。
+    last: Option<usize>,
+}
+
+#[derive(Debug, Default)]
+struct ToolCallSlot {
+    id: String,
+    name: String,
+    arguments: String,
+    /// 是否已经向客户端开过帧（流式路径只在首帧发 `id` / `type`）。
+    announced: bool,
+}
+
+/// 一条上游调用**在本帧新增**的字段（已去重：重复帧不会重复下发）。
+#[derive(Debug, Default)]
+struct Absorbed {
+    slot: usize,
+    id: Option<String>,
+    name: String,
+    arguments: String,
+}
+
+impl ToolCallAccumulator {
+    fn push_slot(&mut self) -> usize {
+        self.slots.push(ToolCallSlot::default());
+        self.slots.len() - 1
+    }
+
+    /// 定位这条上游调用该落在哪个槽位。
+    fn slot_of(&mut self, call: &Value) -> usize {
+        if let Some(index) = call.get("index").and_then(Value::as_i64) {
+            let slot = match self.by_upstream.get(&index) {
+                Some(&slot) => slot,
+                None => {
+                    let slot = self.push_slot();
+                    self.by_upstream.insert(index, slot);
+                    slot
+                }
             };
-            if let Some(function) = object.remove("function_call") {
-                object.insert("function".into(), function);
+            self.last = Some(slot);
+            return slot;
+        }
+        /* 没有 `index`：带非空 `id` 的是**新**调用（除非这个 id 已经出现过 ——
+        那是整帧重放），否则是在续写上一次的调用（实测上游第二帧只给 `arguments`）。
+        这条判据是「不给 index 也不给 id 就无法区分并行调用」的已知边界，比按帧
+        新建槽位安全得多。 */
+        let id = call.get("id").and_then(Value::as_str).unwrap_or("");
+        if !id.is_empty() {
+            if let Some(&slot) = self.by_id.get(id) {
+                self.last = Some(slot);
+                return slot;
             }
-            if let Some(function) = object.get("function").and_then(Value::as_object).cloned() {
-                let mut clean = function;
-                // 这两个字段是上游内部的流式增量，OpenAI 客户端不认识。
-                clean.remove("namespace");
-                clean.remove("partial_arguments");
-                object.insert("function".into(), Value::Object(clean));
+        } else if let Some(slot) = self.last {
+            return slot;
+        }
+        let slot = self.push_slot();
+        self.last = Some(slot);
+        slot
+    }
+
+    /// 吸收一帧里的一条上游调用，返回本帧新增的字段。
+    fn absorb(&mut self, call: &Value) -> Absorbed {
+        let slot = self.slot_of(call);
+        // 上游两种键名都出现过（`function_call` 是 SOLO 原生的）。
+        let function = call
+            .get("function")
+            .or_else(|| call.get("function_call"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let mut absorbed = Absorbed {
+            slot,
+            ..Absorbed::default()
+        };
+
+        let id = call.get("id").and_then(Value::as_str).unwrap_or("");
+        if !id.is_empty() && self.slots[slot].id.is_empty() {
+            self.slots[slot].id = id.to_string();
+            self.by_id.insert(id.to_string(), slot);
+            absorbed.id = Some(id.to_string());
+        }
+
+        let name = function.get("name").and_then(Value::as_str).unwrap_or("");
+        if !name.is_empty() {
+            /* 名字可能分帧发（少见）也可能整帧重复发（常见）：只下发**真正新增**
+            的那一段，否则客户端会把名字拼成 `get_weatherget_weather`。 */
+            let known = self.slots[slot].name.clone();
+            if let Some(tail) = name.strip_prefix(known.as_str()) {
+                absorbed.name = tail.to_string();
+                self.slots[slot].name = name.to_string();
+            } else if !known.starts_with(name) {
+                absorbed.name = name.to_string();
+                self.slots[slot].name.push_str(name);
             }
-            call
-        })
-        .collect()
+        }
+
+        if let Some(arguments) = function.get("arguments") {
+            // 上游偶尔把参数直接给成对象，统一成字符串再累加（参数必须逐段拼接）。
+            let text = match arguments {
+                Value::String(text) => text.clone(),
+                Value::Null => String::new(),
+                other => other.to_string(),
+            };
+            /* 整帧重放（同 id 同 name 同参数）不能重复拼接 —— 否则参数会变成
+            `{}{}`，客户端解析必然失败。逐段增量不会与已累积值完全相等，所以这条
+            判据只吃掉重放，不吃正常拼接。 */
+            if !text.is_empty() && self.slots[slot].arguments != text {
+                self.slots[slot].arguments.push_str(&text);
+                absorbed.arguments = text;
+            }
+        }
+
+        absorbed
+    }
+
+    /// 非流式用：把一帧里的调用全部吸收（不关心「本帧新增」，收尾时统一取 [`merged`]）。
+    ///
+    /// [`merged`]: ToolCallAccumulator::merged
+    fn absorb_all(&mut self, value: &Value) {
+        if let Some(calls) = value.as_array() {
+            for call in calls {
+                self.absorb(call);
+            }
+        }
+    }
+
+    /// 是否真的产出过调用（空帧不算）。
+    fn has_calls(&self) -> bool {
+        self.slots
+            .iter()
+            .any(|slot| !slot.id.is_empty() || !slot.name.is_empty() || !slot.arguments.is_empty())
+    }
+
+    /// 流式：把一帧上游 `tool_calls` 转成 OpenAI `delta.tool_calls` 分片。
+    ///
+    /// 每个槽位只在**首帧**带 `id` / `type`，之后只带 `function` 里新增的部分 ——
+    /// 与 OpenAI 官方的增量形状一致，客户端按 `index` 拼接。
+    fn streaming_deltas(&mut self, value: &Value) -> Vec<Value> {
+        let Some(calls) = value.as_array() else {
+            return Vec::new();
+        };
+        let mut entries = Vec::with_capacity(calls.len());
+        for call in calls {
+            let absorbed = self.absorb(call);
+            let slot = &mut self.slots[absorbed.slot];
+            let has_payload = absorbed.id.is_some()
+                || !absorbed.name.is_empty()
+                || !absorbed.arguments.is_empty();
+            // 纯重复帧不下发空分片（否则客户端会看到一串空 tool_calls 增量）。
+            if slot.announced && !has_payload {
+                continue;
+            }
+            let mut entry = Map::new();
+            entry.insert("index".into(), json!(absorbed.slot));
+            if !slot.announced {
+                slot.announced = true;
+                entry.insert("type".into(), json!("function"));
+                /* `id` 是 Anthropic `tool_use` 块的必要字段：上游首帧通常带，
+                缺省时补一个稳定值，不能让客户端拿到空 id（那正是 #172 的第二条残缺记录）。 */
+                let id = if slot.id.is_empty() {
+                    format!("call_{}", absorbed.slot)
+                } else {
+                    slot.id.clone()
+                };
+                entry.insert("id".into(), json!(id));
+            } else if let Some(id) = absorbed.id {
+                // 晚到的真 id 补发一次；已开的块不会被重命名，但非流式客户端会读到它。
+                entry.insert("id".into(), json!(id));
+            }
+            let mut function = Map::new();
+            if !absorbed.name.is_empty() {
+                function.insert("name".into(), json!(absorbed.name));
+            }
+            if !absorbed.arguments.is_empty() {
+                function.insert("arguments".into(), json!(absorbed.arguments));
+            }
+            if !function.is_empty() {
+                entry.insert("function".into(), Value::Object(function));
+            }
+            entries.push(Value::Object(entry));
+        }
+        entries
+    }
+
+    /// 非流式：把累加结果拼成 `message.tool_calls`（每条都是**完整**调用）。
+    fn merged(&self) -> Vec<Value> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| {
+                !slot.id.is_empty() || !slot.name.is_empty() || !slot.arguments.is_empty()
+            })
+            .map(|(index, slot)| {
+                let id = if slot.id.is_empty() {
+                    format!("call_{index}")
+                } else {
+                    slot.id.clone()
+                };
+                json!({
+                    "id": id,
+                    "type": "function",
+                    "function": { "name": slot.name, "arguments": slot.arguments },
+                })
+            })
+            .collect()
+    }
+}
+
+/// 工具调用存在时，`finish_reason` 必须是 `tool_calls`。
+///
+/// 上游 `done` 事件固定报 `stop`，于是客户端拿到 `stop_reason=end_turn` 就把工具结果
+/// 丢弃（issue #172 的 Anthropic 侧症状）。`length` / `content_filter` 等其它原因不覆盖。
+fn promote_tool_finish(finish: &str, has_calls: bool) -> String {
+    if has_calls && (finish.is_empty() || finish == "stop") {
+        return "tool_calls".to_string();
+    }
+    finish.to_string()
 }
 
 /// 构造一个 OpenAI `chat.completion.chunk` 的 `data:` 行。
-fn chunk_line(chat_id: &str, model: &str, delta: Value, finish_reason: &str, usage: Option<TokenUsage>) -> String {
+fn chunk_line(
+    chat_id: &str,
+    model: &str,
+    delta: Value,
+    finish_reason: &str,
+    usage: Option<TokenUsage>,
+) -> String {
     let mut choice = Map::new();
     choice.insert("index".into(), json!(0));
     choice.insert("delta".into(), delta);
@@ -274,37 +537,64 @@ pub struct StreamOutcome {
     pub usage: TokenUsage,
     /// 是否见过结束标记。
     pub saw_done: bool,
+    /// ★ issue #129：**错误帧是否已经发出**。
+    ///
+    /// 上游显式发 `error` 事件时由 [`emit`] 置位；上游**断流**（`Err`）时没有事件可转，
+    /// 由 [`stream_convert`] 收尾时补一条标准错误帧 —— 否则「断流」与「模型正常说完」
+    /// 在客户端看来是同一个字节序列（都只有 `[DONE]`），用户只看到半句话。
+    pub error_frame_sent: bool,
 }
 
 /// 把上游响应体流式转换为 OpenAI SSE，逐块送入 `sender`。
 ///
 /// **总是**以 `data: [DONE]` 收尾（除非发送端已被对端丢弃），保证客户端不会悬挂。
+///
+/// `capture` 为抓取旁路句柄（[`super::capture::Capture`]）：`Some` 时上游原始流
+/// 逐块追加落盘 `<编号>_upstream_resp.ndjson`，`None` 表示未开启抓取。
 pub async fn stream_convert(
     response: reqwest::Response,
     sender: mpsc::Sender<Result<Bytes, io::Error>>,
     chat_id: &str,
     model: &str,
+    capture: Option<&super::capture::Capture>,
 ) -> StreamOutcome {
     let mut parser = SoloParser::new();
     let mut outcome = StreamOutcome::default();
     let mut pending_usage: Option<TokenUsage> = None;
+    // ★ issue #172：工具调用必须**跨帧累加**，按帧各自输出会被拆成残缺条目。
+    let mut tools = ToolCallAccumulator::default();
     let mut stream = response.bytes_stream();
 
     while let Some(item) = stream.next().await {
         let chunk = match item {
             Ok(chunk) => chunk,
             Err(error) => {
-                // 上游中途断流：不是账号问题，但必须让客户端收到收尾。
+                /* 上游中途断流：不是「模型说完了」，必须让客户端收到**可重试**的错误。
+                ★ issue #129：这里记 **502** 而不是 `0` —— `(code, message)` 的 `code`
+                会进 `classify_solo`，`0` 落到 `TraeErrKind::None`（= 不冷却、对外 400），
+                断流就被记成「调用方的参数错」。502 才是它的真实语义（5xx / 熔断域）。 */
                 if outcome.error.is_none() {
-                    outcome.error = Some((0, format!("上游连接中断：{error}")));
+                    outcome.error = Some((502, format!("上游连接中断：{error}")));
                 }
                 break;
             }
         };
+        // 抓取（诊断旁路）：上游原始流逐块追加，**先于解析** —— 解析失败也有据可查。
+        if let Some(capture) = capture {
+            capture.append("_upstream_resp.ndjson", &chunk);
+        }
         for event in parser.feed(&chunk) {
-            if emit(&event, sender.clone(), chat_id, model, &mut pending_usage, &mut outcome)
-                .await
-                .is_err()
+            if emit(
+                &event,
+                sender.clone(),
+                chat_id,
+                model,
+                &mut pending_usage,
+                &mut tools,
+                &mut outcome,
+            )
+            .await
+            .is_err()
             {
                 // 客户端已断开：停止转换，不再补发任何内容。
                 return outcome;
@@ -313,18 +603,47 @@ pub async fn stream_convert(
     }
 
     for event in parser.finish() {
-        if emit(&event, sender.clone(), chat_id, model, &mut pending_usage, &mut outcome)
-            .await
-            .is_err()
+        if emit(
+            &event,
+            sender.clone(),
+            chat_id,
+            model,
+            &mut pending_usage,
+            &mut tools,
+            &mut outcome,
+        )
+        .await
+        .is_err()
         {
             return outcome;
         }
     }
 
+    /* ★ issue #129 §3.3：上游**断流**（`Err`）没有 `error` 事件可转 ⇒ 在这里补一条
+    标准错误帧。改造前只补 `[DONE]`，客户端拿到的是「模型说完了」，
+    既不报错也不重试 —— 用户只看到半句话；工具调用场景下还会拿半截 JSON 去执行。 */
+    if !outcome.error_frame_sent {
+        if let Some((code, message)) = outcome.error.as_ref() {
+            let error = super::pool::client_error_of(*code, message);
+            let payload = json!({
+                "error": {
+                    "message": error.message,
+                    "type": error.kind,
+                    "code": error.status,
+                }
+            });
+            if sender
+                .send(Ok(Bytes::from(format!("data: {payload}\n\n"))))
+                .await
+                .is_err()
+            {
+                return outcome;
+            }
+            outcome.error_frame_sent = true;
+        }
+    }
     if !outcome.saw_done {
-        let _ = sender
-            .send(Ok(Bytes::from(done_line().to_string())))
-            .await;
+        let _ = sender.send(Ok(Bytes::from(done_line().to_string()))).await;
         outcome.saw_done = true;
     }
     outcome
@@ -337,6 +656,7 @@ async fn emit(
     chat_id: &str,
     model: &str,
     pending_usage: &mut Option<TokenUsage>,
+    tools: &mut ToolCallAccumulator,
     outcome: &mut StreamOutcome,
 ) -> Result<(), ()> {
     match event.event.as_str() {
@@ -349,7 +669,7 @@ async fn emit(
                 delta.insert("reasoning_content".into(), json!(event.reasoning));
             }
             if let Some(calls) = &event.tool_calls {
-                let converted = convert_tool_calls(calls);
+                let converted = tools.streaming_deltas(calls);
                 if !converted.is_empty() {
                     delta.insert("tool_calls".into(), json!(converted));
                 }
@@ -374,7 +694,9 @@ async fn emit(
             } else {
                 event.finish_reason.as_str()
             };
-            let line = chunk_line(chat_id, model, json!({}), finish, *pending_usage);
+            // ★ issue #172：上游固定报 `stop`，有工具调用时必须改口成 `tool_calls`。
+            let finish = promote_tool_finish(finish, tools.has_calls());
+            let line = chunk_line(chat_id, model, json!({}), &finish, *pending_usage);
             sender.send(Ok(Bytes::from(line))).await.map_err(|_| ())?;
             sender
                 .send(Ok(Bytes::from(done_line().to_string())))
@@ -386,17 +708,23 @@ async fn emit(
         "error" => {
             let code = event.error_code.unwrap_or(0);
             outcome.error = Some((code, event.error_message.clone()));
+            /* ★ issue #129：对外形状走 `pool::client_error_of` —— 上游码（1005 / 4008 /
+            12153）客户端一个都归不了类，而 `HTTP <status>` 能被它的文本正则命中
+            （`429` → `RATE_LIMIT`、`5xx` → `SERVER`，两者都可重试）。
+            **上游原文只进日志**，不进对外文案（见 `failover` 模块头）。 */
+            let error = super::pool::client_error_of(code, &event.error_message);
             let payload = json!({
                 "error": {
-                    "message": event.error_message,
-                    "type": "api_error",
-                    "code": code,
+                    "message": error.message,
+                    "type": error.kind,
+                    "code": error.status,
                 }
             });
             sender
                 .send(Ok(Bytes::from(format!("data: {payload}\n\n"))))
                 .await
                 .map_err(|_| ())?;
+            outcome.error_frame_sent = true;
             sender
                 .send(Ok(Bytes::from(done_line().to_string())))
                 .await
@@ -412,10 +740,13 @@ async fn emit(
 /// 非流式聚合：读完整条事件流，拼成单个 `chat.completion`。
 ///
 /// 返回 `(响应体, 上游错误, 用量)`。上游报错时响应体为 `None`。
+///
+/// `capture` 同 [`stream_convert`]：`Some` 时上游原始流逐块追加落盘。
 pub async fn aggregate(
     response: reqwest::Response,
     chat_id: &str,
     model: &str,
+    capture: Option<&super::capture::Capture>,
 ) -> (Option<Value>, Option<(i64, String)>, TokenUsage) {
     let mut parser = SoloParser::new();
     let mut content = String::new();
@@ -423,22 +754,23 @@ pub async fn aggregate(
     let mut finish_reason = "stop".to_string();
     let mut usage = TokenUsage::default();
     let mut error: Option<(i64, String)> = None;
-    let mut tool_calls: Vec<Value> = Vec::new();
+    // ★ issue #172：同一条调用会被拆到多帧 ⇒ 非流式也必须累加后再输出。
+    let mut tools = ToolCallAccumulator::default();
     let mut stream = response.bytes_stream();
 
     let consume = |event: SoloEvent,
-                       content: &mut String,
-                       reasoning: &mut String,
-                       finish_reason: &mut String,
-                       usage: &mut TokenUsage,
-                       error: &mut Option<(i64, String)>,
-                       tool_calls: &mut Vec<Value>| {
+                   content: &mut String,
+                   reasoning: &mut String,
+                   finish_reason: &mut String,
+                   usage: &mut TokenUsage,
+                   error: &mut Option<(i64, String)>,
+                   tools: &mut ToolCallAccumulator| {
         match event.event.as_str() {
             "output" | "thought" => {
                 content.push_str(&event.response);
                 reasoning.push_str(&event.reasoning);
                 if let Some(calls) = &event.tool_calls {
-                    tool_calls.extend(convert_tool_calls(calls));
+                    tools.absorb_all(calls);
                 }
             }
             "token_usage" => {
@@ -468,6 +800,10 @@ pub async fn aggregate(
                 break;
             }
         };
+        // 抓取（诊断旁路）：与流式路径同一份语义 —— 先落盘，再解析。
+        if let Some(capture) = capture {
+            capture.append("_upstream_resp.ndjson", &chunk);
+        }
         for event in parser.feed(&chunk) {
             consume(
                 event,
@@ -476,7 +812,7 @@ pub async fn aggregate(
                 &mut finish_reason,
                 &mut usage,
                 &mut error,
-                &mut tool_calls,
+                &mut tools,
             );
         }
     }
@@ -488,13 +824,16 @@ pub async fn aggregate(
             &mut finish_reason,
             &mut usage,
             &mut error,
-            &mut tool_calls,
+            &mut tools,
         );
     }
 
     if let Some((code, message)) = error {
         return (None, Some((code, message)), usage);
     }
+
+    let tool_calls = tools.merged();
+    let finish_reason = promote_tool_finish(&finish_reason, !tool_calls.is_empty());
 
     let mut message = Map::new();
     message.insert("role".into(), json!("assistant"));
@@ -526,12 +865,22 @@ pub async fn aggregate(
     (Some(Value::Object(response)), None, usage)
 }
 
+/// 把接收端包装成**字节流**。
+///
+/// 与 [`body_from_receiver`] 是同一种构造 —— 抽出来是为了让 `/v1/messages` 的
+/// Anthropic 转换流能包同一份东西（`AnthropicSseStream` 要的是 `Stream`，
+/// 不是 axum 的 `Body`）。两处若各写一份 `unfold`，行为会随重构漂移。
+pub fn stream_from_receiver(
+    rx: mpsc::Receiver<Result<Bytes, io::Error>>,
+) -> impl futures_util::Stream<Item = Result<Bytes, io::Error>> {
+    futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    })
+}
+
 /// 把接收端包装成 axum 响应体。
 pub fn body_from_receiver(rx: mpsc::Receiver<Result<Bytes, io::Error>>) -> Body {
-    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|item| (item, rx))
-    });
-    Body::from_stream(stream)
+    Body::from_stream(stream_from_receiver(rx))
 }
 
 /// OpenAI 形态的错误响应体。
@@ -585,17 +934,80 @@ mod tests {
         assert_eq!(flushed[0].response, "tail");
     }
 
+    /// ★ issue #154：命中量必须能被解析出来（Trae 侧四种上游写法都认），
+    /// 且脏数据（命中 > prompt）钳到 prompt —— 否则下游命中率会 > 100%。
+    #[test]
+    fn cached_tokens_are_read_from_all_four_upstream_shapes() {
+        // DeepSeek
+        assert_eq!(
+            TokenUsage::from_value(&json!({
+                "prompt_tokens": 100, "completion_tokens": 1, "prompt_cache_hit_tokens": 90
+            }))
+            .cached,
+            90
+        );
+        // OpenAI 明细
+        assert_eq!(
+            TokenUsage::from_value(&json!({
+                "prompt_tokens": 100, "completion_tokens": 1,
+                "prompt_tokens_details": { "cached_tokens": 70 }
+            }))
+            .cached,
+            70
+        );
+        // Anthropic
+        assert_eq!(
+            TokenUsage::from_value(&json!({
+                "prompt_tokens": 100, "completion_tokens": 1, "cache_read_input_tokens": 60
+            }))
+            .cached,
+            60
+        );
+        // 裸字段 + 缺字段（= 0 = 上游没报）
+        assert_eq!(
+            TokenUsage::from_value(&json!({
+                "prompt_tokens": 100, "completion_tokens": 1, "cached_tokens": 50
+            }))
+            .cached,
+            50
+        );
+        assert_eq!(
+            TokenUsage::from_value(&json!({"prompt_tokens": 100, "completion_tokens": 1})).cached,
+            0
+        );
+        // 脏数：命中量报得比 prompt 还大 ⇒ 钳到 prompt
+        assert_eq!(
+            TokenUsage::from_value(&json!({
+                "prompt_tokens": 10, "completion_tokens": 1, "prompt_cache_hit_tokens": 999
+            }))
+            .cached,
+            10
+        );
+    }
+
     #[test]
     fn parse_event_reads_every_documented_solo_event() {
-        let output = parse_event("output", r#"{"response":"a","reasoning_content":"r","tool_calls":[{"function_call":{"name":"f"}}]}"#);
+        let output = parse_event(
+            "output",
+            r#"{"response":"a","reasoning_content":"r","tool_calls":[{"function_call":{"name":"f"}}]}"#,
+        );
         assert_eq!(output.response, "a");
         assert_eq!(output.reasoning, "r");
         assert!(output.tool_calls.is_some());
 
-        let usage = parse_event("token_usage", r#"{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"reasoning_tokens":1}"#);
+        let usage = parse_event(
+            "token_usage",
+            r#"{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"reasoning_tokens":1}"#,
+        );
         assert_eq!(
             usage.usage,
-            Some(TokenUsage { prompt: 10, completion: 2, total: 12, reasoning: 1 })
+            Some(TokenUsage {
+                prompt: 10,
+                completion: 2,
+                total: 12,
+                reasoning: 1,
+                ..Default::default()
+            })
         );
 
         let done = parse_event("done", r#"{"finish_reason":"length"}"#);
@@ -625,23 +1037,212 @@ mod tests {
         assert!(partial.is_meaningful());
         assert!(!TokenUsage::default().is_meaningful());
 
-        let openai = TokenUsage { prompt: 1, completion: 2, total: 3, reasoning: 0 }.to_openai();
+        let openai = TokenUsage {
+            prompt: 1,
+            completion: 2,
+            total: 3,
+            reasoning: 0,
+            ..Default::default()
+        }
+        .to_openai();
         assert_eq!(openai["prompt_tokens"], 1);
         assert_eq!(openai["total_tokens"], 3);
         // reasoning_tokens 不是 OpenAI 标准字段，不外发。
         assert!(openai.get("reasoning_tokens").is_none());
+        // ★ issue #154：没有命中量时**整个键不出现**（不是写 0）—— 见 `to_openai` 注释。
+        assert!(
+            openai.get("prompt_tokens_details").is_none(),
+            "没命中量时不得写 prompt_tokens_details（对外 wire 形状要最小）"
+        );
     }
 
+    /// ★ issue #154：Trae 线的客户端也必须能读到命中量。
+    ///
+    /// 为什么钉这条：`to_openai()` 是 Trae 对客户端输出 `usage` 的**唯一构造点**
+    /// （流式末帧 + 非流式响应各一处）。它原来只有三个键 ⇒ 客户端看到的
+    /// `prompt_tokens` 含命中、却没有任何命中量可读，表现为「缓存从不命中」，
+    /// 与 WB 线（`/v1/messages` 给 `cache_read_input_tokens`）口径不一致 ——
+    /// 这正是 issue #154 里「同一个账号、同一个模型，两个客户端显示不同命中率」的
+    /// 另一半原因。
     #[test]
-    fn tool_call_conversion_strips_private_fields() {
-        let converted = convert_tool_calls(&json!([
-            {"id": "1", "function_call": {"name": "f", "arguments": "{}", "namespace": "x", "partial_arguments": "y"}}
+    fn to_openai_carries_cached_tokens_when_observed() {
+        let usage = TokenUsage {
+            prompt: 1000,
+            completion: 20,
+            total: 1020,
+            reasoning: 0,
+            cached: 900,
+        }
+        .to_openai();
+        assert_eq!(
+            usage["prompt_tokens_details"]["cached_tokens"], 900,
+            "命中量必须能被客户端读到"
+        );
+        assert_eq!(usage["prompt_tokens"], 1000, "prompt 仍是原值（含命中）");
+    }
+
+    /// ★ issue #172：上游把一次调用拆到两帧（先 `name`、后 `arguments`），
+    /// 累加后必须只剩**一条完整**调用 —— 改造前会落成「有名无参」+「无名有参」两条。
+    #[test]
+    fn tool_calls_merge_when_upstream_splits_them_across_frames() {
+        let mut tools = ToolCallAccumulator::default();
+        let first = tools.streaming_deltas(&json!([
+            {"id": "call_00_a", "type": "function", "function_call": {"name": "get_weather"}}
         ]));
-        assert_eq!(converted.len(), 1);
-        assert_eq!(converted[0]["function"]["name"], "f");
-        assert!(converted[0]["function"].get("namespace").is_none());
-        assert!(converted[0]["function"].get("partial_arguments").is_none());
-        assert!(converted[0].get("function_call").is_none());
+        assert_eq!(first.len(), 1, "首帧只有一条增量");
+        assert_eq!(first[0]["index"], 0);
+        assert_eq!(first[0]["id"], "call_00_a");
+        assert_eq!(first[0]["type"], "function");
+        assert_eq!(first[0]["function"]["name"], "get_weather");
+        assert!(
+            first[0]["function"].get("arguments").is_none(),
+            "首帧没有参数，不得写空串"
+        );
+
+        // 第二帧：没 id、没 name、没 index，只有参数 —— 必须续写到同一个槽位。
+        let second = tools.streaming_deltas(&json!([
+            {"function_call": {"arguments": "{\"city\": \"北京\"}"}}
+        ]));
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0]["index"], 0, "同一个调用必须是同一个 index");
+        assert_eq!(second[0]["function"]["arguments"], "{\"city\": \"北京\"}");
+        assert!(second[0].get("id").is_none(), "id 只在首帧下发");
+
+        let merged = tools.merged();
+        assert_eq!(merged.len(), 1, "一次调用只能是一条");
+        assert_eq!(merged[0]["id"], "call_00_a");
+        assert_eq!(merged[0]["function"]["name"], "get_weather");
+        assert_eq!(merged[0]["function"]["arguments"], "{\"city\": \"北京\"}");
+        assert!(merged[0].get("index").is_none(), "非流式不带 index");
+        // 上游私有字段不外泄（`function_call` 已归一成 `function`）。
+        assert!(merged[0].get("function_call").is_none());
+    }
+
+    /// 并行调用：上游带 `index` 时必须各归各位，不能因为「参数交替到达」串到一起。
+    #[test]
+    fn parallel_tool_calls_keep_their_own_slots() {
+        let mut tools = ToolCallAccumulator::default();
+        tools.streaming_deltas(&json!([
+            {"index": 0, "id": "call_a", "function_call": {"name": "get_weather"}},
+            {"index": 1, "id": "call_b", "function_call": {"name": "get_time"}},
+        ]));
+        tools.streaming_deltas(&json!([
+            {"index": 1, "function_call": {"arguments": "{\"tz\":\"UTC\"}"}}
+        ]));
+        let tail = tools.streaming_deltas(&json!([
+            {"index": 0, "function_call": {"arguments": "{\"city\":\"上海\"}"}}
+        ]));
+        assert_eq!(tail[0]["index"], 0);
+
+        let merged = tools.merged();
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0]["function"]["name"], "get_weather");
+        assert_eq!(merged[0]["function"]["arguments"], "{\"city\":\"上海\"}");
+        assert_eq!(merged[1]["function"]["name"], "get_time");
+        assert_eq!(merged[1]["function"]["arguments"], "{\"tz\":\"UTC\"}");
+    }
+
+    /// 上游整帧重复发（同 id / 同 name）时不得重复下发，也不得把名字拼两遍。
+    #[test]
+    fn repeated_tool_call_frames_are_idempotent() {
+        let mut tools = ToolCallAccumulator::default();
+        let frame = json!([
+            {"id": "call_x", "function_call": {"name": "f", "arguments": "{}"}}
+        ]);
+        assert_eq!(tools.streaming_deltas(&frame).len(), 1);
+        assert!(
+            tools.streaming_deltas(&frame).is_empty(),
+            "纯重复帧不得再下发空分片"
+        );
+        let merged = tools.merged();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0]["function"]["name"], "f");
+        assert_eq!(merged[0]["function"]["arguments"], "{}");
+    }
+
+    /// 缺 `id` 时必须补一个稳定值：Anthropic 的 `tool_use` 块没有 id 就无法回填结果。
+    #[test]
+    fn tool_call_without_id_gets_a_stable_placeholder() {
+        let mut tools = ToolCallAccumulator::default();
+        let delta = tools.streaming_deltas(&json!([
+            {"function_call": {"name": "f", "arguments": "{}"}}
+        ]));
+        assert_eq!(delta[0]["id"], "call_0");
+        assert_eq!(tools.merged()[0]["id"], "call_0");
+    }
+
+    /// ★ issue #172：有工具调用时 `finish_reason` 必须是 `tool_calls`，
+    /// 否则 Anthropic 侧映射成 `end_turn`，客户端直接丢弃工具结果。
+    #[test]
+    fn finish_reason_promotes_to_tool_calls_only_for_stop() {
+        assert_eq!(promote_tool_finish("stop", true), "tool_calls");
+        assert_eq!(promote_tool_finish("", true), "tool_calls");
+        assert_eq!(promote_tool_finish("stop", false), "stop");
+        assert_eq!(promote_tool_finish("length", true), "length");
+        assert_eq!(
+            promote_tool_finish("content_filter", true),
+            "content_filter"
+        );
+    }
+
+    /// 端到端（流式）：上游两帧 → 客户端分片按 `index` 能拼回一条完整调用，
+    /// 且结束帧的 `finish_reason` 是 `tool_calls`（不是上游报的 `stop`）。
+    #[tokio::test]
+    async fn stream_emits_indexed_tool_call_deltas() {
+        let body = concat!(
+            "id:1\nevent:output\ndata:{\"tool_calls\":[{\"id\":\"call_00_a\",\"function_call\":{\"name\":\"get_weather\"}}]}\n\n",
+            "id:2\nevent:output\ndata:{\"tool_calls\":[{\"function_call\":{\"arguments\":\"{}\"}}]}\n\n",
+            "id:3\nevent:done\ndata:{\"finish_reason\":\"stop\"}\n\n",
+        );
+        let mut parser = SoloParser::new();
+        let mut events = parser.feed(body.as_bytes());
+        events.extend(parser.finish());
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut tools = ToolCallAccumulator::default();
+        let mut outcome = StreamOutcome::default();
+        let mut pending: Option<TokenUsage> = None;
+        for event in &events {
+            emit(
+                event,
+                tx.clone(),
+                "id",
+                "m",
+                &mut pending,
+                &mut tools,
+                &mut outcome,
+            )
+            .await
+            .unwrap();
+        }
+        drop(tx);
+
+        let mut joined = String::new();
+        while let Some(item) = rx.recv().await {
+            joined.push_str(&String::from_utf8(item.unwrap().to_vec()).unwrap());
+        }
+
+        let chunks: Vec<Value> = joined
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|payload| *payload != "[DONE]")
+            .map(|payload| serde_json::from_str::<Value>(payload).unwrap())
+            .collect();
+        assert_eq!(chunks.len(), 3, "两帧工具增量 + 一帧结束");
+
+        let first = &chunks[0]["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(first["index"], 0);
+        assert_eq!(first["id"], "call_00_a");
+        assert_eq!(first["function"]["name"], "get_weather");
+
+        let second = &chunks[1]["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(second["index"], 0, "续写同一调用，index 必须一致");
+        assert_eq!(second["function"]["arguments"], "{}");
+
+        assert_eq!(
+            chunks[2]["choices"][0]["finish_reason"], "tool_calls",
+            "有工具调用时不得再报 stop"
+        );
     }
 
     #[test]
@@ -649,7 +1250,8 @@ mod tests {
         let plain = chunk_line("id", "m", json!({"content": "x"}), "", None);
         assert!(plain.starts_with("data: {"));
         assert!(plain.ends_with("\n\n"));
-        let parsed: Value = serde_json::from_str(plain.trim_start_matches("data: ").trim()).unwrap();
+        let parsed: Value =
+            serde_json::from_str(plain.trim_start_matches("data: ").trim()).unwrap();
         assert_eq!(parsed["object"], "chat.completion.chunk");
         assert_eq!(parsed["model"], "m");
         assert!(parsed["choices"][0].get("finish_reason").is_none());
@@ -657,7 +1259,8 @@ mod tests {
 
         // 全 0 的 usage 不应外发（否则客户端会显示 0 token）。
         let with_zero = chunk_line("id", "m", json!({}), "stop", Some(TokenUsage::default()));
-        let parsed: Value = serde_json::from_str(with_zero.trim_start_matches("data: ").trim()).unwrap();
+        let parsed: Value =
+            serde_json::from_str(with_zero.trim_start_matches("data: ").trim()).unwrap();
         assert!(parsed.get("usage").is_none());
         assert_eq!(parsed["choices"][0]["finish_reason"], "stop");
 
@@ -666,9 +1269,16 @@ mod tests {
             "m",
             json!({}),
             "stop",
-            Some(TokenUsage { prompt: 1, completion: 2, total: 3, reasoning: 0 }),
+            Some(TokenUsage {
+                prompt: 1,
+                completion: 2,
+                total: 3,
+                reasoning: 0,
+                ..Default::default()
+            }),
         );
-        let parsed: Value = serde_json::from_str(with_usage.trim_start_matches("data: ").trim()).unwrap();
+        let parsed: Value =
+            serde_json::from_str(with_usage.trim_start_matches("data: ").trim()).unwrap();
         assert_eq!(parsed["usage"]["total_tokens"], 3);
     }
 
@@ -694,10 +1304,19 @@ mod tests {
             "id:3\nevent:token_usage\ndata:{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}\n\n",
             "id:4\nevent:done\ndata:{\"finish_reason\":\"stop\"}\n\n",
         );
+        let mut tools = ToolCallAccumulator::default();
         for event in parser.feed(raw.as_bytes()) {
-            emit(&event, tx.clone(), "chatcmpl-1", "glm-5.3", &mut pending, &mut outcome)
-                .await
-                .unwrap();
+            emit(
+                &event,
+                tx.clone(),
+                "chatcmpl-1",
+                "glm-5.3",
+                &mut pending,
+                &mut tools,
+                &mut outcome,
+            )
+            .await
+            .unwrap();
         }
         drop(tx);
 
@@ -727,10 +1346,19 @@ mod tests {
         let mut pending: Option<TokenUsage> = None;
 
         let raw = "id:1\nevent:error\ndata:{\"code\":1005,\"message\":\"plan limit\"}\n\n";
+        let mut tools = ToolCallAccumulator::default();
         for event in parser.feed(raw.as_bytes()) {
-            emit(&event, tx.clone(), "chatcmpl-2", "m", &mut pending, &mut outcome)
-                .await
-                .unwrap();
+            emit(
+                &event,
+                tx.clone(),
+                "chatcmpl-2",
+                "m",
+                &mut pending,
+                &mut tools,
+                &mut outcome,
+            )
+            .await
+            .unwrap();
         }
         drop(tx);
 
@@ -739,9 +1367,20 @@ mod tests {
             lines.push(String::from_utf8(item.unwrap().to_vec()).unwrap());
         }
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("\"code\":1005"));
+        /* ★ issue #129：对外形状**不再**透出上游码 `1005`。
+        `1005` 客户端一个正则都命中不了（归成 `PI_AI_ERROR`，终态），
+        而「套餐限额」本质是「这个号现在不行了」⇒ 收敛成可重试的 `429`。
+        上游码仍在 `outcome.error` 里（日志/账号池用它）。 */
+        assert!(lines[0].contains("\"code\":429"), "{}", lines[0]);
+        assert!(lines[0].contains("HTTP 429"), "{}", lines[0]);
+        assert!(lines[0].contains("rate_limit_error"), "{}", lines[0]);
         assert_eq!(lines[1], "data: [DONE]\n\n");
-        assert_eq!(outcome.error, Some((1005, "plan limit".to_string())));
+        assert_eq!(
+            outcome.error,
+            Some((1005, "plan limit".to_string())),
+            "上游码必须原样留在内部（日志/冷却用它，只有对外文案收敛）"
+        );
         assert!(outcome.saw_done);
+        assert!(outcome.error_frame_sent);
     }
 }

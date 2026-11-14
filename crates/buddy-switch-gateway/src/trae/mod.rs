@@ -26,6 +26,10 @@
 //! 与签到页的变体分家口径一致：两个页面看到的是同一份状态。
 
 pub mod apikey;
+pub mod capture;
+pub mod catalog;
+/// 思考档位（`reasoning_effort`）的映射与注入 —— issue #127（默认关，见模块头）。
+pub mod effort;
 pub mod payload;
 pub mod pool;
 pub mod routes;
@@ -36,6 +40,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -43,13 +48,20 @@ use tokio::net::TcpListener;
 use tokio::sync::{oneshot, Mutex, RwLock};
 
 use buddy_switch_core::modules::config as core_config;
+use buddy_switch_core::modules::region::Region;
+use buddy_switch_core::modules::risk_control::RiskStore;
+use buddy_switch_core::modules::trae::region::TraeRegion;
 use buddy_switch_core::modules::trae::variant::TraeVariant;
+
+use crate::disabled_models::DisabledModels;
+use crate::sticky::StickyTable;
 use buddy_switch_core::modules::trae::{paths, TRAE_DEFAULT_API_PORT};
 
 use crate::logging::RequestLog;
 use crate::GatewayHandle;
 
-use pool::{TraePool, TraePoolSummary};
+use crate::pool::PoolSummary;
+use pool::TraePool;
 
 // ---------------------------------------------------------------------------
 // 上游常量
@@ -76,11 +88,93 @@ pub const TRAE_APP_ID: &str = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8";
 pub const TRAE_IDE_VERSION: &str = "0.1.50";
 pub const TRAE_IDE_VERSION_CODE: &str = "20260811";
 
-/// `function` 字段取值。
-pub const TRAE_FUNCTION: &str = "solo_work_lite";
+/// `function` 字段取值 —— **按程序位分家**（2026-09-30 实测，issue #4「看得见、调不动」）。
+///
+/// ## 为什么必须分家（实测现场）
+///
+/// 上游按 `function` 做**白名单**：不属于该 function 的模型一律回
+/// `event:error` / `code 4001 param is invalid`。实测（见
+/// `routes.rs::tests::probe_traecode_model_names`）：
+///
+/// | function | 模型 | 结果 |
+/// |:---|:---|:---|
+/// | `solo_work_lite` | `glm-5.3` | ✅ |
+/// | `solo_work_lite` | `glm-5.3-flash` | ❌ 4001 |
+/// | `chat_v3` | `glm-5.3-flash` | ✅ |
+/// | `solo_agent` | `glm-5.3-flash` | ✅ |
+/// | `solo_work_lite` | `Doubao-Seed-Code`（只在 `solo_coder` 分组里） | ❌ 4001 |
+///
+/// 写死成 `solo_work_lite` 时，TraeCode 的模型（`glm-5.3-flash` 等）**必然调不动**；
+/// 同时 TraeWork 对外清单里那些**不属于 `solo_work_lite`** 的模型也调不动
+/// （见 [`payload::models_response_for`] 的口径）。
+///
+/// ## 取值依据
+///
+/// 分组名直接来自客户端自己的清单键（`state.vscdb` 的
+/// `<uid><分隔符>AI.agent.model.model_list_map`）—— 那是上游下发的原始分组，
+/// 不是我方命名的。TraeWork 的 chat 分组是 `solo_work_lite`（改造前就在用），
+/// TraeCode 的 chat 分组是 `chat_v3`（`solo_agent` 实测也能过，但那是 agent 分组，
+/// 与 OpenAI 兼容网关的纯 chat 语义不符，故不取）。
+///
+/// ⚠️ **国际版两个程序位从未对真实上游跑通过**（本机无可用国际凭据），
+/// 这里按**程序**派生（`TraeWork` 家族 → `solo_work_lite`、TraeCode 家族 → `chat_v3`），
+/// 与「产品线不改变端点、region 才改变端点」的既有结论同向 —— 但**未实测**。
+pub const TRAE_FUNCTION_SOLO_WORK: &str = "solo_work_lite";
+pub const TRAE_FUNCTION_CHAT_V3: &str = "chat_v3";
+
+/// 取该程序位该用的 `function`（见 [`TRAE_FUNCTION_SOLO_WORK`] 的实测表）。
+///
+/// 判据是**程序**而不是区域：`TraeWork` / `Global` 都是 TraeWork 客户端，
+/// `Trae` / `GlobalTraeCode` 都是 TraeCode 客户端。
+///
+/// ## 合并后的客户端（issue #20）取 `chat_v3`
+///
+/// 合并版（CN `Trae CN`、国际 `Trae`）**就是** IDE 那条客户端的下一代构建
+/// （客户端合并时复用了 TraeCode 的目录名与 exe 名，见 `region` 模块头），
+/// 因此它的 chat 分组与 TraeCode 家族相同 = [`TRAE_FUNCTION_CHAT_V3`]。
+/// CN 那一格有实测依据（`Trae CN` 本体）；国际那格与其余国际程序位一样**未实测**，
+/// 按同一判据（程序家族）派生 —— 与「产品线不改变端点、region 才改变端点」同向。
+pub fn function_for(variant: TraeVariant) -> &'static str {
+    match variant {
+        TraeVariant::TraeWork | TraeVariant::Global => TRAE_FUNCTION_SOLO_WORK,
+        TraeVariant::Trae
+        | TraeVariant::GlobalTraeCode
+        | TraeVariant::TraeMerged
+        | TraeVariant::GlobalTraeMerged => TRAE_FUNCTION_CHAT_V3,
+    }
+}
+
+/// Trae 程序位 → 通用 [`Region`]（P11 禁用存储按 region 分家，与 WorkBuddy 侧同一把键）。
+///
+/// 为什么按 **region** 而不是程序位：后端禁用存储是 region 粒度（`cn` / `global`），
+/// 用程序位会引入一个存储里不存在的维度（**决策 #4**）。
+pub fn region_of_variant(variant: TraeVariant) -> Region {
+    match variant.region() {
+        TraeRegion::Cn => Region::Cn,
+        TraeRegion::Global => Region::Global,
+    }
+}
 
 /// 未指定模型时的默认值。
-pub const TRAE_DEFAULT_MODEL: &str = "deepseek-v4-flash";
+///
+/// ## 为什么是 `deepseek-v4.1-flash` 而不是老的 `deepseek-v4-flash`（2026-09-30 实测换名）
+///
+/// 老值 `deepseek-v4-flash` 是**客户端早已不再提供**的旧名（客户端现在叫
+/// `deepseek-v4.1-flash`）；它经 `model_config` 的别名仍能打通上游（实测），
+/// 但「默认模型」是用户**看得见**的一格（模型卡的「默认 X」），指向一个客户端里
+/// 找不到的名字，就是 issue #4 那句「内容滞后」的最后一处。
+///
+/// 新值实测（`probe_traecode_model_names` 的 Y1，`solo_work_lite` 下）：
+/// `config_name=deepseek-v4.1-flash` + `model_name=deepseek-v4.1-flash__dev` → **上游接受**。
+///
+/// ⚠️ 换名会改掉「不带 `model` 的请求」实际调用的模型，因此
+/// [`TraeGatewayConfig::load`] 带一条**窄迁移**：只把落盘值恰好等于
+/// [`LEGACY_DEFAULT_MODEL`] 的改写成新值（那个值是程序自己写进去的，用户改不了它），
+/// 并打印一行说明。其他值一律不动。
+pub const TRAE_DEFAULT_MODEL: &str = "deepseek-v4.1-flash";
+
+/// 历史默认值：只用于**一次性迁移**（见 [`TRAE_DEFAULT_MODEL`] 的说明）。
+pub const LEGACY_DEFAULT_MODEL: &str = "deepseek-v4-flash";
 
 /// 单请求体上限默认值（MB）。与 WorkBuddy 网关保持一致。
 pub const DEFAULT_MAX_BODY_MB: usize = 8;
@@ -104,7 +198,7 @@ pub struct TraeGatewayConfig {
     /// 监听地址，默认 `127.0.0.1`。
     #[serde(alias = "bindAddr")]
     pub bind_addr: String,
-    /// 监听端口，默认 [`TRAE_DEFAULT_API_PORT`]（7864，与 WorkBuddy 的 57891 错开）。
+    /// 监听端口，默认 [`TRAE_DEFAULT_API_PORT`]（57894，与 WorkBuddy 的 57891 错开）。
     pub port: u16,
     /// 是否允许非回环监听（默认 false）。
     #[serde(alias = "allowNonLoopback")]
@@ -124,6 +218,51 @@ pub struct TraeGatewayConfig {
     /// 单轮最多换号次数。
     #[serde(alias = "maxRotate")]
     pub max_rotate: usize,
+    /// 「指定账号」：优先消耗该 uid 的积分；空串表示不指定（自动择优）。
+    ///
+    /// ★ 偏好是**优化而非约束**：该账号不可用（冷却 / 禁用 / 零积分 / 该模型被限流 /
+    /// 已在本轮试过）时**回落**到自动择优，绝不因此拒绝服务。
+    /// 判定与自动选号共用同一套可用性判据（`pool::entry_usable`），
+    /// 否则会出现「明明有别的号可用却一直失败」这种不报错的偶发故障。
+    #[serde(alias = "preferredUid")]
+    pub preferred_uid: String,
+    /// 会话粘性绑定的存活时长（毫秒；`<= 0` 由 [`StickyTable`] 归一为 30 分钟）。
+    ///
+    /// 同一会话（请求体 `metadata.conversation_id`）在 TTL 内**优先复用上次成功的账号**，
+    /// 避免多账号池下「对话突然失忆」与跨账号的缓存前缀命中率归零。
+    /// 与 WorkBuddy 网关的 `sticky_ttl_ms` 同默认值。
+    #[serde(alias = "stickyTtlMs")]
+    pub sticky_ttl_ms: i64,
+    /// 对话转发抓取开关（诊断旁路，落盘 `~/.buddy-switch/trae/capture/<程序位>/`）。
+    ///
+    /// 默认 **false**：抓取会把对话正文（含提示词与响应）原样落盘，
+    /// 属敏感内容，只在排查问题时手动打开；**无轮转、无上限**，用完请手工清理目录。
+    ///
+    /// ★ 本字段没有界面开关，靠 `api_gateway.json` 手改 + 重启网关生效 ——
+    /// 因此它**必须**在管理面的整份保存里被原样带回：配置保存是「整份覆盖」，
+    /// 缺键就回落 `false`（前端 `toTraeGatewayConfigRaw` 负责带上它）。
+    /// 漏了这一步的后果不是报错，而是「用户以为还开着、其实已被静默关掉」。
+    #[serde(alias = "captureEnabled")]
+    pub capture_enabled: bool,
+    /// **Max Mode**：对「官方目录里 `max > dev`」的模型注入 `is_max_mode`，并在
+    /// `/v1/models` 声明它自己的上限（逐模型，**不是统一 1M**）。默认 `true`。
+    ///
+    /// 关闭后：清单只声明 `dev`（`__dev` 通道实际窗口），请求不再注入 —— 用于
+    /// 「Max Mode 万一加价 / 拖慢，先按默认窗口用」的场景。与原型里的开关同义。
+    #[serde(alias = "maxMode")]
+    pub max_mode: bool,
+    /// **账号故障时自动切换**（issue #129，默认 `false`）：流中途的账号级失败不再
+    /// 被「补终止标记」伪装成成功，而是先发**可重试**错误帧（含 `HTTP <status>`），
+    /// 并给失败账号写冷却、解绑粘性 —— 客户端整步重跑时必然落到另一个号。
+    ///
+    /// 与 WorkBuddy 网关的 `GatewayConfig::auto_failover` 同名同义，便于三处对齐。
+    #[serde(alias = "autoFailover")]
+    pub auto_failover: bool,
+}
+
+/// 进程内 Trae 网关当前的 Max Mode 开关（给**命令面**等拿不到 `TraeGatewayState` 的地方用）。
+pub fn max_mode_now() -> bool {
+    <TraeGateway as crate::GatewayProduct>::shared_state().max_mode_now()
 }
 
 impl Default for TraeGatewayConfig {
@@ -138,6 +277,11 @@ impl Default for TraeGatewayConfig {
             max_body_mb: DEFAULT_MAX_BODY_MB,
             default_model: TRAE_DEFAULT_MODEL.to_string(),
             max_rotate: DEFAULT_MAX_ROTATE,
+            preferred_uid: String::new(),
+            sticky_ttl_ms: 30 * 60 * 1000,
+            capture_enabled: false,
+            max_mode: true,
+            auto_failover: false,
         }
     }
 }
@@ -147,11 +291,31 @@ impl TraeGatewayConfig {
     pub fn load() -> Self {
         let file = paths::api_gateway_file();
         if let Ok(text) = std::fs::read_to_string(&file) {
-            if let Ok(config) = serde_json::from_str::<TraeGatewayConfig>(&text) {
+            if let Ok(mut config) = serde_json::from_str::<TraeGatewayConfig>(&text) {
+                config.migrate_legacy_default_model();
                 return config;
             }
         }
         TraeGatewayConfig::default()
+    }
+
+    /// **窄迁移**：把历史默认模型改写成当前默认（见 [`TRAE_DEFAULT_MODEL`] 的说明）。
+    ///
+    /// 只认**恰好等于** [`LEGACY_DEFAULT_MODEL`] 的落盘值 —— 那个值是程序自己在
+    /// [`TraeGatewayConfig::default`] 里写进去的（界面没有编辑入口），所以改写它
+    /// 不会覆盖用户的任何选择。其他值（包括用户手改过的）一律不动。
+    ///
+    /// 刻意**只改内存不落盘**：落盘交给下一次 `save()`。这样「读一次配置」不会产生
+    /// 写副作用（只读路径不该改文件），而任何一次真正的保存都会把新值带下去。
+    fn migrate_legacy_default_model(&mut self) {
+        if self.default_model.trim() == LEGACY_DEFAULT_MODEL {
+            eprintln!(
+                "[trae-gateway] 默认模型由历史值 {} 迁移为 {}（前者已不在客户端清单里；\
+                 如需其它模型请手改 api_gateway.json 的 default_model）",
+                LEGACY_DEFAULT_MODEL, TRAE_DEFAULT_MODEL
+            );
+            self.default_model = TRAE_DEFAULT_MODEL.to_string();
+        }
     }
 
     /// 原子写回配置文件。
@@ -194,6 +358,8 @@ pub fn body_limit_bytes(max_body_mb: usize) -> usize {
 pub struct TraeGatewayState {
     /// 运行配置。
     pub config: Arc<RwLock<TraeGatewayConfig>>,
+    /// 按平台区域保存的请求准入状态；损坏时由路由 fail-closed。
+    pub risk_store: Result<RiskStore, String>,
     /// **按产品线分家的账号池**：Key 的归属（`variant`）决定用哪个池。
     ///
     /// 用 `HashMap<TraeVariant, TraePool>` 而非「一个池 + 每条目带 variant」：
@@ -202,10 +368,26 @@ pub struct TraeGatewayState {
     /// - 避免「同一 uid 在两条线是两个不同账号」被错误合并
     ///   （`core::modules::trae::account` 的 `find_for` 注释）。
     pub pools: Arc<Mutex<HashMap<TraeVariant, TraePool>>>,
+    /// 用户禁用的模型（P11）：**两个出口共用**（`/v1/models` 过滤 + 调用拒绝）。
+    ///
+    /// 进程内**唯一**实例（[`crate::disabled_models::shared`]）—— 与 WorkBuddy 网关、
+    /// 命令面读的是同一个 `Arc`；按 `region`（[`region_of_variant`]）键控。
+    pub disabled: Arc<RwLock<DisabledModels>>,
+    /// **会话粘性绑定表**：同一会话优先复用上次成功的账号。
+    ///
+    /// 与 WorkBuddy 网关共用 [`StickyTable`] 实现。Trae 侧此前没有这一层 ——
+    /// 多账号池下同一对话被换到另一个账号，在上游表现为**对话失忆**。
+    ///
+    /// 绑定**按产品线分家**：键里带 variant，两条产品线的同名会话不会互相污染
+    /// （它们的账号库本就分家，粘到一起会指向另一条线的账号）。
+    pub sticky: Arc<Mutex<StickyTable>>,
     /// 请求日志（与 WorkBuddy 网关同一个 [`RequestLog`]，只是换了落盘路径）。
     pub log: Arc<RequestLog>,
     /// 多 API Key 存储（哈希 + 前缀 + **归属产品线**；含旧 `settings.apiKey` 兼容读）。
     pub key_store: Arc<apikey::TraeApiKeyStore>,
+    /// ★ 按密钥的用量账本（issue #76）—— 与 WB 侧**同一个实现**
+    /// （`crate::key_usage::KeyUsageStore`），只是路径在 `trae/` 下。
+    pub key_usage: Arc<crate::key_usage::KeyUsageStore>,
     /// 进程启动时刻（毫秒）。
     pub started_at: i64,
     /// 累计请求数。
@@ -242,10 +424,16 @@ impl TraeGatewayState {
         ));
         Self {
             config: Arc::new(RwLock::new(config.clone())),
+            risk_store: RiskStore::open_shared(
+                paths::api_gateway_file().with_file_name("risk_control.json"),
+            ),
             pools: Arc::new(Mutex::new(HashMap::new())),
+            disabled: crate::disabled_models::shared(),
+            sticky: Arc::new(Mutex::new(StickyTable::new(config.sticky_ttl_ms))),
             log,
-            key_store: Arc::new(apikey::TraeApiKeyStore::new(
-                paths::api_gateway_keys_file(),
+            key_store: Arc::new(apikey::TraeApiKeyStore::new(paths::api_gateway_keys_file())),
+            key_usage: Arc::new(crate::key_usage::KeyUsageStore::new(
+                paths::api_gateway_key_usage_file(),
             )),
             started_at: core_config::now_ms(),
             total_requests: Arc::new(AtomicU64::new(0)),
@@ -261,11 +449,58 @@ impl TraeGatewayState {
         self.config.read().await.clone()
     }
 
+    /// Max Mode 当前是否开启（**同步**，供 `/v1/models` 与出站注入使用）。
+    ///
+    /// 用 `try_read`：这两条路径都不是 async 上下文里的「配置主流程」，拿不到读锁时
+    /// 按**开启**处理（宁可多注入一次、也不要因为一次瞬时锁竞争静默把 1M 关掉）。
+    pub fn max_mode_now(&self) -> bool {
+        self.config
+            .try_read()
+            .map(|config| config.max_mode)
+            .unwrap_or(true)
+    }
+
+    /// 查询会话粘性绑定（已过期视为无绑定）。
+    ///
+    /// `key` 为 `None`（客户端未给会话 id）时返回 `None` —— 调用方据此**整段跳过**粘性。
+    pub async fn sticky_uid(&self, key: Option<&str>) -> Option<String> {
+        let key = key?;
+        self.sticky
+            .lock()
+            .await
+            .get(key, core_config::now_ms())
+            .map(str::to_string)
+    }
+
+    /// 绑定会话粘性（**只在上游成功之后**调用）。
+    ///
+    /// `key` 为 `None` 时什么都不做 —— 绝不退化成轮级键（那会造出一个永不命中的绑定，
+    /// 让「粘性会话数」看起来非 0 却毫无作用，见 [`crate::sticky::sticky_key`]）。
+    pub async fn bind_sticky(&self, key: Option<&str>, uid: &str) {
+        if let Some(key) = key {
+            self.sticky
+                .lock()
+                .await
+                .bind(key, uid, core_config::now_ms());
+        }
+    }
+
+    /// 解绑会话粘性（该账号失败之后调用）。
+    ///
+    /// 粘性是优化而非约束：账号一失败就必须解绑，否则下一轮会先撞同一个死号。
+    pub async fn unbind_sticky(&self, key: Option<&str>) {
+        if let Some(key) = key {
+            self.sticky.lock().await.unbind(key);
+        }
+    }
+
     /// 记一次请求（计数 + 日志 + 最近错误）。
     ///
     /// 日志条目字段名与 WorkBuddy 网关的 [`RequestMeta::to_value`] 对齐
-    /// （`ts` / `endpoint` / `method` / `account` / `model` / `status` / `latencyMs` /
-    /// `promptTokens` / `completionTokens` / `stream`），只是多了 `error` 与 `variant`。
+    /// （`ts` / `endpoint` / `method` / `account` / `accountUid` / `model` / `status` /
+    /// `latencyMs` / `promptTokens` / `completionTokens` / `stream`），只是多了 `error` 与
+    /// `variant`。Trae 侧 `account` 本就是 uid，故 `accountUid` 与它同值（与 WB 侧
+    /// 「`account`=展示名、`accountUid`=uid」的形状对齐，供 `token_daily` 统一精确归属）。
     /// 这样「Token 统计」页可以用同一套归一化逻辑聚合两侧日志，且能按变体过滤。
     ///
     /// [`RequestMeta::to_value`]: crate::logging::RequestMeta::to_value
@@ -280,8 +515,16 @@ impl TraeGatewayState {
         stream: bool,
         prompt_tokens: u64,
         completion_tokens: u64,
+        // ★ issue #154：命中上游前缀缓存的输入 token（`prompt_tokens` 的子集；
+        //   0 = 上游没报）。进日志后账本按账号 / 模型 / 密钥分桶。
+        cached_tokens: u64,
         error: Option<String>,
         variant: TraeVariant,
+        // ★ issue #76：调用方的 Key id（`None` = 无 Key 的调用 / 老条目）。
+        key_id: Option<&str>,
+        // ★ 归属台账（`"trae"` / `"unified"` / `None`）—— 统一网关转发来的请求
+        //   带的是网关的 Key，没有这个标签会与本产品线的 Key 混淆。
+        key_scope: Option<&'static str>,
     ) {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
         self.log.record(serde_json::json!({
@@ -289,16 +532,22 @@ impl TraeGatewayState {
             "endpoint": endpoint,
             "method": "POST",
             "account": uid,
+            "accountUid": uid,
             "model": model,
             "status": status,
             "latencyMs": latency_ms,
             "promptTokens": prompt_tokens,
             "completionTokens": completion_tokens,
+            "cachedTokens": cached_tokens,
             "stream": stream,
             "error": error,
             // 归属产品线：Token 统计页据此出「变体范围条」（筛选维度）。
             // 用 as_str() 的下划线形态，与 Key/查询参数口径一致（勿用派生 serde）。
             "variant": variant.as_str(),
+            // ★ issue #76：调用方 Key id。**无 Key 写 `null`**（键固定，前端只判一个条件）；
+            //   升级前写入的老条目确实没有这个键 ⇒ 前端两种都要容忍。
+            "keyId": key_id,
+            "keyScope": key_scope,
         }));
         if let Some(message) = error {
             *self.last_error.write().await = Some(message);
@@ -375,7 +624,8 @@ pub struct TraeGatewayStatusView {
     /// API Key 的脱敏展示（`sk-trae-abcd…`）。
     pub api_key_prefix: String,
     /// 账号池摘要。
-    pub pool: TraePoolSummary,
+    /// 池五态计数（形状与 WorkBuddy 侧 `GatewayStatusView::pools` 同源）。
+    pub pool: PoolSummary,
 }
 
 impl TraeGatewayStatusView {
@@ -393,7 +643,7 @@ impl TraeGatewayStatusView {
             total_requests: 0,
             last_error: None,
             api_key_prefix: String::new(),
-            pool: TraePoolSummary::default(),
+            pool: PoolSummary::default(),
         }
     }
 }
@@ -401,15 +651,30 @@ impl TraeGatewayStatusView {
 /// Key 脱敏：保留前缀与末 4 位，中间省略。
 ///
 /// 返回的字符串**不包含**可复原的完整 Key，因此可安全下发到前端。
+///
+/// ## ⚠️ 一律按**字符**切，不按字节（安全审计 P2-18）
+///
+/// 改造前这里是 `&trimmed[..12]` / `&trimmed[trimmed.len() - 4..]` —— **字节**切片。
+/// Trae 的 legacy Key 由用户从 `settings.json` 手填，未必是纯 ASCII，而字节切片
+/// 落在多字节字符中间会**直接 panic**（`byte index is not a char boundary`）。
+///
+/// 生产路径早已改用 `trae/apikey.rs` 的 `legacy_prefix` / `legacy_suffix`
+/// （它们就是按 `chars` 切的），所以这个函数只剩测试在用 —— 但「留着一个会 panic 的
+/// 脱敏函数」本身是陷阱：谁按 doc 拿它做展示就会炸。现在两者口径完全一致
+/// （`legacy_prefix` 取前 12 个字符、`legacy_suffix` 取末 4 个），
+/// 测试里那条「两段式与整串脱敏逐段一致」也因此对非 ASCII 也成立。
 pub fn mask_api_key(key: &str) -> String {
     let trimmed = key.trim();
     if trimmed.is_empty() {
         return String::new();
     }
-    if trimmed.len() <= 12 {
-        return format!("{}…", &trimmed[..trimmed.len().min(4)]);
+    let total = trimmed.chars().count();
+    if total <= 12 {
+        return format!("{}…", trimmed.chars().take(4).collect::<String>());
     }
-    format!("{}…{}", &trimmed[..12], &trimmed[trimmed.len() - 4..])
+    let head: String = trimmed.chars().take(12).collect();
+    let tail: String = trimmed.chars().skip(total - 4).collect();
+    format!("{head}…{tail}")
 }
 
 /// 当前 Unix 秒。
@@ -455,13 +720,11 @@ pub async fn status_view(
 
     let (summary, accounts, diagnose) = {
         let mut pools = state.pools.lock().await;
-        let pool = pools.entry(variant).or_insert_with(|| TraePool::for_variant(variant));
+        let pool = pools
+            .entry(variant)
+            .or_insert_with(|| TraePool::for_variant(variant));
         pool.sync_for(variant);
-        (
-            pool.summary(now),
-            pool.status_list(now),
-            pool.diagnose(now),
-        )
+        (pool.summary(now), pool.status_list(now), pool.diagnose(now))
     };
     view.pool = summary;
 
@@ -481,16 +744,22 @@ pub async fn status_view(
 
 /// 组装 Trae 网关路由（**不含 fallback**）。
 ///
-/// 挂载 `GET /health`、`GET /status`、`GET /v1/models`、`POST /v1/chat/completions`。
-/// 鉴权由 [`routes::bearer_auth`] 统一处理，`/health` 免鉴权。
+/// 挂载 `GET /health`（兼容 `/healthz`，见 [`crate::HEALTH_PATHS`]）、`GET /status`、
+/// `GET /v1/models`、`POST /v1/chat/completions`、`POST /v1/messages`、`POST /v1/responses`。
+/// 鉴权由 [`routes::bearer_auth`] 统一处理，健康检查免鉴权。
 pub fn router(state: TraeGatewayState) -> axum::Router {
     use axum::routing::{get, post};
     let body_limit = state.body_limit_bytes;
     axum::Router::new()
-        .route("/health", get(routes::health))
+        .merge(crate::health_routes(routes::health))
         .route("/status", get(routes::status))
         .route("/v1/models", get(routes::models))
         .route("/v1/chat/completions", post(routes::chat_completions))
+        // Anthropic 协议入口：与上面那条共用整条中继，只在协议层做双向转换。
+        .route("/v1/messages", post(routes::messages))
+        // Responses 协议入口：同样只换协议层（入站 Responses → chat、出站 chat SSE
+        // → Responses 事件流），中继与 `/v1/chat/completions` 是同一份。
+        .route("/v1/responses", post(routes::responses))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             routes::bearer_auth,
@@ -509,9 +778,9 @@ pub async fn spawn_listener(state: TraeGatewayState) -> anyhow::Result<GatewayHa
     let bind_addr = config.bind_addr.clone();
     let port = config.port;
 
-    let ip: IpAddr = bind_addr
-        .parse()
-        .map_err(|_| anyhow::anyhow!("Trae 网关监听地址无效：{bind_addr}（应为 IPv4/IPv6 字面量）"))?;
+    let ip: IpAddr = bind_addr.parse().map_err(|_| {
+        anyhow::anyhow!("Trae 网关监听地址无效：{bind_addr}（应为 IPv4/IPv6 字面量）")
+    })?;
 
     if !ip.is_loopback() && !config.allow_non_loopback {
         return Err(anyhow::anyhow!(
@@ -522,7 +791,9 @@ pub async fn spawn_listener(state: TraeGatewayState) -> anyhow::Result<GatewayHa
 
     let addr = SocketAddr::new(ip, port);
     let listener = TcpListener::bind(addr).await.map_err(|error| {
-        anyhow::anyhow!("无法监听 {addr}：端口可能被占用或不可用（{error}）。请在设置中改用其他端口。")
+        anyhow::anyhow!(
+            "无法监听 {addr}：端口可能被占用或不可用（{error}）。请在设置中改用其他端口。"
+        )
     })?;
     let local = listener.local_addr().unwrap_or(addr);
 
@@ -539,6 +810,59 @@ pub async fn spawn_listener(state: TraeGatewayState) -> anyhow::Result<GatewayHa
     Ok(GatewayHandle::new(local, tx, join))
 }
 
+// ---------------------------------------------------------------------------
+// 网关宿主泛化（P5 §2.4）—— Trae 产品线实现
+// ---------------------------------------------------------------------------
+
+/// Trae 网关产品线（[`crate::GatewayProduct`] 的 Trae 实现）。
+///
+/// **路径所有权**：`GET /health`、`GET /status`、`GET /v1/models`、
+/// `POST /v1/chat/completions`、`POST /v1/messages`（见 [`router`]）。
+///
+/// ⚠️ 与 [`crate::WbGateway`] 的 `/v1/models` / `/v1/chat/completions` **逐字重叠** ⇒
+/// 两者**各持一个 router、各自独立端口**（Trae 57894 / WorkBuddy 57891），**绝不 merge**
+/// （axum 同路径 merge 会 panic）。见 [`crate::GatewayProduct`]。
+pub struct TraeGateway;
+
+/// Trae 网关的进程内共享状态（惰性初始化，读一次配置）。
+static TRAE_SHARED_STATE: OnceLock<TraeGatewayState> = OnceLock::new();
+
+impl crate::GatewayProduct for TraeGateway {
+    type State = TraeGatewayState;
+
+    const OWNED_PATHS: &'static [&'static str] = &[
+        "/health",
+        "/healthz",
+        "/status",
+        "/v1/models",
+        "/v1/chat/completions",
+        "/v1/messages",
+    ];
+
+    fn shared_state() -> TraeGatewayState {
+        TRAE_SHARED_STATE
+            .get_or_init(|| TraeGatewayState::new(TraeGatewayConfig::load()))
+            .clone()
+    }
+
+    fn is_enabled(state: &TraeGatewayState) -> impl std::future::Future<Output = bool> + Send {
+        // 克隆一份（`TraeGatewayState` 是 Arc 句柄，克隆极廉价）使返回的 future 不借 `state`。
+        let state = state.clone();
+        async move { state.config_snapshot().await.enabled }
+    }
+
+    fn router(state: TraeGatewayState) -> axum::Router {
+        // `self::` 明确指向本模块的自由函数（与 trait 方法同名）。
+        self::router(state)
+    }
+
+    fn spawn_listener(
+        state: TraeGatewayState,
+    ) -> impl std::future::Future<Output = anyhow::Result<GatewayHandle>> + Send {
+        self::spawn_listener(state)
+    }
+}
+
 /// Trae 网关请求日志文件路径（供管理命令透出）。
 pub fn log_file() -> PathBuf {
     paths::api_gateway_log_file()
@@ -546,6 +870,46 @@ pub fn log_file() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    /// ★★ 护栏：默认模型**只在恰好等于历史值时**被迁移（其余值一律不动）。
+    ///
+    /// 反例（改坏会红）：
+    /// - 迁移条件写成 `contains` / `starts_with` ⇒ 用户手改的
+    ///   `deepseek-v4-flash-x` 会被悄悄改成别的模型；
+    /// - 干脆不迁移 ⇒ 老用户永远看到「默认 deepseek-v4-flash」这个客户端里
+    ///   早已不存在的名字（issue #4「内容滞后」的最后一处）。
+    #[test]
+    fn legacy_default_model_is_migrated_narrowly() {
+        assert_ne!(TRAE_DEFAULT_MODEL, LEGACY_DEFAULT_MODEL);
+        assert_eq!(
+            TraeGatewayConfig::default().default_model,
+            TRAE_DEFAULT_MODEL,
+            "默认配置必须直接用当前默认值"
+        );
+
+        let mut legacy = TraeGatewayConfig {
+            default_model: LEGACY_DEFAULT_MODEL.to_string(),
+            ..Default::default()
+        };
+        legacy.migrate_legacy_default_model();
+        assert_eq!(
+            legacy.default_model, TRAE_DEFAULT_MODEL,
+            "恰好等于旧值 ⇒ 迁移"
+        );
+
+        // 其余值（用户手改过的、或只差一个字符的）**一律不动**。
+        for keep in ["glm-5.3", "deepseek-v4-flash-x", "DeepSeek-V4-Flash", ""] {
+            let mut config = TraeGatewayConfig {
+                default_model: keep.to_string(),
+                ..Default::default()
+            };
+            config.migrate_legacy_default_model();
+            assert_eq!(
+                config.default_model, keep,
+                "只有恰好等于旧值才迁移：{keep:?}"
+            );
+        }
+    }
     use super::*;
     use std::collections::BTreeSet;
 
@@ -571,6 +935,11 @@ mod tests {
             "max_body_mb",
             "default_model",
             "max_rotate",
+            "preferred_uid",
+            "sticky_ttl_ms",
+            "capture_enabled",
+            "max_mode",
+            "auto_failover",
         ]
         .into_iter()
         .collect();
@@ -581,12 +950,30 @@ mod tests {
     fn config_defaults_are_loopback_and_off_by_default() {
         let config = TraeGatewayConfig::default();
         assert!(!config.enabled, "默认不得自动开始监听");
+        assert!(config.max_mode, "Max Mode 默认开启（逐模型按目录上限）");
         assert_eq!(config.bind_addr, "127.0.0.1");
         assert!(!config.allow_non_loopback);
         assert_eq!(config.port, TRAE_DEFAULT_API_PORT);
-        // 端口必须与 WorkBuddy 网关（57891）错开，否则同时启用会互相抢端口。
-        assert_ne!(config.port, 57891);
-        assert_eq!(config.base_url(), format!("http://127.0.0.1:{TRAE_DEFAULT_API_PORT}"));
+        // ★ 2026-10-17：四条网关统一落在 5789x 一段，本端口必须与**同段**既有端口全部错开，
+        //   否则同时启用会互相抢端口。
+        assert_eq!(config.port, 57894, "Trae 网关默认端口应为 57894");
+        for taken in [
+            57890u16, // 界面本体
+            57891,    // WorkBuddy 网关
+            57892,    // 统一网关
+            57893,    // 客户端会话监听 hook
+            crate::qoder::QODER_DEFAULT_API_PORT,
+            8899, // Trae 登录代理
+        ] {
+            assert_ne!(config.port, taken, "不得与既有端口 {taken} 撞车");
+        }
+        assert_eq!(
+            config.base_url(),
+            format!("http://127.0.0.1:{TRAE_DEFAULT_API_PORT}")
+        );
+        // 会话粘性默认 30 分钟，与 WorkBuddy 网关保持一致（同一管理面不该有两种默认）。
+        assert_eq!(config.sticky_ttl_ms, 30 * 60 * 1000);
+        assert!(config.preferred_uid.is_empty(), "默认不指定账号");
     }
 
     #[test]
@@ -616,6 +1003,24 @@ mod tests {
         assert_eq!(body_limit_bytes(2), 2 * 1024 * 1024);
     }
 
+    /// ★★ 安全审计 P2-18：脱敏函数**不得因多字节字符 panic**。
+    ///
+    /// 改造前按**字节**切片（`&trimmed[..12]`）⇒ 用户从 `settings.json` 手填的非 ASCII
+    /// legacy Key 会在这里 `byte index is not a char boundary` 崩掉。
+    /// 变异验证：改回字节切片 ⇒ 本用例 panic。
+    #[test]
+    fn api_key_mask_handles_multibyte_keys_without_panicking() {
+        // 13 个中文字符：第 12 个字节边界落在字符中间。
+        let key = "密钥密钥密钥密钥密钥密钥密";
+        let masked = mask_api_key(key);
+        // 前 12 个字符 + 省略号 + 末 4 个字符（13 字符的 Key）。
+        assert_eq!(masked, "密钥密钥密钥密钥密钥密钥…钥密钥密");
+        // 短串（≤ 12 字符）走另一条分支，同样不能 panic。
+        let short = mask_api_key("短密钥");
+        assert_eq!(short, "短密钥…", "不足 4 个字符时不能凭空补字");
+        assert_eq!(mask_api_key("一二三四五六"), "一二三四…");
+    }
+
     #[test]
     fn api_key_mask_never_leaks_the_middle() {
         let key = "sk-trae-0123456789abcdef0123456789abcdef";
@@ -635,7 +1040,9 @@ mod tests {
         let key = generate_api_key();
         assert!(key.starts_with("sk-trae-"));
         assert_eq!(key.len(), "sk-trae-".len() + 32);
-        assert!(key["sk-trae-".len()..].chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(key["sk-trae-".len()..]
+            .chars()
+            .all(|c| c.is_ascii_hexdigit()));
         assert_ne!(key, generate_api_key(), "每次生成必须不同");
     }
 

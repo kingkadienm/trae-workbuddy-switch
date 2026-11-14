@@ -1,0 +1,10 @@
+[package]
+name = "buddy-switch-vault"
+version = "2026.11.131828"
+edition = "2021"
+description = "SQLCipher 解密通道（仅本 crate 编 SQLCipher；其余 crate 继续用标准 SQLite，避免全仓换 feature）"
+
+[dependencies]
+# ★ 只有这里开 SQLCipher。core 的 `rusqlite` 仍是 `bundled`（标准 SQLite）——
+#   feature 是编译期开关，共用一个 crate 会让**所有** sqlite 使用点跟着重编 OpenSSL。
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }

@@ -175,7 +175,10 @@ mod tests {
 
         // 默认值必须与抓包固化常量逐字一致。
         let default = OAuthClientConfig::default();
-        assert_eq!(default.client_id, None, "全局覆盖必须缺省，否则会盖掉 SOLO 线");
+        assert_eq!(
+            default.client_id, None,
+            "全局覆盖必须缺省，否则会盖掉 SOLO 线"
+        );
         assert_eq!(default.client_secret, "-");
         assert_eq!(default.exchange_path, "/trae/api/v3/oauth/ExchangeToken");
     }

@@ -16,7 +16,6 @@ export const en = {
 
   // ---- Page: settings ----
   "wbSettings.page.title": "Settings",
-  "wbSettings.page.subtitle": "Auto check-in, permission check and gateway configuration. Appearance, launch at login and auto-update are app-level settings — see \"General\" at the bottom of the sidebar.",
 
   // ---- Auto check-in ----
   "wbSettings.checkin.groupTitle": "Auto check-in",
@@ -34,6 +33,11 @@ export const en = {
   "wbSettings.checkin.resultSuccess": "Checked in",
   "wbSettings.checkin.resultAlready": "Already checked in",
   "wbSettings.checkin.resultFailed": "Failed",
+  // Auto travel (real key: `enabled` in `auto_travel_config.json`).
+  "wbSettings.checkin.travelLabel": "Enable auto travel",
+  "wbSettings.checkin.travelDesc": "Gain extra credits through travel tasks",
+  "wbSettings.checkin.travelOn": "Auto travel enabled",
+  "wbSettings.checkin.travelOff": "Auto travel disabled",
 
   // ---- CodeBuddy CLI auto rotate ----
   "wbSettings.rotate.groupTitle": "CodeBuddy CLI auto rotate",
@@ -64,6 +68,37 @@ export const en = {
   "wbSettings.rotate.actionDisabled": "Disabled",
   "wbSettings.rotate.actionError": "Error",
 
+  // ---- Client detection (read-only; from real probe commands) ----
+  // P15 · external-agent session monitoring (installs hooks into the clients; off by default, reversible).
+  "wbSettings.agentWatch.title": "Session monitoring",
+  "wbSettings.agentWatch.enable": "Watch client sessions",
+  "wbSettings.agentWatch.enableDesc":
+    "Install hooks in the clients so their session status shows up in the companion window. This edits the client's settings.json (reversible), and is off by default.",
+  "wbSettings.agentWatch.slot.workbuddy-cn": "WorkBuddy (CN)",
+  "wbSettings.agentWatch.slot.workbuddy-global": "WorkBuddy (Global)",
+  // CLI clients (slots live under the home dir; see HOOK_FILE_SLOTS in client_settings).
+  "wbSettings.agentWatch.slot.claude": "Claude Code",
+  "wbSettings.agentWatch.slot.codebuddy": "CodeBuddy",
+  // Trae's **hooks file** (`~/.trae-cn/hooks.json` / `~/.trae/hooks.json`, split by region).
+  "wbSettings.agentWatch.slot.trae-hooks-cn": "Trae (CN)",
+  "wbSettings.agentWatch.slot.trae-hooks-global": "Trae (Global)",
+  "wbSettings.agentWatch.state.running": "Client is running — quit it first",
+  "wbSettings.agentWatch.state.installed": "{count} hooks installed",
+  "wbSettings.agentWatch.state.off": "Off",
+  "wbSettings.agentWatch.state.missing": "Client not found",
+  "wbSettings.client.detectTitle": "Client detection",
+  "wbSettings.client.detectWorkbuddy": "WorkBuddy Desktop",
+  "wbSettings.client.detectWorkbuddyDesc": "Detect install path and version",
+  "wbSettings.client.detectCli": "CodeBuddy CLI",
+  "wbSettings.client.detectCliDesc": "Availability of the CLI tool",
+  "wbSettings.client.detectCnIde": "CodeBuddy CN IDE",
+  "wbSettings.client.detectCnIdeDesc": "Connection status of the CN IDE",
+  "wbSettings.client.detected": "Detected",
+  "wbSettings.client.detectedVersion": "Detected · {version}",
+  "wbSettings.client.notDetected": "Not detected",
+  "wbSettings.client.configured": "Connected",
+  "wbSettings.client.notConfigured": "Not connected",
+
   // ---- Permission check ----
   "wbSettings.permission.groupTitle": "Permission check",
   "wbSettings.permission.authFileMissing": "Auth file path not available",
@@ -81,6 +116,29 @@ export const en = {
   "wbSettings.permission.guideStep3Drag": "into",
   "wbSettings.permission.guideStep3Post": " the Full Disk Access list (even without a prompt, dropping it takes effect), then turn on its toggle",
   "wbSettings.permission.guideStep4": "Come back to this page and click \"Check permission\", or just retry switching",
+
+  // ---- Danger zone (Q1) ----
+  // ⚠️ Deliberately **no** "reset device identity": that rewrites Trae client's own 6 layers.
+  //   WorkBuddy has no such structure, and this tool's gateway identity is a pure
+  //   sha256-derived value (not persisted ⇒ nothing to reset).
+  "wbSettings.danger.groupTitle": "Danger zone",
+  "wbSettings.danger.intro": "The actions below affect local data. Make sure you know the consequences first.",
+  "wbSettings.danger.diagLabel": "Export diagnostic bundle",
+  "wbSettings.danger.diagDesc":
+    "Bundles version, platform, which data sources are readable, and a gateway config summary — handy for reporting problems. Contains no credentials and no session content.",
+  "wbSettings.danger.diag": "Export diagnostic bundle",
+  "wbSettings.danger.exporting": "Exporting…",
+  "wbSettings.danger.diagSaved": "Diagnostic bundle saved: {name}",
+  "wbSettings.danger.diagFailed": "Failed to export diagnostic bundle",
+  "wbSettings.danger.logsLabel": "Clear gateway request logs",
+  "wbSettings.danger.logsDesc": "Deletes every gateway request record on this machine. Useful when troubleshooting the proxy. Cannot be undone.",
+  "wbSettings.danger.logsClear": "Clear logs",
+  "wbSettings.danger.logsCleared": "Gateway request logs cleared",
+  "wbSettings.danger.logsClearFailed": "Failed to clear gateway request logs",
+  "wbSettings.danger.logsConfirmTitle": "Clear gateway request logs?",
+  "wbSettings.danger.logsConfirmDesc":
+    "Every gateway request record on this machine will be deleted and cannot be recovered. Accounts, settings, and credentials are not affected.",
+  "wbSettings.danger.logsConfirmBtn": "Clear logs",
 
   // ---- Account switching ----
   "wbSettings.switch.groupTitle": "Account switching",
@@ -119,10 +177,12 @@ export const en = {
   "wbSettings.gateway.bodiesDesc": "Privacy risk; off by default, only metadata such as time / model / status code is logged",
   "wbSettings.gateway.invalidPort": "Port must be an integer between 1 and 65535",
   "wbSettings.gateway.invalidKeep": "Entries kept must be an integer between 0 and 10000",
+  "wbSettings.gateway.enabledLabel": "Enable local gateway",
+  "wbSettings.gateway.enabledDesc": "Serve OpenAI / Anthropic compatible endpoints on 127.0.0.1",
 
   // ---- Scheduled tasks ----
   "wbSettings.schedule.groupTitle": "Scheduled tasks",
-  "wbSettings.schedule.intro": "Each of the six tasks has its own toggle and hour table, and is triggered by the scheduler when due. Hours use 24-hour local time and multiple hour points can be set. Use \"Run now\" to verify right away without waiting for the next full hour.",
+  "wbSettings.schedule.intro": "Each of the six tasks has its own toggle and time list, and is triggered by the scheduler when due. Times use 24-hour local time and can be set to the minute (e.g. 09:37); multiple times are allowed, and each task can add jitter (±5/15/30 min) so the actual trigger shifts day to day. Use \"Run now\" to verify right away without waiting for the next trigger.",
   "wbSettings.schedule.task.checkin.label": "Check-in",
   "wbSettings.schedule.task.checkin.desc": "Check in all accounts automatically",
   "wbSettings.schedule.task.travel.label": "Auto travel",
@@ -135,26 +195,28 @@ export const en = {
   "wbSettings.schedule.task.school.desc": "Back-to-school event tasks",
   "wbSettings.schedule.task.cat.label": "Night owl",
   "wbSettings.schedule.task.cat.desc": "Night owl (cat claim) task",
-  "wbSettings.schedule.task.growth.label": "Growth tasks",
-  "wbSettings.schedule.task.growth.desc": "All-account growth task queue (CN only; default daily at 01:00)",
   "wbSettings.schedule.enableAria": "Enable {label}",
   "wbSettings.schedule.runNowBtn": "Run now",
   "wbSettings.schedule.activityCountLabel": "Activity report count",
   "wbSettings.schedule.activityCountDesc": "Conversations reported per account per day",
   "wbSettings.schedule.saveBtn": "Save schedule",
   "wbSettings.schedule.savedMsg": "Schedule saved",
-  "wbSettings.schedule.invalidHour": "\"{label}\" contains an invalid hour {hour}; hours must be integers between 0 and 23",
-  "wbSettings.schedule.emptyHours": "\"{label}\" is enabled — set at least one hour point, or disable the task",
+  "wbSettings.schedule.invalidTime": "\"{label}\" contains an invalid time {time}; times must be in HH:MM format (00:00–23:59)",
+  "wbSettings.schedule.emptyTimes": "\"{label}\" is enabled — set at least one time, or disable the task",
   "wbSettings.schedule.invalidReportCount": "Activity report count must be an integer greater than 0",
   "wbSettings.schedule.runDone": "\"{label}\" {summary}",
   "wbSettings.schedule.summaryExecuted": "executed",
   "wbSettings.schedule.summaryNoStreak": "reported {reported} entries (streak days unavailable)",
   "wbSettings.schedule.summaryStreak": "reported {reported} entries, current streak {streak} days",
-  "wbSettings.schedule.hourInvalid": "Hour must be an integer between 0 and 23",
-  "wbSettings.schedule.hourDuplicate": "Hour {hour} is already in the list",
-  "wbSettings.schedule.hourEmpty": "No hour points set",
-  "wbSettings.schedule.hourRemoveAria": "Remove hour {hour}",
-  "wbSettings.schedule.hourAdd": "Add",
+  "wbSettings.schedule.timeInvalid": "Time must be in HH:MM format (00:00–23:59)",
+  "wbSettings.schedule.timeDuplicate": "Time {time} is already in the list",
+  "wbSettings.schedule.timeEmpty": "No times set",
+  "wbSettings.schedule.timeRemoveAria": "Remove time {time}",
+  "wbSettings.schedule.timeAdd": "Add",
+  "wbSettings.schedule.jitterLabel": "Jitter",
+  "wbSettings.schedule.jitterAria": "Jitter range",
+  "wbSettings.schedule.jitterOff": "Off",
+  "wbSettings.schedule.jitterOption": "±{minutes} min",
 
   // ---- Update install dialog ----
   "wbSettings.update.timeoutError": "Checking for updates timed out; please check your network connection and try again",
@@ -175,25 +237,61 @@ export const en = {
   "wbSettings.update.connecting": "Connecting to the public releases update source…",
   "wbSettings.update.downloadingLabel": "Downloading update package",
   "wbSettings.update.downloading": "Downloading…",
-  "wbSettings.update.downloadUrlLabel": "Download URL (click to download manually)",
   "wbSettings.update.readyToRestart": "v{version} is ready and takes effect after the app restarts.",
   "wbSettings.update.unknownError": "Unknown update error",
-  "wbSettings.update.openRelease": "Open GitHub Releases",
   "wbSettings.update.retry": "Retry",
-  "wbSettings.update.closeNow": "Close now",
   "wbSettings.update.restarting": "Restarting…",
   "wbSettings.update.restartNow": "Restart now",
+
+  // ---- Pre-upgrade notes: show what changed before anything is installed ----
+  "wbSettings.update.titleAvailable": "New version v{version} available",
+  "wbSettings.update.descAvailable": "See what changed in this release before deciding to upgrade now.",
+  "wbSettings.update.metaCurrent": "Current v{version}",
+  "wbSettings.update.metaPublished": "Published {date}",
+  "wbSettings.update.startNow": "Upgrade now",
+  "wbSettings.update.later": "Later",
+  "wbSettings.update.breakingTitle": "Read before upgrading",
+  "wbSettings.update.breakingCount": "{count} change(s) affect existing behaviour",
+  "wbSettings.update.sectionsTitle": "What's new",
+  "wbSettings.update.sectionsMeta": "{groups} group(s) · {items} item(s)",
+  "wbSettings.update.olderShow": "{count} older version(s)",
+  "wbSettings.update.olderHide": "Collapse older versions",
+  "wbSettings.update.notesEmpty": "This release came without notes.",
+  "wbSettings.update.notesEmptyHint": "Open the full release notes for the commit list (offline or when the publisher provided none, this is what you get).",
+  "wbSettings.update.downloadingHint": "You will be asked to restart when the download finishes",
+  "wbSettings.update.downloadingBusy": "Downloading",
+  "wbSettings.update.restartLater": "Restart later",
+  "wbSettings.update.openDownloadPage": "Open download page",
+  "wbSettings.update.errorProxyHint": "If this machine needs a proxy, set it in App settings → Update proxy and retry; you can also open the download page and install manually.",
+  "wbSettings.update.viewFullNotes": "View full release notes",
 
   // ---- Donate dialog ----
   "wbSettings.donate.trigger": "Buy the author a drink",
   "wbSettings.donate.title": "Support Buddy Switch",
-  "wbSettings.donate.desc": "Buddy Switch is free and open source. If it helped you, you can scan the code to buy the author a drink.",
+  "wbSettings.donate.desc": "Buddy Switch is free and open source. If it helped you, you can buy the author a drink by scanning a code or via Afdian.",
   "wbSettings.donate.wechat": "WeChat Pay",
   "wbSettings.donate.alipay": "Alipay",
+  "wbSettings.donate.ifdianLead": "You can also support me via Afdian",
+  "wbSettings.donate.ifdianCta": "Open the Afdian page",
   "wbSettings.donate.qrAlt": "{name} QR code",
   "wbSettings.donate.repoHome": "Project home",
+  "wbSettings.donate.starLead": "Finding it useful? A star costs you nothing and keeps the project alive",
+  "wbSettings.donate.starCta": "Star on GitHub",
 
-  // ---- Two-Factor Authentication (TOTP) ----
+  // fork扩展词条：保留既有功能的双语文案。
+  "wbSettings.page.subtitle": "Auto check-in, permission check and gateway configuration. Appearance, launch at login and auto-update are app-level settings — see \"General\" at the bottom of the sidebar.",
+  "wbSettings.schedule.task.growth.label": "Growth tasks",
+  "wbSettings.schedule.task.growth.desc": "All-account growth task queue (CN only; default daily at 01:00)",
+  "wbSettings.schedule.invalidHour": "\"{label}\" contains an invalid hour {hour}; hours must be integers between 0 and 23",
+  "wbSettings.schedule.emptyHours": "\"{label}\" is enabled — set at least one hour point, or disable the task",
+  "wbSettings.schedule.hourInvalid": "Hour must be an integer between 0 and 23",
+  "wbSettings.schedule.hourDuplicate": "Hour {hour} is already in the list",
+  "wbSettings.schedule.hourEmpty": "No hour points set",
+  "wbSettings.schedule.hourRemoveAria": "Remove hour {hour}",
+  "wbSettings.schedule.hourAdd": "Add",
+  "wbSettings.update.downloadUrlLabel": "Download URL (click to download manually)",
+  "wbSettings.update.openRelease": "Open GitHub Releases",
+  "wbSettings.update.closeNow": "Close now",
   "wbSettings.totp.groupTitle": "Two-Factor Authentication",
   "wbSettings.totp.enableDesc": "When enabled, you will need to enter a Google Authenticator code to log in.",
   "wbSettings.totp.disableDesc": "When disabled, you will no longer need a verification code to log in.",
@@ -213,4 +311,4 @@ export const en = {
   "wbSettings.totp.addedNext": "Added, next step",
   "wbSettings.totp.secretLabel": "Secret",
   "wbSettings.totp.scanHint": "Open Google Authenticator, tap \"Scan QR code\" or \"Enter setup key\", then enter the verification code below.",
-} as const;
+};

@@ -97,9 +97,9 @@ const JOE_T: [u8; 64] = [
 ];
 const HOE_T: [u8; 64] = [
     246, 204, 26, 232, 232, 70, 129, 109, 223, 146, 169, 242, 23, 241, 105, 145, 50, 196, 165, 42,
-    254, 120, 3, 54, 244, 207, 209, 85, 53, 6, 138, 106, 175, 148, 31, 204, 186, 186, 165, 182,
-    87, 142, 49, 10, 39, 110, 26, 154, 86, 56, 173, 125, 18, 64, 198, 225, 99, 99, 83, 82, 191,
-    134, 76, 170,
+    254, 120, 3, 54, 244, 207, 209, 85, 53, 6, 138, 106, 175, 148, 31, 204, 186, 186, 165, 182, 87,
+    142, 49, 10, 39, 110, 26, 154, 86, 56, 173, 125, 18, 64, 198, 225, 99, 99, 83, 82, 191, 134,
+    76, 170,
 ];
 
 /// storage.json 里设备凭证键的前缀（键名内嵌 `<deviceId>`）。
@@ -156,6 +156,12 @@ impl TcMode {
 pub enum IcubeError {
     /// 该变体没有存在的 userData 目录（客户端没装或从未启动过）。
     DataDirMissing,
+    /// userData 目录存在，但里面**没有** `storage.json`（issue #136）。
+    ///
+    /// 与 [`IcubeError::StorageUnreadable`] 刻意分开：前者是「文件根本不存在」，
+    /// 后者是「文件在、读不出来（权限 / 被独占 / 内容坏）」。两者的下一步**完全不同** ——
+    /// 把前者说成后者会让用户去「关闭客户端后重试」，而他重试一百次也不会生成文件。
+    StorageMissing(String),
     /// `storage.json` 读不出或不是合法 JSON。
     StorageUnreadable(String),
     /// `storage.json` 里没有目标键。
@@ -182,6 +188,7 @@ impl IcubeError {
     pub fn kind(&self) -> &'static str {
         match self {
             IcubeError::DataDirMissing => "dataDirMissing",
+            IcubeError::StorageMissing(_) => "storageMissing",
             IcubeError::StorageUnreadable(_) => "storageUnreadable",
             IcubeError::KeyMissing => "keyMissing",
             IcubeError::DecryptFailed(_) => "decryptFailed",
@@ -212,6 +219,29 @@ impl IcubeError {
                 // 文案与判据全在 [`platform::data_dir_missing_reason`] 一处
                 // （它与「启动客户端」按钮同源），这里**不要**再自己拼一遍。
                 platform::data_dir_missing_reason(variant)
+            }
+            IcubeError::StorageMissing(path) => {
+                // ★ 文案必须给**能解决问题的动作**（issue #136 用户报障原文：
+                //   「反反复复试了多种情况，网页版登录、客户端登录，一直捕捉不到凭证」）。
+                //
+                //   旧文案把「文件不存在」也归进「无法读取…若客户端正在运行请关闭后重试」，
+                //   于是用户的每一次重试都打在同一件与故障无关的事情上。
+                //   这里改成三件事说清：① 目录在、文件没有；② 谁才会写出它；
+                //   ③ 若本机另一条产品线有凭据，直接点明「你可能停错了产品线」。
+                let mut text = format!(
+                    "【{line}】的数据目录里还没有 storage.json（{path}）—— \
+                     目录存在，但客户端从未把设备凭证写进去。\
+                     下一步：启动一次【{line}】客户端并完成登录，等它写完再点「重新发起登录」。"
+                );
+                if let Some(other) = platform::other_line_storage_hint(variant) {
+                    // 这条线索的价值在于：用户明明「登录过」，只是登在**另一条产品线**上。
+                    // 不说这句，他只会继续重启当前这条。
+                    text.push_str(&format!(
+                        "另外，本机在 {other} 里发现了一份 storage.json：\
+                         如果你平时用的是那条产品线，请在页面顶部切换到它再登录。"
+                    ));
+                }
+                text
             }
             IcubeError::StorageUnreadable(detail) => format!(
                 "【{line}】的 storage.json 无法读取（{detail}）；\
@@ -396,6 +426,35 @@ impl std::fmt::Debug for DeviceCredential {
     }
 }
 
+/// 同一台设备的**身份 + 凭证**（refresh 路径的完整输入）。
+///
+/// ## ★ 为什么必须成对取（2026-10-22 真机缺陷的结构性收口）
+///
+/// `ExchangeToken` 的请求体同时要两样东西：
+/// - `DeviceInfo.DevicePublicKey` / `DeviceInfo.MachineID` / `IDEVersion` ← **身份**；
+/// - `DeviceProof.Signature` ← **私钥**。
+///
+/// 两者**必须来自同一条 `icube-dc` 条目**：拿 A 设备的身份配 B 设备的私钥，
+/// 上游只会回 `20403 Device not match`。改造前 refresh 路径只取凭证、身份另外
+/// 从「当前活跃目录」猜，正是「两处各取一份」的旧形态（与 `ClientFacts` 修的是
+/// 同一类缺陷）⇒ 收进一个值后，类型层面不可能再配错。
+#[derive(Clone)]
+pub(crate) struct DeviceSecret {
+    /// 设备身份（公钥 / machineId / 版本）。
+    pub(crate) identity: DeviceIdentity,
+    /// 设备凭证（私钥）。
+    pub(crate) credential: DeviceCredential,
+}
+
+impl std::fmt::Debug for DeviceSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceSecret")
+            .field("identity", &self.identity)
+            .field("credential", &self.credential)
+            .finish()
+    }
+}
+
 /// `icube.cloudide` 键解出的用户级凭据。
 ///
 /// **本轮仅用于诊断 / 导入兜底，不承担登录职责**（架构 N-3）：
@@ -533,6 +592,33 @@ fn credential_from_plain(
     })
 }
 
+/// 明文 → [`DeviceSecret`]（身份 + 凭证，**同一条 `icube-dc` 条目**）。
+///
+/// 刻意调用既有的两个解析函数而不是合并成一份：它们各自有独立的失败语义
+/// （身份缺 `publicKeyPEM` ⇒ [`IcubeError::PublicKeyMissing`]；凭证缺
+/// `privateKeyPEM` ⇒ [`IcubeError::PrivateKeyMissing`]），合并会把这个区分抹掉。
+/// 代价只是把同一个小 JSON 解析两遍（refresh 每 12 小时才走一次）。
+fn secret_from_plain(
+    plain: &str,
+    variant: TraeVariant,
+    device_id: &str,
+    machine_id: &str,
+    app_version: &str,
+    source_app: &str,
+) -> Result<DeviceSecret, IcubeError> {
+    Ok(DeviceSecret {
+        identity: identity_from_plain(
+            plain,
+            variant,
+            device_id,
+            machine_id,
+            app_version,
+            source_app,
+        )?,
+        credential: credential_from_plain(plain, variant, device_id, source_app)?,
+    })
+}
+
 /// 明文 → [`CloudideAuthInfo`]。
 fn cloudide_from_plain(plain: &str, variant: TraeVariant) -> Result<CloudideAuthInfo, IcubeError> {
     let parsed = parse_plain(plain)?;
@@ -567,7 +653,9 @@ struct StorageSnapshot {
 /// 读侧（[`load_storage_from_dir`]）与**写前留档**（`profile::backup_storage_before_write`）
 /// 共用它 —— 两处各拼一次路径，迟早出现「读的是 A 文件、备份的是 B 文件」这种只在真机暴露的分叉。
 pub(crate) fn storage_path_in_dir(dir: &std::path::Path) -> std::path::PathBuf {
-    dir.join("User").join("globalStorage").join("storage.json")
+    // 唯一拼法在 `platform::storage_json_path`：三处（活跃度、存在性、读取）共用一份，
+    // 否则改一处就会让「目录算活跃」与「说它有登录态」指向不同的文件。
+    platform::storage_json_path(dir)
 }
 
 /// 读取**该变体**的 storage.json（目录由 [`platform::select_data_dir_for`] 限定）。
@@ -595,8 +683,13 @@ fn load_storage_from_dir(
         .unwrap_or_default()
         .to_string();
     let path = storage_path_in_dir(dir);
-    let raw = std::fs::read_to_string(&path)
-        .map_err(|e| IcubeError::StorageUnreadable(format!("{}: {e}", path.display())))?;
+    let raw = std::fs::read_to_string(&path).map_err(|e| match e.kind() {
+        // ★ 「文件不存在」与「读不出来」必须分开（issue #136）：
+        //   前者的下一步是「让客户端把它写出来」，后者才是「关掉占用它的进程」。
+        //   旧代码把两者都塞进 `StorageUnreadable`，文案因此恒定地劝用户去关客户端。
+        std::io::ErrorKind::NotFound => IcubeError::StorageMissing(path.display().to_string()),
+        _ => IcubeError::StorageUnreadable(format!("{}: {e}", path.display())),
+    })?;
     let value: Value = serde_json::from_str(&raw)
         .map_err(|e| IcubeError::StorageUnreadable(format!("{}: {e}", path.display())))?;
     let object = value
@@ -650,7 +743,7 @@ pub fn device_identity_for(variant: TraeVariant) -> Result<DeviceIdentity, Icube
 /// 调用方需要让「校验的对象」与「操作的对象」落在同一目录时，先自己定目录再走这里。
 ///
 /// 目录里有**多个** `icube-dc` 条目时取第一个（[`find_icube_dc_entry`] 的既有语义）；
-/// 要按 `deviceId` **精确取某一条**用 [`device_credential_by_device_id`]。
+/// 要按 `deviceId` **精确取某一条**用 [`device_secret_by_device_id`]。
 pub(crate) fn device_identity_from_dir(
     dir: &std::path::Path,
     variant: TraeVariant,
@@ -727,10 +820,10 @@ pub(crate) fn cloudide_auth_info_from_dir(
 /// - 所有候选目录里**一条 `icube-dc` 都没有** ⇒ [`IcubeError::DeviceIdentityMissing`]；
 /// - 有若干条、但**没有一条**绑定请求的 `deviceId` ⇒ [`IcubeError::DeviceIdentityMismatch`]
 ///   （载荷列出本机有的那些 id 的**脱敏**值，便于用户判断是不是换过设备）。
-pub(crate) fn device_credential_by_device_id(
+pub(crate) fn device_secret_by_device_id(
     variant: TraeVariant,
     device_id: &str,
-) -> Result<DeviceCredential, IcubeError> {
+) -> Result<DeviceSecret, IcubeError> {
     let mut others: Vec<String> = Vec::new();
     for dir in platform::data_dirs_by_activity_for(variant) {
         let Ok(snapshot) = load_storage_from_dir(&dir, variant) else {
@@ -749,18 +842,24 @@ pub(crate) fn device_credential_by_device_id(
                 continue;
             };
             let plain = tc_decrypt(b64, TcMode::Aes)?;
-            let credential =
-                credential_from_plain(&plain, variant, found_id, &snapshot.source_app)?;
+            let secret = secret_from_plain(
+                &plain,
+                variant,
+                found_id,
+                &snapshot.machine_id,
+                &snapshot.app_version,
+                &snapshot.source_app,
+            )?;
             // ★ 断言：解出的凭证必须确实绑定请求的 deviceId。不匹配**不得**返回 ——
             //   否则「绑定错了设备」会静默用错私钥（见函数文档）。
-            if credential.device_id != device_id {
+            if secret.credential.device_id != device_id {
                 return Err(IcubeError::DeviceIdentityMismatch(format!(
                     "请求 {}，条目绑定 {}",
                     store::mask(device_id),
-                    store::mask(&credential.device_id)
+                    store::mask(&secret.credential.device_id)
                 )));
             }
-            return Ok(credential);
+            return Ok(secret);
         }
     }
     if others.is_empty() {
@@ -776,6 +875,21 @@ pub(crate) fn device_credential_by_device_id(
                 .join(" / ")
         )))
     }
+}
+
+/// 按**变体**取设备身份 + 凭证（refresh 的回落入参：无绑定时用「当前目录那一条」）。
+pub(crate) fn device_secret_for(variant: TraeVariant) -> Result<DeviceSecret, IcubeError> {
+    let snapshot = load_storage(variant)?;
+    let (device_id, b64) = find_icube_dc_entry(&snapshot.object)?;
+    let plain = tc_decrypt(&b64, TcMode::Aes)?;
+    secret_from_plain(
+        &plain,
+        variant,
+        &device_id,
+        &snapshot.machine_id,
+        &snapshot.app_version,
+        &snapshot.source_app,
+    )
 }
 
 /// 该变体**哪个候选目录装着登录态**（凭据副本，供导入侧定位来源）。
@@ -930,7 +1044,20 @@ pub fn credential_status_for(variant: TraeVariant) -> Value {
 ///
 /// 因此这里用**测试专用密钥对**造一份合成信封。生产代码里没有「加密」这条路
 /// （写信封是客户端的事），故本模块整体 `#[cfg(test)]`。
+///
+/// ## 为什么非 Windows 上要 `allow(dead_code)`
+///
+/// 本模块的 fixture 只被 `#[cfg(windows)]` 用例消费（真机 `storage.json` 的布局、
+/// mtime 活跃度翻转都是 Windows 特有语义）。在 Linux / macOS 上那些用例被 cfg 掉，
+/// 于是这里的辅助函数与 `SelectionGrid` / `SelectionCell` 结构体**一个都不被引用**，
+/// `dead_code` 判真 —— 而 CI 的 `cargo test` 带 `-D warnings`，会把这种「平台裁剪
+/// 造成的假未使用」直接判成编译错误，让整个 test target 起不来。
+///
+/// 这是**测试脚手架**，不是产品代码：此处放行 `dead_code` 不会掩盖生产路径上的死代码
+/// （生产构建仍按 `-D warnings` 把关）。Windows 上不放行，因为那里它们确实被用到，
+/// 放行反而会掩盖真实的未使用项。
 #[cfg(test)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) mod test_support {
     use super::*;
 
@@ -961,8 +1088,8 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEc5xtFi4XpzYjFuYwN0sBaUzcnrds\n\
         let mut plain = Vec::with_capacity(SHA512_LEN + body.len());
         plain.extend_from_slice(tag);
         plain.extend_from_slice(body);
-        let cipher = Aes128CbcEnc::new((&key).into(), (&iv).into())
-            .encrypt_padded_vec_mut::<Pkcs7>(&plain);
+        let cipher =
+            Aes128CbcEnc::new((&key).into(), (&iv).into()).encrypt_padded_vec_mut::<Pkcs7>(&plain);
         let mut raw = Vec::with_capacity(HEADER_LEN + RANDOM_LEN + cipher.len());
         raw.extend_from_slice(&TC_HEADER);
         raw.extend_from_slice(&TEST_RANDOM);
@@ -996,9 +1123,8 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEc5xtFi4XpzYjFuYwN0sBaUzcnrds\n\
     /// `Cloud-IDE-JWT ` 前缀的裸 token，而落库必须补前缀 —— 这里复刻该形态，
     /// 使「补前缀」这条护栏有真实输入可测。
     pub(crate) fn bare_jwt(user_id: &str, exp: i64) -> String {
-        let b64 = |text: &str| {
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(text.as_bytes())
-        };
+        let b64 =
+            |text: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(text.as_bytes());
         format!(
             "{}.{}.{}",
             b64(r#"{"alg":"RS256","typ":"JWT"}"#),
@@ -1039,10 +1165,26 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEc5xtFi4XpzYjFuYwN0sBaUzcnrds\n\
         exp: i64,
     ) -> Vec<(String, String)> {
         let mut out = Vec::new();
-        for (variant_index, variant) in TraeVariant::all().into_iter().enumerate() {
+        // ★ 走 `all_known_specs()`（含退役）而不是 `TraeVariant::all()`（只有两个合并版）：
+        //   夹具的职责是「把**本机可能出现的全部候选目录**都铺出来」，
+        //   按变体粒度的用例仍会指名 `TraeWork` 等退役变体来验证「按变体限定」。
+        //
+        // ★★ 但**同一个目录名只能写一次**：收敛前后有变体共用候选名
+        //   （`TRAE SOLO` 既是 CN TraeWork 的次候选、又是国际 TraeWork 的主候选），
+        //   写两次会让同一目录出现两个 uid，「按目录名过滤」的用例数到 3 个、
+        //   且「活跃目录里的账号」取决于谁最后写 —— 两条用例都跟着假红。
+        //   uid 因此按**目录序号**分配，与变体序号解耦。
+        let mut written: Vec<&str> = Vec::new();
+        for spec in crate::modules::trae::variant::all_known_specs() {
+            let variant = spec.variant;
             let names = crate::modules::trae::platform::data_dir_names_for(variant);
-            for (index, name) in names.iter().enumerate() {
-                let user_id = format!("900000000000{:04}", variant_index * 10 + index);
+            for name in names.iter() {
+                if written.contains(name) {
+                    continue;
+                }
+                written.push(name);
+                let index = written.len() - 1;
+                let user_id = format!("900000000000{:04}", index);
                 let dir = base.join(name).join("User").join("globalStorage");
                 std::fs::create_dir_all(&dir).expect("fixture 目录应能创建");
                 let storage = serde_json::json!({
@@ -1051,7 +1193,7 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEc5xtFi4XpzYjFuYwN0sBaUzcnrds\n\
                 let file = dir.join("storage.json");
                 std::fs::write(&file, serde_json::to_vec_pretty(&storage).unwrap())
                     .expect("fixture storage.json 应能写入");
-                pin_activity(&file, names.len() - 1 - index);
+                pin_activity(&file, written.len() - 1 - index);
                 out.push((user_id, (*name).to_string()));
             }
         }
@@ -1189,8 +1331,8 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEc5xtFi4XpzYjFuYwN0sBaUzcnrds\n\
     /// `pub(crate)` 是给 `account.rs` 的「活跃目录**翻转**后绑定仍指向来源设备」用例用的：
     /// 那需要先铺好 fixture、再**事后**改活跃度，而网格构造器只在构造时钉一次。
     pub(crate) fn pin_activity(file: &std::path::Path, age_hours: usize) {
-        let pinned = std::time::SystemTime::now()
-            - std::time::Duration::from_secs(age_hours as u64 * 3_600);
+        let pinned =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(age_hours as u64 * 3_600);
         // 必须带 `write(true)`：Windows 上 `SetFileTime` 需要 `FILE_WRITE_ATTRIBUTES`，
         // 只读句柄会 `ERROR_ACCESS_DENIED`。
         std::fs::OpenOptions::new()
@@ -1210,7 +1352,7 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEc5xtFi4XpzYjFuYwN0sBaUzcnrds\n\
     ///
     /// 那个 helper 覆盖**全部变体**且**不钉活跃度** —— 候选目录的先后取决于**写入顺序**
     /// （后写的 mtime 更新、更活跃），而 Windows 时间粒度约 15.6ms，同刻度时会退回
-    /// 候选表原顺序。`device_credential_by_device_id` 的护栏要求「请求的 deviceId 落在
+    /// 候选表原顺序。`device_secret_by_device_id` 的护栏要求「请求的 deviceId 落在
     /// **非首个、且不活跃**的候选里」，靠写入顺序会**随机假绿**。
     ///
     /// 返回 `(deviceId, 目录名, 目录路径)`，按候选表顺序（不存在的格子不返回）。
@@ -1300,18 +1442,21 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEc5xtFi4XpzYjFuYwN0sBaUzcnrds\n\
     /// 目录结构：`<base>/<产品线目录>/User/globalStorage/storage.json`。
     pub(crate) fn write_synthetic_user_data(base: &std::path::Path) -> Vec<(String, String)> {
         let mut out = Vec::new();
-        for (variant_index, variant) in TraeVariant::all().into_iter().enumerate() {
-            for (index, name) in crate::modules::trae::platform::data_dir_names_for(variant)
-                .iter()
-                .enumerate()
-            {
+        // ★ 同上：夹具铺的是**全部已知候选目录**（含退役变体的），且**按目录名去重**
+        //   （共用候选名只写一次），见 `write_cloudide_only_user_data`。
+        let mut written: Vec<&str> = Vec::new();
+        for spec in crate::modules::trae::variant::all_known_specs() {
+            let variant = spec.variant;
+            for name in crate::modules::trae::platform::data_dir_names_for(variant) {
+                if written.contains(name) {
+                    continue;
+                }
+                written.push(name);
+                let index = written.len() - 1;
                 // 每个候选目录给**不同** deviceId：这样「按变体限定」若退化成
                 // 「跨变体扫第一个命中」，断言会立刻发现读错了目录。
-                let device_id = format!("22929298067{:06}", variant_index * 100 + index);
-                let dir = base
-                    .join(name)
-                    .join("User")
-                    .join("globalStorage");
+                let device_id = format!("22929298067{:06}", index);
+                let dir = base.join(name).join("User").join("globalStorage");
                 std::fs::create_dir_all(&dir).expect("fixture 目录应能创建");
                 let storage = serde_json::json!({
                     format!("{ICUBE_DC_PREFIX}{device_id}"): synthetic_device_envelope(),
@@ -1364,7 +1509,9 @@ mod tests {
         let error = tc_decrypt(&bad, TcMode::Aes).expect_err("magic 不匹配必须报错");
         assert_eq!(error.kind(), "decryptFailed");
         assert!(
-            error.user_message(TraeVariant::TraeWork).contains("Trae Work"),
+            error
+                .user_message(TraeVariant::TraeWork)
+                .contains("TraeWork CN"),
             "错误文案必须点明产品线"
         );
     }
@@ -1377,7 +1524,8 @@ mod tests {
     #[test]
     fn tc_decrypt_rejects_short_envelope() {
         // magic 正确但总长不足。
-        let short = base64::engine::general_purpose::STANDARD.encode([116u8, 99, 5, 16, 0, 0, 1, 2]);
+        let short =
+            base64::engine::general_purpose::STANDARD.encode([116u8, 99, 5, 16, 0, 0, 1, 2]);
         assert!(tc_decrypt(&short, TcMode::Aes).is_err());
     }
 
@@ -1394,7 +1542,9 @@ mod tests {
         let envelope = seal_envelope(body, &wrong_tag);
         let error = tc_decrypt(&envelope, TcMode::Aes).expect_err("摘要不匹配必须报错");
         assert!(
-            error.user_message(TraeVariant::TraeWork).contains("解密失败"),
+            error
+                .user_message(TraeVariant::TraeWork)
+                .contains("解密失败"),
             "文案应说明是解密环节: {error:?}"
         );
     }
@@ -1437,7 +1587,10 @@ mod tests {
         .expect("信封含 publicKeyPEM，必须解析成功");
 
         // 逐字直取：解析出来的 PEM 必须与信封里的原值（含真实换行）完全一致。
-        assert_eq!(identity.public_key_pem, TEST_PUBLIC_KEY_PEM, "公钥必须逐字直取");
+        assert_eq!(
+            identity.public_key_pem, TEST_PUBLIC_KEY_PEM,
+            "公钥必须逐字直取"
+        );
 
         // 直取的公钥必须是标准 EC P-256 SPKI（DER 头 + 总长 91B）。
         let body: String = identity
@@ -1460,19 +1613,19 @@ mod tests {
     #[test]
     fn device_identity_never_contains_private_key() {
         let plain = device_plain_with_both_keys();
-        let identity = identity_from_plain(
-            &plain,
-            TraeVariant::TraeWork,
-            "d",
-            "m",
-            "v",
-            "TRAE SOLO CN",
-        )
-        .unwrap();
+        let identity =
+            identity_from_plain(&plain, TraeVariant::TraeWork, "d", "m", "v", "TRAE SOLO CN")
+                .unwrap();
         let debug = format!("{identity:?}");
-        assert!(!debug.contains("PRIVATE"), "Debug 里出现了私钥标记: {debug}");
+        assert!(
+            !debug.contains("PRIVATE"),
+            "Debug 里出现了私钥标记: {debug}"
+        );
         assert!(!debug.contains("privateKeyPEM"));
-        assert!(!debug.contains("MIGHAgEAMBMGByqGSM49"), "Debug 里出现了私钥正文");
+        assert!(
+            !debug.contains("MIGHAgEAMBMGByqGSM49"),
+            "Debug 里出现了私钥正文"
+        );
         // 序列化同样不得含私钥（诊断视图按白名单构造）。
         let json = serde_json::to_string(&credential_status_value(
             &Ok(identity),
@@ -1490,7 +1643,10 @@ mod tests {
         let credential = test_credential();
         let debug = format!("{credential:?}");
         assert!(debug.contains("<redacted>"), "应打印占位符: {debug}");
-        assert!(!debug.contains("MIGHAgEAMBMGByqGSM49"), "私钥正文泄漏: {debug}");
+        assert!(
+            !debug.contains("MIGHAgEAMBMGByqGSM49"),
+            "私钥正文泄漏: {debug}"
+        );
         assert!(!debug.contains("BEGIN PRIVATE KEY"));
         // device_id / source_app 属于允许展示的诊断字段。
         assert!(debug.contains("2292929806738024"));
@@ -1528,15 +1684,18 @@ mod tests {
     /// 信封缺 `privateKeyPEM` ⇒ `PrivateKeyMissing`（refresh 路径专用）。
     #[test]
     fn credential_without_private_key_errors() {
-        let error = credential_from_plain(r#"{"publicKeyPEM":"x"}"#, TraeVariant::TraeWork, "d", "app")
-            .expect_err("缺私钥必须报错");
+        let error =
+            credential_from_plain(r#"{"publicKeyPEM":"x"}"#, TraeVariant::TraeWork, "d", "app")
+                .expect_err("缺私钥必须报错");
         assert_eq!(error, IcubeError::PrivateKeyMissing);
     }
 
     /// 明文不是 JSON ⇒ 结构化错误（不 panic）。
     #[test]
     fn non_json_plaintext_is_structured_error() {
-        assert!(identity_from_plain("not-json", TraeVariant::TraeWork, "d", "m", "v", "a").is_err());
+        assert!(
+            identity_from_plain("not-json", TraeVariant::TraeWork, "d", "m", "v", "a").is_err()
+        );
         assert!(cloudide_from_plain("not-json", TraeVariant::TraeWork).is_err());
     }
 
@@ -1550,12 +1709,19 @@ mod tests {
         let plain = device_plain_with_both_keys();
         let envelope = seal(plain.as_bytes());
         let mut object = Map::new();
-        object.insert(format!("{ICUBE_DC_PREFIX}2292929806738024"), json!(envelope));
+        object.insert(
+            format!("{ICUBE_DC_PREFIX}2292929806738024"),
+            json!(envelope),
+        );
         object.insert(CLOUDIDE_KEY.to_string(), json!(envelope));
 
         let before = TC_DECRYPT_CALLS.load(Ordering::SeqCst);
-        let from_dc = decrypt_storage_key(&object, &format!("{ICUBE_DC_PREFIX}2292929806738024"), TcMode::Aes)
-            .expect("icube-dc 键必须能解开");
+        let from_dc = decrypt_storage_key(
+            &object,
+            &format!("{ICUBE_DC_PREFIX}2292929806738024"),
+            TcMode::Aes,
+        )
+        .expect("icube-dc 键必须能解开");
         let from_cloudide =
             decrypt_storage_key(&object, CLOUDIDE_KEY, TcMode::Aes).expect("cloudide 键必须能解开");
         let after = TC_DECRYPT_CALLS.load(Ordering::SeqCst);
@@ -1572,10 +1738,7 @@ mod tests {
             decrypt_storage_key(&object, CLOUDIDE_KEY, TcMode::Aes),
             Err(IcubeError::KeyMissing)
         );
-        assert_eq!(
-            find_icube_dc_entry(&object),
-            Err(IcubeError::KeyMissing)
-        );
+        assert_eq!(find_icube_dc_entry(&object), Err(IcubeError::KeyMissing));
     }
 
     /// `find_icube_dc_entry` 必须从键名里取出 `<deviceId>`。
@@ -1603,11 +1766,16 @@ mod tests {
         .expect("签名不应失败");
 
         let signature = proof.get("Signature").and_then(|v| v.as_str()).unwrap();
-        let raw = base64::engine::general_purpose::STANDARD.decode(signature).unwrap();
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(signature)
+            .unwrap();
         assert_eq!(raw.len(), 64, "P1363 必须是 raw r‖s 64 字节");
 
         assert!(
-            proof.get("Timestamp").map(|v| v.is_i64() || v.is_u64()).unwrap_or(false),
+            proof
+                .get("Timestamp")
+                .map(|v| v.is_i64() || v.is_u64())
+                .unwrap_or(false),
             "Timestamp 必须是 JSON int（字符串会被服务端 schema 拒绝）: {proof}"
         );
         assert_eq!(
@@ -1615,7 +1783,12 @@ mod tests {
             Some(32)
         );
         // 字段名 PascalCase，逐字。
-        let keys: Vec<&str> = proof.as_object().unwrap().keys().map(String::as_str).collect();
+        let keys: Vec<&str> = proof
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         assert!(keys.contains(&"Signature"));
         assert!(keys.contains(&"Timestamp"));
         assert!(keys.contains(&"Nonce"));
@@ -1643,10 +1816,14 @@ mod tests {
     #[test]
     fn device_proof_error_never_leaks_private_key() {
         let mut credential = test_credential();
-        credential.private_key_pem = "-----BEGIN PRIVATE KEY-----\nnot-a-key\n-----END PRIVATE KEY-----".into();
+        credential.private_key_pem =
+            "-----BEGIN PRIVATE KEY-----\nnot-a-key\n-----END PRIVATE KEY-----".into();
         let error = device_proof(&credential, "/p", "cid", "rt", ProofSigFormat::P1363)
             .expect_err("非法 PEM 必须报错");
-        assert!(!error.contains("not-a-key"), "错误文案泄漏了私钥正文: {error}");
+        assert!(
+            !error.contains("not-a-key"),
+            "错误文案泄漏了私钥正文: {error}"
+        );
         assert!(!error.contains("BEGIN PRIVATE KEY"));
     }
 
@@ -1666,7 +1843,8 @@ mod tests {
             }),
             TraeVariant::TraeWork,
         );
-        let failed = credential_status_value(&Err(IcubeError::PrivateKeyMissing), TraeVariant::Trae);
+        let failed =
+            credential_status_value(&Err(IcubeError::PrivateKeyMissing), TraeVariant::Trae);
         for value in [&ok, &failed] {
             let text = serde_json::to_string(value).unwrap();
             let upper = text.to_ascii_uppercase();
@@ -1674,12 +1852,21 @@ mod tests {
             // `errorKind` 里的 `"privateKeyMissing"` 是**类型标签**、不是凭据，
             // 因此按「PRIVATE KEY」这个带空格的 PEM 标记判定，而不是按裸 `privateKey`。
             assert!(!upper.contains("PRIVATE KEY"), "{text}");
-            assert!(!upper.contains("PUBLIC KEY"), "诊断视图不展示 PEM 原文: {text}");
+            assert!(
+                !upper.contains("PUBLIC KEY"),
+                "诊断视图不展示 PEM 原文: {text}"
+            );
             assert!(!text.contains("MIGHAgEAMBMGByqGSM49"), "{text}");
         }
         assert_eq!(ok.get("available").and_then(|v| v.as_bool()), Some(true));
-        assert_eq!(ok.get("sourceApp").and_then(|v| v.as_str()), Some("TRAE SOLO CN"));
-        assert_eq!(failed.get("available").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(
+            ok.get("sourceApp").and_then(|v| v.as_str()),
+            Some("TRAE SOLO CN")
+        );
+        assert_eq!(
+            failed.get("available").and_then(|v| v.as_bool()),
+            Some(false)
+        );
         assert_eq!(
             failed.get("errorKind").and_then(|v| v.as_str()),
             Some("privateKeyMissing")
@@ -1691,7 +1878,7 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap_or_default();
         assert!(message.contains("Trae"), "{message}");
-        assert!(!message.contains("Trae Work"), "{message}");
+        assert!(!message.contains("TraeWork CN"), "{message}");
     }
 
     /// 每种错误都有稳定的 `kind()` 标签（前端与日志依赖它）。
@@ -1699,12 +1886,22 @@ mod tests {
     fn every_error_variant_has_a_stable_kind() {
         let cases = [
             (IcubeError::DataDirMissing, "dataDirMissing"),
-            (IcubeError::StorageUnreadable("x".into()), "storageUnreadable"),
+            (
+                IcubeError::StorageMissing("C:/x/storage.json".into()),
+                "storageMissing",
+            ),
+            (
+                IcubeError::StorageUnreadable("x".into()),
+                "storageUnreadable",
+            ),
             (IcubeError::KeyMissing, "keyMissing"),
             (IcubeError::DecryptFailed("x".into()), "decryptFailed"),
             (IcubeError::PublicKeyMissing, "publicKeyMissing"),
             (IcubeError::PrivateKeyMissing, "privateKeyMissing"),
-            (IcubeError::PrivateKeyInvalid("x".into()), "privateKeyInvalid"),
+            (
+                IcubeError::PrivateKeyInvalid("x".into()),
+                "privateKeyInvalid",
+            ),
             (IcubeError::DeviceIdentityMissing, "deviceIdentityMissing"),
             (
                 IcubeError::DeviceIdentityMismatch("请求 aaaa…bbbb，本机仅有 cccc…dddd".into()),
@@ -1715,7 +1912,7 @@ mod tests {
             assert_eq!(error.kind(), expected);
             // 每条文案都必须点明产品线，且不含凭据片段。
             let message = error.user_message(TraeVariant::TraeWork);
-            assert!(message.contains("Trae Work"), "{message}");
+            assert!(message.contains("TraeWork CN"), "{message}");
             assert!(!message.contains("BEGIN"), "{message}");
         }
     }
@@ -1727,7 +1924,9 @@ mod tests {
             let value = random_hex(len);
             assert_eq!(value.len(), len);
             assert!(
-                value.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                value
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
                 "{value}"
             );
         }
@@ -1744,7 +1943,8 @@ mod tests {
         let variant = TraeVariant::TraeWork;
         // 首位**不活跃**、次位**活跃** —— 断言必须落在「被喂进去的那个目录」上，
         // 而不是活跃目录。
-        let cells = write_device_entries_grid(&env.appdata(), variant, &[(true, false), (true, true)]);
+        let cells =
+            write_device_entries_grid(&env.appdata(), variant, &[(true, false), (true, true)]);
         let (device_id, name, dir) = &cells[1];
 
         let identity =
@@ -1764,19 +1964,26 @@ mod tests {
     /// 活跃度由 `write_device_entries_grid` 显式钉死，**不依赖写入顺序**。
     #[cfg(windows)]
     #[test]
-    fn device_credential_by_device_id_finds_the_entry_in_a_non_first_candidate() {
+    fn device_secret_by_device_id_finds_the_entry_in_a_non_first_candidate() {
         let env = TempEnv::empty();
         let variant = TraeVariant::TraeWork;
         let cells =
             write_device_entries_grid(&env.appdata(), variant, &[(true, true), (true, false)]);
         let (requested, name, _) = &cells[1];
 
-        let credential = device_credential_by_device_id(variant, requested)
+        let secret = device_secret_by_device_id(variant, requested)
             .expect("请求的 deviceId 在**不活跃**的次位候选里，必须能找到");
-        assert_eq!(credential.device_id, *requested);
-        assert_eq!(credential.source_app, *name);
+        // ★ 身份与私钥必须来自**同一条条目**：refresh 请求体要用公钥/机器标识，
+        //   拿另一台设备的公钥配这台设备的私钥 ⇒ 上游 20403。
+        assert_eq!(secret.identity.device_id, *requested);
+        assert_eq!(secret.credential.device_id, *requested);
+        assert_eq!(secret.credential.source_app, *name);
         assert!(
-            credential.private_key_pem.contains("BEGIN"),
+            !secret.identity.public_key_pem.is_empty(),
+            "DeviceInfo.DevicePublicKey 不能为空"
+        );
+        assert!(
+            secret.credential.private_key_pem.contains("BEGIN"),
             "refresh 路径拿到的必须是可用私钥"
         );
     }
@@ -1787,7 +1994,7 @@ mod tests {
     /// 同时断言错误文案**不含** deviceId 原文（模块头的脱敏红线）。
     #[cfg(windows)]
     #[test]
-    fn device_credential_by_device_id_refuses_a_mismatch() {
+    fn device_secret_by_device_id_refuses_a_mismatch() {
         let env = TempEnv::empty();
         let variant = TraeVariant::TraeWork;
         write_device_entries_grid(&env.appdata(), variant, &[(true, true), (true, true)]);
@@ -1795,7 +2002,7 @@ mod tests {
         // 用与真机同形（17 位）的长 id：`store::mask` 只对 >8 字符生效，
         // 短串会被**原样返回**，那样「脱敏」这条断言就失去意义了。
         let requested = "99998888777766665";
-        let error = device_credential_by_device_id(variant, requested)
+        let error = device_secret_by_device_id(variant, requested)
             .expect_err("本机没有这个 deviceId，必须报错而不是返回别的设备的凭证");
         assert_eq!(error.kind(), "deviceIdentityMismatch");
 
@@ -1816,7 +2023,7 @@ mod tests {
     /// 混为一谈会让用户拿不到正确的下一步（前者要重新登录，后者要重新导入）。
     #[cfg(windows)]
     #[test]
-    fn device_credential_by_device_id_reports_missing_when_no_entry_exists() {
+    fn device_secret_by_device_id_reports_missing_when_no_entry_exists() {
         let env = TempEnv::empty();
         let variant = TraeVariant::TraeWork;
         // 只有 cloudide 信封，没有任何 `icube-dc` 条目。
@@ -1827,9 +2034,95 @@ mod tests {
             chrono::Utc::now().timestamp() + 3600,
         );
 
-        let error = device_credential_by_device_id(variant, "99998888777766665")
+        let error = device_secret_by_device_id(variant, "99998888777766665")
             .expect_err("没有任何 icube-dc 条目时必须报缺失");
         assert_eq!(error.kind(), "deviceIdentityMissing");
+    }
+
+    /// ★ issue #136：目录在、`storage.json` 不在 —— 必须报 `storageMissing`，
+    /// 且文案要指向「让客户端把文件写出来」，**不得**再劝用户「关闭客户端后重试」。
+    ///
+    /// ## 为什么这条非钉不可
+    ///
+    /// 用户报障原文：「反反复复试了多种情况，网页版登录、客户端登录，一直捕捉不到凭证」。
+    /// 旧实现把 `NotFound` 也归进 `StorageUnreadable`，文案恒定地说
+    /// 「若客户端正在运行，请关闭后重试」—— 用户照做了十几轮，
+    /// 而那件事**与故障毫无关系**：文件根本没生成，关一百次客户端也不会出现。
+    #[cfg(windows)]
+    #[test]
+    fn storage_missing_is_not_reported_as_unreadable() {
+        let env = TempEnv::empty();
+        let variant = TraeVariant::TraeMerged;
+        // 只建目录：模拟「客户端启动过、写过 Cache / Local Storage，但从未写出设备凭证」。
+        for name in platform::data_dir_names_for(variant) {
+            std::fs::create_dir_all(env.appdata().join(name)).expect("空壳目录应能创建");
+        }
+        // 前置：确实是「目录在、文件不在」—— 否则本用例证明不了任何事。
+        assert!(
+            platform::data_dir_names_for(variant)
+                .iter()
+                .any(|name| env.appdata().join(name).is_dir()),
+            "前置：目录必须存在（否则走的是 DataDirMissing）"
+        );
+        assert!(
+            !platform::data_dir_names_for(variant)
+                .iter()
+                .any(|name| platform::storage_json_present(&env.appdata().join(name))),
+            "前置：候选目录里都不该有 storage.json"
+        );
+
+        let error = device_identity_for(variant).expect_err("没有 storage.json 必须报错");
+        assert_eq!(
+            error.kind(),
+            "storageMissing",
+            "「文件不存在」必须是独立类型，不能被归成 storageUnreadable"
+        );
+
+        let message = error.user_message(variant);
+        assert!(message.contains("还没有 storage.json"), "{message}");
+        assert!(
+            message.contains("启动一次"),
+            "文案必须给出能解决问题的动作：{message}"
+        );
+        assert!(
+            !message.contains("关闭后重试"),
+            "不得再劝用户关客户端 —— 文件没生成，关多少次都不会出现：{message}"
+        );
+    }
+
+    /// ★ issue #136：本变体目录缺 `storage.json`，但**另一条产品线**里有 ——
+    /// 文案必须点名那个目录，否则「我明明登录过」的用户只会继续重启当前这条线。
+    ///
+    /// 用已退役的 `TRAE SOLO CN` 当「另一条线」：卸载客户端**不会**删 userData，
+    /// 所以这种残留目录在真机上很常见，而它不在收敛后的跨变体候选表里 ——
+    /// 这正好钉住「必须用 `all_known_specs()` 扫，不能用 `data_dir_names()`」。
+    #[cfg(windows)]
+    #[test]
+    fn storage_missing_points_at_the_other_line_that_has_a_credential() {
+        let env = TempEnv::empty();
+        let variant = TraeVariant::TraeMerged;
+        for name in platform::data_dir_names_for(variant) {
+            std::fs::create_dir_all(env.appdata().join(name)).expect("空壳目录应能创建");
+        }
+        let other = env
+            .appdata()
+            .join("TRAE SOLO CN")
+            .join("User")
+            .join("globalStorage");
+        std::fs::create_dir_all(&other).expect("另一条线的目录应能创建");
+        std::fs::write(other.join("storage.json"), b"{}").expect("占位文件应能写入");
+
+        let hint =
+            platform::other_line_storage_hint(variant).expect("应发现另一条线里的 storage.json");
+        assert!(hint.contains("TRAE SOLO CN"), "{hint}");
+
+        let message = device_identity_for(variant)
+            .expect_err("本变体目录没有 storage.json，必须报错")
+            .user_message(variant);
+        assert!(
+            message.contains("TRAE SOLO CN"),
+            "文案应点名另一条线，用户才知道该切到哪：{message}"
+        );
     }
 
     /// ★【T13-2 核心】`login_state_dir_for` 必须返回**装着登录态**的那个候选目录，

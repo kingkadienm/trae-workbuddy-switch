@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
-import { ExternalLink } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 
+import { AuthLinkPanel } from "@/components/auth-link-panel";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import {
@@ -12,9 +12,11 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import * as api from "@/lib/api";
+import { closeAuthPage, openAuthPage } from "@/lib/auth-open";
 import { useT } from "@/lib/i18n";
 import type { AccountMeta, OAuthPollResult, Region } from "@/lib/types";
 import { useAccountsStore } from "@/stores/accounts";
+import { identityDisplayName } from "@/components/account-card";
 
 interface Props {
   open: boolean;
@@ -23,14 +25,20 @@ interface Props {
   region?: Region;
 }
 
-/** OAuth 扫码登录采集：发起 → 打开浏览器 → 轮询采集结果 → 入库。 */
+/** OAuth 扫码登录采集：发起 → 打开授权页（默认应用内）→ 轮询采集结果 → 入库。 */
 export function OAuthLoginDialog({ open, onOpenChange, region }: Props) {
   const t = useT();
   const reconcileAccounts = useAccountsStore((s) => s.reconcileAccounts);
+  /** 授权窗的命名键（仅用于 label / 诊断）：每次点「登录」都会开一个新窗口。 */
+  const authKey = `wb-${region ?? "cn"}`;
+  /** 本次授权窗的 label（关窗凭据）。★ 不能用 authKey 关窗 —— 它对应的是一类窗口，不是一个。 */
+  const authLabelRef = useRef<string | null>(null);
 
   const [busy, setBusy] = useState(false);
   const [loginId, setLoginId] = useState<string | null>(null);
   const [uri, setUri] = useState("");
+  /** 授权链接有效期（后端 `expiresIn`）—— 面板据此走倒计时。 */
+  const [expiresIn, setExpiresIn] = useState<number | null>(null);
   const [error, setError] = useState("");
   const [result, setResult] = useState<AccountMeta | null>(null);
   const [postTasks, setPostTasks] = useState<NonNullable<OAuthPollResult["result"]>["postTasks"]>(undefined);
@@ -41,10 +49,18 @@ export function OAuthLoginDialog({ open, onOpenChange, region }: Props) {
       setBusy(false);
       setLoginId(null);
       setUri("");
+      setExpiresIn(null);
       setError("");
       setResult(null);
       setPostTasks(undefined);
     }
+  }, [open]);
+
+  /* 用户关掉弹窗 = 放弃这次登录 ⇒ 把授权窗一起收掉，别留孤儿窗口。 */
+  useEffect(() => {
+    if (open) return;
+    void closeAuthPage(authLabelRef.current);
+    authLabelRef.current = null;
   }, [open]);
 
   // 轮询采集结果
@@ -57,6 +73,10 @@ export function OAuthLoginDialog({ open, onOpenChange, region }: Props) {
       try {
         const res = await api.oauthStatus(loginId, region);
         if (res.done) {
+          /* 令牌已经由后端轮询取回 ⇒ 授权窗的使命结束。
+             不关的话用户会以为「还在等」，而且它挡在主窗口前面。 */
+          void closeAuthPage(authLabelRef.current);
+          authLabelRef.current = null;
           if (res.result) {
             await reconcileAccounts(region);
             if (!cancelled) {
@@ -81,7 +101,7 @@ export function OAuthLoginDialog({ open, onOpenChange, region }: Props) {
       cancelled = true;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [loginId, reconcileAccounts, region]);
+  }, [authKey, loginId, reconcileAccounts, region]);
 
   async function start() {
     setBusy(true);
@@ -90,8 +110,18 @@ export function OAuthLoginDialog({ open, onOpenChange, region }: Props) {
       const res = await api.oauthStart(region);
       setLoginId(res.loginId);
       setUri(res.verificationUri);
-      // 按当前宿主能力打开验证页
-      await openInBrowser(res.verificationUri);
+      setExpiresIn(res.expiresIn ?? null);
+      /* 打开授权页是**尽力而为**：服务器 / 容器里没有 GUI，失败不能算登录失败 ——
+         面板里的链接与二维码才是完整路径（issue #62）。
+         桌面端默认走**应用内授权窗**（公共设置 `auth_in_app`），失败自动退回系统浏览器。
+         ★ 每次发起都开**新窗**：上一轮那个（如果还在）先关掉，避免两个授权页叠着。 */
+      void closeAuthPage(authLabelRef.current);
+      authLabelRef.current = null;
+      void openAuthPage(authKey, res.verificationUri)
+        .then((label) => {
+          authLabelRef.current = label;
+        })
+        .catch(() => {});
     } catch (e) {
       setError(api.asError(e));
     } finally {
@@ -118,57 +148,25 @@ export function OAuthLoginDialog({ open, onOpenChange, region }: Props) {
         )}
 
         {loginId && !result && (
-          <div className="space-y-3">
-            <Alert>
-              <ExternalLink className="size-4" />
-              <AlertDescription className="break-all">
-                <a
-                  href={uri}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="text-primary underline-offset-2 hover:underline"
-                  onClick={(e) => {
-                    // WebUI 直接使用浏览器默认链接行为，确保即使自动弹窗被拦截
-                    // 也能通过用户点击打开验证页。
-                    if (api.isWebui()) return;
-                    e.preventDefault();
-                    void openInBrowser(uri);
-                  }}
-                >
-                  {uri}
-                </a>
-              </AlertDescription>
-            </Alert>
-            <p className="text-sm text-muted-foreground">
-              {t("wbAccounts.dialog.oauthWaiting")}
+          /* 链接 + 二维码 + 倒计时：弹窗本身就是完整路径，不依赖「自动开浏览器」。 */
+          <AuthLinkPanel
+            url={uri}
+            expiresIn={expiresIn}
+            status={error ? "expired" : "waiting"}
+          >
+            <p className="text-[11px] leading-relaxed text-muted-foreground">
+              {t("shared.authPanel.noCallback")}
             </p>
-          </div>
+          </AuthLinkPanel>
         )}
 
         {result && (
-          <div className="space-y-2">
-            <Alert>
-              <AlertDescription>
-                {t("wbAccounts.dialog.oauthCollected", { name: result.nickname || result.email || result.id })}
-              </AlertDescription>
-            </Alert>
-            {postTasks && (
-              <div className="space-y-1 text-xs text-muted-foreground">
-                {postTasks.checkin && (
-                  <p>{`${t("wbAccounts.dialog.postTasksCheckin")}: ${postTasks.checkin}`}</p>
-                )}
-                {postTasks.register && (
-                  <p>{`${t("wbAccounts.dialog.postTasksRegister")}: ${postTasks.register}`}</p>
-                )}
-                {postTasks.trial && (
-                  <p>{`${t("wbAccounts.dialog.postTasksTrial")}: ${postTasks.trial}`}</p>
-                )}
-                {postTasks.credits && (
-                  <p>{`${t("wbAccounts.dialog.postTasksCredits")}: ${postTasks.credits}`}</p>
-                )}
-              </div>
-            )}
-          </div>
+          <Alert>
+            <AlertDescription>
+              {t("wbAccounts.dialog.oauthCollected", { name: identityDisplayName(result) || result.id })}
+              {postTasks && <div className="mt-2 space-y-1">{Object.entries(postTasks).map(([task, result]) => <p key={task}>{task}: {result}</p>)}</div>}
+            </AlertDescription>
+          </Alert>
         )}
 
         {error && (
@@ -188,21 +186,4 @@ export function OAuthLoginDialog({ open, onOpenChange, region }: Props) {
       </DialogContent>
     </Dialog>
   );
-}
-
-/** WebUI 使用浏览器新标签页，Tauri 使用系统 opener。 */
-async function openInBrowser(url: string): Promise<void> {
-  if (api.isWebui()) {
-    // 浏览器环境没有 Tauri 注入的 invoke；window.open 被拦截时由弹窗中的
-    // 原生链接作为兜底，因此这里不把拦截视为 OAuth 失败。
-    try {
-      window.open(url, "_blank", "noopener,noreferrer");
-    } catch {
-      // 忽略自动弹窗失败；弹窗中已展示的原生链接仍可点击。
-    }
-    return;
-  }
-
-  const { openUrl } = await import("@tauri-apps/plugin-opener");
-  return openUrl(url);
 }

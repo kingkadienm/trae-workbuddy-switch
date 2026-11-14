@@ -18,17 +18,19 @@
 
 use serde_json::{json, Value};
 
+use crate::modules::client_settings::variant_for_program;
+use crate::modules::config::RunFlagGuard;
 use crate::modules::trae::account::{self, Scope};
 use crate::modules::trae::checkin::{self, CheckinOptions};
 use crate::modules::trae::credits;
 use crate::modules::trae::paths;
 use crate::modules::trae::platform;
 use crate::modules::trae::profile::{self, SwitchOptions};
-use crate::modules::trae::region::TraeRegion;
+use crate::modules::trae::region::{TraeProgram, TraeRegion};
 use crate::modules::trae::settings;
 use crate::modules::trae::store;
 use crate::modules::trae::token_stats::TraeTokenScope;
-use crate::modules::trae::variant::TraeVariant;
+use crate::modules::trae::variant::{self, TraeVariant};
 
 /// 账号页需要的全部数据：账号视图 + 分组视图 + 概览计数（默认变体，兼容壳）。
 pub fn accounts_overview() -> Value {
@@ -232,6 +234,21 @@ pub fn update_account_for(
     Ok(json!({ "accounts": account::list_account_views_for(variant) }))
 }
 
+/// 设置账号备注（字段级更新；按变体分家）。
+///
+/// 与 [`update_account_for`] 分开：那条的 `name` 是「空串＝不动」，
+/// 而备注必须支持「清空」——两种语义挤在一个参数位上迟早静默错一边。
+/// 语义细节见 [`account::set_remark_for`]。
+pub fn set_remark_for(
+    variant: TraeVariant,
+    user_id: &str,
+    remark: Option<&str>,
+) -> Result<Value, String> {
+    account::set_remark_for(variant, user_id, remark)?;
+    // 与增删改同形：回全量账号视图，省掉前端再拉一次列表。
+    Ok(json!({ "accounts": account::list_account_views_for(variant) }))
+}
+
 /// 删除账号（默认变体，兼容壳）。
 pub fn delete_account(user_id: &str, delete_profile: bool) -> Result<Value, String> {
     delete_account_for(TraeVariant::default(), user_id, delete_profile)
@@ -334,11 +351,7 @@ pub fn group_op(action: &str, params: &Value) -> Result<Value, String> {
 ///
 /// **分组按变体分家**：`group_create` 的「同名分组已存在」判定只在变体内生效，
 /// 两条产品线可以有同名分组而互不冲突。
-pub fn group_op_for(
-    variant: TraeVariant,
-    action: &str,
-    params: &Value,
-) -> Result<Value, String> {
+pub fn group_op_for(variant: TraeVariant, action: &str, params: &Value) -> Result<Value, String> {
     let str_param = |key: &str| params.get(key).and_then(Value::as_str);
     match action {
         "create" => {
@@ -354,7 +367,10 @@ pub fn group_op_for(
                 id,
                 str_param("name").map(str::to_string),
                 str_param("color").map(str::to_string),
-                params.get("order").and_then(Value::as_i64).map(|v| v as i32),
+                params
+                    .get("order")
+                    .and_then(Value::as_i64)
+                    .map(|v| v as i32),
             )?;
             Ok(json!({ "groups": account::list_group_views_for(variant) }))
         }
@@ -375,26 +391,55 @@ pub fn group_op_for(
 
 /// 从请求参数里解析产品线变体（两条通道共用的唯一入口）。
 ///
-/// ## 为什么缺省 / 非法一律回落默认变体，而不是报错
-///
-/// `variant` 是本轮新加的**可选**参数：老前端的请求里根本没有这个键，
+/// 规则见 [`parse_variant_id`]（区域标识优先）。缺省 / 非法一律回落默认变体：
+/// `variant` 是本轮新加的**可选**参数，老前端的请求里根本没有这个键，
 /// 若把它做成必填或对未知值报错，用户升级后会立刻看到一片「参数非法」的红字，
-/// 而真正的问题只是「客户端还没跟上」。因此规则是**宽容的**：
-///
-/// - `trae_work` → [`TraeVariant::TraeWork`]（同时也是缺省）
-/// - `trae_cn` → [`TraeVariant::Trae`]
-/// - 其它任何值（含缺失、空串、拼错、旧前端的 `null`）→ 默认变体
+/// 而真正的问题只是「客户端还没跟上」。
 ///
 /// **默认变体沿用旧文件名**（存续层已如此设计），所以「回落默认」对老用户而言
 /// 语义就是「行为和升级前一模一样」——这是安全的失败方向。
-///
-/// 反过来若回落成 `Trae`，老用户的账号库会瞬间看起来空了。
 pub fn parse_variant_param(params: &Value) -> TraeVariant {
-    params
-        .get("variant")
-        .and_then(Value::as_str)
-        .and_then(TraeVariant::parse)
-        .unwrap_or_default()
+    parse_variant_id(params.get("variant").and_then(Value::as_str))
+}
+
+/// 解析**前端传入的变体标识**（wire 层唯一入口：`api.rs` 与 `commands.rs` 都走这里）。
+///
+/// ## ★ 区域标识必须落到本区域的**合并版**（曾经落到退役的 TraeWork，真实缺陷）
+///
+/// 前端只有一个轴：**区域**（`useTraeVariant` 只会产出 `cn` / `global`）。
+/// issue #28 收敛后每区域只剩一个程序位（合并版 `Trae` / `Trae CN`），
+/// 因此区域标识的正确落点由 [`variant_for_program`] 决定。
+///
+/// 改造前这里直接把字符串交给 [`TraeVariant::parse`]，而它把 `global` 认成
+/// **国际版 TraeWork**（`packageType = SOLO_I18N`，授权页产品线 `auth_from=solo`）：
+/// 授权 URL 因此带 `auth_from=solo&client_id=en1oxy7wnw8j9n&hide_saas_login=true`，
+/// 浏览器打开的是 **TraeWork 的授权页**。国际版 TraeWork 在部分地区被直接拦下
+/// （页面原文 `TraeWork is currently not available in your region`），
+/// 而用户要授权的**国际版 Trae**（`Trae.exe`，`TRAE_I18N` ⇒ `auth_from=trae`
+/// + `client_id=ono9krqynydwx5`）本来是可用的 —— 症状就是「授权页说产品不可用」。
+///
+/// 同一处还会顺带读错**设备身份来源**：`TraeWork` 的 userData 是 `TRAE SOLO`，
+/// `global` 登录会拿另一代客户端（甚至另一代客户端残留目录）的设备凭证去签名。
+///
+/// ## 只认区域标识，**不**放宽到 `TraeRegion::parse` 的全部别名
+///
+/// `TraeRegion::parse` 同时也认 `trae_work` / `trae_cn` / `trae` 这类**程序位**历史值
+/// （一律回 CN）。若拿它做前置判定，显式传 `trae_work` 的老调用点会被静默改指合并版
+/// —— 快照目录从 `profiles` 漂到 `profiles_trae_merged`。因此这里只列前端真会产出的
+/// 区域词（与 `useTraeVariant` 的取值逐字一致），其余仍交给 [`TraeVariant::parse`]。
+pub fn parse_variant_id(raw: Option<&str>) -> TraeVariant {
+    match raw
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("cn") | Some("china") | Some("domestic") => {
+            variant_for_program(TraeRegion::Cn, TraeProgram::Trae)
+        }
+        Some("global") | Some("intl") | Some("international") | Some("sg") => {
+            variant_for_program(TraeRegion::Global, TraeProgram::Trae)
+        }
+        other => other.and_then(TraeVariant::parse).unwrap_or_default(),
+    }
 }
 
 /// 签到网络失败重试次数的上限。
@@ -421,18 +466,18 @@ const MAX_CHECKIN_RETRY: u32 = 5;
 ///
 /// 回落读取设置文件（一次小 JSON 读），因此带 HOME 覆盖的测试需自行隔离目录。
 pub fn parse_checkin_options(params: &Value) -> Result<CheckinOptions, String> {
-    let scope_raw = params
-        .get("scope")
-        .and_then(Value::as_str)
-        .unwrap_or("all");
+    let scope_raw = params.get("scope").and_then(Value::as_str).unwrap_or("all");
     let scope = Scope::parse(scope_raw)?;
-    let user_ids = params.get("userIds").and_then(Value::as_array).map(|items| {
-        items
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::to_string)
-            .collect::<Vec<_>>()
-    });
+    let user_ids = params
+        .get("userIds")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        });
 
     // 只在真的需要回落时才读设置：三个参数都显式给了就完全不碰磁盘。
     let needs_settings = ["skipCheckedIn", "skipExpired", "retry"]
@@ -506,10 +551,103 @@ pub async fn refresh_jwt_for(variant: TraeVariant, user_id: &str) -> Result<Valu
     Ok(json!({
         "userId": user_id,
         "jwt": jwt_value,
-        "jwtExpTimestamp": info.exp_timestamp,
+        // ★ issue #181：同 `account::account_view` —— 出口统一毫秒，内部仍是秒。
+        "jwtExpTimestamp": info.exp_timestamp.map(|seconds| seconds * 1000),
         "jwtExpHours": info.exp_hours,
         "accounts": account::list_account_views_for(variant),
     }))
+}
+
+/// 自动续期一轮的运行标志：同一时刻只允许一轮。
+///
+/// 为什么要它：续期是**换 token** 的操作，而 `refresh_jwt_for` 会用**最新的** refresh_token
+/// 落盘（上游可能轮换）。两轮重叠 ⇒ 第二轮可能拿着已被轮换掉的旧 token 去 exchange ⇒
+/// 白失败一次、还可能把失败写进冷却。启动补跑与排程循环在时间上确实可能撞上。
+static JWT_REFRESH_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 自动续期一轮：把**即将到期**的 Trae 账号 JWT 用 `refresh_token` 换新。
+///
+/// ## 为什么需要这个函数（本轮修复的缺陷）
+///
+/// `refresh_jwt_for` 此前**只有手动入口**（账号卡片菜单的「刷新 JWT」）——
+/// 卡片上那枚「自动刷新 JWT」标记、以及添加账号对话框里「网页登录的账号可以自动续期」
+/// 这句承诺，**生产上没有任何代码去兑现**：账号只会停在原地，直到某次调用突然 401。
+/// 用户能观察到的就是「不会自动刷新，只能手动点」。
+///
+/// ## 口径（三条都别改）
+///
+/// - **遍历全部变体**（[`variant::all_specs`]，6 条 = 区域 × 程序位）：账号库**按变体分家**，
+///   只遍历国内两条会漏掉国际版与 TraeCode 的账号 —— 它们一样会过期，而漏掉的症状是
+///   「某些账号永远续不上」。
+/// - **只处理需要续期的账号**（[`account::needs_jwt_refresh`]，与卡片标记**同源**）：
+///   每次启动补跑都对全部账号发 exchange 是白打上游（多数账号离到期还有好几天）。
+/// - **逐账号失败不中断**：某个账号的 refresh_token 被吊销，不该让其余账号陪葬。
+pub async fn run_jwt_refresh_cycle() -> Value {
+    let Some(_guard) = RunFlagGuard::try_acquire(&JWT_REFRESH_RUNNING) else {
+        return json!({ "skipped": "already_running" });
+    };
+
+    let mut variants: Vec<Value> = Vec::new();
+    for spec in variant::all_specs() {
+        let target = spec.variant;
+        let accounts = account::load_accounts_for(target);
+        let mut results: Vec<Value> = Vec::new();
+        let (mut refreshed, mut skipped, mut failed) = (0usize, 0usize, 0usize);
+
+        for raw in &accounts.accounts {
+            let user_id = account::resolve_user_id(raw);
+            // uid 定不出来的记录**跳过**而不是报错：`refresh_jwt_for` 按 uid 定位账号，
+            // 没有 uid 就连写回都无从下手（这类脏记录由账号页自己提示重新登录）。
+            if user_id.is_empty() {
+                skipped += 1;
+                continue;
+            }
+            if !account::needs_jwt_refresh(raw) {
+                skipped += 1;
+                continue;
+            }
+            match account::refresh_jwt_for(target, &user_id).await {
+                Ok(_) => {
+                    refreshed += 1;
+                    results.push(json!({ "userId": user_id, "result": "refreshed" }));
+                }
+                Err(error) => {
+                    failed += 1;
+                    // ★ **失败必须落日志**（2026-10-22 修复）：本循环此前把失败只塞进
+                    //   返回值，而返回值在排程路径上被 `let _ =` 丢掉，`refresh_jwt_for`
+                    //   又只在成功时写日志 ⇒ 「自动续期连续失败 14 天」在日志里零痕迹，
+                    //   用户只能看到卡片上「凭据已过期」。失败与成功同等重要，都要留痕。
+                    //   文案截断：全变体错误串可达上千字符，日志行不该被一条错误撑爆。
+                    store::append_log(
+                        &paths::checkin_log_file_for(target),
+                        &format!(
+                            "JWT 自动刷新失败: user={user_id} 原因={}",
+                            truncate_for_log(&error, 400)
+                        ),
+                    );
+                    results.push(json!({ "userId": user_id, "result": "failed", "error": error }));
+                }
+            }
+        }
+
+        variants.push(json!({
+            "variant": target.as_str(),
+            "region": target.region().as_str(),
+            "total": accounts.accounts.len(),
+            "refreshed": refreshed,
+            "skipped": skipped,
+            "failed": failed,
+            "results": results,
+        }));
+    }
+
+    json!({ "variants": variants })
+}
+
+/// 截断长文本用于日志行（与 `credits::truncate` 同款；本模块只此一处需要）。
+fn truncate_for_log(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
 }
 
 /// 清除冷却：给了 `userId` 就清单个，否则全清（默认变体，兼容壳）。
@@ -518,10 +656,7 @@ pub fn clear_cooldown(user_id: Option<&str>) -> Result<Value, String> {
 }
 
 /// 清除冷却（按变体分家）：给了 `userId` 就清单个，否则清**该变体**全部。
-pub fn clear_cooldown_for(
-    variant: TraeVariant,
-    user_id: Option<&str>,
-) -> Result<Value, String> {
+pub fn clear_cooldown_for(variant: TraeVariant, user_id: Option<&str>) -> Result<Value, String> {
     match user_id.filter(|id| !id.is_empty()) {
         Some(user_id) => {
             credits::clear_cooldown_for(variant, user_id)?;
@@ -599,7 +734,10 @@ pub fn parse_switch_options(params: &Value) -> Result<SwitchOptions, String> {
     }
     Ok(SwitchOptions {
         user_id,
-        launch: params.get("launch").and_then(Value::as_bool).unwrap_or(true),
+        launch: params
+            .get("launch")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
         proxy_port: params
             .get("proxyPort")
             .and_then(Value::as_u64)
@@ -628,18 +766,29 @@ pub fn reset_device_for(variant: TraeVariant) -> Result<Value, String> {
 // 旧「产品线」账号库 → 区域账号库的一次性合并
 // ---------------------------------------------------------------------------
 
-/// 把旧产品线的账号库（`.trae_cn` 后缀）并入**国内版**区域账号库。
+/// 把旧产品线的账号库（`.trae_cn` 后缀）并入**国内版**区域账号库，
+/// 并把客户端合并（issue #20）遗留的登录态快照搬进合并版槽位。
 ///
-/// **幂等**：没有旧库、或已经并完时返回 `changed: false`，且不产生任何写入
-/// （见 [`super::region_migrate::merge_legacy_cn_into_region`]）。
-/// 因此前端在页面加载时无脑调一次是安全的。
+/// **幂等**：没有旧库 / 已经并完 / 没有可搬的快照时返回 `changed: false`，且不产生任何写入
+/// （见 [`super::region_migrate::merge_legacy_cn_into_region`] 与
+/// [`super::snapshot_migrate::carry_merged_snapshots`]）。因此前端在页面加载时无脑调一次是安全的。
 ///
 /// 为什么由**前端触发**而不是启动阶段自动跑：合并会改写用户的账号库。让用户在
 /// 能看到结果的地方触发、并在合并后收到一条明确提示，比在启动阶段静默改数据
 /// 更符合本工具「改写用户数据前先备份、并让用户知道」的既有约定
 /// —— 备份路径会随报告一起回传。
+///
+/// ⚠️ **快照搬运是尽力而为的**：它的失败只落在报告的 `snapshots.errors` 里，
+/// **不让整条命令失败** —— 账号库此刻已经并完并落盘了，此时报「失败」会让用户
+/// 以为什么都没发生（而那正是最需要他看到报告的时候）。
 pub fn merge_legacy_regions() -> Result<Value, String> {
-    super::region_migrate::merge_legacy_cn_into_region().map(|report| report.to_json())
+    let report = super::region_migrate::merge_legacy_cn_into_region()?;
+    let snapshots = super::snapshot_migrate::carry_merged_snapshots();
+    let mut value = report.to_json();
+    if let Some(object) = value.as_object_mut() {
+        object.insert("snapshots".to_string(), snapshots.to_json());
+    }
+    Ok(value)
 }
 
 // ---------------------------------------------------------------------------
@@ -695,6 +844,15 @@ pub fn oauth_login_status(login_id: &str) -> Value {
 }
 
 /// 取消 OAuth 登录（用户关掉了对话框），释放监听端口。
+/// 手工提交回调链接（远程部署，issue #62）。
+///
+/// 与监听回调走**同一套**解析 / CSRF / 兑换 / 落库（见
+/// [`crate::modules::trae::oauth::submit_callback`]），差别只是「回调从哪来」。
+/// 返回账号视图；失败直接把可读原因抛给调用方（前端要展示它，不能吞成 `{done:false}`）。
+pub async fn oauth_login_submit_callback(login_id: &str, url: &str) -> Result<Value, String> {
+    crate::modules::trae::oauth::submit_callback(login_id, url).await
+}
+
 pub fn oauth_login_cancel(login_id: &str) -> Value {
     let cancelled = crate::modules::trae::oauth::login_cancel(login_id);
     json!({ "cancelled": cancelled })
@@ -748,9 +906,14 @@ pub fn unsupported_note(capability: &str, label: &str, reason: &str) -> Value {
 ///
 /// ## 取哪个目录
 ///
-/// 走 [`crate::modules::trae::platform::select_data_dir_for`]（**读 / 展示侧**语义）：
+/// 走 [`resolve_open_dir`]（内部是 [`crate::modules::trae::platform::select_data_dir_for`]，
+/// **读 / 展示侧**语义）：
 /// 「该产品线最近被用过的那个 userData 目录」。找不到（该变体一个候选目录都不存在）时
 /// 返回**指向该变体**的错误，提示用户先启动一次对应客户端，而不是含糊的「未检测到」。
+///
+/// ⚠️ **测试不得调用本函数**：Windows 分支会真 `spawn explorer`，本机两个 TraeWork
+/// userData（`TRAE SOLO CN` / `TRAE SOLO`）都存在 ⇒ 每跑一次测试就在用户桌面弹一个
+/// 文件管理器窗口。要测定位与错误文案请用 [`resolve_open_dir`]（纯函数、零副作用）。
 pub fn open_data_dir(variant: TraeVariant) -> Result<Value, String> {
     if !cfg!(windows) {
         return Ok(crate::modules::trae::platform::Unsupported::new(
@@ -762,12 +925,7 @@ pub fn open_data_dir(variant: TraeVariant) -> Result<Value, String> {
         .to_json());
     }
 
-    let dir = crate::modules::trae::platform::select_data_dir_for(variant).ok_or_else(|| {
-        format!(
-            "未找到「{}」的 Trae 数据目录：请先启动一次该客户端，再打开目录。",
-            variant.display_name()
-        )
-    })?;
+    let dir = resolve_open_dir(variant)?;
 
     #[cfg(windows)]
     {
@@ -782,6 +940,27 @@ pub fn open_data_dir(variant: TraeVariant) -> Result<Value, String> {
         "path": dir.to_string_lossy(),
         "variant": variant.as_str(),
     }))
+}
+
+/// 定位「打开数据目录」要用的目录 —— **纯函数、零副作用**。
+///
+/// ## 为什么单独拆出来（2026-10-21 用户报障）
+///
+/// `open_data_dir` 的 Windows 分支会 `spawn explorer`，那是**真实副作用**：
+/// 本机 `%APPDATA%` 下 `TRAE SOLO` / `TRAE SOLO CN` 两个 userData 都真实存在
+/// （TraeWork 的候选表就含这两个名字），于是**每跑一次 `cargo test` 都会在用户
+/// 桌面上弹出一个「TRAE SOLO - 文件资源管理器」窗口**，看起来像「这个目录总是
+/// 莫名其妙被打开」。
+///
+/// 拆出本函数后，测试只调它（定位 + 错误文案），不触发 `explorer`；
+/// `open_data_dir` 仍是唯一「定位 + 打开」的实现，行为不变。
+pub fn resolve_open_dir(variant: TraeVariant) -> Result<std::path::PathBuf, String> {
+    platform::select_data_dir_for(variant).ok_or_else(|| {
+        format!(
+            "未找到「{}」的 Trae 数据目录：请先启动一次该客户端，再打开目录。",
+            variant.display_name()
+        )
+    })
 }
 
 /// 启动**指定变体**的 Trae 客户端。
@@ -867,8 +1046,10 @@ pub async fn run_checkin_report(options: CheckinOptions) -> Value {
 pub async fn run_scheduled_checkin() -> Value {
     let mut regions = Vec::new();
     for region in TraeRegion::all() {
-        // `TraeVariant::parse` 收口区域标识（`cn` 落到该区域的**主程序**）。
-        let variant = TraeVariant::parse(region.as_str()).unwrap_or_default();
+        // 区域标识必须走**同一个**解析器（[`parse_variant_id`]）：直接交给
+        // `TraeVariant::parse` 会落到退役的 `TraeWork` / `Global`，
+        // 与账号页（区域 ⇒ 合并版）就不是同一条产品线了。
+        let variant = parse_variant_id(Some(region.as_str()));
         let options = match parse_checkin_options(&json!({
             "variant": variant.as_str(),
             "scope": "all",
@@ -894,6 +1075,66 @@ pub async fn run_scheduled_checkin() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★★ 回归护栏：**区域标识**必须解析到本区域的**合并版**客户端。
+    ///
+    /// 2026-10-20 用户报障「国际版授权打开的是 TraeWork 的授权页，页面说该地区不可用」：
+    /// 根因就是这里把 `global` 交给了 `TraeVariant::parse`，它返回国际版 TraeWork
+    /// （`SOLO_I18N`）⇒ 授权 URL 走 `auth_from=solo`。区域标识的唯一正确落点是
+    /// 该区域**唯一**的程序位（issue #28），由 [`variant_for_program`] 决定。
+    #[test]
+    fn region_ids_resolve_to_the_regions_merged_client() {
+        assert_eq!(parse_variant_id(Some("cn")), TraeVariant::TraeMerged);
+        assert_eq!(
+            parse_variant_id(Some("global")),
+            TraeVariant::GlobalTraeMerged
+        );
+        // 大小写 / 空白容忍（前端会 `trim().toLowerCase()`，但手写参数不一定）。
+        assert_eq!(
+            parse_variant_id(Some(" GLOBAL ")),
+            TraeVariant::GlobalTraeMerged
+        );
+        assert_eq!(
+            parse_variant_id(Some("Intl")),
+            TraeVariant::GlobalTraeMerged
+        );
+        // 区域必须跟着走 —— 账号库按区域分家，解析错区域 = 账号凭空消失。
+        assert_eq!(
+            parse_variant_id(Some("global")).region(),
+            TraeRegion::Global
+        );
+        assert_eq!(parse_variant_id(Some("cn")).region(), TraeRegion::Cn);
+    }
+
+    /// 显式的**程序位**历史值**不许**被区域映射顺手改掉：它们的落盘槽位不同
+    /// （`profiles` vs `profiles_trae_merged`），改了指就会把快照写进另一代客户端目录。
+    #[test]
+    fn legacy_program_ids_keep_their_own_variant() {
+        assert_eq!(parse_variant_id(Some("trae_work")), TraeVariant::TraeWork);
+        assert_eq!(parse_variant_id(Some("trae_cn")), TraeVariant::Trae);
+        assert_eq!(
+            parse_variant_id(Some("global_trae_code")),
+            TraeVariant::GlobalTraeCode
+        );
+        assert_eq!(
+            parse_variant_id(Some("global_trae_merged")),
+            TraeVariant::GlobalTraeMerged
+        );
+        // 未知 / 空 / 缺省 ⇒ 默认变体（宽容回落，不 panic）。
+        assert_eq!(parse_variant_id(Some("trae_bogus")), TraeVariant::default());
+        assert_eq!(parse_variant_id(Some("")), TraeVariant::default());
+        assert_eq!(parse_variant_id(None), TraeVariant::default());
+    }
+
+    /// `parse_variant_param` 只是 [`parse_variant_id`] 的取值壳（从 JSON 里拿 `variant`）。
+    #[test]
+    fn parse_variant_param_reads_the_variant_key() {
+        assert_eq!(
+            parse_variant_param(&json!({ "variant": "global" })),
+            TraeVariant::GlobalTraeMerged
+        );
+        assert_eq!(parse_variant_param(&json!({})), TraeVariant::default());
+    }
 
     #[test]
     fn accounts_overview_has_stable_shape() {
@@ -954,7 +1195,10 @@ mod tests {
         let options = parse_checkin_options(&json!({})).unwrap();
         assert_eq!(options.scope, Scope::All);
         // 隔离目录里没有设置文件 → 落 `TraeSettings` 的默认值，与模块默认一致。
-        assert_eq!(options.skip_checked_in, settings::TraeSettings::default().checkin_skip_checked);
+        assert_eq!(
+            options.skip_checked_in,
+            settings::TraeSettings::default().checkin_skip_checked
+        );
         assert!(options.skip_expired);
         // 默认 retry 与 CheckinOptions::default 必须一致，否则两条通道行为不同
         assert_eq!(options.retry, CheckinOptions::default().retry);
@@ -1060,7 +1304,11 @@ mod tests {
         assert_eq!(options.scope, Scope::Selected(Vec::new()));
         assert_eq!(options.user_ids, Some(vec!["a".into(), "b".into()]));
         // 非字符串项必须被丢弃，而不是变成 "3"
-        assert!(!options.user_ids.as_ref().unwrap().contains(&"3".to_string()));
+        assert!(!options
+            .user_ids
+            .as_ref()
+            .unwrap()
+            .contains(&"3".to_string()));
         assert!(!options.skip_checked_in);
         // retry 必须被夹到上限，避免前端传入 1e9 造成无限重试
         assert_eq!(options.retry, 5);
@@ -1108,6 +1356,125 @@ mod tests {
             // 空库 ⇒ 一个账号都没处理，也不能因此报错。
             assert_eq!(report.get("total").and_then(Value::as_u64), Some(0));
         }
+    }
+
+    /// 造一个 `hours` 小时后到期的 Trae JWT。
+    fn jwt_expiring_in_hours(uid: &str, hours: i64) -> String {
+        use base64::Engine as _;
+        let payload = json!({
+            "data": { "id": uid },
+            "exp": chrono::Utc::now().timestamp() + hours * 3600,
+        });
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload).unwrap());
+        format!("Cloud-IDE-JWT header.{encoded}.signature")
+    }
+
+    /// 自动续期必须覆盖**全部 6 条变体**（区域 × 程序位），且每段形状可辨认。
+    ///
+    /// 可证伪性（**本轮缺陷的护栏**）：
+    /// - 只遍历国内两条（写成 `TraeVariant::all()`）⇒ 变体清单断言红
+    ///   —— 国际版与 TraeCode 的账号会**永远续不上**；
+    /// - 不回报 `variant` ⇒ 第二条断言红（排查「哪条库没续」时这是唯一线索）；
+    /// - 把结果拼成裸对象（丢掉 `refreshed` / `skipped` / `failed`）⇒ 第三条红。
+    ///
+    /// 本用例在**空账号库**下跑（`TempEnv` 隔离了 home）⇒ 一个账号都不处理、
+    /// 不发任何网络请求，因此它只验形状与遍历口径，不验续期语义
+    /// （窗口判据在 `account::tests::needs_jwt_refresh_is_the_single_predicate_*`）。
+    #[tokio::test]
+    async fn jwt_refresh_cycle_covers_every_variant_with_identifiable_shape() {
+        let _env = crate::modules::trae::test_support::TempEnv::with_device_fixture();
+
+        let value = run_jwt_refresh_cycle().await;
+        let variants = value
+            .get("variants")
+            .and_then(Value::as_array)
+            .expect("必须回报 variants 数组");
+
+        // 字面量钉死：顺序 = `all_specs()` 的顺序（收敛后 = 两个区域各一个合并版）。
+        // ★ issue #28：退役的四条变体不再被周期任务遍历 —— 它们没有对应客户端，
+        //   遍历它们等于对着一个已卸载的目录反复重试。
+        let labels: Vec<&str> = variants
+            .iter()
+            .filter_map(|item| item.get("variant").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["trae_merged", "global_trae_merged"],
+            "续期必须覆盖全部可选变体（漏掉国际版会让那些账号永远续不上）"
+        );
+        let regions: Vec<&str> = variants
+            .iter()
+            .filter_map(|item| item.get("region").and_then(Value::as_str))
+            .collect();
+        assert_eq!(regions, vec!["cn", "global"]);
+
+        for item in variants {
+            for key in ["total", "refreshed", "skipped", "failed", "results"] {
+                assert!(item.get(key).is_some(), "每段都要有 {key}: {item}");
+            }
+            // 空库 ⇒ 一个账号都没处理，也不能因此报错。
+            assert_eq!(item.get("total").and_then(Value::as_u64), Some(0));
+            assert_eq!(item.get("refreshed").and_then(Value::as_u64), Some(0));
+            assert_eq!(item.get("failed").and_then(Value::as_u64), Some(0));
+        }
+    }
+
+    /// ★ 自动续期**只碰需要续期的账号** —— 不需要的一律不发请求。
+    ///
+    /// 为什么这条非有不可：「每轮把全部账号都 exchange 一遍」在功能上看不出问题
+    /// （JWT 确实变新了），代价却是**白打上游 + 可能触发风控**，而且每轮都要
+    /// 走一次签名与写盘。判据只能靠「跳过的条数」观察。
+    ///
+    /// 可证伪性：删掉 `account::needs_jwt_refresh` 这道闸门 ⇒ 该账号会被交给
+    /// `refresh_jwt_for`，而它**没有 refresh_token** ⇒ 返回错误 ⇒ `failed` 变 1 ⇒ 红。
+    /// （刻意选「没有 refresh_token」的账号：它在发网络请求**之前**就返回错误，
+    /// 因此这条护栏不需要网络、也不会挂。）
+    #[tokio::test]
+    async fn jwt_refresh_cycle_skips_accounts_that_do_not_need_renewal() {
+        let _env = crate::modules::trae::test_support::TempEnv::with_device_fixture();
+
+        account::save_accounts_for(
+            TraeVariant::TraeMerged,
+            &account::AccountsFile {
+                accounts: vec![account::RawAccount {
+                    name: "far-from-expiry".into(),
+                    user_id: Some("uid-far".into()),
+                    // 100h 后到期 ⇒ 不在 24h 告警窗口内。
+                    jwt: jwt_expiring_in_hours("uid-far", 100),
+                    refresh_token: None,
+                    added_at: None,
+                    updated_at: None,
+                    remark: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .expect("写入账号库不应失败");
+
+        let value = run_jwt_refresh_cycle().await;
+        let segment = value
+            .get("variants")
+            .and_then(Value::as_array)
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item.get("variant").and_then(Value::as_str) == Some("trae_merged"))
+            })
+            .expect("必须有 trae_merged 段");
+
+        assert_eq!(segment.get("total").and_then(Value::as_u64), Some(1));
+        assert_eq!(
+            segment.get("skipped").and_then(Value::as_u64),
+            Some(1),
+            "不需要续期的账号必须计入 skipped"
+        );
+        assert_eq!(segment.get("refreshed").and_then(Value::as_u64), Some(0));
+        assert_eq!(
+            segment.get("failed").and_then(Value::as_u64),
+            Some(0),
+            "不该对不需要续期的账号发请求（闸门被删掉时这里会变成 1）"
+        );
     }
 
     #[test]
@@ -1163,10 +1530,11 @@ mod tests {
     fn unsupported_note_has_the_pinned_four_field_shape() {
         let value = unsupported_note("cache_metrics", "缓存命中率", "上游不回传 cache 字段");
         let object = value.as_object().expect("必须是对象");
-        let keys: std::collections::BTreeSet<&str> =
-            object.keys().map(String::as_str).collect();
+        let keys: std::collections::BTreeSet<&str> = object.keys().map(String::as_str).collect();
         let expected: std::collections::BTreeSet<&str> =
-            ["capability", "label", "supportedOn", "reason"].into_iter().collect();
+            ["capability", "label", "supportedOn", "reason"]
+                .into_iter()
+                .collect();
         assert_eq!(keys, expected, "字段名 / 数量漂移");
         assert_eq!(value["capability"], "cache_metrics");
         assert_eq!(value["label"], "缓存命中率");
@@ -1191,59 +1559,64 @@ mod tests {
             assert!(value.get(key).is_some(), "缺少字段 {key}");
         }
         assert!(value.get("variantCounts").unwrap().is_object());
-        assert!(value.get("variantCounts").unwrap().get("unlabeled").is_some());
+        assert!(value
+            .get("variantCounts")
+            .unwrap()
+            .get("unlabeled")
+            .is_some());
         assert!(value.get("modelDaily").unwrap().is_array());
         assert!(value.get("unsupported").unwrap().is_array());
     }
 
     /// `open_data_dir` 在非 Windows 上必须返回**结构化 Unsupported**（四个字段），
-    /// 而不是裸错误或假成功；Windows 上返回 `{ok,path,variant}`（路径可不存在但不得 panic）。
+    /// 而不是裸错误或假成功。
     ///
-    /// ## 为什么 Windows 分支容忍 Err（本用例曾经恒红）
+    /// ## ★ Windows 分支只测定位，绝不真打开（2026-10-21 用户报障）
     ///
-    /// 旧版无条件 `.expect("open_data_dir 不应 Err")`，于是**本机没装 Trae 时必然失败**，
-    /// 长期给整套 lib 测试挂一条假失败（真回归会被这条淹没）。而「该变体没有数据目录 ⇒ Err」
-    /// 其实是**正确行为**：
-    /// - `open_data_dir` 取 `select_data_dir_for(variant)`，后者是
-    ///   `data_dirs_by_activity_for(..).into_iter().next()`，而 `data_dirs_by_activity_for`
-    ///   里写着 `.filter(|dir| dir.is_dir())` —— **刻意只返回存在的目录**（与
-    ///   `detect_data_dir_for` 的「回落主候选名」相对，两者各有护栏用例）。
-    /// - 隔离用的 `HomeOverrideGuard` 改的是 `BUDDY_SWITCH_HOME`，**管不到** `data_dir_base()`
-    ///   （它读 `APPDATA`）⇒ 这个用例**根本没法**靠隔离 home 造出「有 Trae」的环境。
-    /// - 旧注释「隔离 home 下不一定真装了 Trae」本身就与无条件 `.expect` 自相矛盾。
+    /// `open_data_dir` 的 Windows 分支会 `spawn explorer`。本机 `%APPDATA%` 下
+    /// `TRAE SOLO` / `TRAE SOLO CN` 两个 userData 都真实存在（TraeWork 候选表就是
+    /// 这两个名字，按活跃度取首项 ⇒ 落到 `TRAE SOLO`），于是**旧用例每跑一次
+    /// `cargo test` 就在用户桌面弹一个「TRAE SOLO - 文件资源管理器」窗口** ——
+    /// 被当成「这个目录莫名其妙自己打开」。因此 Windows 分支改为只调纯函数
+    /// [`resolve_open_dir`]，不触发任何进程。
     ///
-    /// ⚠️ **刻意不去造一个假数据目录**：真拿到目录时 Windows 分支会 `spawn explorer`
-    /// ⇒ 每次跑测试都会在用户桌面上弹出文件管理器窗口。故这里只钉住「Err 必须可读且指名变体」。
+    /// ## 为什么隔离 home 造不出「没有 Trae」
+    ///
+    /// `HomeOverrideGuard` 改的是 `BUDDY_SWITCH_HOME`，**管不到** `data_dir_base()`
+    /// （它读 `APPDATA`）⇒ 本机永远能定位到真实目录。所以 Windows 分支只能二选一
+    /// 断言（Ok ⇒ 是已存在目录 / Err ⇒ 文案点名变体），不能假定走哪一支。
     #[test]
     fn open_data_dir_is_structured_unsupported_off_windows() {
-        let dir = std::env::temp_dir().join(format!("trae-opendir-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let _guard = crate::modules::config::HomeOverrideGuard::set(&dir);
-
-        let value = match open_data_dir(TraeVariant::TraeWork) {
-            Ok(value) => value,
-            Err(error) => {
-                // 「没找到数据目录」是**合法结果**（本机没装 Trae 时必然走到这里）。
-                // 但必须响亮、可读、且点名是哪个变体，不能是空串或 panic。
-                assert!(
-                    error.contains("未找到"),
-                    "Err 必须说明是「没找到数据目录」，实际: {error}"
-                );
-                assert!(
-                    error.contains(TraeVariant::TraeWork.display_name()),
-                    "Err 必须点名变体，实际: {error}"
-                );
-                return;
-            }
-        };
+        // ★ Windows 上**不许**调 `open_data_dir`：它真的会 `spawn explorer`。本机
+        //   `%APPDATA%` 下 `TRAE SOLO` 与 `TRAE SOLO CN` 两个 userData 都存在
+        //   （TraeWork 候选表正是这两个名字）⇒ 旧用例每跑一次 `cargo test` 就在用户
+        //   桌面弹一个「TRAE SOLO - 文件资源管理器」窗口。这里只测**纯函数**
+        //   `resolve_open_dir`：Ok ⇒ 必须是已存在目录；Err ⇒ 文案可读且点名变体。
         if cfg!(windows) {
-            // 真装了 Trae 才可能走到这里；能拿到 ok+path 就够（实际打开是宿主副作用）。
-            assert!(value.get("ok").is_some() || value.get("capability").is_some());
-        } else {
-            assert_eq!(value["capability"], "open_data_dir");
-            assert_eq!(value["supportedOn"], "Windows");
-            assert!(value.get("reason").is_some());
-            assert!(value.get("ok").is_none(), "非 Windows 不得返回假成功");
+            match resolve_open_dir(TraeVariant::TraeWork) {
+                Ok(dir) => assert!(
+                    dir.is_dir(),
+                    "定位结果必须是已存在的目录（select_data_dir_for 只返回存在的候选）: {}",
+                    dir.display()
+                ),
+                Err(error) => {
+                    assert!(
+                        error.contains("未找到"),
+                        "Err 必须说明是「没找到数据目录」，实际: {error}"
+                    );
+                    assert!(
+                        error.contains(TraeVariant::TraeWork.display_name()),
+                        "Err 必须点名变体，实际: {error}"
+                    );
+                }
+            }
+            return;
         }
+
+        let value = open_data_dir(TraeVariant::TraeWork).expect("非 Windows 走 Unsupported 分支");
+        assert_eq!(value["capability"], "open_data_dir");
+        assert_eq!(value["supportedOn"], "Windows");
+        assert!(value.get("reason").is_some());
+        assert!(value.get("ok").is_none(), "非 Windows 不得返回假成功");
     }
 }

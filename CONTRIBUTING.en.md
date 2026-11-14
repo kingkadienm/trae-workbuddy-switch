@@ -13,9 +13,15 @@
 | Report a problem | File a bug or a suggestion in [Issues](https://github.com/kingkadienm/trae-workbuddy-switch/issues). Include **steps to reproduce**, the **client version** and logs; strip tokens, account details and anything else sensitive before pasting |
 | Fix a bug | A client update changed a data structure or an endpoint and something stopped working — these fixes are the most valuable kind |
 | Support a new client version | Follow up on data-structure and endpoint changes in new client releases |
-| Docs and translation | Correct outdated descriptions in the README / `docs/`, improve the Chinese or English wording |
+| Docs and translation | Correct outdated descriptions in the README / `docs/`, improve the Chinese or English wording (layout map: [docs/README.md](docs/README.md)) |
 | UI and UX | Frontend interaction, accessibility, dark-mode details (see [Frontend components](#frontend-components-shadcn-first)) |
 | New features | Please open an Issue first to align on the direction, so you do not finish something only to find the approach disagrees |
+
+## Before you open an issue
+
+1. **Search first** — search by the symptom (error text, field name, UI copy). If a matching issue exists, **comment there** with your version and logs instead of opening a new one.
+2. **One issue, one problem** — bundling three unrelated problems into one issue usually means none of them gets fixed.
+3. **Duplicates get merged** — the earliest issue stays, the rest are closed and linked back (label `duplicate`); their content is copied into the surviving issue, so nothing is lost. If you believe the root cause differs, say so and we will reopen it.
 
 ## Before you open a PR
 
@@ -55,7 +61,7 @@ Decision order: reuse an existing component from `src/components/ui/` → compos
 
 Custom components must still reuse the project's theme tokens (`primary` / `ring` / `border` / `popover` / `muted` / `destructive` / `brand`) and the existing density, radius and accessibility conventions. Use components for menus, overlays, dialogs, selects and tooltips — do not substitute native shortcuts such as `details` / `summary`.
 
-The full rules live in [`.trellis/spec/guides/ui-component-guidelines.md`](.trellis/spec/guides/ui-component-guidelines.md).
+The full rules live in [`AGENTS.md` › UI Component Policy](AGENTS.md#ui-component-policy).
 
 ### Adding an API command: everything that must stay in sync
 
@@ -90,13 +96,13 @@ When cleaning up, mind the "smallest committable unit": if A uses a **newly adde
 - The frontend bundle is embedded into the server binary at **compile time** (`rust-embed`) ⇒ after changing the frontend you must rebuild the host, or the UI will not change
 - Stop any running `buddy-switch` before rebuilding, otherwise linking fails on Windows because the binary is locked
 - On Windows, `LNK1104` or `拒绝访问 (os error 5)` is usually a transient conflict between concurrent compile jobs: retry, or use `cargo build -j 1`. It is **not a code error**
-- Environment requirements, packaging and the release process: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)
+- Environment requirements, packaging and the release process: [docs/guides/DEVELOPMENT.md](docs/guides/DEVELOPMENT.md)
 
 ## A few hard requirements
 
 - **Never commit local data**: account stores, auth files, API keys, tokens and logs stay out of the repository. Re-read your diff before pushing and make sure no real credentials are in it
 - **Never commit code of unknown origin**: anything borrowed from another project must be credited, and its license must be compatible
-- **This project is licensed under the [PolyForm Noncommercial License 1.0.0](./LICENSE)**: by submitting a contribution you agree that it is distributed under the same license, and confirm you have the right to submit it. See [docs/LICENSING.md](docs/LICENSING.md)
+- **This project is licensed under the [PolyForm Noncommercial License 1.0.0](./LICENSE)**: by submitting a contribution you agree that it is distributed under the same license, and confirm you have the right to submit it. See [docs/policies/LICENSING.md](docs/policies/LICENSING.md)
 - Do not paste complete tokens or account credentials in an Issue or PR, not even your own
 
 ## Where to ask

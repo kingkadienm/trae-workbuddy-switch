@@ -21,7 +21,7 @@
 //      `exp` 未过期）⇒ 账号仍进队列，但上游必然拒绝；
 //   ③ 跑前清空 `account_cooldowns.json` —— 失败会写冷却，第二次跑就会被跳过。
 //
-// 跑法见 `docs/perf-audit-2026-09-24.md` 记录的三步（后端内嵌 dist + cdp-drive）。
+// 跑法见 `docs/history/perf-audit-2026-09-24.md` 记录的三步（后端内嵌 dist + cdp-drive）。
 
 const CHECKIN_ALL = `document.querySelector('button[aria-label="签到并刷新全部账号积分"]')`;
 
