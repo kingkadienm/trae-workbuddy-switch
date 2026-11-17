@@ -1061,8 +1061,6 @@ function Layout() {
             className={cn("flex min-h-0 flex-1 flex-col gap-[3px]", sidebarCollapsed && "items-center")}
             aria-label={t("product.navAria", { product: t(platformDescriptor(product).labelKey) })}
           >
-            {product === "workbuddy" && navRegion === "cn" && <NavLink to="/growth" className={navLinkClass({ isActive: location.pathname === "/growth", collapsed: sidebarCollapsed })} title={t("nav.growth")}><MessagesSquare className="size-4" />{sidebarCollapsed ? null : t("nav.growth")}</NavLink>}
-            <NavLink to="/doubao/accounts" className={navLinkClass({ isActive: location.pathname.startsWith("/doubao"), collapsed: sidebarCollapsed })} title={t("product.doubao")}><User className="size-4" />{sidebarCollapsed ? null : t("product.doubao")}</NavLink>
             {scopedNav.map((item) => (
               <SidebarNavItem key={item.to} item={item} collapsed={sidebarCollapsed} />
             ))}
