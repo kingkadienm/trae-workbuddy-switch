@@ -1,6 +1,6 @@
 {
   "name": "@kingkadienm/buddy-switch-darwin-arm64",
-  "version": "2026.11.141429",
+  "version": "2026.11.171425",
   "description": "Buddy Switch platform binary (darwin-arm64)",
   "os": [
     "darwin"

@@ -53,6 +53,8 @@ pub mod session_headers;
 pub mod state;
 pub mod sticky;
 pub mod timeutil;
+/// Video Gateway（P1）：提交 / 查询视频任务的最小闭环实现。
+pub mod video;
 /// Trae 的 OpenAI 兼容网关（**平行第二套实现**，与上面的 WorkBuddy 网关互不复用）。
 ///
 /// 独立模块而非 `GatewayState` 的一个分支：两者归属域、凭据形态、上游协议、
@@ -143,9 +145,12 @@ pub fn router(state: GatewayState) -> axum::Router {
     let mut router = axum::Router::new()
         .merge(health_routes(routes::health::handler))
         .route("/v1/models", get(routes::models::handler))
+        .route("/v1/video/models", get(routes::video::video_models))
         .route("/status", get(routes::status::handler))
         .route("/v1/chat/completions", post(routes::chat::handler))
         .route("/v1/messages", post(routes::messages::handler))
+        .route("/v1/videos", post(routes::video::submit_video_handler))
+        .route("/v1/videos/:id", get(routes::video::get_video_handler))
         // Responses API（issue #21）：与 chat/messages 共用同一条中继，只差协议层。
         .route("/v1/responses", post(routes::responses::handler))
         // P12 T03 · **业务请求转发**（本地路由）：白名单内的业务路径走 `relay` 的治理层

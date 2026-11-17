@@ -13,6 +13,11 @@ pub mod relay;
 pub mod responses;
 pub mod status;
 
+/// Video Gateway（P1）的编排与路由实现（见 [`crate::video`] 模块文档）。
+pub mod video {
+    pub use crate::video::routes::*;
+}
+
 use axum::body::Bytes;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};

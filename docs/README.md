@@ -27,6 +27,8 @@
 | 用 Docker 部署服务端 | [`guides/DOCKER.md`](guides/DOCKER.md) |
 | 服务器上没有客户端，怎么登录 / 能不能开网关 | [`specs/CLIENTLESS-AUTH-PLAN.md`](specs/CLIENTLESS-AUTH-PLAN.md) |
 | 把 Codex / Claude Code / 其它客户端接到网关 | [`guides/GATEWAY-CLIENT-INTEGRATION.md`](guides/GATEWAY-CLIENT-INTEGRATION.md) |
+| 用 WorkBuddy 生成视频 / 配置火宝 custom 视频服务 | [`guides/VIDEO-GATEWAY-INTEGRATION.md`](guides/VIDEO-GATEWAY-INTEGRATION.md) |
+| 修改视频网关的目录、参数、账号绑定或任务状态 | [`specs/VIDEO-GATEWAY-ARCH.md`](specs/VIDEO-GATEWAY-ARCH.md) |
 | 改网关（路由 / 换号 / 错误信封 / 命名空间） | [`specs/UNIFIED-GATEWAY-ARCH.md`](specs/UNIFIED-GATEWAY-ARCH.md) + [`specs/P11-ARCH.md`](specs/P11-ARCH.md) + [`specs/P12-ARCH.md`](specs/P12-ARCH.md) |
 | 账号在回复中途挂掉 / 想「静默换号」（issue #129） | [`specs/ACCOUNT-FAILOVER.md`](specs/ACCOUNT-FAILOVER.md)（对外错误形状契约 + 关闭态不变量 + 五条治理链路） |
 | 网关「必须开着代理才能用」/ 上游 TLS 被掐断 / 要不要走 `HTTPS_PROXY` | [`specs/GATEWAY-UPSTREAM-NETWORK.md`](specs/GATEWAY-UPSTREAM-NETWORK.md) |
@@ -42,7 +44,7 @@
 | 想知道某功能当初为什么这么做 | [`specs/DECISIONS.md`](specs/DECISIONS.md)（D1–D46） |
 | 加新交互（先原型、后代码） | [`prototype/`](prototype/) → `index.html` 可直接打开 |
 | 账号页「客户端限流」怎么和网关「限流探测」联动（同一份数据 + 两处入口） | [`prototype/limit-link-proto.html`](prototype/limit-link-proto.html)（可点设计稿，**已落地**）+ [`prototype/verify-limit-link.mjs`](prototype/verify-limit-link.mjs)（34 条行为校验）+ [`specs/MODEL-LIMIT-PROBE-PLAN.md`](specs/MODEL-LIMIT-PROBE-PLAN.md) §5.9（口径） |
-| 查这版改了什么 | [`releases/`](releases/)（最新：[`v2026.11.131448`](releases/v2026.11.131448.md)） |
+| 查这版改了什么 | [`releases/`](releases/)（最新：[`v2026.11.171425`](releases/v2026.11.171425.md)） |
 
 ---
 
@@ -61,6 +63,7 @@
 | [`P5-P12-TASKS.md`](specs/P5-P12-TASKS.md) | P5–P12 的执行级任务清单 | 现行 |
 | [`UPDATE-NOTES-ARCH.md`](specs/UPDATE-NOTES-ARCH.md) | 升级前说明弹窗（版本内容）：四阶段交互、数据契约、发布侧产出与切片口径 | 现行 · 2026-10-17 落地 |
 | [`GATEWAY-UPSTREAM-NETWORK.md`](specs/GATEWAY-UPSTREAM-NETWORK.md) | 网关**出站**网络：默认直连 vs 系统代理（`no_proxy` 纪律 + 兜底回落 + 排查手法） | 现行 · 2026-11-08 落地 |
+| [`VIDEO-GATEWAY-ARCH.md`](specs/VIDEO-GATEWAY-ARCH.md) | WorkBuddy 视频 P1：动态目录、模型能力校验、Key/区域与原账号绑定、进程内任务状态和边界 | 现行 · 2026-11-17 |
 | [`RISK-ACCOUNT-ISOLATION.md`](specs/RISK-ACCOUNT-ISOLATION.md) | 本地认证快照、共享出站客户端与风控状态的适用边界 | 现行 · 2026-11-13 |
 | [`RISK-CONTROLS-DESIGN.md`](specs/RISK-CONTROLS-DESIGN.md) | WorkBuddy / Trae / Qoder 网关合规风控设置设计（方案 A） | 现行 · 2026-11-13 落地 |
 | [`2026-11-13-three-platform-risk-controls.md`](superpowers/plans/2026-11-13-three-platform-risk-controls.md) | 三平台合规风控设置实施计划 | 已完成 · 2026-11-13 |

@@ -1,0 +1,51 @@
+{
+  "code": 0,
+  "msg": "ok",
+  "data": {
+    "models": [
+      {
+        "id": "non-video-text-model",
+        "videoGeneration": null
+      },
+      {
+        "id": "kling-video-v3",
+        "name": "Kling-Video-V3",
+        "tags": [
+          "text-to-video",
+          "image-to-video"
+        ],
+        "videoGeneration": {
+          "allowMixedReferenceMaterials": false,
+          "aspectRatios": [
+            "16:9",
+            "9:16",
+            "1:1"
+          ],
+          "audioMode": "switchable",
+          "defaultAspectRatio": "16:9",
+          "defaultEnableAudio": true,
+          "defaultResolution": "720P",
+          "defaultSeconds": 5,
+          "framesExclusiveWithReferenceMaterials": false,
+          "lastFrameRequiresFirstFrame": true,
+          "maxPromptLength": 2500,
+          "maxReferenceAudios": 0,
+          "maxReferenceImages": 0,
+          "maxReferenceMaterials": 0,
+          "maxReferenceVideos": 0,
+          "maxSeconds": 15,
+          "minSeconds": 3,
+          "referenceAudioRequiresVisualMaterial": false,
+          "resolutions": [
+            "720P",
+            "1080P",
+            "4K"
+          ],
+          "supportedSeconds": [],
+          "supportsFirstFrame": true,
+          "supportsFirstLastFrame": true
+        }
+      }
+    ]
+  }
+}

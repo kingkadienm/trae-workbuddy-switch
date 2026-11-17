@@ -444,6 +444,8 @@ pub struct GatewayState {
     pub body_limit_bytes: usize,
     /// AutoClaw 桥接客户端。
     pub autoclaw: AutoclawClient,
+    /// Video Gateway（P1）的进程内任务表：不落盘，重启即清空。
+    pub video_tasks: Arc<crate::video::store::VideoTaskStore>,
 }
 
 impl GatewayState {
@@ -535,7 +537,14 @@ impl GatewayState {
             last_error: Arc::new(RwLock::new(None)),
             body_limit_bytes: body_limit_bytes(config.max_body_mb),
             autoclaw,
+            video_tasks: Arc::new(crate::video::store::VideoTaskStore::default()),
         }
+    }
+
+    /// Video Gateway 出站的 UA（与 chat / 目录请求同一来源，按 region 解析）。
+    pub fn video_user_agent(region: buddy_switch_core::modules::region::Region) -> String {
+        let info = buddy_switch_core::modules::identity::resolve_app_version(region);
+        format!("WorkBuddyAI/{}", info.version)
     }
 
     /// 记下「最近一次请求失败」的可读原因（管理面 `last_error`）。

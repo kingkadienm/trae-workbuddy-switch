@@ -3,6 +3,8 @@
 > 适用版本：`Buddy Switch` 当前主线（网关 crate `buddy-switch-gateway`）。
 > 本文只写**能核实**的内容。凡是本仓没有证据、只能靠外部文档的，一律显式标注「以官方文档为准 / 未在本仓验证」，**不编造配置片段** —— 编错的配置比没有说明更糟：用户会以为网关坏了。
 
+WorkBuddy 视频 P1 的模型查询、任务提交/查询和火宝 `custom` 接入，见 [视频网关接入指南](VIDEO-GATEWAY-INTEGRATION.md)。视频接口仅挂在 WorkBuddy 网关，不代表 Trae、Qoder 或统一入口已支持视频。
+
 ---
 
 ## 0. 先分清两个方向，别搞混
