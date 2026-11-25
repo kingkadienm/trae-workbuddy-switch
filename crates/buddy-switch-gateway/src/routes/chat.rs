@@ -25,7 +25,7 @@ use crate::timeutil;
 ///
 /// 两个入口对前缀的语义**完全不同**，不能共用一套规则：
 /// - **产品线独立端口**：`cn:` / `global:` 是「跨域重路由」，由 `allow_model_region_prefix` 把关；
-/// - **统一网关**：来源已由**命名空间**（`wb-cn:`）决定，模型名里剩下的 `:` 属于模型本身
+/// - **统一网关**：来源已由**命名空间**（新格式 `wb-cn/`，兼容旧 `wb-cn:`）决定，模型名剩余部分原样透传
 ///   （如 `vendor:model`）⇒ **绝不能再解析一次**，否则会被二次改写。
 pub enum PrefixPolicy {
     /// 产品线入口：按既有开关处理 `cn:` / `global:`。
@@ -92,10 +92,21 @@ pub async fn chat_for_region(
     let started = Instant::now();
     let mut region = region;
 
-    let parsed = match parse_body(&body) {
+    let mut parsed = match parse_body(&body) {
         Ok(value) => value,
         Err(error) => return openai_error(error),
     };
+    // Resolve a content fallback against the original messages before trimming can
+    // remove the first user turn and make later requests look like another session.
+    let session_key = session_headers::session_key_or_content_identity(&parsed, &headers, &parsed);
+    let mut history_trimmed = false;
+    if let Some(messages) = parsed.get("messages").cloned() {
+        let trimmed = crate::protocol::responses::trim_chat_messages(&messages);
+        history_trimmed = trimmed != messages;
+        if let Some(object) = parsed.as_object_mut() {
+            object.insert("messages".into(), trimmed);
+        }
+    }
     let requested_model = parsed
         .get("model")
         .and_then(|value| value.as_str())
@@ -145,9 +156,16 @@ pub async fn chat_for_region(
         }
     }
 
-    let raw_source = String::from_utf8_lossy(&body);
+    // Keep the original bytes on the common path; only serialize after the shared
+    // history policy actually changed `messages`.
+    let raw_source = if history_trimmed {
+        serde_json::to_string(&parsed)
+            .unwrap_or_else(|_| String::from_utf8_lossy(&body).into_owned())
+    } else {
+        String::from_utf8_lossy(&body).into_owned()
+    };
     let raw = if model == requested_model {
-        raw_source.to_string()
+        raw_source
     } else {
         crate::model_route::rewrite_body_model(&raw_source, &model)
     };
@@ -155,7 +173,6 @@ pub async fn chat_for_region(
     // ★ issue #150：粘性键不能只认 body 的 `metadata.conversation_id` —— Claude Code
     //   发 `x-claude-code-session-id` 头、Codex 发 body `session_id`，都要认
     //   （见 `session_headers::session_key_of`）。出站 `X-Conversation-ID` 同样用它。
-    let session_key = session_headers::session_key_of(&parsed, &headers);
     let turn_key = session_headers::turn_key(&parsed);
     let inbound_request_id = header_of(&headers, "x-conversation-request-id");
     let trace_id = header_of(&headers, "x-trace-id");
@@ -225,7 +242,7 @@ pub async fn chat_for_region(
                     total_ms: elapsed,
                     prompt_tokens: 0,
                     completion_tokens: 0,
-                    cached_tokens: 0,
+                    cached_tokens: None,
                     credit: 0.0,
                     stream: true,
                     // ★ issue #129：流中途失败摘要（`None` = 正常结束 / 老条目）。
@@ -240,6 +257,8 @@ pub async fn chat_for_region(
             // 先取轨迹：下面的日志会把 `failure.uid` move 走，之后再借整条 `failure` 就晚了。
             let note = relay::fallback_summary_json(&failure);
             let http_status = failure.error.status();
+            let error =
+                crate::logging::request_failure_detail(&failure.upstream_message, &failure.error);
             let elapsed_ms = started.elapsed().as_millis() as i64;
             state.log.record(
                 RequestMeta {
@@ -257,11 +276,10 @@ pub async fn chat_for_region(
                     total_ms: elapsed_ms,
                     prompt_tokens: 0,
                     completion_tokens: 0,
-                    cached_tokens: 0,
+                    cached_tokens: None,
                     credit: 0.0,
                     stream: wants_stream,
-                    // ★ issue #129：流中途失败摘要（`None` = 正常结束 / 老条目）。
-                    error: None,
+                    error: Some(error),
                 }
                 .to_value(),
             );
@@ -315,7 +333,7 @@ pub async fn chat_for_region(
                         total_ms: 0,
                         prompt_tokens: 0,
                         completion_tokens: 0,
-                        cached_tokens: 0,
+                        cached_tokens: None,
                         credit: 0.0,
                         stream: true,
                         // ★ issue #129：流中途失败摘要（`None` = 正常结束 / 老条目）。
@@ -329,14 +347,29 @@ pub async fn chat_for_region(
                     // ★ issue #129：日志据此写真实状态码（不是恒 200）。
                     Some(failure.clone()),
                 );
+                let forwarded_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let upstream = relay::prefix_stream(prefix, response);
+                let stream = if region == Region::Cn {
+                    relay::stream_with_idle_timeout(
+                        upstream,
+                        relay::stream_idle_timeout(),
+                        forwarded_bytes.clone(),
+                    )
+                } else {
+                    use futures_util::StreamExt;
+                    upstream
+                        .map(|item| {
+                            item.map_err(|error| {
+                                std::io::Error::new(std::io::ErrorKind::Other, error.to_string())
+                            })
+                        })
+                        .boxed()
+                };
                 // 组合顺序：上游字节流 -> UsageTap (旁观原始字节 + 结束回报) -> ReasoningDelta
                 // (快照差分) -> SsePassthrough (补发 [DONE])
-                sse_response(
-                    SsePassthrough::new(crate::protocol::reasoning::ReasoningDelta::new(
-                        crate::protocol::usage_tap::UsageTap::new(
-                            relay::prefix_stream(prefix, response),
-                            sinks,
-                        )
+                use futures_util::StreamExt;
+                let output = SsePassthrough::new(crate::protocol::reasoning::ReasoningDelta::new(
+                    crate::protocol::usage_tap::UsageTap::new(stream, sinks)
                         // ★ 流内信封错误（P0-3 流式半边）：逐帧旁听，命中就记冷却 +
                         //   计模型闸门。**不改字节**，客户端看到的内容与改造前完全一致。
                         .with_error_sink(relay::envelope_error_sink(
@@ -348,10 +381,17 @@ pub async fn chat_for_region(
                         ))
                         // ★ issue #129：同一份嗅探结果也写进失败槽（出口/日志读它）。
                         .with_failure(Some(failure.clone())),
-                    ))
-                    // ★ issue #129：开关开启时，收尾先发可重试错误帧再补 [DONE]。
-                    .with_failover(Some(failure), &account, &model),
-                )
+                ))
+                // ★ issue #129：开关开启时，收尾先发可重试错误帧再补 [DONE]。
+                .with_failover(Some(failure), &account, &model);
+                let output = output.map(move |item| {
+                    if let Ok(chunk) = &item {
+                        forwarded_bytes
+                            .fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    item
+                });
+                sse_response(output)
             } else {
                 let text = relay::body_text_with_prefix(prefix, response).await;
                 // ★★ **200 信封错误**（P0-3）：上游常把限流/封禁/会话失效装在 2xx 响应体里
@@ -411,7 +451,10 @@ pub async fn chat_for_region(
                         total_ms: started.elapsed().as_millis() as i64,
                         prompt_tokens: accumulator.prompt_tokens.unwrap_or(0),
                         completion_tokens: accumulator.completion_tokens.unwrap_or(0),
-                        cached_tokens: 0,
+                        cached_tokens: accumulator
+                            .raw_usage
+                            .as_ref()
+                            .and_then(crate::protocol::usage_tap::cached_tokens_from_usage),
                         credit: accumulator.credit.unwrap_or(0.0),
                         stream: false,
                         // ★ issue #129：流中途失败摘要（`None` = 正常结束 / 老条目）。
@@ -428,6 +471,54 @@ pub async fn chat_for_region(
             }
             resp
         }
+    }
+}
+
+#[cfg(test)]
+mod session_identity_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 环境变量是进程级全局状态：用守卫保证用例结束后恢复原值。
+    struct EnvGuard(&'static str, Option<String>);
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(value) => std::env::set_var(self.0, value),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+
+    #[test]
+    fn content_identity_is_captured_before_history_trimming() {
+        let old = std::env::var(crate::protocol::responses::MAX_INPUT_HISTORY_BYTES_ENV).ok();
+        let _guard = EnvGuard(crate::protocol::responses::MAX_INPUT_HISTORY_BYTES_ENV, old);
+        // 用一个小预算把「首轮 user 会被裁掉」变成确定事实，避免依赖默认预算大小。
+        std::env::set_var(
+            crate::protocol::responses::MAX_INPUT_HISTORY_BYTES_ENV,
+            "4096",
+        );
+
+        let body = json!({
+            "messages": [
+                {"role": "developer", "content": "Project identity"},
+                {"role": "user", "content": "The first request"},
+                {"role": "assistant", "content": "First response"},
+                {"role": "user", "content": "large follow up ".repeat(2_000)}
+            ]
+        });
+        let headers = HeaderMap::new();
+        let captured = session_headers::session_key_or_content_identity(&body, &headers, &body);
+        let trimmed = crate::protocol::responses::trim_chat_messages(&body["messages"]);
+
+        assert_eq!(captured, session_headers::chat_content_identity(&body));
+        assert_ne!(
+            captured,
+            session_headers::chat_content_identity(&json!({"messages": trimmed})),
+            "the old first user turn is removed by the configured history budget"
+        );
     }
 }
 
@@ -479,7 +570,7 @@ async fn envelope_error_response(
             total_ms: elapsed_ms,
             prompt_tokens: 0,
             completion_tokens: 0,
-            cached_tokens: 0,
+            cached_tokens: None,
             credit: 0.0,
             stream: false,
             // ★ issue #129：流中途失败摘要（`None` = 正常结束 / 老条目）。

@@ -21,7 +21,7 @@ export const en = {
 
   "qoder.page.accounts.source.missing": "Not found",
   "qoder.page.accounts.source.unreadable": "Unreadable",
-  "qoder.page.accounts.source.empty": "No account inside",
+  "qoder.page.accounts.source.empty": "Installed · Not signed in",
   "qoder.page.accounts.source.ready": "Importable",
 
   "qoder.page.accounts.pat.title": "Paste a PAT",
@@ -170,6 +170,7 @@ export const en = {
   "qoder.page.usage.creditsView.partial": "{n} accounts failed (others shown as usual)",
   "qoder.page.usage.creditsView.reload": "Query again",
   "qoder.page.usage.trend": "Daily credits",
+  "qoder.page.usage.hourlyTrend": "Hourly credits today",
   "qoder.page.usage.empty.title": "No usage in this window",
   "qoder.page.usage.empty.description": "No request in the local client session records falls inside this window.",
   "qoder.page.usage.missing.title": "No client session records found",
@@ -208,6 +209,8 @@ export const en = {
   // Expiry badge (issue #166): warning = expiring soon (7-day window, same as WB / Trae).
   // Badge reports the **closest-expiring batch only**; per-batch absolute timestamps go in the tooltip.
   "qoder.page.accounts.metric.expiringChip": "Closest expiry in {days} days · {amount} credits",
+  /* Under an hour the badge speaks in minutes, so the last hour keeps moving. */
+  "qoder.page.accounts.metric.expiringChipMinutes": "Closest expiry in {minutes} min · {amount} credits",
   /* Within 48 hours the badge speaks in hours, so 25h and 47h stay distinguishable. */
   "qoder.page.accounts.metric.expiringChipHours": "Closest expiry in {hours} hrs · {amount} credits",
   "qoder.page.accounts.metric.expiringTipTitle": "Expiring batches ({n})",
@@ -329,11 +332,15 @@ export const en = {
   "qoder.page.settings.proxy.saving": "Saving…",
   "qoder.page.settings.proxy.saved": "Proxy settings saved",
   "qoder.page.settings.proxy.saveFailed": "Failed to save proxy settings",
-  "qoder.page.settings.section.client": "Client detection",
-  "qoder.page.settings.client.description": "Probe result for the two official credential stores (read-only).",
+  "qoder.page.settings.account.title": "Accounts and sign-in",
+  "qoder.page.settings.account.description":
+    "Importing, switching and program-slot sign-in are managed on the Accounts page; this is a direct entry, not a duplicate form.",
+  "qoder.page.settings.account.action": "Open accounts",
+  "qoder.page.settings.client.description": "Check local Qoder clients and their sign-in status.",
   "qoder.page.settings.client.error": "Probe failed: {error}",
   // ★ Scheduled tasks (Qoder has two; the schedule config is a single global file)
   "qoder.page.settings.schedule.checkinGroup": "Auto check-in",
+  "qoder.page.settings.section.client": "Client detection",
   "qoder.page.settings.schedule.checkinEnable": "Check in on schedule",
   "qoder.page.settings.schedule.checkinDesc":
     "Claims the campaign credit reward at the configured times (off by default — it acts on your behalf, so it must be opted in).",

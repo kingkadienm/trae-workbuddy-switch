@@ -105,6 +105,8 @@ enum Behavior {
     FailFirstTimes(Arc<AtomicUsize>),
     /// 一直 429（**轮换耗尽**验证）。
     Always429(Arc<AtomicUsize>),
+    /// 首次返回指定 HTTP 错误，之后正常；回放限流与排队的不同信封。
+    RejectOnce(StatusCode, &'static str, Arc<AtomicUsize>),
     /// HTTP 200 + **非信封错误帧**（issue #46 的真机形态：`event:error` + Jackson
     /// 堆栈 + `{"success":false,"msgCode":500}`）——验证「不再静默成空补全」。
     NonEnvelopeError,
@@ -172,6 +174,14 @@ async fn mock_chat(
             .body(Body::from(NON_ENVELOPE_ERROR_FRAMES))
             .expect("构造 mock 响应");
     }
+    if let Behavior::RejectOnce(status, detail, counter) = &behavior {
+        if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Response::builder()
+                .status(*status)
+                .body(Body::from(*detail))
+                .expect("构造 mock 响应");
+        }
+    }
     /* ★ 自动降级（issue #72）：第一次回 400（参数错），之后正常；并把解码后的
     请求体记下来 —— 断言「第二发确实是文本模式」需要看到**请求体**，不是响应。 */
     if let Behavior::RejectFirst(seen) = &behavior {
@@ -214,7 +224,10 @@ async fn mock_chat(
         Behavior::Always429(_) => true,
         Behavior::Normal | Behavior::NonEnvelopeError => false,
         // 已在上面单独处理（第一次回 400，之后放行 / 一直 400 / 只记录）。
-        Behavior::RejectFirst(_) | Behavior::Always400 | Behavior::Record(_) => false,
+        Behavior::RejectFirst(_)
+        | Behavior::Always400
+        | Behavior::Record(_)
+        | Behavior::RejectOnce(..) => false,
     };
     if should_fail {
         return Response::builder()
@@ -614,13 +627,13 @@ async fn orphan_tool_history_is_cleaned_before_reaching_upstream() {
     assert!(!body.contains("\"c9\""), "悬空结果必须清掉：{body}");
 }
 
-/// 上游现行单次POST契约：429原样返回，写回首号冷却，不自动转交另一个账号。
+/// 429 是终态：首个账号被限流后必须直接失败，不得由第二个账号接力。
 #[tokio::test]
-async fn chat_returns_single_429_without_replaying_on_another_account() {
+async fn chat_does_not_rotate_on_429() {
     let _guard = guard();
     let counter = Arc::new(AtomicUsize::new(0));
     let (state, key) = gateway_for(
-        "rotate",
+        "rate-limit",
         &[("q1", "dt-1"), ("q2", "dt-2")],
         Behavior::FailFirstTimes(counter.clone()),
     )
@@ -640,7 +653,7 @@ async fn chat_returns_single_429_without_replaying_on_another_account() {
         1,
         "失败的非幂等POST不得自动重放"
     );
-    // 429 的账号被写回**模型级**冷却（池状态可见）。
+    // 429 的账号被写回**模型级**冷却（池状态可见）；另一个账号不得被调用。
     let pools = state.pools.lock().await;
     let pool = pools.get(&QoderRegion::Cn).expect("池存在");
     let cooling = pool
@@ -679,6 +692,459 @@ async fn chat_single_account_429_keeps_status_and_reason_without_replay() {
     let text = body_text(response).await;
     assert!(text.contains("429"), "{text}");
     assert_eq!(counter.load(Ordering::SeqCst), 1, "单账号失败也不得重放");
+}
+
+/// #204：同模型的第二次请求被本地冷却挡住，仍应是可重试的 429。
+#[tokio::test]
+async fn model_cooldown_followup_is_429_with_retry_after() {
+    let _guard = guard();
+    // 嵌套 RESOURCE_LIMIT 的排队标记确实可被前 300 字符截掉；HTTP 429 本来
+    // 就不查标记，截断前后都归 RateLimited，不能把它误报成 Queued 冷却。
+    const NESTED_QUEUE: &str = concat!(
+        "{\"code\":\"RESOURCE_LIMIT\",\"message\":\"",
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "\",\"detail\":{\"code\":10605,\"isQueued\":true}}"
+    );
+    let clipped: String = NESTED_QUEUE.chars().take(300).collect();
+    use buddy_switch_gateway::qoder::pool::{classify_http_with_detail, QoderErrKind};
+    assert!(!clipped.contains("isQueued") && !clipped.contains("10605"));
+    assert_eq!(
+        classify_http_with_detail(429, NESTED_QUEUE),
+        QoderErrKind::RateLimited
+    );
+    assert_eq!(
+        classify_http_with_detail(429, &clipped),
+        QoderErrKind::RateLimited
+    );
+    // 401/403 则受截断影响，但会误判成 AuthDead，不是 RateLimited。
+    assert_eq!(
+        classify_http_with_detail(403, NESTED_QUEUE),
+        QoderErrKind::Queued
+    );
+    assert_eq!(
+        classify_http_with_detail(403, &clipped),
+        QoderErrKind::AuthDead
+    );
+    for detail in [
+        r#"{"code":"RESOURCE_LIMIT"}"#,
+        r#"{"isQueued":true}"#,
+        r#"{"code":10605}"#,
+        NESTED_QUEUE,
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (state, key) = gateway_for(
+            "cooldown-followup",
+            &[("q1", "dt-1")],
+            Behavior::RejectOnce(StatusCode::TOO_MANY_REQUESTS, detail, calls.clone()),
+        )
+        .await;
+        let app = router(state.clone());
+        let request = r#"{"model":"ultimate","messages":[]}"#;
+        let initial = app
+            .clone()
+            .oneshot(chat_request(Some(&key), request))
+            .await
+            .unwrap();
+        assert_eq!(initial.status(), StatusCode::TOO_MANY_REQUESTS);
+        let initial_retry: u64 = initial
+            .headers()
+            .get("retry-after")
+            .expect("首个模型限流响应也必须给出 Retry-After")
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((1..=60).contains(&initial_retry));
+        let _ = body_text(initial).await;
+
+        let followup = app
+            .clone()
+            .oneshot(chat_request(Some(&key), request))
+            .await
+            .unwrap();
+        assert_eq!(followup.status(), StatusCode::TOO_MANY_REQUESTS, "{detail}");
+        let retry_after: u64 = followup.headers()["retry-after"]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((1..=60).contains(&retry_after), "{retry_after}");
+        let text = body_text(followup).await;
+        let body: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["error"]["code"], "rate_limit_error", "{text}");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("HTTP 429") && message.contains("ultimate"),
+            "{text}"
+        );
+        assert!(
+            message.contains("冷却") && !message.contains("导入"),
+            "{text}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "冷却中不得再次请求上游");
+
+        // 相同账号的另一模型仍可调用，不能把模型冷却升级成账号故障。
+        let other = app
+            .oneshot(chat_request(
+                Some(&key),
+                r#"{"model":"qwen3.8-max","messages":[]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(other.status(), StatusCode::OK);
+        let _ = body_text(other).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+}
+
+/// 所有协议（包括 stream 请求）共享冷却出口，等待时间取最早解冻并向上取整。
+#[tokio::test]
+async fn model_cooldown_retry_after_uses_earliest_account_for_all_protocols() {
+    let _guard = guard();
+    for (path, request, anthropic) in [
+        (
+            "/v1/chat/completions",
+            json!({"model":"ultimate","messages":[],"stream":true}),
+            false,
+        ),
+        (
+            "/v1/messages",
+            json!({"model":"ultimate","messages":[],"max_tokens":16,"stream":true}),
+            true,
+        ),
+        (
+            "/v1/responses",
+            json!({"model":"ultimate","input":"hi","stream":true}),
+            false,
+        ),
+    ] {
+        let (state, key) = gateway_for(
+            "cooldown-protocol",
+            &[("q1", "dt-1"), ("q2", "dt-2")],
+            Behavior::Normal,
+        )
+        .await;
+        let now = buddy_switch_core::modules::config::now_ms();
+        {
+            let mut pools = state.pools.lock().await;
+            let pool = pools.entry(QoderRegion::Cn).or_default();
+            pool.sync_for(QoderRegion::Cn);
+            for (uid, delay) in [("q1", 60_500), ("q2", 120_500)] {
+                pool.adopt_probe_result(
+                    uid,
+                    "ultimate",
+                    &buddy_switch_gateway::pool::ProbeOutcome::ModelRateLimited {
+                        reset_at_ms: Some(now + delay),
+                        upstream_reset_at_ms: None,
+                    },
+                    now,
+                );
+            }
+            assert_eq!(
+                pool.model_cooldown_retry_after("ultimate", &Default::default(), None, now),
+                Some(61)
+            );
+            assert_eq!(
+                pool.model_cooldown_retry_after(
+                    "ultimate",
+                    &Default::default(),
+                    None,
+                    now + 60_500
+                ),
+                None,
+                "至少一个账号已解冻，就不能再归因为全冷却"
+            );
+        }
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("authorization", format!("Bearer {key}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS, "{path}");
+        let retry: i64 = response.headers()["retry-after"]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        // 60.5s 的余量避免将测试绑定到单个墙钟毫秒；仍能抓到错误地取最晚解冻。
+        assert!((60..=61).contains(&retry), "{path}: {retry}");
+        let text = body_text(response).await;
+        let body: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            body["error"][if anthropic { "type" } else { "code" }],
+            "rate_limit_error",
+            "{text}"
+        );
+        assert_eq!(
+            state.log.list().last().unwrap()["status"],
+            429,
+            "日志应与响应一致"
+        );
+    }
+}
+
+/// 只根据本区域、Key 名单和硬排除后的账号判冷却；不能被无关账号影响。
+#[tokio::test]
+async fn model_cooldown_diagnosis_respects_account_scope_and_other_failures() {
+    use buddy_switch_gateway::qoder::pool::QoderErrKind;
+    let _guard = guard();
+    for (case, selected, status) in [
+        ("selected-cold", "q1", StatusCode::TOO_MANY_REQUESTS),
+        ("selected-healthy", "q2", StatusCode::OK),
+        (
+            "selected-missing",
+            "missing",
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+        ("selected-pat", "pat", StatusCode::SERVICE_UNAVAILABLE),
+        ("auth-dead", "q1", StatusCode::SERVICE_UNAVAILABLE),
+        ("excluded", "q1", StatusCode::SERVICE_UNAVAILABLE),
+        ("paused", "q1", StatusCode::SERVICE_UNAVAILABLE),
+        ("mixed-upstream", "", StatusCode::BAD_GATEWAY),
+        ("mixed-transport", "", StatusCode::SERVICE_UNAVAILABLE),
+        ("mixed-quota", "", StatusCode::TOO_MANY_REQUESTS),
+        ("other-region", "q1", StatusCode::SERVICE_UNAVAILABLE),
+    ] {
+        let (state, key) = gateway_for(
+            case,
+            &[("q1", "dt-1"), ("q2", "dt-2"), ("pat", "")],
+            if case == "mixed-upstream" {
+                Behavior::RejectOnce(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream unavailable",
+                    Arc::new(AtomicUsize::new(0)),
+                )
+            } else {
+                Behavior::Normal
+            },
+        )
+        .await;
+        let state = if case == "mixed-transport" {
+            // 非法 URL 使真实 reqwest 立即报传输错误，无需等待外部网络超时。
+            state.with_upstream("http://[".into())
+        } else {
+            state
+        };
+        if !selected.is_empty() {
+            let record = state.key_store.verify(&key).unwrap();
+            state
+                .key_store
+                .update_policy(
+                    &record.id,
+                    buddy_switch_gateway::apikey::KeyPolicy {
+                        scope_mode: buddy_switch_gateway::apikey::ScopeMode::Selected,
+                        scope_accounts: vec![selected.into()],
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        {
+            let mut pools = state.pools.lock().await;
+            let pool = pools.entry(QoderRegion::Cn).or_default();
+            pool.sync_for(QoderRegion::Cn);
+            pool.apply_error(
+                "q1",
+                QoderErrKind::RateLimited,
+                "RESOURCE_LIMIT",
+                "ultimate",
+            );
+            if case == "auth-dead" {
+                pool.apply_error("q1", QoderErrKind::AuthDead, "token expired", "ultimate");
+            }
+        }
+        if case == "excluded" {
+            buddy_switch_gateway::pool::exclusions::set_at(
+                &buddy_switch_gateway::pool::exclusions::file_path(),
+                "qoder:cn",
+                "q1",
+                true,
+                "test",
+                1,
+            )
+            .unwrap();
+        }
+        // 真实认证失败同时写入池的 AuthDead 和持久化 Paused；复现完整状态。
+        if matches!(case, "paused" | "auth-dead") {
+            use buddy_switch_core::modules::risk_control::{RiskOutcome, RiskScope};
+            state
+                .risk_store
+                .as_ref()
+                .unwrap()
+                .record_outcome_at(
+                    &RiskScope::new("qoder", "cn").unwrap(),
+                    "q1",
+                    RiskOutcome::Banned("test".into()),
+                    None,
+                    1,
+                    60,
+                )
+                .unwrap();
+        }
+        if case == "mixed-quota" {
+            buddy_switch_gateway::qoder::quota::park_exhausted(QoderRegion::Cn, "q2", "test");
+        }
+        if case == "other-region" {
+            // 国际区 Key 不得借用国内区的账号或冷却诊断。
+            let (_, global_key) = state
+                .key_store
+                .create("global".into(), QoderRegion::Global)
+                .unwrap();
+            let response = router(state)
+                .oneshot(chat_request(
+                    Some(&global_key),
+                    r#"{"model":"ultimate","messages":[]}"#,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                status,
+                "{case}: {}",
+                body_text(response).await
+            );
+            continue;
+        }
+        let response = router(state)
+            .oneshot(chat_request(
+                Some(&key),
+                r#"{"model":"ultimate","messages":[]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{case}");
+        if case != "selected-cold" {
+            assert!(!response.headers().contains_key("retry-after"), "{case}");
+        }
+        let text = body_text(response).await;
+        if case == "mixed-quota" {
+            buddy_switch_gateway::qoder::quota::release_park(QoderRegion::Cn, "q2");
+        }
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            assert!(text.contains("no_available_account"), "{case}: {text}");
+        } else if case == "mixed-quota" {
+            assert!(text.contains("quota_exceeded"), "{text}");
+        }
+    }
+}
+
+/// 401/403 排队只留痕，不写模型冷却；后续请求必须仍能调用上游。
+#[tokio::test]
+async fn queued_followup_remains_callable_without_cooldown() {
+    let _guard = guard();
+    for (status, detail, initial_status) in [
+        (StatusCode::UNAUTHORIZED, r#"{"code":10605,"isQueued":true}"#, StatusCode::UNAUTHORIZED),
+        (StatusCode::FORBIDDEN, r#"{"code":10605,"isQueued":true}"#, StatusCode::FORBIDDEN),
+        (StatusCode::OK, "data:{\"body\":\"{\\\"code\\\":10605,\\\"isQueued\\\":true}\",\"statusCodeValue\":403}\n", StatusCode::TOO_MANY_REQUESTS),
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (state, key) = gateway_for("queued-followup", &[("q1", "dt-1")],
+            Behavior::RejectOnce(status, detail, calls.clone())).await;
+        let app = router(state.clone());
+        let request = r#"{"model":"ultimate","messages":[]}"#;
+        let initial = app.clone().oneshot(chat_request(Some(&key), request)).await.unwrap();
+        assert_eq!(initial.status(), initial_status);
+        let _ = body_text(initial).await;
+        let pools = state.pools.lock().await;
+        let entry = pools[&QoderRegion::Cn].entries().next().unwrap();
+        assert!(!entry.auth_dead && entry.model_cooldowns.is_empty());
+        drop(pools);
+        let followup = app.oneshot(chat_request(Some(&key), request)).await.unwrap();
+        assert_eq!(followup.status(), StatusCode::OK);
+        let _ = body_text(followup).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+}
+
+/// #204：队列标记在第 300 字符之后，也不能把健康账号标死并持久化暂停。
+#[tokio::test]
+async fn long_queued_403_is_classified_before_detail_truncation() {
+    let _guard = guard();
+    const DETAIL: &str = concat!(
+        "{\"code\":\"RESOURCE_LIMIT\",\"message\":\"",
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "\",\"detail\":{\"code\":10605,\"isQueued\":true}}"
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (state, key) = gateway_for(
+        "long-queued-403",
+        &[("q1", "dt-1")],
+        Behavior::RejectOnce(StatusCode::FORBIDDEN, DETAIL, calls.clone()),
+    )
+    .await;
+    let app = router(state.clone());
+    let request = r#"{"model":"ultimate","messages":[]}"#;
+    let initial = app
+        .clone()
+        .oneshot(chat_request(Some(&key), request))
+        .await
+        .unwrap();
+    assert_eq!(
+        initial.status(),
+        StatusCode::FORBIDDEN,
+        "保留直接 HTTP 状态语义"
+    );
+    assert!(!initial.headers().contains_key("retry-after"));
+    let text = body_text(initial).await;
+    let body: Value = serde_json::from_str(&text).unwrap();
+    let shown = body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("上游拒绝（HTTP 403）：")
+        .unwrap();
+    assert_eq!(shown.chars().count(), 300, "展示详情仍限 300 字符");
+    assert!(!shown.contains("isQueued") && !shown.contains("10605"));
+    {
+        let pools = state.pools.lock().await;
+        let entry = pools[&QoderRegion::Cn].entries().next().unwrap();
+        assert!(!entry.auth_dead, "迟到的排队标记不能被截断成 AuthDead");
+        assert_eq!(entry.cooldown_until, 0);
+        assert!(entry.model_cooldowns.is_empty());
+        assert!(entry.last_error.as_deref().unwrap().starts_with("queued: "));
+    }
+    assert!(
+        !buddy_switch_gateway::risk_controls::account_blocked(
+            &state.risk_store,
+            "qoder",
+            "cn",
+            "q1",
+            buddy_switch_core::modules::config::now_ms().max(0) as u64,
+        ),
+        "排队不得持久化暂停账号"
+    );
+    let logs = state.log.list();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0]["status"], 403);
+    assert_eq!(
+        logs[0]["error"].as_str().unwrap(),
+        shown,
+        "日志只保留截断详情"
+    );
+
+    let followup = app
+        .oneshot(chat_request(Some(&key), request))
+        .await
+        .unwrap();
+    assert_eq!(
+        followup.status(),
+        StatusCode::OK,
+        "后续请求不得变成 no_available_account"
+    );
+    let _ = body_text(followup).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
 /// 没有账号 ⇒ 503 且原因**不是**「全部失败」而是「没有可用账号」。
@@ -839,4 +1305,88 @@ async fn responses_stream_emits_response_events() {
         .find_map(|data| serde_json::from_str::<Value>(data).ok())
         .expect("至少一个事件");
     assert_eq!(first["sequence_number"], 0, "{text}");
+}
+
+/// 业务会话聚合（默认开）：同一会话的两轮请求复用同一个 `business`
+/// `id / begin_at / name`；不同会话使用独立的 `business` 锚点。
+#[tokio::test]
+async fn business_anchor_is_reused_across_turns_of_the_same_conversation() {
+    let _guard = guard();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (state, key) = gateway_for(
+        "business",
+        &[("q1", "dt-1")],
+        Behavior::Record(seen.clone()),
+    )
+    .await;
+
+    // 同一会话的第二轮：历史前缀不变，只追加 assistant + 新 user。
+    let first = json!({
+        "model": "qwen3.8-max",
+        "messages": [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "round one"},
+        ],
+    })
+    .to_string();
+    let second = json!({
+        "model": "qwen3.8-max",
+        "messages": [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "round one"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "round two"},
+        ],
+    })
+    .to_string();
+    let other = json!({
+        "model": "qwen3.8-max",
+        "messages": [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "another conversation"},
+        ],
+    })
+    .to_string();
+
+    for body in [&first, &second, &other] {
+        let response = router(state.clone())
+            .oneshot(chat_request(Some(&key), body))
+            .await
+            .expect("请求");
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = body_text(response).await;
+    }
+
+    let bodies = seen
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    assert_eq!(bodies.len(), 3, "三次请求都应到达上游");
+    let business = |index: usize| -> Value {
+        serde_json::from_str::<Value>(&bodies[index])
+            .expect("上游请求体是 JSON")
+            .get("business")
+            .cloned()
+            .expect("请求体必须带 business")
+    };
+    let first_turn = business(0);
+    let second_turn = business(1);
+    let other_conversation = business(2);
+
+    assert_eq!(
+        first_turn["id"], second_turn["id"],
+        "同一会话必须复用 business.id：{first_turn} vs {second_turn}"
+    );
+    assert_eq!(
+        first_turn["begin_at"], second_turn["begin_at"],
+        "begin_at 必须复用首次锚点"
+    );
+    assert_eq!(
+        first_turn["name"], second_turn["name"],
+        "name 必须复用首次锚点"
+    );
+    assert_ne!(
+        first_turn["id"], other_conversation["id"],
+        "不同会话不得共用 business.id"
+    );
 }

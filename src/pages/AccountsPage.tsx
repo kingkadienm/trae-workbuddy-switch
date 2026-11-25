@@ -51,6 +51,8 @@ import { OAuthLoginDialog } from "@/components/oauth-login-dialog";
 import { RecycleBinSheet } from "@/components/recycle-bin-sheet";
 import { RestartConfirmDialog } from "@/components/restart-confirm-dialog";
 import { SwitchAccountDialog } from "@/components/switch-account-dialog";
+import { ExtensionSessionCopy } from "@/components/switch-account/extension-session-copy";
+import { LinkedSessions } from "@/components/switch-account/linked-sessions";
 import { ExtSessionDrawer } from "@/components/sessions/ext-session-drawer";
 import * as api from "@/lib/api";
 // ★ B5：`checkinCreditsOf` 是**值**（从条目/raw 里取积分字段），`CheckinStatusEntry` 是**类型**。
@@ -75,6 +77,7 @@ import { displayText } from "@/lib/display-text";
 import { formatDate } from "@/lib/format";
 import { regionDescriptor } from "@/lib/region";
 import { scopeOf } from "@/lib/scope";
+import type { ExtensionSwitchOptions, LinkedSwitchReport, LinkedSwitchSelection } from "@/lib/switch-session-links";
 import { useRefreshAction } from "@/lib/use-refresh-action";
 import { useSlowLoading } from "@/lib/use-slow-loading";
 import type {
@@ -88,6 +91,8 @@ import type {
   CreditStatsEvent,
   JetbrainsCodebuddyPluginStatus,
   ExtClientId,
+  ExtCopyItem,
+  ExtCopyResponse,
   Region,
   SwitchConfig,
   TravelConfig,
@@ -331,6 +336,8 @@ function RegionPanel({ region }: { region: Region }) {
     account: AccountMeta;
     client: SwitchClient;
   } | null>(null);
+  const [extensionCopies, setExtensionCopies] = useState<ExtCopyItem[]>([]);
+  const [extensionSelections, setExtensionSelections] = useState<LinkedSwitchSelection[]>([]);
   const [importing, setImporting] = useState(false);
   const [autoCheckinConfig, setAutoCheckinConfig] = useState<CheckinConfig | null>(null);
   const [autoCheckinSaving, setAutoCheckinSaving] = useState(false);
@@ -769,7 +776,7 @@ function RegionPanel({ region }: { region: Region }) {
 
   async function refreshCodebuddyCnIdeStatus() {
     try {
-      setCodebuddyCnIde(await api.getCodebuddyCnIdeStatus());
+      setCodebuddyCnIde(await (region === "global" ? api.getCodebuddyIdeStatus() : api.getCodebuddyCnIdeStatus()));
     } catch {
       setCodebuddyCnIde(null);
     }
@@ -805,7 +812,7 @@ function RegionPanel({ region }: { region: Region }) {
     void refreshVscodePluginStatus();
     void refreshJetbrainsPluginStatus();
     void (async () => {
-      if (!api.isDemoMode()) {
+      if (region === "cn" && !api.isDemoMode()) {
         try {
           await api.detectCodebuddyCnIdeAccount();
         } catch {
@@ -817,7 +824,7 @@ function RegionPanel({ region }: { region: Region }) {
     return () => {
       cancelled = true;
     };
-  }, [accounts.length]);
+  }, [accounts.length, region]);
 
   /**
    * 自动导入「已登录、但还不在账号库里」的本机账号。
@@ -1318,11 +1325,13 @@ function RegionPanel({ region }: { region: Region }) {
   /** 点「切换到 CodeBuddy IDE」：先走**统一重启确认**（IDE 需重启，默认勾选自动重开）。 */
   function onSwitchCodebuddyCnIde(account: AccountMeta) {
     if (codebuddyCnIdeSwitchingId !== null) return;
+    setExtensionCopies([]);
+    setExtensionSelections([]);
     setRestartConfirm({ account, client: "ide" });
   }
 
   /** 用户在确认框里点了确认后，真正执行 IDE 切换（`restart` 由确认框决定）。 */
-  async function doSwitchCodebuddyCnIde(account: AccountMeta, restart: boolean) {
+  async function doSwitchCodebuddyCnIde(account: AccountMeta, restart: boolean, options?: ExtensionSwitchOptions) {
     if (codebuddyCnIdeSwitchingId !== null) return;
     /* ★ issue #86：切换**之后** IDE 的当前账号就变成目标账号，那时再回头找「切换前是谁」
        已经找不到了 —— 所以先记下来，成功后用它作为「复制会话」的来源。
@@ -1341,14 +1350,16 @@ function RegionPanel({ region }: { region: Region }) {
           }),
     });
     try {
-      const result = await api.switchCodebuddyCnIdeAccount(account.id, restart);
-      await refreshCodebuddyCnIdeStatus();
+      const result = await api.switchCodebuddyCnIdeAccount(account.id, restart, options);
+      void refreshCodebuddyCnIdeStatus();
       /* ★ issue #86 方案 B：**不自动复制**（写数据必须用户显式点），只在切换成功的提示里
          给一个入口。来源是切换前的账号，目标预选刚切到的这个 —— 用户点开就能直接确认。 */
-      const canCopySessions = Boolean(previousAccount && previousAccount.id !== account.id);
-      toast.success(t("wbAccounts.toast.switchIdeUpdated"), {
+      const canCopySessions = Boolean(!result.sessionCopy && previousAccount && previousAccount.id !== account.id);
+      const report = extensionSwitchDescription(result);
+      const announce = report.hasErrors ? toast.warning : toast.success;
+      announce(t("wbAccounts.toast.switchIdeUpdated"), {
         id: toastId,
-        description: result.message || result.account,
+        description: report.description,
         action: canCopySessions
           ? {
               label: t("wbAccounts.toast.switchIdeCopySessions"),
@@ -1371,6 +1382,22 @@ function RegionPanel({ region }: { region: Region }) {
     }
   }
 
+  function extensionSwitchDescription(result: {
+    message?: string; account?: string; sessionCopy?: ExtCopyResponse; sessionSync?: LinkedSwitchReport;
+  }) {
+    const lines = [result.message || result.account];
+    const issues = [
+      ...(result.sessionCopy?.errors ?? []).map((item) => item.error),
+      ...(result.sessionSync?.errors ?? []).map((item) => item.error),
+      ...(result.sessionSync?.skipped ?? []).map((item) => item.message || t("sessions.switchLinks.skipped")),
+    ];
+    const copied = result.sessionCopy?.copied.length ?? 0;
+    const synced = result.sessionSync?.synced.length ?? 0;
+    if (copied > 0) lines.push(t("wbAccounts.dialog.copiedSessions", { n: copied }));
+    if (synced > 0) lines.push(t("sessions.switchLinks.synced", { n: synced }));
+    return { description: [...lines, ...issues].filter(Boolean).join("\n"), hasErrors: issues.length > 0 };
+  }
+
   /**
    * 编辑器内 CodeBuddy 插件（VS Code / JetBrains）两个程序位：**一条**切换实现，参数化客户端。
    *
@@ -1391,7 +1418,9 @@ function RegionPanel({ region }: { region: Region }) {
     busyId: string | null,
     setBusy: (id: string | null) => void,
     label: string,
-    doSwitch: (accountId: string, restart: boolean) => Promise<{ message?: string; account?: string }>,
+    doSwitch: (accountId: string, restart: boolean) => Promise<{
+      message?: string; account?: string; sessionCopy?: ExtCopyResponse; sessionSync?: LinkedSwitchReport;
+    }>,
     refresh: () => Promise<void>,
   ) {
     if (busyId !== null) return;
@@ -1404,9 +1433,11 @@ function RegionPanel({ region }: { region: Region }) {
     try {
       const result = await doSwitch(account.id, restart);
       await refresh();
-      toast.success(t("wbAccounts.toast.switchPluginUpdated", { client: label }), {
+      const report = extensionSwitchDescription(result);
+      const announce = report.hasErrors ? toast.warning : toast.success;
+      announce(t("wbAccounts.toast.switchPluginUpdated", { client: label }), {
         id: toastId,
-        description: result.message || result.account,
+        description: report.description,
       });
     } catch (error) {
       toast.error(t("wbAccounts.toast.switchPluginFail", { client: label }), {
@@ -1421,17 +1452,19 @@ function RegionPanel({ region }: { region: Region }) {
   /** 点「切换 VS Code 扩展」：先走**统一重启确认**（写 `state.vscdb` 前 VS Code 必须退出）。 */
   function onSwitchVscodePlugin(account: AccountMeta) {
     if (vscodePluginSwitchingId !== null) return;
+    setExtensionCopies([]);
+    setExtensionSelections([]);
     setRestartConfirm({ account, client: "vscode" });
   }
 
-  function doSwitchVscodePlugin(account: AccountMeta, restart: boolean) {
+  function doSwitchVscodePlugin(account: AccountMeta, restart: boolean, options?: ExtensionSwitchOptions) {
     void runPluginSwitch(
       account,
       restart,
       vscodePluginSwitchingId,
       setVscodePluginSwitchingId,
       t("wbAccounts.program.vscodeCodebuddyPlugin"),
-      api.switchVscodeCodebuddyPluginAccount,
+      (accountId, restart) => api.switchVscodeCodebuddyPluginAccount(accountId, restart, options),
       refreshVscodePluginStatus,
     );
   }
@@ -1580,6 +1613,9 @@ function RegionPanel({ region }: { region: Region }) {
   /* ★ 2026-10-09：编辑器内两个插件的「当前账号」——同样来自**本地状态文件**
      （`status.activeAccountId`），不为了这一行去解密 secret（那会弹钥匙串授权）。 */
   const vscodePluginCurrentAccountId = vscodePlugin?.activeAccountId;
+  const extensionSwitchSource = restartConfirm?.client === "ide" ? cnIdeCurrentAccountId
+    : restartConfirm?.client === "vscode" ? vscodePluginCurrentAccountId : null;
+  const extensionSwitchSourceUid = accounts.find((item) => item.id === extensionSwitchSource)?.uid;
   const jetbrainsPluginCurrentAccountId = jetbrainsPlugin?.activeAccountId;
   const codebuddyUsesSettingsEnv = codebuddyCli?.authMode === "settings-env";
 
@@ -1863,9 +1899,9 @@ function RegionPanel({ region }: { region: Region }) {
       /**
        * 「积分到期」列（issue #69）：**积分**最近到期，tooltip 给绝对时刻与金额。
        *
-       * 粒度走 `remainingSpan()` —— 与卡片徽章**同一个判据**（≤ 48 小时说小时）。
-       * 此前这里用只到天的 `daysUntil()`：2 小时后到期显示「1 天」，而同一行的卡片
-       * 徽章说「2小时」—— 同一批积分在同一页两句话（2026-11-09 修）。
+       * 粒度走 `remainingSpan()` —— 与卡片徽章**同一个判据**（<1 小时说分钟、
+       * ≤ 48 小时说小时）。此前这里用只到天的 `daysUntil()`：2 小时后到期显示「1 天」，
+       * 而同一行的卡片徽章说「2小时」—— 同一批积分在同一页两句话（2026-11-09 修）。
        *
        * ⚠️ 与下一列「Token 到期」是**两件事**：那列是 Token 有效期（所有账号差不多），
        * 这列才是用户要的「先用哪个账号」。同名会让用户以为看错了。
@@ -1881,9 +1917,11 @@ function RegionPanel({ region }: { region: Region }) {
             <TooltipTrigger asChild>
               <span className="tabular-nums text-muted-foreground">
                 {t(
-                  span.unit === "hours"
-                    ? "wbAccounts.table.creditExpiryHours"
-                    : "wbAccounts.table.creditExpiryDays",
+                  span.unit === "minutes"
+                    ? "wbAccounts.table.creditExpiryMinutes"
+                    : span.unit === "hours"
+                      ? "wbAccounts.table.creditExpiryHours"
+                      : "wbAccounts.table.creditExpiryDays",
                   { value: span.value },
                 )}
               </span>
@@ -2890,25 +2928,48 @@ function RegionPanel({ region }: { region: Region }) {
         }}
         clientLabel={switchClientLabel(restartConfirm?.client ?? "ide")}
         isCli={(restartConfirm?.client ?? "ide") === "cli"}
+        requireRestart={extensionSelections.length > 0}
         onConfirm={(restart) => {
           const target = restartConfirm;
           setRestartConfirm(null);
           if (!target) return;
+          const options = { region, copySessions: extensionCopies, syncSelections: extensionSelections };
           switch (target.client) {
             case "cli":
               void doSwitchCodebuddyCli(target.account);
               return;
             case "ide":
-              void doSwitchCodebuddyCnIde(target.account, restart);
+              void doSwitchCodebuddyCnIde(target.account, restart, options);
               return;
             case "vscode":
-              doSwitchVscodePlugin(target.account, restart);
+              doSwitchVscodePlugin(target.account, restart, options);
               return;
             default:
               doSwitchJetbrainsPlugin(target.account, restart);
           }
         }}
-      />
+      >
+        {restartConfirm && (restartConfirm.client === "ide" || restartConfirm.client === "vscode") &&
+          restartConfirm.account.id !== extensionSwitchSource ? (
+          <div className="max-h-[46vh] space-y-3 overflow-y-auto pr-1">
+            {extensionSwitchSourceUid ? (
+              <ExtensionSessionCopy
+                client={restartConfirm.client === "ide" ? "codebuddy-ide" : "vscode"}
+                sourceUid={extensionSwitchSourceUid}
+                selected={extensionCopies}
+                onChange={setExtensionCopies}
+              />
+            ) : null}
+            <LinkedSessions
+              client={restartConfirm.client === "ide" ? "codebuddyIde" : "vscodeExt"}
+              accountId={restartConfirm.account.id}
+              region={region}
+              selected={extensionSelections}
+              onChange={setExtensionSelections}
+            />
+          </div>
+        ) : null}
+      </RestartConfirmDialog>
 
       {/* 接入/升级 CLI 认证确认（桌面 App 不支持 window.confirm） */}
       <Dialog open={installConfirmOpen} onOpenChange={setInstallConfirmOpen}>

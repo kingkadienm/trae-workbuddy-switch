@@ -12,6 +12,7 @@ import {
   type ExpiringSummary,
 } from "@/lib/credit-expiry";
 import type { Translate } from "@/lib/i18n";
+import type { Scope } from "@/lib/scope";
 
 /**
  * 「临期」窗口：**7 天**。
@@ -85,7 +86,7 @@ export function packSourceLabel(
  *
  * ## 与 WorkBuddy 的口径关系
  *
- * WB 卡的黄徽章（`最近到期 {N天|N小时} · {金额} 积分`）用**后端 `expiringSoon`**；Qoder 的逐包响应里
+ * WB 卡的黄徽章（`最近到期 {N分钟|N小时|N天} · {金额} 积分`）用**后端 `expiringSoon`**；Qoder 的逐包响应里
  * **没有这个标记**，所以这里用 `EXPIRING_SOON_MS`（7 天）自己判 —— 它是后端窗口的
  * 镜像常量，不是第二个口径（`packState()` 判每行状态用的就是它）。
  *
@@ -130,4 +131,9 @@ export function qoderExpiringSummary(
   now: number = Date.now(),
 ): ExpiringSummary | null {
   return summarizeExpiring(expiringItems(packs, now), { now });
+}
+
+/** Stable effect dependency for prefetching the active scope's account packs. */
+export function qoderPacksPrefetchFingerprint(scope: Scope, uids: readonly string[]): string {
+  return JSON.stringify([scope, [...new Set(uids.filter(Boolean))].sort()]);
 }

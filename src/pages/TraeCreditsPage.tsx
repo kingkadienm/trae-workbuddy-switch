@@ -57,13 +57,13 @@ import { ModelDonut } from "@/components/usage/model-donut";
 import { StatTiles, type StatTile } from "@/components/usage/stat-tiles";
 import type { UsageViewProps } from "@/components/usage/view-param-bar";
 import * as api from "@/lib/api";
-import { balanceCaption } from "@/lib/chart-caption";
 import { displayText } from "@/lib/display-text";
 import { formatDate } from "@/lib/format";
 import { useT } from "@/lib/i18n";
 import { mergeTraeCredits, type TraeRegionSlice } from "@/lib/trae-credits-merge";
 import {
   traeAccountSlices,
+  traeCreditBalance,
   traeCreditBars,
   traeCreditExpiry,
   traeStatusSlices,
@@ -73,8 +73,8 @@ import { useCachedResource } from "@/lib/use-cached-resource";
 import { useAutoRefreshWhenVisible } from "@/lib/use-auto-refresh";
 import { CREDITS_LOCAL_REFRESH_INTERVAL_MS } from "@/lib/use-credit-auto-refresh";
 import { useTraeVariant } from "@/lib/use-trae-variant";
-import { balanceCurve, expiryBuckets } from "@/lib/usage-charts";
-import { usageWindowSpanDays } from "@/lib/usage-window";
+import { expiryBuckets } from "@/lib/usage-charts";
+import { todayKey, usageWindowSpanDays } from "@/lib/usage-window";
 
 /** 原型的两个环形只展示**前 6 名**账号（`accountShare.slice(0, 6)`）。 */
 const ACCOUNT_SHARE_LIMIT = 6;
@@ -161,12 +161,17 @@ export default function TraeCreditsPage({ viewWindow, combineAll }: UsageViewPro
   /** 单区也走同一个聚合函数 ⇒ 只有一条渲染路径（见 `lib/trae-credits-merge.ts`）。 */
   const merged = useMemo(() => mergeTraeCredits(snapshot ?? []), [snapshot]);
   const credits = snapshot?.[0]?.credits ?? null;
+  const todayCreditSnapshot = merged.daily.find((point) => point.date === todayKey());
+  const hourlyCreditView = viewWindow.kind === "today" && todayCreditSnapshot?.hourlyFromHour != null;
 
   const bars = useMemo(
     () => traeCreditBars(merged.daily, viewWindow),
     [merged.daily, viewWindow],
   );
-  const balancePoints = useMemo(() => balanceCurve(bars, merged.total), [bars, merged.total]);
+  const balancePoints = useMemo(
+    () => traeCreditBalance((snapshot ?? []).map((slice) => slice.credits.daily ?? []), viewWindow),
+    [snapshot, viewWindow],
+  );
   const buckets = useMemo(() => expiryBuckets(traeCreditExpiry(merged.rows)), [merged.rows]);
   const hasExpiry = buckets.some((bucket) => bucket.value > 0);
   const expiringTotal = buckets.reduce((sum, bucket) => sum + bucket.value, 0);
@@ -193,12 +198,10 @@ export default function TraeCreditsPage({ viewWindow, combineAll }: UsageViewPro
 
   const balanceCaptionText =
     balancePoints.length > 0
-      ? balanceCaption(
-          t,
-          balancePoints[0].value,
-          balancePoints[balancePoints.length - 1].value,
-          balancePoints[0].baseline,
-        )
+      ? t("trae.stats.credits.balanceNote", {
+          first: formatCredits(balancePoints[0].value),
+          last: formatCredits(balancePoints[balancePoints.length - 1].value),
+        })
       : "";
 
   const tiles: StatTile[] = [
@@ -310,8 +313,10 @@ export default function TraeCreditsPage({ viewWindow, combineAll }: UsageViewPro
           {/* 3 · 每日积分收支（**双向**：Trae 的入账可得） */}
           {bars.length > 0 ? (
             <ChartFrame
-              title={t("trae.stats.credits.dailyTitle")}
-              caption={t("trae.stats.credits.dailyNote")}
+              title={t(hourlyCreditView ? "trae.stats.credits.hourlyTitle" : "trae.stats.credits.dailyTitle")}
+              caption={t(hourlyCreditView
+                ? todayCreditSnapshot?.hourlyPartial ? "trae.stats.credits.hourlyPartialNote" : "trae.stats.credits.hourlyNote"
+                : "trae.stats.credits.dailyNote")}
               ariaLabel={t("trae.stats.credits.dailyAria")}
             >
               <CreditDivergingBar bars={bars} />

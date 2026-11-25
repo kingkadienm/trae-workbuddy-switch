@@ -634,6 +634,9 @@ export interface TraeDailySnapshot {
   total: number;
   earned: number;
   consumed: number;
+  hourly?: Array<{ hour: number; earned: number; consumed: number }>;
+  hourlyFromHour?: number | null;
+  hourlyPartial?: boolean;
 }
 
 /** 积分总览（`get_trae_credits`）。 */
@@ -928,6 +931,8 @@ export interface TraeGatewayStatus {
 /** 网关请求日志（仅元数据；默认不记录正文）。 */
 export interface TraeGatewayLogEntry {
   ts: number;
+  /** 上游账号所属区域（若该条日志包含此字段）。 */
+  region?: string;
   endpoint: string;
   method: string;
   account: string | null;
@@ -1206,6 +1211,11 @@ export interface TraeModelDailyPoint {
   records: number;
 }
 
+/** 按本地日期小时 × 模型的用量点（键 `YYYY-MM-DD-HH`）。 */
+export interface TraeModelHourlyPoint extends Omit<TraeModelDailyPoint, "date"> {
+  dateHour: string;
+}
+
 /**
  * Trae Token 统计（`get_trae_token_statistics`）。
  *
@@ -1228,6 +1238,9 @@ export interface TraeTokenStatistics {
   statuses: { key: string; records: number }[];
   /** 按天 × 模型的用量点（堆叠柱）。 */
   modelDaily: TraeModelDailyPoint[];
+  /** 只按日期小时统计，不与跨周热力图的 `hours` 混用。 */
+  dailyHours?: TraeTokenBucket[];
+  modelHourly?: TraeModelHourlyPoint[];
   /** 变体范围条各档计数。 */
   variantCounts: TraeVariantCounts;
   /** 平台做不到的维度（置灰卡），形状见 {@link TraeUnsupported}。 */

@@ -3695,20 +3695,25 @@ const fmtTok = (n) => (n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1
 
 /* ── 剩余时长的展示粒度（与产品 `lib/credit-expiry.ts::remainingSpan` 同规则）──
  *
- * ≤ 48 小时说小时（向上取整、≥1）：25 小时与 47 小时都能各自说准；
- * > 48 小时才折算成天（向上取整，宁可说晚不说早 —— 49 小时算「3 天」）。
- * ⚠️ 别在调用点另写 `<= 48` 的边界：产品侧就因为「徽章改了、表格没改」出过
+ * < 1 小时说分钟（向下取整）：最后一小时里「1 小时」会停滞，看不出还剩多少；
+ *   1 分钟以内向下取整到 0 分钟（刻意不设秒档 —— 0 分钟就是「马上到期」）；
+ * ≤ 48 小时说小时（向下取整）：25 小时与 47 小时都能各自说准；
+ * > 48 小时才折算成天（向上取整 —— 49 小时算「3 天」，宁可说晚不说早）。
+ * ⚠️ 别在调用点另写边界：产品侧就因为「徽章改了、表格没改」出过
  *   「2 小时 / 1 天」同屏两句话（#189 后的回归，2026-11-09 修）。 */
 const expirySpan = (ms) => {
+  const MINUTE = 60000;
   const HOUR = 3600000;
   const DAY = 86400000;
+  if (ms < HOUR) return { value: Math.max(0, Math.floor(ms / MINUTE)), unit: "minutes" };
   return ms <= 48 * HOUR
-    ? { value: Math.max(1, Math.ceil(ms / HOUR)), unit: "hours" }
+    ? { value: Math.max(1, Math.floor(ms / HOUR)), unit: "hours" }
     : { value: Math.max(1, Math.ceil(ms / DAY)), unit: "days" };
 };
-const spanUnitText = (unit) => (unit === "hours" ? "小时" : "天");
+const spanUnitText = (unit) =>
+  unit === "minutes" ? "分钟" : unit === "hours" ? "小时" : "天";
 
-/** 卡片徽章：「最近到期 {N天|N小时} · {金额} 积分」—— 数值与金额同批（`soonestExpire`）。 */
+/** 卡片徽章：「最近到期 {N分钟|N小时|N天} · {金额} 积分」—— 数值与金额同批（`soonestExpire`）。 */
 function expiringChipText(a) {
   if (!a.soonestExpire) return "";
   const span = expirySpan(a.soonestExpire.ms - Date.now());
@@ -6399,13 +6404,13 @@ const uniKeysUsing = (ns) => UNI.keys.filter((k) => k.ns.includes(ns));
    ★ 2026-10-22：Trae 侧补齐 `/v1/responses`，原先那条 501 示例已移除。 */
 const UNI_ERRORS = [
   ["裸模型名被拒", "400 namespace_prefix_required",
-    "统一网关要求模型名带命名空间前缀。本网关启用的命名空间：wb-cn: / wb-global: / trae-cn: / trae-global: / qoder-cn: / qoder-global:。\n你填的是 `deepseek-v4.1-flash`，请改成 `wb-cn:deepseek-v4.1-flash` 这类形式。"],
+    "统一网关要求模型名带命名空间前缀。本网关启用的命名空间：wb-cn/ / wb-global/ / trae-cn/ / trae-global/ / qoder-cn/ / qoder-global/。\n你填的是 `deepseek-v4.1-flash`，请改成 `wb-cn/deepseek-v4.1-flash` 这类形式；旧配置里的冒号格式仍兼容。"],
   ["命名空间未授权", "403 namespace_forbidden",
     "该 API Key 未被授权使用命名空间 `trae-global`（它只授权了 wb-cn、wb-global）。\n请到「网关 → 统一网关 → 密钥」为该 Key 勾选，或另建一把。"],
   ["命名空间未启用", "400 namespace_not_enabled",
     "命名空间 `traework-cn` 未在本网关启用（下方「启用的命名空间」里没有它）。"],
   ["在旧端口填命名空间", "400 namespace_not_parsed_here",
-    "模型名 `wb-cn:deepseek-v4.1-flash` 看起来是统一网关的命名空间前缀，\n但本端口（57891）不解析命名空间。请改用统一网关 http://127.0.0.1:57892/v1，\n或去掉前缀、改用 `cn:` / `global:` 前缀。"],
+    "模型名 `wb-cn/deepseek-v4.1-flash` 看起来是统一网关的命名空间前缀，\n但本端口（57891）不解析命名空间。请改用统一网关 http://127.0.0.1:57892/v1，\n或去掉前缀、改用 `cn:` / `global:` 前缀。"],
 ];
 
 /* ── 命名空间勾选（按平台分组 · 表驱动）──
@@ -6572,7 +6577,7 @@ function uniOverviewSection() {
   /* 失败态走深链（`?err=unified`），与既有 `?err=gateway` / `?err=usage` 同一口径。 */
   const errBlock = state.errors.unified ? errorState({
     title: "最近一次请求失败：命名空间背后没有可用账号",
-    desc: "请求 `trae-global:deepseek-v4.1-flash` 已按契约回落到自动择优，但 trae-global 的池里一个账号都没有。网关不会因此拒绝服务 —— 它返回一条可诊断的错误。",
+    desc: "请求 `trae-global/deepseek-v4.1-flash` 已按契约回落到自动择优，但 trae-global 的池里一个账号都没有。网关不会因此拒绝服务 —— 它返回一条可诊断的错误。",
     action: { label: "重试校验", act: "retry|unified" },
   }) : "";
   return `${errBlock}
@@ -6612,7 +6617,7 @@ function uniOverviewSection() {
 function uniGuideCard() {
   const base = `http://127.0.0.1:${UNI.port}`;
   const api = state.gwApi || "openai";
-  const model = "wb-cn:deepseek-v4.1-flash";
+  const model = "wb-cn/deepseek-v4.1-flash";
   const snippet = api === "anthropic"
     ? `curl ${base}/v1/messages \\
   -H "x-api-key: $BUDDY_SWITCH_KEY" \\

@@ -29,6 +29,7 @@
 //! 首次真机跑通前，不要把「网关可用」当作已有事实。
 
 pub mod apikey;
+pub mod business;
 pub mod degrade;
 pub mod payload;
 pub mod pool;
@@ -279,6 +280,8 @@ pub struct QoderGatewayState {
     pub disabled: Arc<RwLock<crate::disabled_models::DisabledModels>>,
     /// 会话粘性绑定表。
     pub sticky: Arc<Mutex<crate::StickyTable>>,
+    /// 业务会话锚点表（同一会话复用 `business` 三元组）。
+    pub business: business::SharedBusinessTable,
     /// 请求日志。
     pub log: Arc<RequestLog>,
     /// 多 API Key 存储。
@@ -313,6 +316,9 @@ impl QoderGatewayState {
             pools: Arc::new(Mutex::new(HashMap::new())),
             disabled: crate::disabled_models::shared(),
             sticky: Arc::new(Mutex::new(crate::StickyTable::new(config.sticky_ttl_ms))),
+            business: Arc::new(std::sync::Mutex::new(business::BusinessTable::new(
+                config.sticky_ttl_ms,
+            ))),
             log,
             key_store: Arc::new(apikey::QoderApiKeyStore::new(paths::gateway_keys_file())),
             key_usage: Arc::new(crate::key_usage::KeyUsageStore::new(
@@ -527,8 +533,8 @@ impl QoderGatewayState {
         prompt_tokens: i64,
         completion_tokens: i64,
         // ★ issue #154：命中上游前缀缓存的输入 token（`prompt_tokens` 的子集；
-        //   0 = 上游没报）。进日志后账本按账号 / 模型 / 密钥分桶。
-        cached_tokens: i64,
+        //   `None` = 上游没报，`Some(0)` = 上游明确报 0）。进日志后账本按账号 / 模型 / 密钥分桶。
+        cached_tokens: Option<u64>,
         // 上游 `usage.credits`（浮点；`0` = 未取到）：G3 的计数来源，也进日志。
         credits: f64,
         error: Option<String>,

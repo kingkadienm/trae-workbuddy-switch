@@ -42,6 +42,15 @@ use crate::modules::auth_file;
 use crate::modules::config::{backup_dir, home_dir, now_ms, now_secs, utc_iso};
 use crate::modules::region::Region;
 
+mod workbench;
+pub(crate) use workbench::ensure_link_store;
+pub(crate) use workbench::restore_link_pair_legacy_baseline;
+pub use workbench::{
+    copy_linked_sessions_for_switch, linked_replica_batch, list_linked_replica_groups_for,
+    manage_linked_sessions_for, preview_linked_switch, prune_linked_replicas_for,
+    recover_linked_sessions_for, sync_linked_sessions_for_switch,
+};
+
 /// 打开数据库并设置 busy_timeout（对照 Python `sqlite3.connect(timeout=5)`）。
 pub(crate) fn open_db(path: &Path, read_only: bool) -> Option<Connection> {
     let conn = if read_only {
@@ -2313,6 +2322,77 @@ impl CopyBatch {
         self.baselines_dirty = true;
     }
 
+    /// 账本已命中时，只有能证明「源正文在共同基线之后变化、目标正文未变」才自动更新目标。
+    ///
+    /// 没有基线时两份当前指纹不同并不能证明谁更新，必须留给用户处理；旧基线超过
+    /// 512 行时若前缀不足以证明两端状态，也同样保守跳过。
+    fn sync_ledger_replica(&mut self, source_cid: &str, target_cid: &str) -> Value {
+        let Some(source_path) = self.find_jsonl(source_cid) else {
+            return json!({ "status": "unavailable", "message": "找不到来源会话正文，未同步已有副本" });
+        };
+        let target_path = target_jsonl_path_for(
+            self.source_region,
+            self.target_region,
+            &source_path,
+            target_cid,
+        );
+        if !target_path.is_file() {
+            return json!({ "status": "unavailable", "message": "找不到目标副本正文，未同步" });
+        }
+        let (Some(source_fp), Some(target_fp)) = (
+            fingerprint_of_file(&source_path, source_cid),
+            fingerprint_of_file(&target_path, target_cid),
+        ) else {
+            return json!({ "status": "unavailable", "message": "无法稳定读取会话正文，未同步" });
+        };
+        if source_fp.line_count == target_fp.line_count
+            && source_fp.prefix_hashes == target_fp.prefix_hashes
+            && source_fp.full_hash == target_fp.full_hash
+        {
+            return json!({ "status": "unchanged", "message": "来源与目标副本内容一致" });
+        }
+
+        let baseline = self.baselines.get(&baseline_key(source_cid, target_cid));
+        let Some(baseline) = baseline else {
+            return json!({ "status": "needs_review", "message": "副本缺少共同基线，无法判断哪份更新；未覆盖" });
+        };
+        let (Some(source_unchanged), Some(target_unchanged)) = (
+            fingerprint_matches_baseline(&source_fp, baseline),
+            fingerprint_matches_baseline(&target_fp, baseline),
+        ) else {
+            return json!({ "status": "needs_review", "message": "共同基线不足以确认更新方向；未覆盖" });
+        };
+        if source_unchanged && target_unchanged {
+            return json!({ "status": "needs_review", "message": "会话指纹不同但未能证明更新方向；未覆盖" });
+        }
+        if !source_unchanged && !target_unchanged {
+            return json!({ "status": "diverged", "message": "来源与目标副本都在共同基线后发生变化；未覆盖" });
+        }
+        if source_unchanged {
+            return json!({ "status": "target_ahead", "message": "目标副本在共同基线后发生变化；保留目标内容" });
+        }
+
+        let backup_root = backup_dir().join("sessions-sync").join(utc_iso());
+        match unify_replica_between_files(
+            &source_path,
+            &target_path,
+            source_cid,
+            target_cid,
+            &backup_root,
+        ) {
+            Ok(report) => {
+                self.record_baseline(source_cid, target_cid, &target_path);
+                json!({
+                    "status": "updated",
+                    "message": "来源会话有新内容，已安全同步到已有副本",
+                    "backup": report.backup,
+                    "lostLines": report.lost_lines,
+                })
+            }
+            Err(error) => json!({ "status": "failed", "message": error }),
+        }
+    }
+
     /// 基线表整批一次落盘；无新基线时视为成功（不写文件）。
     fn flush_baselines(&mut self) -> bool {
         if !self.baselines_dirty {
@@ -2440,7 +2520,12 @@ fn run_copy_batch(
         }
         // ① 账本去重（内存账本 + 副本存活判定）
         if let Some(existing) = batch.ledger_hit(cid) {
-            skipped.push(dedup_report(cid, &existing));
+            let sync = batch.sync_ledger_replica(cid, &existing);
+            let mut report = dedup_report(cid, &existing);
+            if let Some(object) = report.as_object_mut() {
+                object.insert("sync".into(), sync);
+            }
+            skipped.push(report);
             continue;
         }
         // ② 批内去重：同一 id 重复勾选 / 重复传入时，只复制第一个
@@ -3137,6 +3222,28 @@ fn baseline_value(fingerprint: &SessionFingerprint) -> Value {
     })
 }
 
+/// 当前指纹是否仍与持久化基线一致。`None` 表示基线前缀太短，无法证明正文未变。
+fn fingerprint_matches_baseline(current: &SessionFingerprint, baseline: &Value) -> Option<bool> {
+    let line_count = baseline.get("lineCount")?.as_u64()? as usize;
+    let hashes: Vec<u64> = baseline
+        .get("prefixHashes")?
+        .as_array()?
+        .iter()
+        .map(Value::as_u64)
+        .collect::<Option<Vec<_>>>()?;
+    if current.line_count != line_count {
+        return Some(false);
+    }
+    let comparable = line_count.min(PREFIX_HASH_LIMIT);
+    if hashes.len() < comparable || current.prefix_hashes.len() < comparable {
+        return None;
+    }
+    if current.prefix_hashes[..comparable] != hashes[..comparable] {
+        return Some(false);
+    }
+    (line_count <= hashes.len()).then_some(true)
+}
+
 /// ★ P14 S2：**分歧统一**成功（真的覆盖了）⇒ 记一条基线。
 ///
 /// 与 [`CopyBatch::record_baseline`] **同口径**（都走 [`baseline_value`]）：
@@ -3220,6 +3327,66 @@ fn ledger_origin_of(value: &Value) -> Option<(String, String)> {
     let uid = map.get(LEDGER_ORIGIN_UID)?.as_str()?.trim();
     let cid = map.get(LEDGER_ORIGIN_CID)?.as_str()?.trim();
     (!uid.is_empty() && !cid.is_empty()).then(|| (uid.to_string(), cid.to_string()))
+}
+
+/// 读取「副本会话 → 来源账号/会话/目标账号」索引，供今日用量按复制时刻切分归属。
+///
+/// 旧格式账本没有 lineage；调用方仍能识别副本与目标账号，但复制前的用量只能进 unknown。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CopyLedgerLineage {
+    pub(crate) origin_uid: Option<String>,
+    pub(crate) origin_cid: Option<String>,
+    pub(crate) target_uid: String,
+}
+
+pub(crate) fn copy_ledger_lineage_for(region: Region) -> HashMap<String, CopyLedgerLineage> {
+    let ledger = load_copy_ledger_at(&copy_ledger_path_for(region));
+    let mut lineage = HashMap::new();
+    let mut ambiguous = BTreeSet::new();
+    for (key, value) in ledger {
+        let parts: Vec<&str> = key.split(LEDGER_SEP).collect();
+        let target_uid = match parts.as_slice() {
+            [source_uid, target_uid, source_cid]
+                if !source_uid.is_empty() && !target_uid.is_empty() && !source_cid.is_empty() =>
+            {
+                *target_uid
+            }
+            [source_region, source_uid, target_uid, source_cid]
+                if matches!(*source_region, "cn" | "global")
+                    && !source_uid.is_empty()
+                    && !target_uid.is_empty()
+                    && !source_cid.is_empty() =>
+            {
+                *target_uid
+            }
+            _ => continue,
+        };
+        let Some(new_cid) = ledger_new_of(&value) else {
+            continue;
+        };
+        if ambiguous.contains(&new_cid) {
+            continue;
+        }
+        let (origin_uid, origin_cid) = ledger_origin_of(&value)
+            .map(|(uid, cid)| (Some(uid), Some(cid)))
+            .unwrap_or((None, None));
+        let mapped = CopyLedgerLineage {
+            origin_uid,
+            origin_cid,
+            target_uid: target_uid.to_string(),
+        };
+        match lineage.get(&new_cid) {
+            Some(previous) if previous != &mapped => {
+                lineage.remove(&new_cid);
+                ambiguous.insert(new_cid);
+            }
+            Some(_) => {}
+            None => {
+                lineage.insert(new_cid, mapped);
+            }
+        }
+    }
+    lineage
 }
 
 /// 从账本键里取 `target_uid`（键形如 `[region␟]source␟target␟cid`）。
@@ -3430,6 +3597,10 @@ fn parse_copy_ledger_key_same_region(key: &str) -> Option<(String, String, Strin
 /// ```
 pub fn list_replica_groups_for(region: Region) -> Value {
     let (entries, source) = replica_group_entries(region, None);
+    render_replica_groups(region, entries, source)
+}
+
+fn render_replica_groups(region: Region, entries: Vec<ReplicaGroupEntry>, source: &str) -> Value {
     if entries.is_empty() {
         // 无可用登记（文件缺失 / 空 / 只有跨 region 边）⇒ 前端渲染结构化空态。
         // ⚠️ **此时不动缓存**：账本损坏读到空时剪枝 / 落盘会把好端端的一份缓存毁掉。
@@ -3437,15 +3608,35 @@ pub fn list_replica_groups_for(region: Region) -> Value {
     }
     // ★ 内容状态：**在这里算完**，只把每组几个整数回给前端（见 [`derive_content_status`]）。
     //   `projects/` 索引只建一次 —— 逐副本重扫目录是「加载很久」的第二大来源。
-    let projects = build_projects_index_for(region);
+    let projects: HashMap<_, _> = entries
+        .iter()
+        .flat_map(|entry| entry.regions.iter().copied())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .map(|member_region| (member_region, build_projects_index_for(member_region)))
+        .collect();
     let mut store = fingerprint_store().lock().unwrap();
     let mut groups: Vec<Value> = Vec::with_capacity(entries.len());
     // 本次真的请求过的键 ⇒ 用来剪掉「会话已被删掉」的陈旧条目（缓存不无限长）。
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for entry in &entries {
-        let fingerprints = fingerprints_for_members(&mut store, region, &projects, &entry.members);
-        for (_uid, cid) in &entry.members {
-            seen.insert(fingerprint_key(region, cid));
+        let mut fingerprints = vec![None; entry.members.len()];
+        for member_region in Region::all() {
+            let Some(index) = projects.get(&member_region) else {
+                continue;
+            };
+            let (positions, members): (Vec<_>, Vec<_>) = entry
+                .members
+                .iter()
+                .enumerate()
+                .filter(|(position, _)| entry.regions[*position] == member_region)
+                .map(|(position, member)| (position, member.clone()))
+                .unzip();
+            let reads = fingerprints_for_members(&mut store, member_region, index, &members);
+            for (position, fingerprint) in positions.into_iter().zip(reads) {
+                fingerprints[position] = fingerprint;
+                seen.insert(fingerprint_key(member_region, &entry.members[position].1));
+            }
         }
         let baseline = newest_baseline(&entry.baselines);
         let mut json = entry.json.clone();
@@ -3458,8 +3649,9 @@ pub fn list_replica_groups_for(region: Region) -> Value {
                 return Some(fingerprint.full_hash);
             }
             let (_uid, cid) = entry.members.get(index)?;
-            let path = projects.get(cid)?;
-            let key = fingerprint_key(region, cid);
+            let member_region = *entry.regions.get(index)?;
+            let path = projects.get(&member_region)?.get(cid)?;
+            let key = fingerprint_key(member_region, cid);
             if let Some(digest) = store.probe(&key, offset) {
                 return Some(digest);
             }
@@ -3503,6 +3695,7 @@ fn list_replica_groups_at(region: Region, override_path: Option<&Path>) -> Value
 struct ReplicaGroupEntry {
     /// 成员顶点 `(uid, cid)`，已排序、已去重。
     members: Vec<(String, String)>,
+    regions: Vec<Region>,
     /// 该组在组内命中的基线（两端成员都在组内），**已按 `createdAt` 升序**。
     baselines: Vec<GroupBaseline>,
     /// 出给前端的 JSON（`key` / `replicas` / `previewToken` / `baseline`）。
@@ -3706,52 +3899,62 @@ fn replica_groups_from_ledger(
     replica_group_members_from_ledger(ledger)
         .into_iter()
         .map(|(key, members)| {
-            let cids: BTreeSet<&str> = members.iter().map(|(_, cid)| cid.as_str()).collect();
-            let mut group_baselines: Vec<GroupBaseline> = baselines
-                .iter()
-                .filter(|baseline| {
-                    cids.contains(baseline.a.as_str()) && cids.contains(baseline.b.as_str())
-                })
-                .cloned()
-                .collect();
-            // 稳定输出：`createdAt` 升序，其次 `a` / `b` 字典序。
-            group_baselines.sort_by(|left, right| {
-                (left.created_at, &left.a, &left.b).cmp(&(right.created_at, &right.a, &right.b))
-            });
-
-            let replicas: Vec<Value> = members
-                .iter()
-                .map(|(uid, cid)| {
-                    json!({
-                        "accountUid": uid,
-                        "sessionId": cid,
-                        "region": region.as_str(),
-                    })
-                })
-                .collect();
-            let baseline_json = newest_baseline(&group_baselines)
-                .map(|baseline| {
-                    json!({
-                        "a": baseline.a,
-                        "b": baseline.b,
-                        "createdAt": baseline.created_at,
-                        "lineCount": baseline.line_count,
-                    })
-                })
-                .unwrap_or(Value::Null);
-            let json = json!({
-                "key": key,
-                "replicas": replicas,
-                "previewToken": group_fingerprint(&members),
-                "baseline": baseline_json,
-            });
-            ReplicaGroupEntry {
-                members,
-                baselines: group_baselines,
-                json,
-            }
+            let regions = vec![region; members.len()];
+            replica_group_entry(key, members, regions, baselines)
         })
         .collect()
+}
+
+fn replica_group_entry(
+    key: String,
+    members: Vec<(String, String)>,
+    regions: Vec<Region>,
+    baselines: &[GroupBaseline],
+) -> ReplicaGroupEntry {
+    let cids: BTreeSet<&str> = members.iter().map(|(_, cid)| cid.as_str()).collect();
+    let mut group_baselines: Vec<GroupBaseline> = baselines
+        .iter()
+        .filter(|baseline| cids.contains(baseline.a.as_str()) && cids.contains(baseline.b.as_str()))
+        .cloned()
+        .collect();
+    // 稳定输出：`createdAt` 升序，其次 `a` / `b` 字典序。
+    group_baselines.sort_by(|left, right| {
+        (left.created_at, &left.a, &left.b).cmp(&(right.created_at, &right.a, &right.b))
+    });
+
+    let replicas: Vec<Value> = members
+        .iter()
+        .zip(&regions)
+        .map(|((uid, cid), region)| {
+            json!({
+                "accountUid": uid,
+                "sessionId": cid,
+                "region": region.as_str(),
+            })
+        })
+        .collect();
+    let baseline_json = newest_baseline(&group_baselines)
+        .map(|baseline| {
+            json!({
+                "a": baseline.a,
+                "b": baseline.b,
+                "createdAt": baseline.created_at,
+                "lineCount": baseline.line_count,
+            })
+        })
+        .unwrap_or(Value::Null);
+    let json = json!({
+        "key": key,
+        "replicas": replicas,
+        "previewToken": group_fingerprint(&members),
+        "baseline": baseline_json,
+    });
+    ReplicaGroupEntry {
+        members,
+        regions,
+        baselines: group_baselines,
+        json,
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -1,13 +1,13 @@
 //! 本地积分观察快照与统计投影。
 //!
 //! WorkBuddy 只返回当前资源余额，没有可复用的历史账单序列。因此这里把
-//! 成功查询到的余额保存为本地观察值，再用相邻快照的正向下降量推导“观察到
-//! 的消耗”。首次快照和余额增加只建立新的基线，不产生负数消耗。
+//! 成功查询到的余额和总额度保存为本地观察值，按已用量的增量推导观察消耗。
+//! 快照不能精确还原历史账单。
 
 use chrono::{Datelike, Duration as ChronoDuration, Local, NaiveDate, TimeZone};
 use serde_json::{json, Value};
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 use crate::modules::account::{account_display_name, load_accounts_for};
@@ -199,6 +199,13 @@ fn local_date_string(ts: i64) -> Option<String> {
     local_date(ts).map(|date| date.format("%Y-%m-%d").to_string())
 }
 
+fn local_date_hour_string(ts: i64) -> Option<String> {
+    Local
+        .timestamp_millis_opt(ts)
+        .single()
+        .map(|date| date.format("%Y-%m-%d-%H").to_string())
+}
+
 /// 生成逐日观察序列（daily_start..=today，无数据的天补 0）；无快照起点时返回空数组。
 fn local_daily_series(
     daily: &HashMap<String, f64>,
@@ -352,16 +359,35 @@ fn build_statistics(
     let mut usage_events = Vec::new();
     let mut usage_totals: HashMap<String, (f64, f64, f64)> = HashMap::new();
     let mut daily_usage: HashMap<String, HashMap<String, f64>> = HashMap::new();
+    let mut hourly_usage: BTreeMap<String, f64> = BTreeMap::new();
     let mut latest_snapshots = HashMap::new();
     for (account_id, mut snapshots) in by_account {
         snapshots.sort_by_key(|snapshot: &Snapshot| snapshot.ts);
         if let Some(latest) = snapshots.last() {
             latest_snapshots.insert(account_id.clone(), latest.clone());
         }
-        for pair in snapshots.windows(2) {
-            let previous = &pair[0];
-            let current = &pair[1];
-            let amount = previous.remaining - current.remaining;
+        // 总额度为零时看不到资源包的已用量，不用这条快照重置消费基线。
+        let mut observations = snapshots
+            .iter()
+            .filter(|snapshot| snapshot.total > 0.0)
+            .peekable();
+        let mut previous = observations.next();
+        while let (Some(baseline), Some(current)) = (previous, observations.next()) {
+            if current.total < baseline.total {
+                // 下一次又看到同等或更多额度：这次少报资源包，沿用原基线。
+                // 额度持续下降时换基线，无法确认下降前后的已用量是否可比。
+                if !observations
+                    .peek()
+                    .is_some_and(|next| next.total >= baseline.total)
+                {
+                    previous = Some(current);
+                }
+                continue;
+            }
+            previous = Some(current);
+            let previously_used = (baseline.total - baseline.remaining).max(0.0);
+            let currently_used = (current.total - current.remaining).max(0.0);
+            let amount = currently_used - previously_used;
             if amount <= f64::EPSILON {
                 continue;
             }
@@ -390,6 +416,11 @@ fn build_statistics(
                 account_id: account_id.clone(),
                 amount,
             });
+            if local_date(current.ts) == Some(today) {
+                if let Some(key) = local_date_hour_string(current.ts) {
+                    *hourly_usage.entry(key).or_default() += amount;
+                }
+            }
         }
     }
 
@@ -500,6 +531,10 @@ fn build_statistics(
         }
     }
     let daily = local_daily_series(&aggregate_daily, daily_start, today);
+    let daily_hours: Vec<Value> = hourly_usage
+        .iter()
+        .map(|(key, usage)| json!({ "key": key, "usage": usage }))
+        .collect();
 
     let mut events: Vec<(i64, Value)> = usage_events
         .iter()
@@ -555,6 +590,7 @@ fn build_statistics(
             "todayFailed": today_failed,
         },
         "daily": daily,
+        "dailyHours": daily_hours,
         "accounts": account_summaries,
         "events": recent_events,
     })
@@ -830,12 +866,30 @@ pub fn merge_credit_statistics(cn: &Value, global: &Value) -> Value {
         .or_else(|| global.get("generatedAt").and_then(Value::as_i64))
         .unwrap_or_else(now_ms);
 
+    let mut hourly: BTreeMap<String, f64> = BTreeMap::new();
+    for source in [cn, global] {
+        if let Some(points) = source.get("dailyHours").and_then(Value::as_array) {
+            for point in points {
+                let Some(key) = point.get("key").and_then(Value::as_str) else {
+                    continue;
+                };
+                let usage = point.get("usage").and_then(Value::as_f64).unwrap_or(0.0);
+                *hourly.entry(key.to_string()).or_default() += usage;
+            }
+        }
+    }
+    let daily_hours: Vec<Value> = hourly
+        .into_iter()
+        .map(|(key, usage)| json!({ "key": key, "usage": usage }))
+        .collect();
+
     json!({
         "generatedAt": generated_at,
         "retentionDays": retention_days,
         "coverageStartAt": coverage_start_at,
         "summary": summary,
         "daily": merge_daily_series(cn, global),
+        "dailyHours": daily_hours,
         "accounts": accounts,
         "events": events,
         "officialUsage": merge_official_usage(
@@ -1025,11 +1079,7 @@ mod tests {
         let earlier = at_local_date(2, 12);
         let yesterday = at_local_date(1, 12);
         let stats = build_statistics(
-            &[
-                snap(earlier, 100.0),
-                snap(yesterday, 125.0),
-                snap(now, 115.0),
-            ],
+            &[snap(earlier, 70.0), snap(yesterday, 95.0), snap(now, 85.0)],
             &[],
             &[],
             now,
@@ -1038,6 +1088,59 @@ mod tests {
         assert_eq!(stats["summary"]["usageToday"], 10.0);
         assert_eq!(stats["summary"]["usage7Days"], 10.0);
         assert_eq!(stats["events"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn transient_missing_packs_do_not_turn_into_usage_or_duplicate_usage() {
+        let now = at_local_date(0, 12);
+        let snapshots = [
+            (350.0, 350.0),
+            (0.0, 0.0),
+            (380.0, 380.0),
+            (30.0, 30.0),
+            (380.0, 379.63),
+            (380.0, 379.56),
+            (30.0, 30.0),
+            (0.0, 0.0),
+            (380.0, 379.56),
+        ];
+        let values: Vec<_> = snapshots
+            .iter()
+            .enumerate()
+            .map(|(index, &(total, remaining))| {
+                snapshot_value(
+                    now - (snapshots.len() - index) as i64 * 60_000,
+                    "account-1",
+                    "test",
+                    total,
+                    remaining,
+                )
+            })
+            .collect();
+        let stats = build_statistics(&values, &[], &[json!({"id": "account-1"})], now);
+        assert_eq!(stats["summary"]["currentRemaining"], 379.56);
+        let usage = stats["summary"]["usageToday"].as_f64().unwrap();
+        assert!((usage - 0.44).abs() < 1e-9, "usage: {usage}");
+        assert_eq!(stats["events"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn lasting_capacity_reduction_establishes_a_new_baseline() {
+        let now = at_local_date(0, 12);
+        let sample = |offset, total, remaining| {
+            snapshot_value(now - offset, "account-1", "test", total, remaining)
+        };
+        let stats = build_statistics(
+            &[
+                sample(120_000, 350.0, 320.0),
+                sample(60_000, 30.0, 30.0),
+                sample(0, 30.0, 27.0),
+            ],
+            &[],
+            &[],
+            now,
+        );
+        assert_eq!(stats["summary"]["usageToday"], 3.0);
     }
 
     #[test]

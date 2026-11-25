@@ -139,7 +139,8 @@ pub async fn messages_for_region(
     // ★ issue #150：粘性键不能只认 body 的 `metadata.conversation_id` —— Claude Code
     //   发 `x-claude-code-session-id` 头、Codex 发 body `session_id`，都要认
     //   （见 `session_headers::session_key_of`）。出站 `X-Conversation-ID` 同样用它。
-    let session_key = session_headers::session_key_of(&parsed, &headers);
+    let session_key =
+        session_headers::session_key_or_content_identity(&parsed, &headers, &upstream_body);
     let turn_key = session_headers::turn_key(&parsed);
     let inbound_request_id = header_of(&headers, "x-conversation-request-id");
     let trace_id = header_of(&headers, "x-trace-id");
@@ -207,7 +208,7 @@ pub async fn messages_for_region(
                     total_ms: elapsed,
                     prompt_tokens: 0,
                     completion_tokens: 0,
-                    cached_tokens: 0,
+                    cached_tokens: None,
                     credit: 0.0,
                     stream: true,
                     // ★ issue #129：流中途失败摘要（`None` = 正常结束 / 老条目）。
@@ -222,6 +223,8 @@ pub async fn messages_for_region(
             // 先取轨迹：下面的日志会把 `failure.uid` move 走，之后再借整条 `failure` 就晚了。
             let note = relay::fallback_summary_json(&failure);
             let http_status = failure.error.status();
+            let error =
+                crate::logging::request_failure_detail(&failure.upstream_message, &failure.error);
             let elapsed_ms = started.elapsed().as_millis() as i64;
             state.log.record(
                 RequestMeta {
@@ -239,11 +242,10 @@ pub async fn messages_for_region(
                     total_ms: elapsed_ms,
                     prompt_tokens: 0,
                     completion_tokens: 0,
-                    cached_tokens: 0,
+                    cached_tokens: None,
                     credit: 0.0,
                     stream: wants_stream,
-                    // ★ issue #129：流中途失败摘要（`None` = 正常结束 / 老条目）。
-                    error: None,
+                    error: Some(error),
                 }
                 .to_value(),
             );
@@ -291,7 +293,7 @@ pub async fn messages_for_region(
                         total_ms: 0,
                         prompt_tokens: 0,
                         completion_tokens: 0,
-                        cached_tokens: 0,
+                        cached_tokens: None,
                         credit: 0.0,
                         stream: true,
                         // ★ issue #129：流中途失败摘要（`None` = 正常结束 / 老条目）。
@@ -355,7 +357,7 @@ pub async fn messages_for_region(
                             total_ms: elapsed_ms,
                             prompt_tokens: 0,
                             completion_tokens: 0,
-                            cached_tokens: 0,
+                            cached_tokens: None,
                             credit: 0.0,
                             stream: false,
                             // ★ issue #129：流中途失败摘要（`None` = 正常结束 / 老条目）。
@@ -398,16 +400,7 @@ pub async fn messages_for_region(
                 let cached_tokens = message
                     .get("usage")
                     .and_then(|usage| usage.get("cache_read_input_tokens"))
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0);
-                relay::record_usage_success(
-                    &state,
-                    region,
-                    &uid,
-                    &model,
-                    prompt_tokens,
-                    completion_tokens,
-                );
+                    .and_then(serde_json::Value::as_u64);
                 state.log.record(
                     RequestMeta {
                         endpoint: "/v1/messages",

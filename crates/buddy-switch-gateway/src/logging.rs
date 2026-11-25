@@ -36,6 +36,27 @@ use buddy_switch_core::modules::region::Region;
 
 use crate::protocol::usage_tap::{UsageReport, UsageSink};
 
+/// 失败日志优先保留上游原因；未触达上游时使用本地错误文案。
+/// 先脱敏再按 Unicode 字符截断到 4096 字符（含省略号），不接收请求正文或认证头。
+pub(crate) fn request_failure_detail(
+    upstream_message: &str,
+    error: &crate::error::GatewayError,
+) -> String {
+    let message = if upstream_message.trim().is_empty() {
+        error.message()
+    } else {
+        upstream_message.to_string()
+    };
+    let redacted = buddy_switch_core::modules::runtime_log::redact(&message);
+    let mut chars = redacted.chars();
+    let mut detail: String = chars.by_ref().take(4096).collect();
+    if chars.next().is_some() {
+        detail.pop();
+        detail.push('…');
+    }
+    detail
+}
+
 /// 一次请求的元数据（不含 prompt/response 正文）。
 #[derive(Debug, Clone)]
 pub struct RequestMeta {
@@ -77,8 +98,8 @@ pub struct RequestMeta {
     /// 为什么进日志：命中率与**选号**强相关（缓存按账号分家），而此前日志只有
     /// promptTokens / completionTokens ⇒ 「命中率掉了」与「换号了」这两件事在日志里
     /// **无法 join**，只能靠客户端界面上的一个百分比去猜。
-    /// `0` = 上游没报 / 本入口拿不到（不是「没命中」）。
-    pub cached_tokens: u64,
+    /// `None` = 上游未返回缓存字段；`Some(0)` = 上游明确报告未命中。
+    pub cached_tokens: Option<u64>,
     /// **上游上报的积分消耗**（`usage.credit`，与客户端 jsonl 的 `usage.credit` 同单位）。
     ///
     /// 为什么进日志：用量页的「积分」视图要按**来源**拆消耗（客户端 / 网关），
@@ -88,17 +109,18 @@ pub struct RequestMeta {
     /// `0.0` = 上游没带 credit（不是「免费」，是「不知道」）—— 与 token 写 0 同一诚实口径。
     pub credit: f64,
     pub stream: bool,
-    /// ★ issue #129：**流中途被判定失败**时的错误摘要（`None` = 正常结束 / 老条目）。
+    /// 请求失败摘要：发流前的 HTTP / 本地失败，以及流中途被判定失败
+    /// （`None` = 正常结束 / 老条目）。
     ///
     /// 为什么必须有：流式日志的 `status` 在模板里是硬编码的 `200`（上游响应头到达时
     /// 写日志那一刻还不可能知道后面会断流）。没有这个字段，一次「流中途账号故障」
     /// 在日志页会显示成**成功的 200 请求** —— 用户那边看起来一切正常，
     /// 网关的日志与统计却什么也看不见（故障被隐藏了，排查时无从下手）。
     ///
-    /// 口径与 Qoder 侧 `record_request` 的 `error: Option<String>` 同形：
-    /// 记**上游原文**（含账号名/码），**不是**对外收敛后的文案 —— 对外文案为了能被
-    /// 客户端归成可重试而刻意抹掉了真实原因（见 `crate::failover`），
-    /// 真实原因只在这里与账号池状态里。
+    /// 发流前失败优先保留上游原因；未触达上游时回退到本地错误文案，
+    /// 经 [`request_failure_detail`] 脱敏并限长，不附加请求正文或认证头。
+    /// 流中失败沿用 `crate::failover` 的内部摘要，保留上游真实原因，
+    /// 便于与对外收敛的可重试文案区分。
     pub error: Option<String>,
 }
 
@@ -128,7 +150,7 @@ impl RequestMeta {
             "keyId": self.key_id,
             // ★ 归属台账（`null` = 老条目 / 无 Key）。与 `keyId` **同生同空**。
             "keyScope": self.key_scope,
-            // ★ issue #129：流中途失败摘要（`null` = 正常结束 / 老条目）。
+            // 发流前 / 流中失败摘要（`null` = 正常结束 / 老条目）。
             //   与 `keyId` 同一纪律：**键固定存在、无值写 `null`**。
             "error": self.error,
         })
@@ -190,10 +212,12 @@ impl UsageSink for StreamingLogSink {
             Some(usage) => (
                 u64::try_from(usage.prompt_tokens).unwrap_or(0),
                 u64::try_from(usage.completion_tokens).unwrap_or(0),
-                u64::try_from(usage.cached_tokens).unwrap_or(0),
+                usage
+                    .cached_tokens
+                    .and_then(|tokens| u64::try_from(tokens).ok()),
                 usage.credit,
             ),
-            None => (0, 0, 0, 0.0),
+            None => (0, 0, None, 0.0),
         };
         // ★ issue #129：流中途失败 ⇒ 日志写**真实**状态码 + 摘要。
         //   不这么做的话，一次「账号在流中途挂掉」在日志页会显示成成功的 200 请求
@@ -401,6 +425,57 @@ impl RequestLog {
 mod tests {
     use super::*;
 
+    #[test]
+    fn request_failure_detail_bounds_unicode_and_local_errors_to_4096_chars() {
+        let error = crate::error::GatewayError::Internal("local fallback".into());
+        let short = "400/11128 渠道校验失败";
+        assert_eq!(request_failure_detail(short, &error), short);
+        assert_eq!(
+            request_failure_detail(&"界".repeat(4096), &error),
+            "界".repeat(4096)
+        );
+
+        let detail = request_failure_detail(&"界".repeat(5000), &error);
+        assert_eq!(detail.chars().count(), 4096);
+        assert_eq!(detail, format!("{}…", "界".repeat(4095)));
+
+        let local = crate::error::GatewayError::Internal("界".repeat(5000));
+        assert_eq!(request_failure_detail("", &local), detail);
+
+        // JWT 跨过截断边界：必须先脱敏，否则截短后不再符合 JWT 的识别条件。
+        let jwt = format!(
+            "eyJ{}.{}.{}",
+            "A".repeat(40),
+            "B".repeat(40),
+            "C".repeat(40)
+        );
+        let source = format!("{}{jwt}", "x".repeat(4080));
+        assert_eq!(
+            request_failure_detail(&source, &error),
+            format!("{}<redacted>", "x".repeat(4080))
+        );
+    }
+
+    #[test]
+    fn request_failure_detail_redacts_credentials_and_preserves_upstream_reason() {
+        let error = crate::error::GatewayError::Internal("local fallback".into());
+        let detail = request_failure_detail(
+            "code=11128 unapproved channel; Authorization: Bearer fake-access; refresh_token=fake-refresh",
+            &error,
+        );
+        assert!(detail.contains("code=11128 unapproved channel"));
+        assert!(!detail.contains("local fallback"));
+        assert!(!detail.contains("fake-access"));
+        assert!(!detail.contains("fake-refresh"));
+        assert!(detail.contains("<redacted>"));
+
+        let local = crate::error::GatewayError::Internal("local failure api_key=fake-local".into());
+        assert_eq!(
+            request_failure_detail(" \n ", &local),
+            "local failure api_key=<redacted>"
+        );
+    }
+
     /// 日志条目必须携带写入时的**精确 uid**（`accountUid`），且 `account`（展示名）语义不变；
     /// 两个**耗时字段必须各自独立**（2026-10-15：合并它们是「数字放大」事故的根因）。
     #[test]
@@ -419,7 +494,7 @@ mod tests {
             total_ms: 3456,
             prompt_tokens: 10,
             completion_tokens: 2,
-            cached_tokens: 0,
+            cached_tokens: None,
             credit: 0.0,
             stream: false,
             // ★ issue #129：流中途失败摘要（`None` = 正常结束 / 老条目）。
@@ -495,7 +570,7 @@ mod tests {
             total_ms: 0,
             prompt_tokens: 0,
             completion_tokens: 0,
-            cached_tokens: 0,
+            cached_tokens: None,
             credit: 0.0,
             stream: true,
             // ★ issue #129：流中途失败摘要（`None` = 正常结束 / 老条目）。

@@ -179,15 +179,14 @@ export const zh = {
   /* 设置页的入口改成「先看说明」：点开的是说明弹窗，不是直接下载（见 UPDATE-NOTES-ARCH.md）。 */
   "appSettings.update.viewNotes": "查看更新内容",
 
-  // ---- 设置页子导航（P7 §3.9：9 项，第 9 项「备份与恢复」）----
+  // ---- 设置页子导航（只列产品设置；应用框架设置在顶栏 ⚙ 抽屉）----
   // 应用级导航，与 appSettings 同域（§5：应用级放 shell，备份功能放 backup）。
   "settings.subnav.aria": "设置分区",
-  "settings.subnav.general": "通用",
   "settings.scope.global": "全局设置 · 对所有作用域生效，切换作用域不会改变它",
   "settings.scope.scoped": "仅影响当前作用域（{scope}）· 其他作用域有各自的设置",
+  "settings.subnav.general": "通用",
   "settings.subnav.account": "账号与登录",
   "settings.subnav.checkin": "签到与积分",
-  "settings.subnav.gateway": "网关",
   "settings.subnav.schedule": "计划任务",
   "settings.subnav.client": "客户端",
   "settings.subnav.cli": "CodeBuddy CLI",
@@ -314,13 +313,13 @@ export const zh = {
   "unifiedGateway.errorsTitle": "统一网关的错误响应",
   "unifiedGateway.errorsHint": "每一条错误都带出路 —— 只说「不支持」会让人反复试错。",
   "unifiedGateway.err.bareModel.title": "裸模型名被拒",
-  "unifiedGateway.err.bareModel.body": "统一网关要求模型名带命名空间前缀。本网关启用的命名空间：wb-cn: / wb-global: / trae-cn: / trae-global: / qoder-cn: / qoder-global:。\n你填的是 deepseek-v4.1-flash，请改成 wb-cn:deepseek-v4.1-flash 这类形式。",
+  "unifiedGateway.err.bareModel.body": "统一网关要求模型名带命名空间前缀。本网关启用的命名空间：wb-cn/ / wb-global/ / trae-cn/ / trae-global/ / qoder-cn/ / qoder-global/。\n你填的是 deepseek-v4.1-flash，请改成 wb-cn/deepseek-v4.1-flash 这类形式；旧配置里的冒号格式仍兼容。",
   "unifiedGateway.err.forbidden.title": "命名空间未授权",
   "unifiedGateway.err.forbidden.body": "该 API Key 未被授权使用命名空间 trae-global（它只授权了 wb-cn、wb-global）。\n请到「网关 → 统一网关 → 密钥」为该 Key 勾选，或另建一把。",
   "unifiedGateway.err.notEnabled.title": "命名空间未启用",
   "unifiedGateway.err.notEnabled.body": "命名空间 traework-cn 未在本网关启用（「命名空间」分区里没有勾选它）。",
   "unifiedGateway.err.oldPort.title": "在旧端口填了命名空间",
-  "unifiedGateway.err.oldPort.body": "模型名 wb-cn:deepseek-v4.1-flash 看起来是统一网关的命名空间前缀，\n但本端口（57891）不解析命名空间。请改用统一网关 http://127.0.0.1:57892/v1，\n或去掉前缀、改用 cn: / global: 前缀。",
+  "unifiedGateway.err.oldPort.body": "模型名 wb-cn/deepseek-v4.1-flash 看起来是统一网关的命名空间前缀，\n但本端口（57891）不解析命名空间。请改用统一网关 http://127.0.0.1:57892/v1，\n或去掉前缀、改用 cn: / global: 前缀。",
   /* 未启用态的一行提示（关着开关时改配置，用户不确定有没有生效）。 */
   "unifiedGateway.notEnabled": "当前未启用：下面的配置会照常保存，启用后生效；端口上现在没有监听，任何调用都会连接失败。",
   /* 开关旁的**真实监听状态**（issue #52：开关开着 ≠ 端口上有人 accept）。 */

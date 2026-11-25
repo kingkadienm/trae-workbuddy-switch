@@ -53,9 +53,8 @@ pub struct UsageReport {
     /// - OpenAI：`usage.prompt_tokens_details.cached_tokens`
     /// - Anthropic：`usage.cache_read_input_tokens`
     ///
-    /// 读不到就是 `0`（**不是**「没有命中」）—— 与 `credit` 写 0 同一诚实口径：
-    /// 上游没报 ≠ 事实为零。
-    pub cached_tokens: i64,
+    /// `None` 表示上游没返回缓存字段；`Some(0)` 表示明确报告未命中。
+    pub cached_tokens: Option<i64>,
 }
 
 impl UsageReport {
@@ -68,7 +67,7 @@ impl UsageReport {
 /// 用量回报接收方。
 ///
 /// 抽象成 trait 是为了让单测用记录型替身，不必真的起账号池 / 日志文件；
-/// 与 `cat.rs` 的 `CatIo` / `school.rs` 的 `SchoolIo` 是同一套可注入缝思路。
+/// 与 `cat.rs` 的 `CatIo` 是同一套可注入缝思路。
 pub trait UsageSink: Send + Sync + 'static {
     /// 流结束时调用**恰好一次**。
     ///
@@ -122,16 +121,15 @@ pub fn extract_usage(frame: &Value) -> Option<UsageReport> {
                     .and_then(|details| details.get("cached_tokens"))
             })
             .or_else(|| usage.get("cache_read_input_tokens"))
+            .or_else(|| usage.get("cached_tokens"))
             .and_then(Value::as_i64)
-            .unwrap_or(0)
-            .max(0)
-            .min(prompt),
+            .map(|cached| cached.max(0).min(prompt)),
     })
 }
 
 /// Read cached input tokens from a raw upstream usage object using the same aliases
 /// as `extract_usage`. This is also used by non-streaming response loggers.
-pub fn cached_tokens_from_usage(usage: &Value) -> i64 {
+pub fn cached_tokens_from_usage(usage: &Value) -> Option<u64> {
     usage
         .get("prompt_cache_hit_tokens")
         .or_else(|| {
@@ -141,9 +139,7 @@ pub fn cached_tokens_from_usage(usage: &Value) -> i64 {
         })
         .or_else(|| usage.get("cache_read_input_tokens"))
         .or_else(|| usage.get("cached_tokens"))
-        .and_then(Value::as_i64)
-        .unwrap_or(0)
-        .max(0)
+        .and_then(Value::as_u64)
 }
 
 /// **流内错误**回调（P0-3 的流式半边）。
@@ -161,6 +157,25 @@ pub trait StreamErrorSink: Send + Sync {
     fn on_error(&self, error: crate::protocol::error_sniffer::SniffedError);
 }
 
+/// 可由 `UsageTap` 稳定识别的上游流 idle 超时及诊断数据。
+#[derive(Debug)]
+pub struct StreamIdleTimeoutError {
+    pub idle_ms: u128,
+    pub forwarded_bytes: u64,
+}
+
+impl std::fmt::Display for StreamIdleTimeoutError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "stream idle timeout: idleMs={} forwardedBytes={}",
+            self.idle_ms, self.forwarded_bytes
+        )
+    }
+}
+
+impl std::error::Error for StreamIdleTimeoutError {}
+
 /// `usage` 探针流包装。**不改变字节流**，只在流结束（或出错、或被丢弃）时回报一次用量。
 pub struct UsageTap<S> {
     inner: Pin<Box<S>>,
@@ -168,7 +183,7 @@ pub struct UsageTap<S> {
     sinks: Vec<Arc<dyn UsageSink>>,
     /// 流内错误接收方（可选）：某一帧是错误信封时回调一次。
     error_sink: Option<Arc<dyn StreamErrorSink>>,
-    /// ★ issue #129：流中途失败信号（可选）。命中错误帧 / 上游断流时写一次，
+    /// ★ issue #129：流中途失败信号（可选）。命中错误帧 / 上游断流 / idle 超时时写一次，
     /// 供协议出口（要不要补成功标记）与请求日志（写真实状态码）读取。
     ///
     /// 嗅探**只在这一处做**：三个消费者各自判一次必然漂移。
@@ -176,7 +191,7 @@ pub struct UsageTap<S> {
     /// 已经回调过错误（同一条流只报一次；错误帧之后通常就是断流）。
     error_reported: bool,
     buffer: Vec<u8>,
-    /// 最近一次见到的用量（后到的帧覆盖先到的）。
+    /// 最近一次见到的总用量；缓存命中数单独合并，避免后到的部分 usage 帧抹掉它。
     latest: Option<UsageReport>,
     reported: bool,
     finished: bool,
@@ -273,24 +288,50 @@ impl<S> UsageTap<S> {
     /// 改造前这里只 `report()`：连接被 reset 这种最常见的断流既不给客户端报错、
     /// 也不给账号写冷却 ⇒ 下一次选号那个号仍然「可用」，客户端即便重试也会再撞同一堵墙。
     ///
-    /// 归为 `Server`（走熔断域）而不是 `SessionDead`：网络抖动不该被升级成
-    /// 「禁用账号」；只有开关开启时才上报，关闭态保持原行为。
-    fn note_upstream_break<E: std::fmt::Debug>(&mut self, error: &E) {
+    /// 普通断流归为 `Server`（走熔断域）而不是 `SessionDead`：网络抖动不该被升级成
+    /// 「禁用账号」；只有开关开启时才上报。idle timeout 独立归为 `Timeout`，无论开关都记录。
+    fn note_upstream_break<E: std::fmt::Debug + std::error::Error + 'static>(&mut self, error: &E) {
         // 错误帧已经报过（帧在前、断流在后）：不要再把同一次事故记两遍。
         if self.error_reported {
             return;
         }
-        let Some(failure) = self.failure.as_ref().filter(|signal| signal.is_enabled()) else {
+        let Some(failure) = self.failure.as_ref() else {
             return;
         };
-        let detail = format!("上游连接中断：{error:?}");
-        failure.record(crate::pool::UpstreamEvent::Server, detail.clone());
+        let idle_timeout = (error as &dyn std::error::Error)
+            .downcast_ref::<std::io::Error>()
+            .filter(|error| error.kind() == std::io::ErrorKind::TimedOut)
+            .and_then(std::io::Error::get_ref)
+            .and_then(|source| source.downcast_ref::<StreamIdleTimeoutError>());
+        let is_idle_timeout = idle_timeout.is_some();
+        if !is_idle_timeout && !failure.is_enabled() {
+            return;
+        }
+        let detail = if let Some(idle_timeout) = idle_timeout {
+            format!(
+                "上游流中 idle 超时：idleMs={} forwardedBytes={}",
+                idle_timeout.idle_ms, idle_timeout.forwarded_bytes
+            )
+        } else {
+            format!("上游连接中断：{error:?}")
+        };
+        let event = if is_idle_timeout {
+            crate::pool::UpstreamEvent::Timeout
+        } else {
+            crate::pool::UpstreamEvent::Server
+        };
+        let status = crate::failover::client_error(&event, "", "").status;
+        if is_idle_timeout {
+            failure.record_idle_timeout(detail.clone());
+        } else {
+            failure.record(event.clone(), detail.clone());
+        }
         self.error_reported = true;
         if let Some(sink) = self.error_sink.as_ref() {
             sink.on_error(crate::protocol::error_sniffer::SniffedError {
-                event: crate::pool::UpstreamEvent::Server,
+                event,
                 message: detail,
-                status: 502,
+                status,
             });
         }
     }
@@ -317,7 +358,11 @@ impl<S> UsageTap<S> {
                 continue;
             };
             if let Some(usage) = extract_usage(&value) {
-                self.latest = Some(usage);
+                let mut latest = usage;
+                if latest.cached_tokens.is_none() {
+                    latest.cached_tokens = self.latest.and_then(|previous| previous.cached_tokens);
+                }
+                self.latest = Some(latest);
             }
         }
     }
@@ -347,7 +392,7 @@ impl<S> Drop for UsageTap<S> {
 impl<S, E> Stream for UsageTap<S>
 where
     S: Stream<Item = Result<Bytes, E>> + Send,
-    E: std::fmt::Debug,
+    E: std::fmt::Debug + std::error::Error + 'static,
 {
     type Item = Result<Bytes, E>;
 
@@ -578,7 +623,7 @@ mod tests {
             credit,
             prompt_tokens: prompt,
             completion_tokens: completion,
-            cached_tokens: 0,
+            cached_tokens: None,
         })
     }
 
@@ -636,6 +681,37 @@ mod tests {
             vec![report(9.0, 10, 10)],
             "后到的用量应覆盖先到的"
         );
+    }
+
+    #[tokio::test]
+    async fn later_partial_usage_does_not_erase_observed_cache_hits() {
+        let sink = Arc::new(RecordingSink::default());
+        let stream = stream_of(vec![
+            "data: {\"usage\":{\"credit\":1.0,\"prompt_tokens\":100,\"completion_tokens\":10,\"prompt_cache_hit_tokens\":90}}\n\n",
+            "data: {\"usage\":{\"credit\":1.2,\"prompt_tokens\":110,\"completion_tokens\":11}}\n\n",
+        ]);
+        let _ = UsageTap::new(stream, only(&sink)).collect::<Vec<_>>().await;
+        assert_eq!(
+            sink.calls(),
+            vec![Some(UsageReport {
+                credit: 1.2,
+                prompt_tokens: 110,
+                completion_tokens: 11,
+                cached_tokens: Some(90),
+            })],
+            "the latest totals should win while an omitted cache field retains the earlier observation"
+        );
+    }
+
+    #[tokio::test]
+    async fn later_explicit_zero_replaces_an_earlier_cache_hit_count() {
+        let sink = Arc::new(RecordingSink::default());
+        let stream = stream_of(vec![
+            "data: {\"usage\":{\"credit\":1.0,\"prompt_tokens\":100,\"completion_tokens\":10,\"prompt_cache_hit_tokens\":90}}\n\n",
+            "data: {\"usage\":{\"credit\":1.3,\"prompt_tokens\":120,\"completion_tokens\":12,\"prompt_cache_hit_tokens\":0}}\n\n",
+        ]);
+        let _ = UsageTap::new(stream, only(&sink)).collect::<Vec<_>>().await;
+        assert_eq!(sink.calls()[0].as_ref().unwrap().cached_tokens, Some(0));
     }
 
     /// ★ 没有可用用量时**仍要回报一次 `None`** —— 日志类 sink 靠它记下「这次请求发生过」。
@@ -740,7 +816,7 @@ mod tests {
             "prompt_cache_hit_tokens": 80, "prompt_cache_miss_tokens": 20
         }}))
         .expect("合法样本");
-        assert_eq!(deepseek.cached_tokens, 80);
+        assert_eq!(deepseek.cached_tokens, Some(80));
 
         // OpenAI：`prompt_tokens_details.cached_tokens`
         let openai = extract_usage(&json!({"usage": {
@@ -748,7 +824,7 @@ mod tests {
             "prompt_tokens_details": {"cached_tokens": 64}
         }}))
         .expect("合法样本");
-        assert_eq!(openai.cached_tokens, 64);
+        assert_eq!(openai.cached_tokens, Some(64));
 
         // Anthropic：`cache_read_input_tokens`
         let anthropic = extract_usage(&json!({"usage": {
@@ -756,14 +832,14 @@ mod tests {
             "cache_read_input_tokens": 96
         }}))
         .expect("合法样本");
-        assert_eq!(anthropic.cached_tokens, 96);
+        assert_eq!(anthropic.cached_tokens, Some(96));
 
-        // 上游没报 ⇒ 0（不是「没命中」，是「不知道」）。
+        // 未返回缓存字段与明确未命中分开记录。
         let absent = extract_usage(&json!({"usage": {
             "credit": 0.1, "prompt_tokens": 100, "completion_tokens": 20
         }}))
         .expect("合法样本");
-        assert_eq!(absent.cached_tokens, 0);
+        assert_eq!(absent.cached_tokens, None);
 
         // 脏数（命中数 > 输入总数）⇒ 钳到输入总数，不把不可能的读数写进日志。
         let dirty = extract_usage(&json!({"usage": {
@@ -771,7 +847,7 @@ mod tests {
             "prompt_cache_hit_tokens": 999
         }}))
         .expect("合法样本");
-        assert_eq!(dirty.cached_tokens, 10, "命中数不可能超过输入总数");
+        assert_eq!(dirty.cached_tokens, Some(10), "命中数不可能超过输入总数");
     }
 
     #[test]
@@ -797,7 +873,7 @@ mod tests {
                 credit: 1.0,
                 prompt_tokens: 0,
                 completion_tokens: 2,
-                cached_tokens: 0
+                cached_tokens: None
             }),
             "负数项应被钳制为 0，而不是让求和变成负数"
         );
@@ -808,7 +884,7 @@ mod tests {
                 credit: 0.0,
                 prompt_tokens: 3,
                 completion_tokens: 0,
-                cached_tokens: 0
+                cached_tokens: None
             }),
             "显式 credit=0 是合法样本（免费模型），不同于「缺 credit」"
         );

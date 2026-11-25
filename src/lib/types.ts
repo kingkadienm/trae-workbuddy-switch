@@ -145,6 +145,10 @@ export interface GatewayTokenTrend {
   retentionDays: number;
   /** 逐日点，**日期升序**、只含落库日。 */
   days: GatewayTrendPoint[];
+  /** Today-only timestamped usage by local hour; absent when raw logs are unavailable. */
+  hourly?: GatewayTrendPoint[];
+  /** Earlier hours are unobserved; don't fill them as zero. */
+  hourlyFromHour?: number;
   /** `days` 的合计。 */
   total: number;
 }
@@ -170,10 +174,15 @@ export interface GatewayDimEntry {
   /**
    * 命中上游前缀缓存的输入 token（`input` 的**子集**，不参与 `total`）。
    *
-   * `null` = 这天没观测到命中（老账本无此列 / 上游没报），**不是「命中为 0」**。
-   * 命中率 = `cached / input`，与后端 `token_stats::cacheHitRate` 同口径。
+   * `null` = 这天没有可判定的缓存样本（老账本无此列 / 上游未分配池）。
+   * 命中率以各条目的已观测输入为分母，与后端账本同口径。
    */
   cached?: number | null;
+  /**
+   * 后端是否至少有一笔可判定的缓存样本（包含明确 0）。
+   * 缺省只为兼容旧账本；新账本用它区分「全部未观测」与「已测得 0%」。
+   */
+  cacheObserved?: boolean;
   requests: number;
   /** HTTP `>= 400` 的条数（429 也在内）。 */
   failed: number;
@@ -218,6 +227,10 @@ export interface GatewayUsageDim {
   date: string;
   retentionDays: number;
   days: GatewayUsageDimDay[];
+  /** Current-day request usage split by local hour when the retained gateway log is complete. */
+  dailyHours?: Array<{ key: string; input: number; output: number; total: number; requests: number; credit: number }>;
+  hourlyFromHour?: number | null;
+  hourlyPartial?: boolean;
 }
 
 /** 对账的拓扑结论。 */
@@ -400,6 +413,273 @@ export interface Session {
   isCopy?: boolean;
 }
 
+// Linked-session workbench wire contract. See SESSION-LINKS-MIT.txt in the core modules.
+export type WbVariant = "cn" | "ai";
+
+export type SessionBackupCleanupState = "cleaned" | "pending" | "legacyRetained";
+
+/**
+ * 临时备份残留（待清理 / 待恢复）：复制、同步、恢复报告共用同一结构。
+ * `cleanupPending` 表示已完成但本轮没清理成功（下次切号重试）；`needsRecovery`
+ * 表示必须保留材料、需要恢复流程或人工确认。
+ */
+export interface TemporaryFileInfo {
+  operationId: string;
+  sessionId?: string;
+  title?: string;
+  state: "cleanupPending" | "needsRecovery";
+  reason: string;
+}
+
+export type SessionSyncVerdict = "identical" | "fastForward" | "ahead" | "diverge" | "unknown";
+
+/** 同步写入模式：只有后端 `availableModes` 里给出的模式才允许提交。 */
+export type SessionSyncMode = "fastForward" | "overwrite" | "unifyOverwrite" | "statusOnly";
+
+/** 关联组成员（不含正文）：`state` 为 active 时才算该账号的有效成员。 */
+export interface SessionLinkMember {
+  memberId: string;
+  uid: string;
+  accountId: string | null;
+  sessionId: string;
+  state: "active" | "stale" | "superseded";
+}
+
+/** 关联组的预览项；`defaultChecked` 与 `availableModes` 是勾选权限的唯一来源。 */
+export interface SessionLinkPreviewGroup {
+  groupId: string;
+  title: string;
+  cwd: string;
+  verdict: SessionSyncVerdict;
+  /** 来源独有记录数（多重集差集，仅用于向用户解释）。 */
+  extraA: number;
+  /** 目标独有记录数（多重集差集，仅用于向用户解释）。 */
+  extraB: number;
+  common: number;
+  defaultChecked: boolean;
+  /**
+   * 正文写入模式；为空且没有 `archiveAction` 时才不可勾选
+   * （identical / ahead / unknown / 预览凭据不可用，但仅同步归档仍可勾选）。
+   */
+  availableModes: SessionSyncMode[];
+  reason: string;
+  /**
+   * 仅同步生命周期状态（把目标对齐为已归档），正文零写入。
+   * 由后端在生成预览时给出，不随用户勾选变化。
+   */
+  archiveAction?: "statusOnly";
+  /** 记录数（不是消息数）：不可验证时 source/target 为 0、baseline 为 null。 */
+  recordCount: { source: number; target: number; baseline: number | null };
+  source: SessionLinkMember | null;
+  target: SessionLinkMember | null;
+  /** 勾选时必须原样回传的预览凭据；缺失即不可勾选。 */
+  previewToken?: string;
+}
+
+/** 关联会话预览：`supported` 为 false（或 storeStatus 为 unsupported）时不展示同步区块。 */
+export interface SessionLinksPreview {
+  supported: boolean;
+  storeStatus: "ready" | "missing" | "unavailable" | "unsupported";
+  storeError?: string;
+  sourceUid: string;
+  targetUid: string;
+  /** 跨档预览时带两侧档位；同档预览不出现这两个字段。 */
+  sourceVariant?: WbVariant;
+  targetVariant?: WbVariant;
+  groups: SessionLinkPreviewGroup[];
+}
+
+/** 一条同步选择：与预览凭据绑定，执行时后端会重新校验。 */
+export interface SessionSyncSelection {
+  groupId: string;
+  previewToken: string;
+  mode: SessionSyncMode;
+}
+
+/** 已同步的关联组（保留目标 sessionId 与标题）。 */
+export interface SessionSyncResultItem {
+  groupId: string;
+  status: "synced";
+  verdict: SessionSyncVerdict;
+  mode: SessionSyncMode;
+  sourceSessionId: string;
+  targetSessionId: string;
+  recordCount: { source: number; targetBefore: number; target: number };
+  updatedAt: number;
+  /** 待清理位置（已清理为 null）；旧操作可能仍返回目录路径。 */
+  backup: string | null;
+  backupManifest: string | null;
+  /** 成功后立即清理：cleaned 表示临时备份已回收；pending 表示待下次维护重试。 */
+  cleanupState?: SessionBackupCleanupState;
+  cleanupError?: string;
+  message: string;
+}
+
+/** 被跳过的关联组：`reasonCode` 为 previewStale 时说明预览已过期，不得显示为成功。 */
+export interface SessionSyncSkippedItem {
+  groupId: string;
+  status: "skipped";
+  reasonCode: string;
+  message: string;
+  verdict: SessionSyncVerdict | null;
+}
+
+/** 同步执行报告；`errors` 里可能是整批被拒（无 groupId）。 */
+export interface SessionSyncReport {
+  synced: SessionSyncResultItem[];
+  skipped: SessionSyncSkippedItem[];
+  errors: { groupId?: string; error: string }[];
+  /** 仍有未完成/无法安全恢复的会话写入时为 true。 */
+  needsRecovery?: boolean;
+  /** 临时备份残留（待清理/待恢复）；无异常时为空数组。 */
+  temporaryFiles?: TemporaryFileInfo[];
+}
+
+// ---------------------------------------------------------------------------
+// Client-scoped session group directory
+// ---------------------------------------------------------------------------
+
+export type SessionGroupClient = "workbuddy" | "codebuddyIde" | "vscodeExt";
+export type SessionGroupStatus = "latest" | "behind" | "diverge" | "missing" | "unknown";
+export type SessionMemberVersionStatus = SessionGroupStatus | "stale" | "superseded";
+
+export interface SessionGroupSummary {
+  key: string;
+  client: SessionGroupClient;
+  variantScope: WbVariant | null;
+  groupId: string;
+  groupVariant: WbVariant;
+  title: string;
+  projectLabel: string;
+  latestActivityAt: number;
+  memberCount: number;
+  activeMemberCount: number;
+  accountNames: string[];
+  summaryStatus: SessionGroupStatus;
+  summaryText: string;
+  safeSourceMemberId: string | null;
+  hasSafeSource: boolean;
+}
+
+export interface SessionGroupMemberDetail {
+  memberId: string;
+  accountId: string | null;
+  uid: string;
+  sessionId: string;
+  accountName: string;
+  variant: WbVariant;
+  linkState: "active" | "stale" | "superseded";
+  versionStatus: SessionMemberVersionStatus;
+  title: string;
+  projectLabel: string;
+  updatedAt: number;
+  recordCount: number | null;
+  contentPreview?: { speaker: string; text: string }[];
+  contentState: "ready" | "missing" | "unavailable";
+  reason: string;
+  canBeSource: boolean;
+}
+
+export interface SessionGroupList {
+  client: SessionGroupClient;
+  variantScope: WbVariant | null;
+  storeStatus: "missing" | "ready" | "unavailable";
+  storeError?: string;
+  groups: SessionGroupSummary[];
+}
+
+export interface SessionGroupDetail extends SessionGroupSummary {
+  members: SessionGroupMemberDetail[];
+  addTargets: AccountMeta[];
+  divergence?: {
+    commonMemberIds: string[];
+    branches: string[][];
+  };
+}
+
+export interface SessionGroupPairPreview {
+  client: SessionGroupClient;
+  variantScope: WbVariant | null;
+  groupId: string;
+  sourceMemberId: string;
+  targetMemberId: string;
+  verdict: SessionSyncVerdict;
+  availableModes: SessionSyncMode[];
+  previewToken: string | null;
+  reason: string;
+  recordCount: { source: number; target: number; baseline: number | null } | null;
+  extraTargetCount: number;
+  archiveAction?: "statusOnly";
+}
+
+/** One read-only plan for making every active copy match a chosen group member. */
+export interface SessionGroupUnifyPlan {
+  client: SessionGroupClient;
+  groupId: string;
+  sourceMemberId: string;
+  sourceName: string;
+  targets: {
+    memberId: string;
+    accountName: string;
+    preview: SessionGroupPairPreview | null;
+    error: string | null;
+  }[];
+}
+
+/** A client-reported current login, matched by stable UID or saved account ID. */
+export interface SessionGroupCurrentAccount {
+  variant?: WbVariant;
+  uid?: string | null;
+  accountId?: string | null;
+  running?: boolean;
+}
+
+export interface SessionGroupActionReport {
+  client: SessionGroupClient;
+  groupId: string;
+  sourceMemberId?: string;
+  targetMemberId?: string;
+  synced: SessionSyncResultItem[];
+  skipped: SessionSyncSkippedItem[];
+  errors: { groupId?: string; error: string }[];
+  needsRecovery?: boolean;
+  temporaryFiles?: TemporaryFileInfo[];
+  restartedVariants?: WbVariant[];
+  /** 插件侧：本次由 wb-switch 关闭并成功重开了 VS Code。 */
+  restartedEditor?: boolean;
+  /** 插件侧：写入已完成但 VS Code 未能自动重新打开（无 `errors` 数组的入口用它兜底）。 */
+  editorError?: string;
+}
+
+export interface SessionGroupAccountList {
+  sessions: (Omit<Session, "cwd"> & { cwd?: string; workspaceHash?: string })[];
+  current?: string | null;
+  variant?: WbVariant;
+  dataRoot?: string | null;
+  sourceUid?: string | null;
+  skipped?: number;
+}
+
+export interface SessionGroupCopyReport {
+  copied?: { id: string; newId: string; groupId: string }[];
+  alreadyLinked?: { id: string; sessionId: string; groupId: string }[];
+  errors?: { id: string; error: string }[];
+  needsRecovery?: boolean;
+  temporaryFiles?: TemporaryFileInfo[];
+  error?: string;
+}
+
+export interface SessionGroupLinkReport {
+  status: "linked" | "alreadyLinked" | "copiedUnlinked" | "failed";
+  restartedEditor?: boolean;
+  editorError?: string;
+  skipped?: { id: string; error: string }[];
+  linkErrors?: { error: string }[];
+  report?: { copied?: unknown[]; errors?: { error: string }[] };
+  needsRecovery?: boolean;
+  error?: string;
+}
+
 /**
  * 一份会话在某个账号里的副本（= copy ledger 的一条边的**一端**）—— P8 T02。
  *
@@ -412,7 +692,7 @@ export interface SessionReplica {
   accountUid: string;
   /** 该账号里的会话 id（复制生成的新 id，或源会话 id）。 */
   sessionId: string;
-  /** 副本所在 region（本期恒为**当前 region**，跨 region 边不引入，P8 ✅ #2）。 */
+  /** 副本所在的 WorkBuddy 版本。 */
   region: Region;
 }
 
@@ -696,6 +976,13 @@ export interface SessionReplicaContent {
 export interface SessionReplicaResponse {
   groups: SessionReplicaGroup[];
   source: "ledger" | "empty";
+  needsRecovery?: boolean;
+}
+
+export interface SessionLinkRecoveryResponse {
+  recovered: string[];
+  abandoned: string[];
+  needsRecovery: { operationId: string; reason: string; retryable: boolean }[];
 }
 
 /** Result of an explicit stale replica-edge cleanup (issue #203). */
@@ -714,7 +1001,10 @@ export interface PruneSessionReplicaResponse {
  * ⚠️ **方向由调用方定**：源必须是**行数更多**的那一份（落后的是目标）。
  * 后端**独立复核**「目标是不是源的严格前缀」⇒ 方向给反了会 `ok: false`，**不会写坏数据**。
  */
+export type SessionReplicaSyncMode = "fastForward" | "overwrite" | "unifyOverwrite";
+
 export interface SyncSessionReplicaItem {
+  mode?: SessionReplicaSyncMode;
   /** 源副本的会话 id（行数更多、内容更全的那一份）。 */
   sourceCid: string;
   /** 目标副本的会话 id（落后的那一份，只会在其末尾**追加**）。 */
@@ -758,6 +1048,7 @@ export interface SyncSessionReplicaResponse {
  * 这里是**覆盖**（目标原有的分歧内容会被丢弃）⇒ UI **必须**二次确认。
  */
 export interface UnifySessionReplicaItem {
+  mode?: SessionReplicaSyncMode;
   /** 用户选定**要保留**的那一份。 */
   sourceCid: string;
   /** 被覆盖的副本（它的分歧内容会被丢弃）。 */
@@ -792,6 +1083,19 @@ export interface UnifySessionReplicaResult {
 /** `unify_session_replicas` 的返回（汇总条用 `okCount` / `failCount`）。 */
 export interface UnifySessionReplicaResponse {
   results: UnifySessionReplicaResult[];
+  okCount: number;
+  failCount: number;
+}
+
+export interface SessionReplicaPreviewResult extends SyncSessionReplicaResult {
+  previewToken?: string;
+  mode?: SessionReplicaSyncMode;
+  unchanged?: boolean;
+  lostLines?: number;
+}
+
+export interface SessionReplicaPreviewResponse {
+  results: SessionReplicaPreviewResult[];
   okCount: number;
   failCount: number;
 }
@@ -1075,10 +1379,12 @@ export interface CopyResult {
   jsonlCopied: boolean;
   /** 是否成功写入目标账号的 sessions 索引行；false 表示索引库不可写（已降级为只复制 jsonl 正文）。 */
   sessionRowWritten?: boolean;
-  mappingWritten: boolean;
-  backup: string;
+  mappingWritten?: boolean;
+  backup: string | null;
   /** 命中去重账本：该会话此前已复制到目标账号且副本仍存活，本次跳过。 */
   deduplicated?: boolean;
+  /** 账本命中后对既有副本的安全同步结果；缺少基线时后端会保守保留两边内容。 */
+  sync?: { status: string; message: string; backup?: string | null; lostLines?: number };
   /** 本次是否成功写入去重账本（仅未去重时出现）。 */
   ledgerWritten?: boolean;
   /** 降级警告（如「目标索引不可写，已复制正文，请重启 WorkBuddy 重建索引」）。 */
@@ -1089,6 +1395,7 @@ export interface SwitchResult {
   ok: boolean;
   account: string;
   backup: string | null;
+  sessionSync?: import("@/lib/switch-session-links").LinkedSwitchReport;
   sessionCopy?: {
     sourceUid: string;
     targetUid: string;
@@ -1297,7 +1604,7 @@ export interface ScheduleConfig {
  * 「立即执行」某一类定时任务的结果（`POST /api/schedule/run`）。
  *
  * 形状随任务而异：签到 / 活跃上报 / 保活按 region 逐段返回；旅行返回派出与领取两段；
- * 开学季 / 夜猫子只返回单段结果。各段即业务模块自身的返回，原样透传便于定位到具体账号。
+ * 夜猫子只返回单段结果。各段即业务模块自身的返回，原样透传便于定位到具体账号。
  */
 export interface ScheduleRunResult {
   /** 被执行的任务标识（与 `SCHEDULE_TASKS` 的 key 一致）。 */
@@ -1308,7 +1615,7 @@ export interface ScheduleRunResult {
   dispatched?: Record<string, unknown>;
   /** 旅行领取一段的结果。 */
   claimed?: Record<string, unknown>;
-  /** 单段结果（开学季 / 夜猫子）。 */
+  /** 单段结果（夜猫子）。 */
   result?: Record<string, unknown>;
 }
 
@@ -1657,6 +1964,8 @@ export interface CreditStatistics {
   coverageStartAt: number | null;
   summary: CreditStatsSummary;
   daily: CreditStatsDailyPoint[];
+  /** Today's snapshot-delta consumption, bucketed by local hour. */
+  dailyHours?: Array<{ key: string; usage: number }>;
   accounts: CreditStatsAccount[];
   events: CreditStatsEvent[];
   /** 官方接口不可用时仍使用上述本地观察字段；缺省兼容旧后端。 */
@@ -1671,7 +1980,7 @@ export interface TokenStatsTotals { total: number; input: number; output: number
  * 而不是 0（0 = 真的没消耗，`—` = 不知道，两者不能混）。
  */ credit?: number | null; }
 export interface TokenStatsGroup extends TokenStatsTotals { key: string; title?: string | null; project?: string; sessionId?: string; /** ★ 仅 `sessions[]` 携带：会话**逐日拆分**（窗口切片的素材，键 `YYYY-MM-DD`）。旧后端缺省 ⇒ 前端按全时口径回落（见 `sessionPoints`）。 */ daily?: TokenStatsGroup[]; }
-export interface TokenStatsSource { source: "workbuddy" | "codebuddy-cli" | "codebuddy-ide" | "workbuddy-ai" | "workbuddy-gateway" | "trae-gateway" | "trae-client"; summary: TokenStatsTotals; models: TokenStatsGroup[]; projects: TokenStatsGroup[]; sessions: TokenStatsGroup[]; daily: TokenStatsGroup[]; /** Optional model-specific daily series for trend filtering. */ dailyByModel?: Record<string, TokenStatsGroup[]>; hours: TokenStatsGroup[]; filesScanned: number; parseErrors: number; coverageStartAt?: number | null; coverageEndAt?: number | null; }
+export interface TokenStatsSource { source: "workbuddy" | "codebuddy-cli" | "codebuddy-ide" | "workbuddy-ai" | "workbuddy-gateway" | "trae-gateway" | "trae-client"; summary: TokenStatsTotals; models: TokenStatsGroup[]; projects: TokenStatsGroup[]; sessions: TokenStatsGroup[]; daily: TokenStatsGroup[]; /** Optional model-specific daily series for trend filtering. */ dailyByModel?: Record<string, TokenStatsGroup[]>; /** Date plus local hour buckets (`YYYY-MM-DD-HH`), available on newer backends. */ dailyHours?: TokenStatsGroup[]; /** Per-model date plus local hour buckets. */ dailyHoursByModel?: Record<string, TokenStatsGroup[]>; hours: TokenStatsGroup[]; filesScanned: number; parseErrors: number; coverageStartAt?: number | null; coverageEndAt?: number | null; }
 export interface TokenStatistics { /** 查询范围（后端返回：cn / global / all）；缺省兼容旧后端。 */ region?: RegionFilter; generatedAt: number; rangeDays?: number | null; sources: TokenStatsSource[]; }
 
 export interface CodeBuddyCliStatus {
@@ -1855,6 +2164,8 @@ export interface CodeBuddyCnIdeSwitchResult {
   dbPath?: string;
   restarted?: boolean;
   message?: string;
+  sessionSync?: import("@/lib/switch-session-links").LinkedSwitchReport;
+  sessionCopy?: ExtCopyResponse;
 }
 
 /**
@@ -1919,6 +2230,8 @@ export interface JetbrainsCodebuddyPluginStatus {
  */
 export interface CodebuddyPluginSwitchResult {
   ok: boolean;
+  sessionSync?: import("@/lib/switch-session-links").LinkedSwitchReport;
+  sessionCopy?: ExtCopyResponse;
   account: string;
   accountId: string;
   dbPath?: string;

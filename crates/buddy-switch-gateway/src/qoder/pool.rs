@@ -59,7 +59,7 @@ pub enum QoderErrKind {
     /// 4xx（非上述）：客户端参数错 ⇒ **不换号**，原样回给调用方。
     ClientError,
     /// ★ 上游**排队**（`10605` / `isQueued`，通常裹在 401/403 信封里）：
-    /// 账号没问题、也不是凭据死 ⇒ **不冷却、不标 dead**，只轮换。
+    /// 账号没问题、也不是凭据死 ⇒ **不冷却、不标 dead**；当前自动化停止。
     Queued,
     /// ★ 402：余额耗尽并暂停该账号，当前自动化停止，不由其他账号接力消耗。
     BalanceExhausted,
@@ -550,6 +550,36 @@ impl QoderPool {
             &input,
             preferred_uid,
         )
+    }
+
+    /// 若本轮所有可路由账号都只因当前模型冷却不可用，返回最早解冻的等待秒数。
+    /// 名单、硬排除与 `tried`（含风控暂停）必须和选号一致；无凭据不算冷却。
+    pub fn model_cooldown_retry_after(
+        &self,
+        model: &str,
+        tried: &HashSet<String>,
+        allowed: Option<&HashSet<String>>,
+        now: i64,
+    ) -> Option<i64> {
+        let excluded = crate::pool::exclusions::uid_set(&format!("qoder:{}", self.region_key()));
+        let mut earliest = None;
+        for entry in self.entries.values().filter(|entry| {
+            !tried.contains(&entry.uid)
+                && !excluded.contains(&entry.uid)
+                && allowed.map_or(true, |only| only.contains(&entry.uid))
+                && !entry.needs_intervention()
+                && entry.cooldown_until <= now
+        }) {
+            // 有任何账号不在该模型冷却中，就不能归因为「全部模型冷却」。
+            let until = entry
+                .model_cooldowns
+                .get(model)
+                .copied()
+                .filter(|until| *until > now)?;
+            earliest = Some(earliest.map_or(until, |previous: i64| previous.min(until)));
+        }
+        // 向上取整，避免客户端在实际解冻之前重试；空候选仍返回 None。
+        earliest.map(|until| until.saturating_sub(now).saturating_add(999) / 1000)
     }
 
     /// 成功收尾：复位错误态 + EMA 上升。

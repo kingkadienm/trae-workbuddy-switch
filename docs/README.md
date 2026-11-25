@@ -9,6 +9,7 @@
 | [`guides/`](guides/) | 怎么装、怎么开发、客户端怎么接网关 | 跟着版本更新 |
 | [`policies/`](policies/) | 许可与免责声明（README 引用它们） | 极少 |
 | [`specs/`](specs/) | 现行架构与决策：改代码前该读的依据 | **随代码一起改** |
+| [`superpowers/specs/`](superpowers/specs/) | 已确认实现设计的短文档 | 随设计归档 |
 | [`superpowers/plans/`](superpowers/plans/) | 经确认设计对应的分步实施计划 | 实施期间更新，完成后归档 |
 | [`history/`](history/) | 已完结的一次性报告：审计、探针、外部调研、旧方案 | **只读，不再改** |
 | [`prototype/`](prototype/) | 可点原型 + JSDOM 校验套件（门禁读这里的文件） | 新增交互先进这里 |
@@ -44,7 +45,7 @@
 | 想知道某功能当初为什么这么做 | [`specs/DECISIONS.md`](specs/DECISIONS.md)（D1–D46） |
 | 加新交互（先原型、后代码） | [`prototype/`](prototype/) → `index.html` 可直接打开 |
 | 账号页「客户端限流」怎么和网关「限流探测」联动（同一份数据 + 两处入口） | [`prototype/limit-link-proto.html`](prototype/limit-link-proto.html)（可点设计稿，**已落地**）+ [`prototype/verify-limit-link.mjs`](prototype/verify-limit-link.mjs)（34 条行为校验）+ [`specs/MODEL-LIMIT-PROBE-PLAN.md`](specs/MODEL-LIMIT-PROBE-PLAN.md) §5.9（口径） |
-| 查这版改了什么 | [`releases/`](releases/)（最新：[`v2026.11.171619`](releases/v2026.11.171619.md)） |
+| 查这版改了什么 | [`releases/`](releases/)（最新：[`v2026.11.231559`](releases/v2026.11.231559.md)） |
 
 ---
 
@@ -64,9 +65,17 @@
 | [`UPDATE-NOTES-ARCH.md`](specs/UPDATE-NOTES-ARCH.md) | 升级前说明弹窗（版本内容）：四阶段交互、数据契约、发布侧产出与切片口径 | 现行 · 2026-10-17 落地 |
 | [`GATEWAY-UPSTREAM-NETWORK.md`](specs/GATEWAY-UPSTREAM-NETWORK.md) | 网关**出站**网络：默认直连 vs 系统代理（`no_proxy` 纪律 + 兜底回落 + 排查手法） | 现行 · 2026-11-08 落地 |
 | [`VIDEO-GATEWAY-ARCH.md`](specs/VIDEO-GATEWAY-ARCH.md) | WorkBuddy 视频 P1：动态目录、模型能力校验、Key/区域与原账号绑定、进程内任务状态和边界 | 现行 · 2026-11-17 |
+| [`PROCESS-GUARD-THREAD-HEURISTIC.md`](specs/PROCESS-GUARD-THREAD-HEURISTIC.md) | Windows 客户端判活：0 线程内核残留不算「在运行」，快照失败仍 fail-closed | 现行 · 2026-11-17 落地 |
 | [`RISK-ACCOUNT-ISOLATION.md`](specs/RISK-ACCOUNT-ISOLATION.md) | 本地认证快照、共享出站客户端与风控状态的适用边界 | 现行 · 2026-11-13 |
 | [`RISK-CONTROLS-DESIGN.md`](specs/RISK-CONTROLS-DESIGN.md) | WorkBuddy / Trae / Qoder 网关合规风控设置设计（方案 A） | 现行 · 2026-11-13 落地 |
 | [`2026-11-13-three-platform-risk-controls.md`](superpowers/plans/2026-11-13-three-platform-risk-controls.md) | 三平台合规风控设置实施计划 | 已完成 · 2026-11-13 |
+| [`2026-11-14-agent-session-isolation.md`](superpowers/plans/2026-11-14-agent-session-isolation.md) | 多 Agent Responses 会话身份隔离、续接状态保活与历史裁剪诊断实施计划 | 已完成 · 2026-11-14 |
+| [`2026-11-16-unified-gateway-slash-model-ids-design.md`](superpowers/specs/2026-11-16-unified-gateway-slash-model-ids-design.md) | 统一网关模型 ID 改斜杠并兼容冒号请求 | 已确认 |
+| [`2026-11-16-unified-gateway-slash-model-ids.md`](superpowers/plans/2026-11-16-unified-gateway-slash-model-ids.md) | 统一网关斜杠模型 ID 实施计划 | 已完成 · 2026-11-16 |
+| [`2026-11-23-workbuddy-stream-idle-timeout-design.md`](superpowers/specs/2026-11-23-workbuddy-stream-idle-timeout-design.md) | WorkBuddy CN 流式转发 idle 超时（issue #208） | 已实现 · 2026-11-23 |
+| [`2026-11-23-workbuddy-stream-idle-timeout.md`](superpowers/plans/2026-11-23-workbuddy-stream-idle-timeout.md) | WorkBuddy CN 流式转发 idle 超时实施计划（issue #208） | 已完成 · 2026-11-23 |
+| [`2026-11-24-hourly-axis-interval-labels-design.md`](superpowers/specs/2026-11-24-hourly-axis-interval-labels-design.md) | 今天用量图小时轴区间标签（issue #223 评论） | 已实现 · 2026-11-24 |
+| [`2026-11-24-hourly-axis-interval-labels.md`](superpowers/plans/2026-11-24-hourly-axis-interval-labels.md) | 今天用量图小时轴区间标签实施计划 | 已完成 · 2026-11-24 |
 | [`GATEWAY-MODEL-EFFORT.md`](specs/GATEWAY-MODEL-EFFORT.md) | 按模型的**默认思考档**（`model_efforts`）：语义、数据流、非 DeepSeek 约束、回归防线 | 现行 · 2026-11-01 落地 |
 
 ### 分期架构（P3–P15）
@@ -136,6 +145,16 @@
 | [`reference-changexbc-workbuddy-switch.md`](history/reference-changexbc-workbuddy-switch.md) | 外部同产品实现的调研记录 |
 | [`reference-workbuddy-manager.md`](history/reference-workbuddy-manager.md) | 外部同栈项目的调研记录 |
 | [`CLEANUP-2026-10-13.md`](history/CLEANUP-2026-10-13.md) | 上一轮工作区清理报告（含当时的引用扫描证据） |
+| [openrouter-docs-2026-11-16/](history/openrouter-docs-2026-11-16/) | 2026-11-16 抓取的 OpenRouter 官方文档快照（外部资料，非本仓设计依据） |
+| [`deepseek-codex-cache-research-2026-11-17.md`](history/deepseek-codex-cache-research-2026-11-17.md) | Codex 经 Buddy/Trae 使用 DeepSeek 时缓存 0% 的官方语义、统计口径与源码边界调研 |
+| [`issue-152-2026-11-02.md`](history/issue-152-2026-11-02.md) | macOS 切换账号问题现场摘要（后续已合并 #153）（只读历史） |
+| [`issue-171-2026-11-06.md`](history/issue-171-2026-11-06.md) | 刷新暂时失败误标与账号列表轮询问题现场分析（只读历史） |
+| [`issue-198-2026-11-10.md`](history/issue-198-2026-11-10.md) | CodeBuddy 长期记忆迁移缺口现场分析（只读历史） |
+| [`issue-202-2026-11-13.md`](history/issue-202-2026-11-13.md) | JetBrains CodeBuddy Token 展示问题用户报告（只读历史） |
+| [`issue-203-2026-11-13.md`](history/issue-203-2026-11-13.md) | 关联会话残留与 Qoder 签到误报问题用户报告（只读历史） |
+| [`issue-204-2026-11-13.md`](history/issue-204-2026-11-13.md) | WorkBuddy/Qoder 网关请求错误复现记录（只读历史） |
+| [`issue-205-2026-11-14.md`](history/issue-205-2026-11-14.md) | 教师企业版积分问题用户报告（只读历史） |
+| [`issues-snapshot-2026-11-15.json`](history/issues-snapshot-2026-11-15.json) | GitHub issue 列表快照（截至 2026-11-15）（只读历史） |
 
 ---
 

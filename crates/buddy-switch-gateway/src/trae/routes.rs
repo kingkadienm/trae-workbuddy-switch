@@ -11,8 +11,8 @@
 //!
 //! | 路径 | 连接期失败（HTTP 非 2xx / 传输层错误） | 流内失败（`event:error`） |
 //! |:---|:---|:---|
-//! | 流式 | 冷却该账号 → **换号重试**（最多 `max_rotate` 次） | 冷却该账号 → **不换号** |
-//! | 非流式 | 冷却该账号 → **换号重试** | 冷却该账号 → **换号重试** |
+//! | 流式 | 暂时性故障最多重试 `max_rotate` 次；账号终态不换号 | 冷却该账号 → **不换号** |
+//! | 非流式 | 暂时性故障最多重试 `max_rotate` 次；账号终态不换号 | 冷却该账号 → **不换号** |
 //!
 //! 差别来自「响应头是否已经发出」：流式一旦把 `200 + text/event-stream` 发给客户端，
 //! 就只能把错误塞进事件流里（补一条 `data: {...error...}` 再 `data: [DONE]`）；
@@ -38,7 +38,6 @@ use buddy_switch_core::modules::trae::region::TraeRegion;
 use buddy_switch_core::modules::trae::variant::TraeVariant;
 
 use crate::protocol::anthropic;
-use crate::session_headers;
 use crate::sticky;
 
 use super::capture::Capture;
@@ -285,7 +284,7 @@ pub async fn chat_completions(
     Extension(key_variant): Extension<TraeKeyVariant>,
     // ★ issue #76：整条 Key（配额 / 白名单 / 记账）。缺这个扩展 = 老路由 / 测试调用。
     key_ctx: Option<Extension<TraeKeyContext>>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     // 归属产品线由鉴权中间件经请求扩展传入 ⇒ 这里只是把它转成**显式参数**交给共用实现，
@@ -300,7 +299,7 @@ pub async fn chat_completions(
             "trae",
         ))
     });
-    chat_for_variant(state, key_variant.0, body, actor).await
+    chat_for_variant(state, key_variant.0, body, actor, headers).await
 }
 
 /// 一趟 Trae chat 中继（**认证之后的全部逻辑**）—— 产品线入口与统一网关**共用**这一份实现。
@@ -320,6 +319,7 @@ pub async fn chat_for_variant(
     body: Bytes,
     // ★ issue #76：调用方的 Key（`None` = 无 Key 的调用 ⇒ 不判配额、不过白名单、不记账）。
     key: Option<std::sync::Arc<crate::apikey::KeyActor>>,
+    headers: HeaderMap,
 ) -> Response {
     let started = Instant::now();
     // ★ issue #76：配额判定（选号前）—— 超限直接 429，一步都不发。
@@ -335,7 +335,7 @@ pub async fn chat_for_variant(
             );
         }
     }
-    let parsed: Value = match serde_json::from_slice(&body) {
+    let mut parsed: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(error) => {
             return openai_error(
@@ -366,13 +366,16 @@ pub async fn chat_for_variant(
     let max_rotate = config.max_rotate.max(1);
     let chat_id = format!("chatcmpl-{}", uuid_like());
 
-    let sticky_key = sticky_key_of(&parsed, variant, &model);
+    let sticky_key = sticky_key_for_request(&parsed, &headers, &parsed, variant, &model);
+    let client_identity = crate::session_headers::response_session_identity(&parsed, &headers);
+    payload::set_session_id(&mut parsed, client_identity.as_deref());
 
     // ★ 降级链（P13）：主模型失败且命中触发条件时，改用备选模型重发。
     //   hop 循环放在**入口层**而不是 `stream_chat` 内部 —— 三个入口（chat / messages /
     //   responses）共用同一段，不会各写一份而漂移。
     let fallback = crate::routes::fallback::FallbackLoop::plan(scope, &model).await;
-    let raw_body = String::from_utf8_lossy(&body).to_string();
+    let raw_body = serde_json::to_string(&parsed)
+        .unwrap_or_else(|_| String::from_utf8_lossy(&body).into_owned());
     let mut hop = 0usize;
     // 上一跳的失败响应（越界时返回它）与触发原因（写进降级头）。
     let mut last: Option<Response> = None;
@@ -502,6 +505,7 @@ pub async fn messages(
     State(state): State<TraeGatewayState>,
     Extension(key_variant): Extension<TraeKeyVariant>,
     key_ctx: Option<Extension<TraeKeyContext>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     // 同 `/v1/chat/completions`：把扩展里的归属转成显式参数，交给共用实现。
@@ -514,7 +518,7 @@ pub async fn messages(
             "trae",
         ))
     });
-    messages_for_variant(state, key_variant.0, body, actor).await
+    messages_for_variant(state, key_variant.0, body, actor, headers).await
 }
 
 /// 一趟 Trae **Anthropic** 中继（认证之后的全部逻辑）—— 产品线入口与统一网关共用。
@@ -527,6 +531,7 @@ pub async fn messages_for_variant(
     body: Bytes,
     // ★ issue #76：同 `chat_for_variant`。
     key: Option<std::sync::Arc<crate::apikey::KeyActor>>,
+    headers: HeaderMap,
 ) -> Response {
     let started = Instant::now();
     // ★ issue #76：配额判定（选号前）。
@@ -555,7 +560,9 @@ pub async fn messages_for_variant(
     丢弃时文本里会留下「已移除 N 张图片」；`BUDDY_SWITCH_ANTHROPIC_FORWARD_IMAGES=1`
     打开后改走带图分支。`llm_utils_chat` 本来就要求 `content` 是数组，带图产出
     的 parts 数组不需要额外适配。 */
-    let upstream = anthropic::to_upstream_request_adaptive(&parsed);
+    let mut upstream = anthropic::to_upstream_request_adaptive(&parsed);
+    let client_identity = crate::session_headers::response_session_identity(&parsed, &headers);
+    payload::set_session_id(&mut upstream, client_identity.as_deref());
     let Ok(encoded) = serde_json::to_vec(&upstream) else {
         return anthropic_error(
             StatusCode::BAD_REQUEST,
@@ -588,10 +595,8 @@ pub async fn messages_for_variant(
     // **再包一层** `msg_`，用 `msg_` 当上游前缀会得到 `msg_msg_xxx`（真实请求实测到）。
     let chat_id = format!("chatcmpl-{}", uuid_like());
 
-    // 会话 id 取**原始** Anthropic 请求体：`to_upstream_request` 不保证把
-    // `metadata` 原样带过去，而客户端塞会话 id 的习惯位置就是那里
-    // （与 WorkBuddy 侧 `messages.rs` 同源）。拿不到 ⇒ 返回 `None` ⇒ 整段跳过粘性。
-    let sticky_key = sticky_key_of(&parsed, variant, &model);
+    // 原协议 metadata、会话头和转换后的 system/user 内容共同提供身份。
+    let sticky_key = sticky_key_for_request(&parsed, &headers, &upstream, variant, &model);
 
     // ★ 降级链（P13）：与 `/v1/chat/completions` 同一套 hop 循环（见那里的注释）。
     let fallback = crate::routes::fallback::FallbackLoop::plan(scope, &model).await;
@@ -730,6 +735,7 @@ pub async fn responses(
     State(state): State<TraeGatewayState>,
     Extension(key_variant): Extension<TraeKeyVariant>,
     key_ctx: Option<Extension<TraeKeyContext>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let key = key_ctx.map(|Extension(ctx)| ctx.0);
@@ -741,7 +747,7 @@ pub async fn responses(
             "trae",
         ))
     });
-    responses_for_variant(state, key_variant.0, body, actor).await
+    responses_for_variant(state, key_variant.0, body, actor, headers).await
 }
 
 /// 一趟 Trae **Responses** 中继（认证之后的全部逻辑）—— 产品线入口与统一网关共用。
@@ -763,6 +769,7 @@ pub async fn responses_for_variant(
     body: Bytes,
     // ★ issue #76：同 `chat_for_variant`。
     key: Option<std::sync::Arc<crate::apikey::KeyActor>>,
+    headers: HeaderMap,
 ) -> Response {
     let started = Instant::now();
     // ★ issue #76：配额判定（选号前）。
@@ -787,7 +794,7 @@ pub async fn responses_for_variant(
         );
     };
 
-    let response_state_scope = format!(
+    let base_response_state_scope = format!(
         "trae:{}:{}:{}",
         variant.as_str(),
         key.as_deref().map(|actor| actor.scope).unwrap_or("local"),
@@ -795,15 +802,19 @@ pub async fn responses_for_variant(
             .map(|actor| actor.key_id.as_str())
             .unwrap_or("anonymous"),
     );
-    let (parsed, response_transcript) = match crate::protocol::responses::prepare_request_with_state(
-        &parsed,
-        &response_state_scope,
-    ) {
-        Ok(prepared) => prepared,
-        Err(message) => {
-            return openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message);
-        }
-    };
+    let response_identity = crate::session_headers::response_session_identity(&parsed, &headers);
+    let response_state_scope = crate::protocol::responses::state_scope_for_session(
+        &base_response_state_scope,
+        response_identity.as_deref(),
+    );
+    let (parsed, response_transcript, response_state_scope) =
+        match crate::protocol::responses::prepare_request_with_state(&parsed, &response_state_scope)
+        {
+            Ok(prepared) => prepared,
+            Err(message) => {
+                return openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message);
+            }
+        };
 
     /* freeform（custom）工具名必须从**原始**请求体取：转换之后它们已被降级成普通
     function，`type` 没了，名字还在但语义丢失 —— 出站要靠这份集合还原成
@@ -813,15 +824,10 @@ pub async fn responses_for_variant(
 
     // Responses 请求 → 上游 chat 形态。
     let mut upstream = crate::protocol::responses::to_upstream_request(&parsed);
-    // The Trae adapter derives its provider conversation IDs from this identity;
-    // keep it available internally until prepare_llm_chat_body replaces session_id.
-    if upstream.get("session_id").and_then(Value::as_str).is_none() {
-        if let Some(session_id) = crate::protocol::responses::session_identity_of(&parsed) {
-            if let Some(object) = upstream.as_object_mut() {
-                object.insert("session_id".into(), Value::String(session_id.to_string()));
-            }
-        }
-    }
+    // Preserve body/header identity until prepare_llm_chat_body derives Trae's
+    // provider conversation IDs. Without it, header-only sessions collapse to a
+    // content-derived ID and can share upstream context across projects.
+    payload::set_session_id(&mut upstream, response_identity.as_deref());
     let Ok(encoded) = serde_json::to_vec(&upstream) else {
         return openai_error(
             StatusCode::BAD_REQUEST,
@@ -849,21 +855,16 @@ pub async fn responses_for_variant(
     let max_rotate = config.max_rotate.max(1);
     let chat_id = format!("chatcmpl-{}", uuid_like());
 
-    /* 粘性键：会话 id 优先；Responses 客户端（Codex 等）没有 `metadata`，用
-    `prompt_cache_key` 顶上 —— 它本身就是「同一段会话复用同一前缀」的语义，
-    与粘性同目的。两者都没有 ⇒ `None` ⇒ 整段跳过粘性（绝不退化成轮级键）。 */
-    let sticky_key = session_headers::conversation_id_of(&parsed)
-        .map(|conversation| conversation.trim().to_string())
-        .filter(|conversation| !conversation.is_empty())
-        .or_else(|| {
-            parsed
-                .get("prompt_cache_key")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|key| !key.is_empty())
-                .map(str::to_string)
-        })
-        .map(|conversation| sticky::sticky_key(variant.as_str(), &model, &conversation));
+    /* 账号粘性优先复用 Responses 状态隔离使用的会话身份（含顶层 session_id 与
+    会话请求头）。没有显式身份时，用转换后的首段 system/user 内容指纹；同一 Codex
+    对话追加历史后仍稳定，可避免多账号池每轮换号造成上游前缀缓存冷启动。
+    这里不使用 previous_response_id：它逐轮变化，不能作为会话键。 */
+    let sticky_identity = response_identity
+        .clone()
+        .or_else(|| payload::conversation_sticky_identity(&upstream));
+    let sticky_key = sticky_identity
+        .as_deref()
+        .map(|identity| sticky::sticky_key(variant.as_str(), &model, identity));
 
     // ★ 降级链（P13）：与 `/v1/chat/completions` 同一套 hop 循环（见那里的注释）。
     let fallback = crate::routes::fallback::FallbackLoop::plan(scope, &model).await;
@@ -1338,9 +1339,26 @@ fn anthropic_wants_stream(parsed: &Value) -> bool {
 /// （见 [`sticky::sticky_key`] 的文档）。
 ///
 /// 变体进键是必须的：两条产品线的账号库**分家**，粘到一起会指向另一条线的账号。
+#[cfg(test)]
 fn sticky_key_of(parsed: &Value, variant: TraeVariant, model: &str) -> Option<String> {
     crate::protocol::responses::session_identity_of(parsed)
-        .map(|conversation| sticky::sticky_key(variant.as_str(), model, conversation))
+        .map(str::to_string)
+        // Codex 的 Chat Completions 请求常不携带会话字段。此时复用上游会话 ID
+        // 的内容指纹绑定账号，避免多账号池每轮换号导致提示词缓存反复冷启动。
+        .or_else(|| payload::conversation_sticky_identity(parsed))
+        .map(|conversation| sticky::sticky_key(variant.as_str(), model, &conversation))
+}
+
+fn sticky_key_for_request(
+    parsed: &Value,
+    headers: &HeaderMap,
+    chat_body: &Value,
+    variant: TraeVariant,
+    model: &str,
+) -> Option<String> {
+    let identity = crate::session_headers::response_session_identity(parsed, headers)
+        .or_else(|| payload::conversation_sticky_identity(chat_body));
+    identity.map(|identity| sticky::sticky_key(variant.as_str(), model, &identity))
 }
 
 /// 合并两个偏好来源，得到本次选号的偏好 uid。
@@ -1851,7 +1869,7 @@ async fn settle_failure(
             stream,
             0,
             0,
-            0,
+            None,
             Some(failure.message.clone()),
             variant,
             key_id,
@@ -2168,6 +2186,65 @@ mod tests {
         assert_eq!(
             work,
             sticky_key_of(&body, TraeVariant::TraeWork, "deepseek-v4-flash").unwrap()
+        );
+    }
+
+    #[test]
+    fn sticky_key_honors_client_session_headers_and_content_identity() {
+        let body = json!({"messages": [{"role": "user", "content": "same request"}]});
+        let mut session_a = HeaderMap::new();
+        session_a.insert(
+            "x-claude-code-session-id",
+            "project-a-session".parse().unwrap(),
+        );
+        let mut session_b = HeaderMap::new();
+        session_b.insert(
+            "x-claude-code-session-id",
+            "project-b-session".parse().unwrap(),
+        );
+
+        let a = sticky_key_for_request(
+            &body,
+            &session_a,
+            &body,
+            TraeVariant::TraeWork,
+            "deepseek-v4-flash",
+        )
+        .unwrap();
+        let b = sticky_key_for_request(
+            &body,
+            &session_b,
+            &body,
+            TraeVariant::TraeWork,
+            "deepseek-v4-flash",
+        )
+        .unwrap();
+        assert_ne!(a, b, "different client sessions must remain isolated");
+
+        let project_a = json!({"messages": [
+            {"role": "developer", "content": "Project A instructions"},
+            {"role": "user", "content": "same request"}
+        ]});
+        let project_b = json!({"messages": [
+            {"role": "developer", "content": "Project B instructions"},
+            {"role": "user", "content": "same request"}
+        ]});
+        assert_ne!(
+            sticky_key_for_request(
+                &project_a,
+                &HeaderMap::new(),
+                &project_a,
+                TraeVariant::TraeWork,
+                "deepseek-v4-flash"
+            ),
+            sticky_key_for_request(
+                &project_b,
+                &HeaderMap::new(),
+                &project_b,
+                TraeVariant::TraeWork,
+                "deepseek-v4-flash"
+            ),
+            "project-specific developer instructions must separate sessions"
         );
     }
 

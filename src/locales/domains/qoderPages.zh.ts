@@ -30,7 +30,7 @@ export const zh = {
 
   "qoder.page.accounts.source.missing": "未检测到",
   "qoder.page.accounts.source.unreadable": "读不出来",
-  "qoder.page.accounts.source.empty": "里面没有账号",
+  "qoder.page.accounts.source.empty": "已安装 · 未登录",
   "qoder.page.accounts.source.ready": "可导入",
 
   "qoder.page.accounts.pat.title": "粘贴 PAT",
@@ -146,6 +146,7 @@ export const zh = {
   "qoder.page.usage.ledger.bothNote":
     "「全部」把两本账按日相加 —— 同一笔调用若既在客户端记录里又经网关转发，会被两边各记一次；要看准确消耗请切到单一账本。",
   "qoder.page.usage.trend": "每日积分",
+  "qoder.page.usage.hourlyTrend": "今日每小时积分",
   "qoder.page.usage.empty.title": "这段时间没有用量记录",
   "qoder.page.usage.empty.description": "本机客户端的会话记录里没有落在该窗口内的请求。",
   "qoder.page.usage.missing.title": "没有找到客户端会话记录",
@@ -218,6 +219,9 @@ export const zh = {
   // 到期徽章（issue #166）：黄=临期警告（7 天窗口，与 WB / Trae 同口径）。
   // 只报**最快到期的那一批**：天数与该批金额同批；逐批明细（绝对时刻）在 tooltip。
   "qoder.page.accounts.metric.expiringChip": "最近到期 {days}天 · {amount} 积分",
+  /* < 1 小时说分钟：与 `summarizeExpiring.soonestUnit` 同源；
+     1 分钟以内向下取整到 0 分钟（刻意不设秒档）。 */
+  "qoder.page.accounts.metric.expiringChipMinutes": "最近到期 {minutes}分钟 · {amount} 积分",
   /* ≤ 48 小时用小时：与 `summarizeExpiring.soonestUnit` 同源。 */
   "qoder.page.accounts.metric.expiringChipHours": "最近到期 {hours}小时 · {amount} 积分",
   "qoder.page.accounts.metric.expiringTipTitle": "按到期时间分批（共 {n} 批）",
@@ -338,11 +342,15 @@ export const zh = {
   "qoder.page.settings.proxy.saving": "保存中…",
   "qoder.page.settings.proxy.saved": "代理设置已保存",
   "qoder.page.settings.proxy.saveFailed": "代理设置保存失败",
-  "qoder.page.settings.section.client": "客户端检测",
-  "qoder.page.settings.client.description": "本机两处官方凭据存储的探测结果（只读，不落库）。",
+  "qoder.page.settings.account.title": "账号与登录",
+  "qoder.page.settings.account.description":
+    "导入、切换和程序位登录态都在账号页管理；这里只提供入口，不重复同一份表单。",
+  "qoder.page.settings.account.action": "前往账号页",
+  "qoder.page.settings.client.description": "查看本机 Qoder 客户端和登录状态。",
   "qoder.page.settings.client.error": "探测失败：{error}",
   // ★ 计划任务（Qoder 的两类排程；排程是全局单份 `schedule_config.json`）
   "qoder.page.settings.schedule.checkinGroup": "自动签到",
+  "qoder.page.settings.section.client": "客户端检测",
   "qoder.page.settings.schedule.checkinEnable": "按排程自动签到",
   "qoder.page.settings.schedule.checkinDesc":
     "到点自动领取活动平台的积分奖励（默认关闭 —— 替你去领东西，需要你明确打开）。",

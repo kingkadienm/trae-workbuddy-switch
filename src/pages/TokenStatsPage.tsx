@@ -98,6 +98,7 @@ import {
   SESSION_RENDER_LIMIT,
   calendarWindowKeys,
   heatmapMatrix,
+  hourAxisLabel,
   mergeGatewayTrends,
   mergeSources,
   workbuddyClientSources,
@@ -122,7 +123,7 @@ import {
   overlapInWindow,
   type UsageLedger,
 } from "@/lib/usage-ledger";
-import { usageWindowDays, type UsageWindow } from "@/lib/usage-window";
+import { todayKey, usageWindowDays, type UsageWindow } from "@/lib/usage-window";
 
 /** 本页承载的视图（积分视图在 `CreditStatsPage`）。 */
 export type TokenUsageView = "trend" | "models" | "sessions" | "keys";
@@ -208,29 +209,53 @@ function TrendView({
     () => new Map(gatewayDailyInWindow(gatewayTrend, viewWindow).map((day) => [day.key, day.total])),
     [gatewayTrend, viewWindow],
   );
+  const clientHours = useMemo(() => new Map((source.dailyHours ?? []).map((point) => [point.key, point.total])), [source.dailyHours]);
+  const gatewayHours = useMemo(() => new Map((gatewayTrend?.hourly ?? []).map((point) => [point.key, point.total])), [gatewayTrend]);
+  const hourlyAvailable = viewWindow.kind === "today" && (
+    ledger === "client" ? Array.isArray(source.dailyHours)
+      : ledger === "gateway" ? Array.isArray(gatewayTrend?.hourly)
+        : Array.isArray(source.dailyHours) && Array.isArray(gatewayTrend?.hourly)
+  );
   const columns = useMemo(
-    () =>
-      ledgerDailySeries({
+    () => {
+      if (hourlyAvailable) {
+        const date = todayKey();
+        const lastHour = new Date().getHours();
+        const hours = Array.from({ length: lastHour + 1 }, (_, hour) => {
+          const key = `${date}-${String(hour).padStart(2, "0")}`;
+          return { key, total: 0 };
+        });
+        return ledgerDailySeries({
+          days: hours,
+          clientTotals: clientHours,
+          gatewayTotals: gatewayHours,
+          ledger,
+          labelOf: hourAxisLabel,
+        });
+      }
+      return ledgerDailySeries({
         days: keys.map((key) => ({ key, total: 0 })),
         clientTotals: clientDaily,
         gatewayTotals: gatewayDaily,
         ledger,
         labelOf: (key) => key.slice(5).replace("-", "/"),
-      }),
-    [keys, clientDaily, gatewayDaily, ledger],
+      });
+    },
+    [keys, clientDaily, gatewayDaily, clientHours, gatewayHours, ledger, hourlyAvailable],
   );
 
   const sumOf = (map: Map<string, number>) => keys.reduce((sum, key) => sum + (map.get(key) ?? 0), 0);
   const clientTokens = sumOf(clientDaily);
   const gatewayTokens = sumOf(gatewayDaily);
-  const overlap = useMemo(() => overlapInWindow(recon, clientTokens), [recon, clientTokens]);
+  const windowRecon = recon && keys.includes(recon.window.date) ? recon : null;
+  const overlap = useMemo(() => overlapInWindow(windowRecon, clientTokens), [windowRecon, clientTokens]);
   const combined = combinedTotal(clientTokens, gatewayTokens, overlap);
   const formula = useMemo(() => {
     const parts = combinedFormula({
       clientTokens,
       gatewayTokens,
       overlapTokens: overlap,
-      verdict: recon?.verdict ?? null,
+      verdict: windowRecon?.verdict ?? null,
     });
     return parts.kind === "subset"
       ? t("wbStats.usage.trend.formulaSubset", {
@@ -242,7 +267,7 @@ function TrendView({
           gateway: compactTokens(gatewayTokens),
           overlap: compactTokens(parts.overlapTokens),
         });
-  }, [clientTokens, gatewayTokens, overlap, recon?.verdict, t]);
+  }, [clientTokens, gatewayTokens, overlap, windowRecon?.verdict, t]);
 
   const visibleTotal = ledger === "client" ? clientTokens : ledger === "gateway" ? gatewayTokens : combined;
   const total = visibleTotal;
@@ -250,13 +275,24 @@ function TrendView({
   const peak = Math.max(0, ...dailyTotals);
   /* ★ A1-3：日均的分母是**窗口天数**，不是「有数据的天数」——
      后者在稀疏数据下会把 5 天用量显示成「日均 300」，而真实 30 天日均是 50。 */
-  const average = Math.round(total / usageWindowDays(viewWindow));
+  const average =
+    viewWindow.kind === "today"
+      ? Math.round(total / Math.max(columns.length, 1))
+      : Math.round(total / usageWindowDays(viewWindow));
 
   const rangeRecords = useMemo(() => {
     const inWindow = new Set(keys);
     return source.daily.reduce((sum, point) => (inWindow.has(point.key) ? sum + point.records : sum), 0);
   }, [source.daily, keys]);
-  const filtered = source.summary.records > 0 && rangeRecords === 0 && gatewayTokens === 0;
+  const gatewayEndpoints = useMemo(() => dimTotals(dim, viewWindow, endpointKey), [dim, viewWindow]);
+  const gatewayRequests = dim
+    ? gatewayEndpoints.reduce((sum, row) => sum + row.requests, 0)
+    : windowRecon?.gatewayRows ?? 0;
+  const overlapRequests = Math.min(windowRecon?.matched ?? 0, rangeRecords, gatewayRequests);
+  const requests = ledger === "client"
+    ? rangeRecords
+    : ledger === "gateway" ? gatewayRequests : rangeRecords + gatewayRequests - overlapRequests;
+  const filtered = source.summary.records > 0 && rangeRecords === 0 && gatewayTokens === 0 && gatewayRequests === 0;
 
   /* 模型占比：**按单本账各画一个环**（跨账本合并占比的分母含重复计数，是假的）。 */
   const clientSlices = useMemo(
@@ -339,19 +375,19 @@ function TrendView({
           icon: DatabaseZap,
           label: t("wbStats.usage.trend.cacheHit"),
           value: cacheHit.observed ? compactTokens(cacheHit.cached) : "—",
-          hint: cacheHit.observed
-            ? t("wbStats.usage.trend.cacheHitHint", {
-                rate: `${Math.round((cacheHit.hitRate ?? 0) * 100)}%`,
-                input: compactTokens(cacheHit.input),
-              })
-            : t("wbStats.usage.trend.cacheHitUnobserved"),
-          title: t("wbStats.usage.trend.cacheHitTitle"),
+          hint: !cacheHit.observed
+            ? t("wbStats.usage.trend.cacheHitUnobserved")
+            : cacheHit.hitRate == null
+              ? t("wbStats.usage.trend.cacheHitZeroInput")
+              : t("wbStats.usage.trend.cacheHitHint", {
+                  rate: `${Math.round(cacheHit.hitRate * 100)}%`,
+                  input: compactTokens(cacheHit.input),
+                }),
         }
-      : null;
-  const tiles: StatTile[] = [
+      : null;  const tiles: StatTile[] = [
     totalTile,
     ...(cacheTile ? [cacheTile] : []),
-    { icon: TrendingUp, label: t("wbStats.usage.trend.avg"), value: compactTokens(average), hint: t("wbStats.usage.trend.avgHint") },
+    { icon: TrendingUp, label: t(viewWindow.kind === "today" ? "wbStats.usage.trend.hourAvg" : "wbStats.usage.trend.avg"), value: compactTokens(average), hint: t(viewWindow.kind === "today" ? "wbStats.usage.trend.hourAvgHint" : "wbStats.usage.trend.avgHint") },
     { icon: Gauge, label: t("wbStats.usage.trend.peak"), value: compactTokens(peak) },
     /* 决策 #4：WB 的第四张卡是「模型数」，不是「活跃账号」—— 账号维度在账号页，
        这里放模型数才能回答「这段时间动了几个模型」。 */
@@ -359,12 +395,10 @@ function TrendView({
     {
       icon: MessagesSquare,
       label: t("wbStats.usage.trend.requests"),
-      value: exactTokens(
-        ledger === "gateway"
-          ? dimTotals(dim, viewWindow, endpointKey).reduce((sum, row) => sum + row.requests, 0)
-          : rangeRecords,
-      ),
-      hint: t("wbStats.usage.trend.requestsHint"),
+      value: exactTokens(requests),
+      hint: ledger === "all"
+        ? t("wbStats.usage.trend.requestsCombinedHint")
+        : t("wbStats.usage.trend.requestsHint"),
     },
   ];
 
@@ -373,19 +407,19 @@ function TrendView({
       <StatTiles tiles={tiles} ariaLabel={t("wbStats.usage.view.trend")} />
       <CoverageStrip
         clientTokens={clientTokens}
-        clientRequests={recon?.clientRows ?? rangeRecords}
+        clientRequests={rangeRecords}
         gatewayTokens={gatewayTokens}
-        gatewayRequests={recon?.gatewayRows ?? 0}
-        gatewayFailed={dimTotals(dim, viewWindow, endpointKey).reduce((sum, row) => sum + row.failed, 0)}
+        gatewayRequests={gatewayRequests}
+        gatewayFailed={gatewayEndpoints.reduce((sum, row) => sum + row.failed, 0)}
         recorded={coverage.recorded}
         windowDays={coverage.total}
-        overlapRows={recon?.matched ?? 0}
+        overlapRows={overlapRequests}
         overlapTokens={overlap}
-        onReconcile={recon ? onReconcile : undefined}
+        onReconcile={windowRecon ? onReconcile : undefined}
       />
       {columns.some((column) => column.total > 0) ? (
         <ChartFrame
-          title={t("wbStats.usage.trend.stackedTitle")}
+          title={t(hourlyAvailable ? "wbStats.usage.trend.hourStackedTitle" : "wbStats.usage.trend.stackedTitle")}
           caption={t("wbStats.usage.trend.ledgerCaption")}
           ariaLabel={t("wbStats.usage.trend.stackedAria")}
         >
@@ -476,7 +510,7 @@ function ModelsView({
         failed: model.failed,
         /* ★ issue #154：命中率 = `cached / input`（分母是**输入侧**，不含输出）。
            `cached === 0 && input === 0` ⇒ null（没观测到），别写成 0%。 */
-        hitRate: model.input > 0 && model.cached > 0 ? model.cached / model.input : null,
+        hitRate: model.observed && model.observedInput > 0 ? model.cached / model.observedInput : null,
       })),
     [dim, viewWindow, t],
   );
@@ -758,13 +792,15 @@ export default function TokenStatsPage({
   const hasSource = (stats?.sources.length ?? 0) > 0;
   /* 网关用量（`gatewayTrend`，扫 `gateway_logs`）是客户端（扫 `projects/*.jsonl`）
      之外的另一条记录源，按窗口取。 */
-  const gatewayInWindow = useMemo(() => {
+  const hasGatewayActivity = useMemo(() => {
     const keys = new Set(calendarWindowKeys(viewWindow));
-    return (gatewayTrend?.days ?? []).reduce(
-      (sum, day) => (keys.has(day.key) ? sum + day.total : sum),
-      0,
+    const hasRequests = dim?.days.some((day) =>
+      keys.has(day.key) && day.endpoints.some((entry) => entry.requests > 0),
     );
-  }, [gatewayTrend, viewWindow]);
+    const reconHasRequests = !dim && recon && keys.has(recon.window.date) && recon.gatewayRows > 0;
+    return hasRequests || reconHasRequests
+      || (gatewayTrend?.days ?? []).some((day) => keys.has(day.key) && day.total > 0);
+  }, [dim, gatewayTrend, recon, viewWindow]);
   /**
    * 有来源但**两个数据源都翻不出用量** ⇒ 整页空态（区分于「被视图参数筛没」，后者在视图内处理）。
    *
@@ -775,7 +811,7 @@ export default function TokenStatsPage({
    *   不加 cutoff），窗口内被筛没的由各视图自行展示 ⇒ 这里只需「有没有任何来源
    *   记录」来决定是否渲染页面，避免空态把可能有值的视图整片吞掉。 */
   const clientHasRecords = (source?.summary.records ?? 0) > 0;
-  const trulyEmpty = Boolean(source) && !clientHasRecords && gatewayInWindow === 0;
+  const trulyEmpty = Boolean(source) && !clientHasRecords && !hasGatewayActivity;
 
   return (
     /* ⚠️ 页头 / 子 Tab / **视图参数条**都由**上层** `UsagePage` 统一渲染

@@ -26,11 +26,11 @@ pub struct TokenUsage {
     pub completion: u64,
     pub total: u64,
     pub reasoning: u64,
-    /// 命中上游前缀缓存的输入 token（`prompt` 的**子集**；0 = 上游没报）。
+    /// 命中上游前缀缓存的输入 token（`prompt` 的**子集**；`None` = 上游没报）。
     ///
     /// ★ issue #154：进请求日志的 `cachedTokens`，账本再按账号 / 模型 / 密钥分桶
     /// ⇒ 「命中率掉了」与「换号了」终于能在同一本账里 join。
-    pub cached: u64,
+    pub cached: Option<u64>,
 }
 
 impl TokenUsage {
@@ -70,8 +70,8 @@ impl TokenUsage {
             "completion_tokens": self.completion,
             "total_tokens": self.total,
         });
-        if self.cached > 0 {
-            usage["prompt_tokens_details"] = json!({ "cached_tokens": self.cached });
+        if let Some(cached) = self.cached {
+            usage["prompt_tokens_details"] = json!({ "cached_tokens": cached });
         }
         usage
     }
@@ -93,7 +93,7 @@ impl TokenUsage {
 ///
 /// **上限钳到 `prompt_tokens`**：命中量在语义上是输入的子集，脏数据（上游报大）
 /// 会让下游的命中率 > 100%。与 `usage_tap::extract_usage` 同一处置。
-fn cached_tokens_of(usage: &Value) -> u64 {
+fn cached_tokens_of(usage: &Value) -> Option<u64> {
     let read = |key: &str| usage.get(key).and_then(Value::as_u64);
     let hit = read("prompt_cache_hit_tokens")
         .or_else(|| {
@@ -103,10 +103,52 @@ fn cached_tokens_of(usage: &Value) -> u64 {
                 .and_then(Value::as_u64)
         })
         .or_else(|| read("cache_read_input_tokens"))
-        .or_else(|| read("cached_tokens"))
-        .unwrap_or(0);
+        .or_else(|| read("cached_tokens"))?;
     let prompt = read("prompt_tokens").unwrap_or(0);
-    hit.min(prompt)
+    Some(hit.min(prompt))
+}
+
+/// 把 metadata 的 cache pool 记录转成三态。
+///
+/// `prompt_cache_pool_record` 缺失 = 老上游未回报（None）；显式 null = 本次明确无池
+/// （Some(false)）；对象/数组/非空值 = 已挂池（Some(true)）。真假值 0、false 也按无池，
+/// 因为这不是布尔字段，其余标量都不是有效池记录。
+fn cache_pool_assigned(metadata: &Map<String, Value>) -> Option<bool> {
+    let record = metadata.get("prompt_cache_pool_record")?;
+    match record {
+        Value::Null => Some(false),
+        Value::Object(_) | Value::Array(_) => Some(true),
+        _ => Some(false),
+    }
+}
+
+/// metadata 已证明本次没有 cache pool 时，缓存计数 0 不是可测得的 miss。
+/// 非零计数仍原样保留（真实命中优先于无池声明，便于识别上游口径变化）；
+/// 未见到 metadata 时保持旧行为，避免把老上游的明确 0 误降级。
+fn resolve_cache_observation(
+    previous: Option<u64>,
+    cache_pool_assigned: Option<bool>,
+    measured: Option<u64>,
+) -> Option<u64> {
+    match (measured, cache_pool_assigned) {
+        (Some(0), Some(false)) => None,
+        (Some(value), _) => Some(value),
+        (None, _) => previous,
+    }
+}
+
+/// 把一个 usage 事件的可信度与已积累的用量合并。
+fn merge_token_usage_with_pool(
+    previous: Option<TokenUsage>,
+    mut latest: TokenUsage,
+    cache_pool_assigned: Option<bool>,
+) -> TokenUsage {
+    latest.cached = resolve_cache_observation(
+        previous.and_then(|usage| usage.cached),
+        cache_pool_assigned,
+        latest.cached,
+    );
+    latest
 }
 
 /// 一个解析完成的 SOLO 事件。
@@ -117,6 +159,9 @@ pub struct SoloEvent {
     pub reasoning: String,
     pub tool_calls: Option<Value>,
     pub usage: Option<TokenUsage>,
+    /// Trae metadata 三态：Some(true)=明确有池，Some(false)=明确无池，None=未回报。
+    /// 只有明确有池时，token_usage 的缓存 0 才是可信的「未命中」。
+    pub cache_pool_assigned: Option<bool>,
     pub finish_reason: String,
     pub error_code: Option<i64>,
     pub error_message: String,
@@ -231,6 +276,9 @@ fn parse_event(event: &str, data: &str) -> SoloEvent {
         }
         "token_usage" => {
             parsed.usage = Some(TokenUsage::from_value(&raw));
+        }
+        "metadata" => {
+            parsed.cache_pool_assigned = cache_pool_assigned(object);
         }
         "done" => {
             parsed.finish_reason = object
@@ -561,6 +609,7 @@ pub async fn stream_convert(
     let mut parser = SoloParser::new();
     let mut outcome = StreamOutcome::default();
     let mut pending_usage: Option<TokenUsage> = None;
+    let mut cache_pool_assigned: Option<bool> = None;
     // ★ issue #172：工具调用必须**跨帧累加**，按帧各自输出会被拆成残缺条目。
     let mut tools = ToolCallAccumulator::default();
     let mut stream = response.bytes_stream();
@@ -584,6 +633,9 @@ pub async fn stream_convert(
             capture.append("_upstream_resp.ndjson", &chunk);
         }
         for event in parser.feed(&chunk) {
+            if let Some(assigned) = event.cache_pool_assigned {
+                cache_pool_assigned = Some(assigned);
+            }
             if emit(
                 &event,
                 sender.clone(),
@@ -592,6 +644,7 @@ pub async fn stream_convert(
                 &mut pending_usage,
                 &mut tools,
                 &mut outcome,
+                cache_pool_assigned,
             )
             .await
             .is_err()
@@ -603,6 +656,9 @@ pub async fn stream_convert(
     }
 
     for event in parser.finish() {
+        if let Some(assigned) = event.cache_pool_assigned {
+            cache_pool_assigned = Some(assigned);
+        }
         if emit(
             &event,
             sender.clone(),
@@ -611,6 +667,7 @@ pub async fn stream_convert(
             &mut pending_usage,
             &mut tools,
             &mut outcome,
+            cache_pool_assigned,
         )
         .await
         .is_err()
@@ -658,6 +715,7 @@ async fn emit(
     pending_usage: &mut Option<TokenUsage>,
     tools: &mut ToolCallAccumulator,
     outcome: &mut StreamOutcome,
+    cache_pool_assigned: Option<bool>,
 ) -> Result<(), ()> {
     match event.event.as_str() {
         "output" | "thought" => {
@@ -683,8 +741,10 @@ async fn emit(
         }
         "token_usage" => {
             if let Some(usage) = event.usage {
-                *pending_usage = Some(usage);
-                outcome.usage = usage;
+                let latest =
+                    merge_token_usage_with_pool(*pending_usage, usage, cache_pool_assigned);
+                *pending_usage = Some(latest);
+                outcome.usage = latest;
             }
             Ok(())
         }
@@ -736,7 +796,6 @@ async fn emit(
         _ => Ok(()),
     }
 }
-
 /// 非流式聚合：读完整条事件流，拼成单个 `chat.completion`。
 ///
 /// 返回 `(响应体, 上游错误, 用量)`。上游报错时响应体为 `None`。
@@ -753,6 +812,7 @@ pub async fn aggregate(
     let mut reasoning = String::new();
     let mut finish_reason = "stop".to_string();
     let mut usage = TokenUsage::default();
+    let mut cache_pool_assigned: Option<bool> = None;
     let mut error: Option<(i64, String)> = None;
     // ★ issue #172：同一条调用会被拆到多帧 ⇒ 非流式也必须累加后再输出。
     let mut tools = ToolCallAccumulator::default();
@@ -763,9 +823,15 @@ pub async fn aggregate(
                    reasoning: &mut String,
                    finish_reason: &mut String,
                    usage: &mut TokenUsage,
+                   cache_pool_assigned: &mut Option<bool>,
                    error: &mut Option<(i64, String)>,
                    tools: &mut ToolCallAccumulator| {
         match event.event.as_str() {
+            "metadata" => {
+                if let Some(assigned) = event.cache_pool_assigned {
+                    *cache_pool_assigned = Some(assigned);
+                }
+            }
             "output" | "thought" => {
                 content.push_str(&event.response);
                 reasoning.push_str(&event.reasoning);
@@ -775,7 +841,7 @@ pub async fn aggregate(
             }
             "token_usage" => {
                 if let Some(value) = event.usage {
-                    *usage = value;
+                    *usage = merge_token_usage_with_pool(Some(*usage), value, *cache_pool_assigned);
                 }
             }
             "done" | "turn_completion" => {
@@ -811,6 +877,7 @@ pub async fn aggregate(
                 &mut reasoning,
                 &mut finish_reason,
                 &mut usage,
+                &mut cache_pool_assigned,
                 &mut error,
                 &mut tools,
             );
@@ -823,6 +890,7 @@ pub async fn aggregate(
             &mut reasoning,
             &mut finish_reason,
             &mut usage,
+            &mut cache_pool_assigned,
             &mut error,
             &mut tools,
         );
@@ -944,7 +1012,7 @@ mod tests {
                 "prompt_tokens": 100, "completion_tokens": 1, "prompt_cache_hit_tokens": 90
             }))
             .cached,
-            90
+            Some(90)
         );
         // OpenAI 明细
         assert_eq!(
@@ -953,7 +1021,7 @@ mod tests {
                 "prompt_tokens_details": { "cached_tokens": 70 }
             }))
             .cached,
-            70
+            Some(70)
         );
         // Anthropic
         assert_eq!(
@@ -961,7 +1029,7 @@ mod tests {
                 "prompt_tokens": 100, "completion_tokens": 1, "cache_read_input_tokens": 60
             }))
             .cached,
-            60
+            Some(60)
         );
         // 裸字段 + 缺字段（= 0 = 上游没报）
         assert_eq!(
@@ -969,11 +1037,11 @@ mod tests {
                 "prompt_tokens": 100, "completion_tokens": 1, "cached_tokens": 50
             }))
             .cached,
-            50
+            Some(50)
         );
         assert_eq!(
             TokenUsage::from_value(&json!({"prompt_tokens": 100, "completion_tokens": 1})).cached,
-            0
+            None
         );
         // 脏数：命中量报得比 prompt 还大 ⇒ 钳到 prompt
         assert_eq!(
@@ -981,7 +1049,72 @@ mod tests {
                 "prompt_tokens": 10, "completion_tokens": 1, "prompt_cache_hit_tokens": 999
             }))
             .cached,
-            10
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn later_partial_token_usage_does_not_erase_cache_hits() {
+        let first = TokenUsage::from_value(&json!({
+            "prompt_tokens": 100, "completion_tokens": 10, "prompt_cache_hit_tokens": 90
+        }));
+        let partial = TokenUsage::from_value(&json!({
+            "prompt_tokens": 110, "completion_tokens": 11
+        }));
+        assert_eq!(
+            merge_token_usage_with_pool(Some(first), partial, Some(true)).cached,
+            Some(90)
+        );
+
+        let explicit_zero = TokenUsage::from_value(&json!({
+            "prompt_tokens": 120, "completion_tokens": 12, "prompt_cache_hit_tokens": 0
+        }));
+        assert_eq!(
+            merge_token_usage_with_pool(Some(first), explicit_zero, Some(true)).cached,
+            Some(0)
+        );
+    }
+
+    /// Trae can explicitly say that no prompt-cache pool was attached to the
+    /// request. In that case a later `cache_read_input_tokens: 0` is not a
+    /// measured miss and must not be promoted to an observed zero by the logs
+    /// or ledger.
+    #[test]
+    fn metadata_without_cache_pool_makes_zero_cache_unobserved() {
+        let mut parser = SoloParser::new();
+        let events = parser.feed(concat!(
+            "event:metadata\ndata:{\"prompt_cache_pool_record\":null}\n\n",
+            "event:token_usage\ndata:{\"prompt_tokens\":100,\"completion_tokens\":2,\"cache_read_input_tokens\":0}\n\n",
+        ).as_bytes());
+        assert_eq!(events.len(), 2, "metadata and token_usage must both parse");
+        assert_eq!(events[0].cache_pool_assigned, Some(false));
+        let cache = resolve_cache_observation(
+            None,
+            events[0].cache_pool_assigned,
+            events[1].usage.expect("usage").cached,
+        );
+        assert_eq!(
+            cache, None,
+            "no pool means zero is not a measured hit count"
+        );
+    }
+
+    #[test]
+    fn metadata_with_cache_pool_preserves_measured_zero() {
+        let mut parser = SoloParser::new();
+        let events = parser.feed(concat!(
+            "event:metadata\ndata:{\"prompt_cache_pool_record\":{\"id\":\"pool-1\"}}\n\n",
+            "event:token_usage\ndata:{\"prompt_tokens\":100,\"completion_tokens\":2,\"cache_read_input_tokens\":0}\n\n",
+        ).as_bytes());
+        assert_eq!(events[0].cache_pool_assigned, Some(true));
+        assert_eq!(
+            resolve_cache_observation(
+                None,
+                events[0].cache_pool_assigned,
+                events[1].usage.expect("usage").cached
+            ),
+            Some(0),
+            "an attached pool makes an explicit zero a measured miss"
         );
     }
 
@@ -1071,7 +1204,7 @@ mod tests {
             completion: 20,
             total: 1020,
             reasoning: 0,
-            cached: 900,
+            cached: Some(900),
         }
         .to_openai();
         assert_eq!(
@@ -1211,6 +1344,7 @@ mod tests {
                 &mut pending,
                 &mut tools,
                 &mut outcome,
+                None,
             )
             .await
             .unwrap();
@@ -1314,6 +1448,7 @@ mod tests {
                 &mut pending,
                 &mut tools,
                 &mut outcome,
+                None,
             )
             .await
             .unwrap();
@@ -1356,6 +1491,7 @@ mod tests {
                 &mut pending,
                 &mut tools,
                 &mut outcome,
+                None,
             )
             .await
             .unwrap();

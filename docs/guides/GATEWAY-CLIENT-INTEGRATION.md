@@ -78,7 +78,7 @@ WorkBuddy 视频 P1 的模型查询、任务提交/查询和火宝 `custom` 接�
 1. 网关页 →「统一入口」分区 → 打开「启用统一网关」（默认关，端口 `57892`）。
 2. 在「统一密钥」卡创建一把 Key —— **一把 Key 可同时授权多个命名空间**（如 `wb-cn` + `trae-cn`）。
 3. 客户端里 Base URL 填 `http://127.0.0.1:57892/v1`，认证头用 `Authorization: Bearer sk-uni-…`。
-4. 模型名必须带前缀：`wb-cn:deepseek-v4.1-flash`、`trae-global:…`。**不带前缀一律 400**，错误体里给出可用前缀清单。
+4. 模型名必须带前缀：`wb-cn/deepseek-v4.1-flash`、`trae-global/…`。新配置请使用斜杠；旧客户端配置中的冒号格式（如 `wb-cn:deepseek-v4.1-flash`）仍兼容。**不带前缀一律 400**，错误体里给出可用前缀清单。
 
 | 命名空间 | 默认 | 说明 |
 |:---|:---|:---|
@@ -87,6 +87,8 @@ WorkBuddy 视频 P1 的模型查询、任务提交/查询和火宝 `custom` 接�
 | `qoder-cn` / `qoder-global` | ✅ 开 | Qoder 国内版 / 国际版 |
 
 > 命名空间**派生自作用域注册表**（`Scope::all()`）：共 6 条，全部默认启用。Trae 的两条老程序线（`traework-*` / `traecode-*`）已随「客户端合并」清空扩展层，不再出现在表里。
+
+**如果统一网关请求总是走 WorkBuddy**：统一入口不会按账号积分自动猜产品线。检查客户端请求的 `model` 是否带了精确命名空间前缀（例如 `trae-cn/模型名` 或 `qoder-cn/模型名`），并确认这把 `sk-uni-…` Key 已授权对应命名空间。`wb-cn/…` 明确走 WorkBuddy；裸模型名会返回 400，不会自动回落。可在统一网关请求日志核对命中的 `namespace` 与 `resolved_model`。
 
 **三条硬边界**：
 
@@ -151,18 +153,22 @@ Anthropic 系客户端**自己会拼 `/v1/messages`**；给它带 `/v1` 的地�
 
 - **Codex、Trae 自定义模型、CodeBuddy `models.json` 需要手填模型 ID** —— 从 `/v1/models` 里复制，别猜。
 - `/v1/models` 返回 200 **不等于**该模型此刻一定能用（上游可能限流）。清单只代表「网关愿意暴露」。
-- **统一入口的模型名必须带命名空间前缀**（`wb-cn:…`）—— 不带前缀一律 400，不做兜底猜测。见 §1.3。
+- **统一入口的新模型 ID 使用斜杠命名空间前缀**（`wb-cn/…`）；旧冒号格式仍兼容。裸模型名一律 400，不做兜底猜测。见 §1.3。
 - **Trae 的上下文上限（Max Mode）逐模型不同，且不需要特殊模型名**：网关从 Trae 官方模型目录
   读取每个模型的 `dev`（`__dev` 通道实际窗口）与 `max`（Max Mode 上限）；`max > dev` 的模型在请求时
   注入 `is_max_mode`，`/v1/models` 直接声明它**自己的** `max`。
   - 不是统一 1M：实测 `glm-5.3` 200k→1M、`mimo-v2.6-pro` 200k→981504、`Doubao-Seed-2.1-Turbo` 上限仍是 256k；
     清单里 `max_mode: true` 表示这条已开 Max。
   - 目录拉不到（无账号 / 网络）⇒ 按客户端清单的默认窗口声明，**不猜数字**。
-  - 基名即可（`glm-5.3`、统一入口 `trae-cn:glm-5.3`），不用加后缀、不用另选一条。
+  - 基名即可（`glm-5.3`、统一入口 `trae-cn/glm-5.3`），不用加后缀、不用另选一条。
 
 ### 2.5 流式
 
 两个协议都支持 SSE。网关对上游**强制 `stream: true`**，客户端要非流式时由网关聚合后再返回。
+
+WorkBuddy CN 的 `/v1/chat/completions` 流在上游字节静默 60 秒后会显式结束并发送 SSE 错误帧与 `[DONE]`，
+避免客户端等到 reqwest 默认读超时。可在网关进程启动环境中设置 `BUDDY_SWITCH_STREAM_IDLE_TIMEOUT_SECS` 覆盖秒数；
+设为 `0` 可关闭。该设置只作用于 WorkBuddy CN 流式 Chat Completions，不影响 WorkBuddy Global、非流式或其它 SSE 端点。
 
 ### 2.6 60 秒自检（先跑这个，再配客户端）
 
@@ -202,7 +208,7 @@ Trae 分区：把端口换成 `57894`，且**认证头统一用 `Authorization: 
 | **`401` + `"type":"no_credential"`**，且文案里带「N 个已禁用 / 冷却中 / 余额为 0 / 被你排除 / 在途已满」 | **号在库里，但此刻一个都用不了** —— 不是没登录，重新登录/切换账号救不了 | 按文案里的计数去「网关 → 账号池」看逐账号原因。禁用是终态（需余额刷新成功或人工恢复）；排除点「取消排除」；「在途已满」会自己好 |
 | **`503` + `"type":"pool_busy"`** | 号**都健康**、凭据与余额正常，只是**在途并发占满**（旧版本这里错报成 401，会把人骗去重新登录） | 响应头已带 `Retry-After: 2`，等 2 秒重试即可。长期出现说明并发确实高：调高「每账号在途上限」或增加账号 |
 | **`402`** | 上游余额不足（网关按硬冷却处理，通常冷到次日 04:00） | 换号由网关自动处理；**全都余额不足**时才会把这个 402 透出来 —— 该去充值/换号了 |
-| `404` | 路径拼错，或 Codex 对 Trae 网关用了 `responses` | 见 §2.3；Codex 接 Trae 必须 `wire_api = "chat"` |
+| `404` | 路径拼错，或当前运行的旧版网关尚不支持该端点 | 见 §2.3；升级网关后确认对应 `/v1` 路由可用 |
 | `413` | 请求体超过 `max_body_mb`（默认 8MB） | 调大后**重启网关**（该值在 router 构建期固化，不热生效） |
 | `429` | 上游限流 / Key 限流 | 换号由网关自动处理；持续 429 看「请求日志」与「客户端限流台账」 |
 | `502` | 上游错误 / 账号池无可用户 | 看「API 服务」页的诊断行（逐账号说明为什么不能路由） |
@@ -230,7 +236,7 @@ Trae 分区：把端口换成 `57894`，且**认证头统一用 `Authorization: 
 
 ### 3.1 Codex（OpenAI Codex CLI）
 
-**结论**：改 `~/.codex/config.toml`，加一个自定义 `model_provider`。WB 与 Qoder 网关都能用 `wire_api = "responses"`；Trae 网关只能用 `wire_api = "chat"`。
+**结论**：改 `~/.codex/config.toml`，加一个自定义 `model_provider`。三个网关都支持 `wire_api = "responses"`；Trae 也可继续用 `wire_api = "chat"`。Codex 接 Trae 推荐 Responses，以使用网关的会话隔离和历史输入预算。
 
 **WorkBuddy 网关（推荐 `responses`）**
 
@@ -259,7 +265,7 @@ env_key = "BUDDY_SWITCH_KEY"
 wire_api = "responses"
 ```
 
-**Trae 网关（必须 `chat`）**
+**Trae 网关（推荐 `responses`）**
 
 ```toml
 model = "<从 /v1/models 复制的模型 id>"
@@ -269,7 +275,7 @@ model_provider = "buddy_switch_trae"
 name = "Buddy Switch (Trae)"
 base_url = "http://127.0.0.1:57894/v1"
 env_key = "BUDDY_SWITCH_KEY"
-wire_api = "chat"
+wire_api = "responses"
 ```
 
 Key 放环境变量，**不要写进 TOML**：
@@ -292,8 +298,8 @@ setx BUDDY_SWITCH_KEY "sk-wb-..."
 - **Responses 支持的是一个子集**（网关侧 `protocol/responses.rs` 已写清边界）：
   - 支持：`input`（字符串 / items 数组）、`instructions`、扁平 `tools`、`tool_choice`、`temperature` / `top_p` / `max_output_tokens` / `parallel_tool_calls`。
   - **忽略而非报错**：`store`、`include`、`background`、`stream_options`、文件 / 音频输入。`store` 不会开启持久化存储；Responses 状态只由网关在进程内短期保存。
-  - `previous_response_id` 已由 WorkBuddy、Trae、Qoder 三条 Responses 路由支持：状态按 API Key 与区域隔离（Trae 还区分客户端变体），最多保留 256 条、单条 transcript 上限 512 KiB、1 小时过期；只有成功完成且 transcript 未超限的响应会保存。超限时本轮响应仍会返回，但不会保存续接状态；后续使用该 ID 会返回 400。网关重启、状态过期或被容量淘汰后，该 ID 也会返回 400；跨 Key / 区域 / Trae 变体续接同样会返回 400。状态不是持久会话存储。
-  - Responses 历史输入还会按 64 KiB 预算裁剪：保留 system/developer 指令和最新完整 user turn，再尽量保留较新的完整旧轮次。因此超长对话可能不再包含较早历史；Codex 若发送 `compaction` 项，该项也无法还原为上游可读内容。
+  - `previous_response_id` 已由 WorkBuddy、Trae、Qoder 三条 Responses 路由支持：状态按 API Key、区域、产品线（Trae 还区分客户端变体）隔离；请求提供会话身份时，再按身份指纹隔离。支持的身份来源包括 body `session_id` / `conversation_id`、metadata 会话字段、`x-claude-code-session-id` / `x-session-id` / `x-conversation-id`，以及 Codex 可用的 `prompt_cache_key`。续接请求临时缺少身份时，只在该 response ID 于现有 Key/区域/产品线范围内唯一时继承原会话；如果 ID 不能唯一确定会话，续接失败。首轮和续接都不提供稳定身份时，网关仍无法区分该客户端的不同项目。状态按 24 小时空闲过期；续接访问会刷新过期时间。单条 transcript 序列化大小上限 512 KiB，估算的全局内存预算 128 MiB、每个 API Key/区域/产品线 scope 64 MiB、每个会话 32 MiB；条目上限分别为全局 1024、每 scope 512、每会话 64。容量不足时先在超额会话或 scope 内淘汰最久未访问项，全局压力则优先回收占用最大的 scope。只有成功完成且 transcript 未超限的响应会保存。状态未保存、过期和淘汰会产生不含 ID、Key 或正文的摘要日志。网关重启、状态空闲过期或被容量淘汰后，该 ID 会返回 400；身份 / Key / 区域 / 产品线不匹配时按状态不存在处理。状态不是持久会话存储。
+  - Responses 和 Chat Completions 的历史输入预算为 256 KiB：保留 system/developer 指令和最新完整 user 消息；超长的同一轮会裁掉较早活动，只保留最近完整条目，并将 function call 与对应输出成组保留。剩余预算再纳入较新的旧轮次。指令或最新 user 消息本身超过预算时仍会完整保留，因此 256 KiB 是历史裁剪预算，不是请求绝对上限。网关只记录输入/保留字节数与裁剪条目数，不记录正文。Codex 若发送 `compaction` 项，该项也无法还原为上游可读内容。
 - `reasoning` 项在 **WB 路径**会被丢弃（上游不接受）；**Qoder 路径**会翻成上游的思考档位 ⇒ `model_reasoning_effort` 生效。
 
 ### 3.2 Claude Code

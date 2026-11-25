@@ -914,12 +914,22 @@ pub async fn get_codebuddy_cn_ide_status() -> Result<Value, String> {
 pub async fn switch_codebuddy_cn_ide_account(
     account_id: String,
     restart: Option<bool>,
+    copy_sessions: Option<Value>,
+    sync_selections: Option<Value>,
+    region: Option<String>,
 ) -> Result<Value, String> {
     if account_id.trim().is_empty() {
         return Err("缺少 accountId".to_string());
     }
     tauri::async_runtime::spawn_blocking(move || {
-        programs::switch("codebuddy_cn_ide", &account_id, restart)
+        switch::switch_linked_extension(
+            "codebuddyIde",
+            parse_region(region.as_deref()),
+            &account_id,
+            restart,
+            copy_sessions,
+            sync_selections.as_ref(),
+        )
     })
     .await
     .map_err(|e| e.to_string())?
@@ -959,12 +969,22 @@ pub async fn get_vscode_codebuddy_plugin_status() -> Result<Value, String> {
 pub async fn switch_vscode_codebuddy_plugin_account(
     account_id: String,
     restart: Option<bool>,
+    copy_sessions: Option<Value>,
+    sync_selections: Option<Value>,
+    region: Option<String>,
 ) -> Result<Value, String> {
     if account_id.trim().is_empty() {
         return Err("缺少 accountId".to_string());
     }
     tauri::async_runtime::spawn_blocking(move || {
-        programs::switch("vscode_codebuddy_plugin", &account_id, restart)
+        switch::switch_linked_extension(
+            "vscodeExt",
+            parse_region(region.as_deref()),
+            &account_id,
+            restart,
+            copy_sessions,
+            sync_selections.as_ref(),
+        )
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1529,6 +1549,7 @@ pub async fn switch_account(
     restart: Option<bool>,
     copy_session_ids: Option<Vec<String>>,
     source_region: Option<String>,
+    sync_selections: Option<Value>,
 ) -> Result<Value, String> {
     if account_id.trim().is_empty() {
         return Err("缺少 accountId".to_string());
@@ -1541,6 +1562,9 @@ pub async fn switch_account(
     };
     let restart = restart.unwrap_or(true);
     let copy_ids = copy_session_ids.unwrap_or_default();
+    let sync_selections = buddy_switch_core::modules::linked_workbuddy::parse_sync_selections(
+        sync_selections.as_ref(),
+    )?;
 
     // 与 webui 的 `/api/switch/progress` 同契约：同步写入进程内进度缓存，
     // 供 `switch_progress` 轮询；事件 `switch-progress` 仍照常派发。
@@ -1559,13 +1583,14 @@ pub async fn switch_account(
         let _ = app.emit("switch-progress", json!({ "message": message }));
     });
     let result = tauri::async_runtime::spawn_blocking(move || {
-        switch::switch_account_cross(
+        switch::switch_account_cross_with_sync(
             region,
             source_region,
             Some(&progress),
             &account_id,
             restart,
             &copy_ids,
+            &sync_selections,
         )
     })
     .await;
@@ -1574,6 +1599,26 @@ pub async fn switch_account(
     *SWITCH_REGION.lock().unwrap() = None;
 
     result.map_err(|e| e.to_string())?
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn preview_switch_session_links(
+    account_id: String,
+    region: Option<String>,
+    source_region: Option<String>,
+    client: Option<String>,
+) -> Result<Value, String> {
+    require_capability(Product::Workbuddy, capability::Capability::SessionCopy)?;
+    let region = parse_region(region.as_deref());
+    let source_region = source_region
+        .as_deref()
+        .map(|region| parse_region(Some(region)))
+        .unwrap_or(region);
+    tauri::async_runtime::spawn_blocking(move || {
+        switch::preview_switch_session_links(client.as_deref(), source_region, region, &account_id)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// GET /api/switch/progress —— 轮询切换进度（与 webui 同契约）。
@@ -1633,9 +1678,9 @@ pub async fn list_sessions(region: Option<String>) -> Result<Value, String> {
 pub async fn list_session_replicas(region: Option<String>) -> Result<Value, String> {
     require_capability(Product::Workbuddy, capability::Capability::SessionCopy)?;
     let region = parse_region(region.as_deref());
-    tauri::async_runtime::spawn_blocking(move || session::list_replica_groups_for(region))
+    tauri::async_runtime::spawn_blocking(move || session::list_linked_replica_groups_for(region))
         .await
-        .map_err(|error| format!("读取会话副本失败: {error}"))
+        .map_err(|error| format!("读取会话副本失败: {error}"))?
 }
 
 /// POST /api/sessions/replicas/prune —— remove replica-ledger edges whose target
@@ -1648,9 +1693,48 @@ pub async fn list_session_replicas(region: Option<String>) -> Result<Value, Stri
 pub async fn prune_session_replicas(region: Option<String>) -> Result<Value, String> {
     require_capability(Product::Workbuddy, capability::Capability::SessionCopy)?;
     let region = parse_region(region.as_deref());
-    tauri::async_runtime::spawn_blocking(move || session::prune_deleted_replica_edges_for(region))
+    tauri::async_runtime::spawn_blocking(move || session::prune_linked_replicas_for(region))
         .await
-        .map_err(|error| format!("清理会话关联失败: {error}"))
+        .map_err(|error| format!("清理会话关联失败: {error}"))?
+}
+
+#[tauri::command]
+pub async fn recover_session_links(region: Option<String>) -> Result<Value, String> {
+    require_capability(Product::Workbuddy, capability::Capability::SessionCopy)?;
+    let region = parse_region(region.as_deref());
+    tauri::async_runtime::spawn_blocking(move || session::recover_linked_sessions_for(region))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn manage_session_links(region: Option<String>, change: Value) -> Result<Value, String> {
+    require_capability(Product::Workbuddy, capability::Capability::SessionCopy)?;
+    let region = parse_region(region.as_deref());
+    tauri::async_runtime::spawn_blocking(move || {
+        session::manage_linked_sessions_for(region, &change)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn session_groups_action(
+    action: String,
+    client: String,
+    variant_scope: Option<String>,
+    input: Value,
+) -> Result<Value, String> {
+    require_capability(Product::Workbuddy, capability::Capability::SessionCopy)?;
+    let request = buddy_switch_core::modules::session_groups::GroupActionRequest {
+        action,
+        client,
+        variant_scope,
+        input,
+    };
+    tauri::async_runtime::spawn_blocking(move || request.execute())
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 /// POST /api/sessions/sync —— P8 **安全同步（增量追加）**：把源副本的新增行追加到落后副本。
@@ -1665,12 +1749,15 @@ pub async fn prune_session_replicas(region: Option<String>) -> Result<Value, Str
 pub async fn sync_session_replicas(
     items: Vec<Value>,
     region: Option<String>,
+    preview: Option<bool>,
 ) -> Result<Value, String> {
     require_capability(Product::Workbuddy, capability::Capability::SessionCopy)?;
     let region = parse_region(region.as_deref());
-    tauri::async_runtime::spawn_blocking(move || session::sync_session_replicas_for(region, &items))
-        .await
-        .map_err(|error| format!("同步会话副本失败: {error}"))
+    tauri::async_runtime::spawn_blocking(move || {
+        session::linked_replica_batch(region, &items, false, preview.unwrap_or(false))
+    })
+    .await
+    .map_err(|error| format!("同步会话副本失败: {error}"))?
 }
 
 /// POST /api/sessions/unify —— P8 **分歧处理（覆盖式统一）**：把用户选定保留的那一份覆盖到其余副本。
@@ -1685,14 +1772,15 @@ pub async fn sync_session_replicas(
 pub async fn unify_session_replicas(
     items: Vec<Value>,
     region: Option<String>,
+    preview: Option<bool>,
 ) -> Result<Value, String> {
     require_capability(Product::Workbuddy, capability::Capability::SessionCopy)?;
     let region = parse_region(region.as_deref());
     tauri::async_runtime::spawn_blocking(move || {
-        session::unify_session_replicas_for(region, &items)
+        session::linked_replica_batch(region, &items, true, preview.unwrap_or(false))
     })
     .await
-    .map_err(|error| format!("统一会话副本失败: {error}"))
+    .map_err(|error| format!("统一会话副本失败: {error}"))?
 }
 
 /// POST /api/sessions/export —— 把会话导出成一个 JSON 包（issue #87）。
@@ -1963,15 +2051,7 @@ pub async fn copy_sessions(
     tauri::async_runtime::spawn_blocking(move || {
         let target =
             account::find_account_for(region, &target_account_id).ok_or("目标账号不存在")?;
-        // 独立复制入口没有切换进度事件通道，传 None（三段管线的耗时优化照常生效）。
-        Ok(session::copy_sessions_for_switch_cross(
-            source_region,
-            region,
-            None,
-            &target,
-            &session_ids,
-        )
-        .unwrap_or_else(|| json!({})))
+        session::copy_linked_sessions_for_switch(source_region, region, &target, &session_ids)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -3448,71 +3528,10 @@ pub async fn get_gateway_models(region: Option<String>) -> Value {
 pub async fn refresh_gateway_models(region: Option<String>) -> Result<Value, String> {
     let region = parse_region(region.as_deref());
     let state = gateway::shared_state();
-    let strategies = state.strategies.read().await;
-    let primary = strategies.get(&region).cloned().unwrap_or_default();
-    drop(strategies);
-
-    // 依次尝试策略：配置策略 → pinned(首个账号) → max_credits → current(本机)
-    let fallback_chain: Vec<buddy_switch_gateway::account_strategy::AccountStrategy> = vec![
-        primary.clone(),
-        first_pinned_strategy(region),
-        buddy_switch_gateway::account_strategy::AccountStrategy::MaxCredits,
-        buddy_switch_gateway::account_strategy::AccountStrategy::Current,
-    ];
-
-    let mut last_error = None;
-    for strategy in &fallback_chain {
-        match refresh_with_strategy(&state, region, strategy).await {
-            Ok(snapshot) => {
-                return Ok(serde_json::to_value(snapshot).unwrap_or(Value::Null));
-            }
-            Err(e) => {
-                last_error = Some(e);
-                continue;
-            }
-        }
-    }
-
-    // 全部策略都失败：返回缓存的或内置的
-    let snapshot = state.catalogs.current(region);
-    let mut result = serde_json::to_value(snapshot).unwrap_or(Value::Null);
-    if let Some(err) = last_error {
-        result["refreshError"] = serde_json::json!(err);
-    }
-    Ok(result)
-}
-
-/// 用指定策略选号并刷新目录。
-async fn refresh_with_strategy(
-    state: &buddy_switch_gateway::GatewayState,
-    region: Region,
-    strategy: &buddy_switch_gateway::account_strategy::AccountStrategy,
-) -> Result<buddy_switch_core::modules::catalog::CatalogSnapshot, String> {
-    let account = buddy_switch_gateway::AccountSelector
-        .select(region, strategy)
+    let snapshot = buddy_switch_gateway::catalog_probe::probe_region(&state, region)
         .await
-        .map_err(|e| e.message())?;
-    state
-        .catalogs
-        .try_refresh(region, &state.upstream, &account)
-        .await
-}
-
-/// 取该 region 账号库中第一个账号 id（用于回退策略）。
-fn first_pinned_strategy(
-    region: Region,
-) -> buddy_switch_gateway::account_strategy::AccountStrategy {
-    let accounts = buddy_switch_core::modules::account::load_accounts_for(region);
-    if let Some(id) = accounts.into_iter().find_map(|acc| {
-        acc.get("id")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    }) {
-        buddy_switch_gateway::account_strategy::AccountStrategy::Pinned { account_id: id }
-    } else {
-        buddy_switch_gateway::account_strategy::AccountStrategy::Current
-    }
+        .map_err(|error| error.message())?;
+    Ok(serde_json::to_value(snapshot).unwrap_or(Value::Null))
 }
 
 /// GET /api/gateway/strategy —— 各 region 账号策略。
@@ -4451,6 +4470,38 @@ const TRAE_SWITCH_PROGRESS_EVENT: &str = "trae-switch-progress";
 #[tauri::command]
 pub async fn trae_switch_account(app: tauri::AppHandle, options: Value) -> Result<Value, String> {
     let options = trae::handlers::parse_switch_options(&options)?;
+    if let Some(account) = trae::account::find_for(options.variant, &options.user_id) {
+        let db_exp = trae::jwt::parse(&account.jwt).exp_timestamp.unwrap_or(0);
+        let snapshot_exp = trae::paths::profile_dir_for(options.variant, &options.user_id)
+            .filter(|path| path.is_dir())
+            .and_then(|path| trae::icube::cloudide_auth_info_from_dir(&path, options.variant).ok())
+            .and_then(|info| {
+                info.expired_at
+                    .or_else(|| trae::jwt::parse(&info.token).exp_timestamp)
+            })
+            .unwrap_or(0);
+        let active_user = trae::profile::extract_local_jwt_for(options.variant)
+            .ok()
+            .map(|(user_id, _)| user_id);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        if db_exp > 0
+            && db_exp < now
+            && db_exp > snapshot_exp
+            && active_user.as_deref() != Some(options.user_id.as_str())
+        {
+            trae::account::refresh_jwt_for(options.variant, &options.user_id)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "目标账号登录凭据已过期，切换尚未开始。自动续期失败：{error}。\
+                         请在 Trae 客户端重新登录并保存登录态后重试。"
+                    )
+                })?;
+        }
+    }
     tauri::async_runtime::spawn_blocking(move || {
         let outcome = trae::profile::switch_account(&options, |step| {
             let _ = app.emit(TRAE_SWITCH_PROGRESS_EVENT, step.to_json());

@@ -292,6 +292,73 @@ pub fn prefix_stream(
     futures_util::stream::iter(head).chain(response.bytes_stream())
 }
 
+/// WorkBuddy CN 流式请求的上游字节 idle 超时环境变量。
+pub const STREAM_IDLE_TIMEOUT_SECS_ENV: &str = "BUDDY_SWITCH_STREAM_IDLE_TIMEOUT_SECS";
+/// 缺省的上游字节 idle 超时（秒）。
+pub const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 60;
+
+/// 读取上游字节 idle 超时；未设置或非法值回退到 60 秒，`0` 表示禁用。
+pub fn stream_idle_timeout() -> std::time::Duration {
+    match std::env::var(STREAM_IDLE_TIMEOUT_SECS_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        Some(seconds) => std::time::Duration::from_secs(seconds),
+        None => std::time::Duration::from_secs(DEFAULT_STREAM_IDLE_TIMEOUT_SECS),
+    }
+}
+
+/// 在上游字节流上按「相邻 chunk」增加 idle 闸门。
+///
+/// reqwest 传输错误转成 `Other`，idle 超时转成 `TimedOut`；后者由 `UsageTap`
+/// 作为明确的 `UpstreamEvent::Timeout` 记录。`forwarded_bytes` 由最终 SSE 输出层更新，
+/// 因此超时详情只统计已经交给下游的字节，不含后续生成的错误帧和 `[DONE]`。
+pub fn stream_with_idle_timeout<S>(
+    stream: S,
+    timeout: std::time::Duration,
+    forwarded_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) -> futures_util::stream::BoxStream<'static, Result<axum::body::Bytes, std::io::Error>>
+where
+    S: futures_util::Stream<Item = Result<axum::body::Bytes, reqwest::Error>> + Send + 'static,
+{
+    use futures_util::StreamExt;
+
+    let stream = stream
+        .map(|item| {
+            item.map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))
+        })
+        .boxed();
+    if timeout.is_zero() {
+        return stream;
+    }
+
+    futures_util::stream::unfold(
+        (stream, forwarded_bytes, false),
+        move |(mut stream, forwarded_bytes, finished)| async move {
+            if finished {
+                return None;
+            }
+            match tokio::time::timeout(timeout, stream.next()).await {
+                Ok(Some(Ok(chunk))) => Some((Ok(chunk), (stream, forwarded_bytes, false))),
+                Ok(Some(Err(error))) => Some((Err(error), (stream, forwarded_bytes, true))),
+                Ok(None) => None,
+                Err(_) => {
+                    let error = std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        crate::protocol::usage_tap::StreamIdleTimeoutError {
+                            idle_ms: timeout.as_millis(),
+                            forwarded_bytes: forwarded_bytes
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                        },
+                    );
+                    Some((Err(error), (stream, forwarded_bytes, true)))
+                }
+            }
+        },
+    )
+    .boxed()
+}
+
 /// 非流式：把 peek 取走的首块拼回正文，再读出剩余全部字节。
 pub async fn body_text_with_prefix(
     prefix: Option<axum::body::Bytes>,
@@ -1768,9 +1835,9 @@ fn describe_event(event: &UpstreamEvent) -> String {
         UpstreamEvent::Server => "5xx 上游异常 → 计入熔断".to_string(),
         UpstreamEvent::Timeout => "请求超时 → 计入熔断并换号（换模型可能更有效）".to_string(),
         UpstreamEvent::SessionDead => "12153 会话失效 → 三振禁用".to_string(),
-        // issue #100：401/403 不再归到「调用方错误」—— 那是**该账号的凭据**被拒。
+        // 401/403 是**该账号的凭据**被拒：冷却该账号，但当前请求不换号。
         UpstreamEvent::AuthRejected => {
-            "401/403 凭据被拒 → 浅冷却 60s 并换号（保活刷新后可自愈）".to_string()
+            "401/403 凭据被拒 → 冷却当前账号（不换号，保活刷新后可自愈）".to_string()
         }
         UpstreamEvent::Client => "4xx 调用方错误（不换号）".to_string(),
     }
@@ -2679,7 +2746,7 @@ mod tests {
             credit: 1.0,
             prompt_tokens: 10,
             completion_tokens: 5,
-            cached_tokens: 2,
+            cached_tokens: Some(2),
         }));
         failure.record(UpstreamEvent::Server, "fixture");
         sink.finish(None);
@@ -3118,6 +3185,10 @@ mod tests {
         ));
         // 对照：参数错（400/422）仍然不换号 —— 换号只是把同一份坏参数喂给下一个号。
         assert!(!should_rotate(&UpstreamEvent::Client, 0));
+        assert!(
+            describe_event(&UpstreamEvent::AuthRejected).contains("不换号"),
+            "用户可见说明必须与终态策略一致"
+        );
     }
 }
 
